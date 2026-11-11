@@ -3589,17 +3589,11 @@ const MACOS_UNDO_VM_RUNNING_NOTE: &str = "note: the loopback IPs boxes use stay 
 #[cfg(any(test, not(target_os = "macos")))]
 const LINUX_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
      resolver setting for box names, Minimal's DNS service, the user-namespace profile, \
-     the classifier tree, and the kvm group membership the step added";
+     the network policy loader, and the kvm group membership the step added";
 
 /// The AppArmor profile directory the user-namespace profile installs under.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const APPARMOR_DIR: &str = "/etc/apparmor.d";
-
-/// The classifier tree the privileged step lays out
-/// (`sandbox::classifier::TREE_ROOT`, spelled here because the CLI does
-/// not build the sandbox crate on every host).
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_TREE_ROOT: &str = "/sys/fs/cgroup/minimald.slice";
 
 /// The record the step leaves when it adds the operator to the `kvm`
 /// group, naming the user it added, so the removal takes back only the
@@ -3614,78 +3608,137 @@ pub(crate) const KVM_GROUP_RECORD: &str = "/var/lib/minimal/finalize-install-kvm
 pub(crate) const APPARMOR_PROFILE_RECORD: &str =
     "/var/lib/minimal/finalize-install-apparmor-profile";
 
-/// The record the step leaves when it installs the classifier tree, so
-/// the removal takes away only a tree the step put there; one installed
-/// another way (the script by hand) stays.
+/// The systemd units of the network policy loader. systemd starts one
+/// instance of the template service per connection on the socket.
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_TREE_RECORD: &str = "/var/lib/minimal/finalize-install-classifier";
+pub(crate) const POLICY_LOADER_SYSTEMD_UNIT: &str = "minimal-policy-loader";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const POLICY_LOADER_UNIT_SOCKET_PATH: &str =
+    "/etc/systemd/system/minimal-policy-loader.socket";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const POLICY_LOADER_UNIT_SERVICE_PATH: &str =
+    "/etc/systemd/system/minimal-policy-loader@.service";
 
-/// The heredoc delimiter the classifier's installer rides under in a
-/// script.
+/// The loader's socket unit. Only the operator's daemon may connect:
+/// the loader does what a connection asks with root's capabilities.
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_SCRIPT_HEREDOC: &str = "MINIMAL_CLASSIFIER_SCRIPT_EOF";
+const POLICY_LOADER_SOCKET_TEMPLATE: &str = "\
+[Unit]
+Description=Minimal network policy loader
 
-/// The classifier's privileged step, the very file the native lane runs:
-/// the install step writes it to [`CLASSIFIER_PROGRAM_PATH`] and runs it,
-/// and the removal script carries it whole and runs its `--uninstall`.
-/// This binary is its one source: nothing is fetched.
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_SCRIPT: &str =
-    include_str!("../../../scripts/install-host-classifier.sh");
+[Socket]
+ListenSequentialPacket=__SOCKET__
+SocketUser=__OPERATOR__
+SocketMode=0600
+Accept=yes
+MaxConnections=4
+RemoveOnStop=yes
 
-/// The root-owned copy of the classifier's step the install step leaves,
-/// which the placement unit runs on every daemon start.
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
-    "/usr/local/lib/minimal/install-host-classifier.sh";
+[Install]
+WantedBy=sockets.target
+";
 
-/// The systemd unit pair that places the daemon's listener in its leaf on
-/// every daemon start: a socket unit at [`paths::PLACE_REQUEST_SOCKET`], which the
-/// daemon connects to once its own listener is bound, and the template
-/// service systemd starts for each connection, which runs the step's
-/// `--place-listener`. The pair is why no daemon restart needs a root step
-/// of its own. A socket in `/run` that systemd itself created needs no
-/// inotify watch, which SELinux policy can deny systemd for a socket under
-/// the account's home (gominimal/inbox#1206).
+/// The loader's service unit: the root-owned copy of minimald, with the
+/// connection on stdin and no more of the host than loading programs and
+/// attaching them to cgroups takes.
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/minimald-place.socket";
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place@.service";
-/// The path unit and its oneshot an earlier install placed the daemon with,
-/// by watching the daemon's socket. The install removes them before it
-/// writes the socket pair, and `--undo` removes whichever it finds.
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const LEGACY_PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const LEGACY_PLACE_UNIT_SERVICE_PATH: &str =
-    "/etc/systemd/system/minimald-place.service";
+const POLICY_LOADER_SERVICE_TEMPLATE: &str = "\
+[Unit]
+Description=Minimal network policy loader
+CollectMode=inactive-or-failed
 
-/// The boot unit: a oneshot that re-runs the classifier's step from the
-/// root-owned copy at every boot, which the placement service is ordered
-/// after. The tree lives in cgroupfs and the table in the kernel, so
-/// neither survives a reboot on its own; without this unit the first
-/// placement request after a boot would find no tree to place the daemon
-/// in.
+[Service]
+ExecStart=__PROGRAM__ __policy-loader
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN
+LimitMEMLOCK=infinity
+";
+
+/// The loader's socket unit for `operator`'s daemon.
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_SYSTEMD_UNIT: &str = "minimald-classifier";
+pub(crate) fn policy_loader_socket_unit(operator: &str) -> String {
+    POLICY_LOADER_SOCKET_TEMPLATE
+        .replace("__SOCKET__", paths::POLICY_LOADER_SOCKET)
+        .replace("__OPERATOR__", operator)
+}
+
+/// The loader's service unit.
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const CLASSIFIER_UNIT_SERVICE_PATH: &str =
-    "/etc/systemd/system/minimald-classifier.service";
+pub(crate) fn policy_loader_service_unit() -> String {
+    POLICY_LOADER_SERVICE_TEMPLATE.replace("__PROGRAM__", paths::POLICY_LOADER_PROGRAM)
+}
+
+/// The files an earlier version installed for network enforcement. Hosts
+/// upgrade from releases that left them, so the install and the removal
+/// both take them away, and the policy engine item is not done while one
+/// is left.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const EARLIER_INSTALL_FILES: &[&str] = &[
+    "/etc/systemd/system/minimald-classifier.service",
+    "/etc/systemd/system/minimald-place.socket",
+    "/etc/systemd/system/minimald-place@.service",
+    "/etc/systemd/system/minimald-place.path",
+    "/etc/systemd/system/minimald-place.service",
+    "/usr/local/lib/minimal/install-host-classifier.sh",
+    "/usr/local/lib/minimal/quic443-leaf",
+    "/etc/sudoers.d/minimal-quic443-leaf",
+    "/var/lib/minimal/finalize-install-classifier",
+];
+
+/// The cgroup directory an earlier version installed.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const EARLIER_INSTALL_CGROUP: &str = "/sys/fs/cgroup/minimald.slice";
+
+/// The lines that remove what an earlier version installed. Every line
+/// tolerates what is already gone. `root` prefixes every path, as in
+/// [`linux_undo_command_under`].
+///
+/// One unit per `systemctl disable`: a call that names a unit the host
+/// lacks disables none of them. `find` exits 0 whether or not `rmdir`
+/// removed anything, so the directory is tested afterwards. A cgroup that
+/// still holds a process cannot be removed, and cgroupfs is empty again
+/// after a boot.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn earlier_install_removal(root: &str) -> String {
+    format!(
+        "# what an earlier version installed\n\
+         for unit in minimald-classifier.service minimald-place.socket minimald-place.path; do\n\
+         \x20 systemctl disable --now \"$unit\" 2>/dev/null || true\n\
+         done\n\
+         rm -f {root}/etc/systemd/system/minimald-classifier.service \\\n\
+         \x20     {root}/etc/systemd/system/minimald-place.socket \
+         {root}/etc/systemd/system/minimald-place@.service \\\n\
+         \x20     {root}/etc/systemd/system/minimald-place.path \
+         {root}/etc/systemd/system/minimald-place.service \\\n\
+         \x20     {root}/usr/local/lib/minimal/install-host-classifier.sh \
+         {root}/usr/local/lib/minimal/quic443-leaf \\\n\
+         \x20     {root}/etc/sudoers.d/minimal-quic443-leaf \
+         {root}/var/lib/minimal/finalize-install-classifier\n\
+         systemctl daemon-reload 2>/dev/null || true\n\
+         if command -v nft >/dev/null 2>&1; then nft delete table inet minimal_class \
+         2>/dev/null || true; fi\n\
+         if [ -d {root}/sys/fs/cgroup/minimald.slice ]; then\n\
+         \x20 find {root}/sys/fs/cgroup/minimald.slice -depth -type d -exec rmdir {{}} \\; \
+         2>/dev/null || true\n\
+         \x20 [ ! -d {root}/sys/fs/cgroup/minimald.slice ] \\\n\
+         \x20   || echo \"minimal: {root}/sys/fs/cgroup/minimald.slice is still in use; it is \
+         gone after the next boot\" >&2\n\
+         fi\n"
+    )
+}
 
 /// The lines that remove the Linux items beyond the names: the
-/// user-namespace profile (unloaded, then its files), the classifier tree
-/// (the step's own `--uninstall`, run only while the tree exists) with its
-/// units and the root-owned copy of the step, and the
-/// `kvm` membership the step recorded adding. The profile and the tree
-/// come away only by the step's records: one without its record was
-/// installed another way and stays, named in a note. The classifier's removal runs last and its
-/// failure is held to the end — the tree is still held while minimald or
-/// a box has a leaf, and the script is `set -e` — so every other item's
-/// removal runs whatever it does, and the script still exits non-zero
-/// with the note that names what to stop. Every other line tolerates what
-/// is already gone.
+/// user-namespace profile (unloaded, then its files), the network policy
+/// loader with what an earlier version installed in its place, and the
+/// `kvm` membership the step recorded adding. The profile comes away only
+/// by the step's record: one without it was installed another way and
+/// stays, named in a note. Every line tolerates what is already gone.
 /// `root` prefixes every path, as in [`linux_undo_command_under`].
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_host_items_removal(root: &str) -> String {
@@ -3706,17 +3759,14 @@ fn linux_host_items_removal(root: &str) -> String {
          stays; remove it with: apparmor_parser --remove {root}{APPARMOR_DIR}/minimald && rm -f \
          {root}{APPARMOR_DIR}/minimald {root}{APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
-         # One unit per call: systemctl refuses a whole call that names a unit this\n\
-         # host does not have, and an install carries either the socket pair or the\n\
-         # earlier path pair.\n\
-         for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
-         {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do\n\
-         \x20 systemctl disable --now \"$unit\" 2>/dev/null || true\n\
-         done\n\
-         rm -f {root}{PLACE_UNIT_SOCKET_PATH} {root}{PLACE_UNIT_SERVICE_PATH} \
-         {root}{LEGACY_PLACE_UNIT_PATH_PATH} {root}{LEGACY_PLACE_UNIT_SERVICE_PATH} \
-         {root}{CLASSIFIER_UNIT_SERVICE_PATH} {root}{CLASSIFIER_PROGRAM_PATH}\n\
+         \n\
+         # The network policy loader: its socket, both units and the root-owned copy\n\
+         # of minimald they run.\n\
+         systemctl disable --now {POLICY_LOADER_SYSTEMD_UNIT}.socket 2>/dev/null || true\n\
+         rm -f {root}{POLICY_LOADER_UNIT_SOCKET_PATH} {root}{POLICY_LOADER_UNIT_SERVICE_PATH} \
+         {root}{loader}\n\
          systemctl daemon-reload 2>/dev/null || true\n\
+         {earlier}\
          rmdir \"{root}{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
          # The kvm group memberships the step added, one user per line of its record.\n\
@@ -3725,30 +3775,9 @@ fn linux_host_items_removal(root: &str) -> String {
          \x20   [ -z \"$kvm_user\" ] || gpasswd -d \"$kvm_user\" kvm 2>/dev/null || true\n\
          \x20 done < {root}{KVM_GROUP_RECORD}\n\
          \x20 rm -f {root}{KVM_GROUP_RECORD}\n\
-         fi\n\
-         \n\
-         # The classifier tree: the step's own removal, by the step's record and while\n\
-         # the tree is there. A tree without the record was installed another way and\n\
-         # stays. Last, and its failure held to the end: the tree stays held while\n\
-         # minimald or a box has a leaf, and nothing above should be skipped for that.\n\
-         classifier_held=\n\
-         if [ -f {root}{CLASSIFIER_TREE_RECORD} ] ; then\n\
-         \x20 if [ -d {root}{CLASSIFIER_TREE_ROOT} ] ; then\n\
-         \x20   bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1\n\
-         {CLASSIFIER_SCRIPT}\
-         {CLASSIFIER_SCRIPT_HEREDOC}\n\
-         \x20 fi\n\
-         \x20 [ -n \"$classifier_held\" ] || rm -f {root}{CLASSIFIER_TREE_RECORD}\n\
-         elif [ -d {root}{CLASSIFIER_TREE_ROOT} ] ; then\n\
-         \x20 echo 'note: the classifier tree at {root}{CLASSIFIER_TREE_ROOT} was not installed by min \
-         finalize-install and stays; remove it as root with: {root}{CLASSIFIER_PROGRAM_PATH} --uninstall \
-         (or the same script from a checkout)' >&2\n\
-         fi\n\
-         if [ -n \"$classifier_held\" ] ; then\n\
-         \x20 echo 'note: the classifier tree at {root}{CLASSIFIER_TREE_ROOT} is still held: stop minimald \
-         and its boxes, then run min finalize-install --undo again' >&2\n\
-         \x20 exit 1\n\
-         fi\n"
+         fi\n",
+        loader = paths::POLICY_LOADER_PROGRAM,
+        earlier = earlier_install_removal(root),
     )
 }
 
@@ -3867,8 +3896,7 @@ pub(crate) fn linux_undo_command(channel: &str) -> String {
 /// path the script names, `channel` included, is `root` followed by that
 /// path, so a test gives one temp dir and the script reaches nothing
 /// outside it. `root` is empty for the host itself, and the script is then
-/// byte for byte the one `--show --script` prints. The classifier's own
-/// step rides whole in a heredoc to `bash`, which a test stands in for.
+/// byte for byte the one `--show --script` prints.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_undo_command_under(root: &str, channel: &str) -> String {
     format!(
@@ -5095,52 +5123,73 @@ async fn range_present_on_host() -> bool {
 /// own verb, named and never run.
 pub const FINALIZE_INSTALL: &str = "min finalize-install";
 
-/// The install facts the host line reads beyond the surface verdict
-/// (NET-018): the names item is the surface verdict itself, so only the
-/// other items' state travels here.
+/// The install facts the host line reads beyond the surface verdict: the
+/// names item is the surface verdict itself, so only the other items'
+/// state travels here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostInstall {
-    /// A finalize-install item other than names is not done on this host —
-    /// the ones `min finalize-install --show` lists for it, under the same
-    /// scoping the plan applies (a VM-backed daemon carries no classifier
-    /// item, a native one no KVM item).
+    /// A finalize-install item other than names is not done on this host:
+    /// one of those `min finalize-install --show` lists for it.
     pub other_items_unfinished: bool,
+    /// The installed network policy loader is from another version than
+    /// this host's minimald.
+    pub policy_loader_out_of_date: bool,
 }
 
-/// Whether this host's install is unfinished (NET-018, NET-122): the names
-/// item is done exactly when the surface is native, and any other item
-/// not done counts the same.
-#[must_use]
-pub fn install_unfinished(surface: &LiveSurface, host: HostInstall) -> bool {
-    *surface != LiveSurface::Native || host.other_items_unfinished
+/// What the surface line says about this host's install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPointer {
+    /// Every item is done: the line carries no pointer.
+    Finished,
+    /// An item is not done.
+    FinishSetup,
+    /// The network policy loader is out of date. It is named on its own
+    /// because an upgrade causes it and boxes with a network policy are
+    /// refused until the command runs.
+    LoaderOutOfDate,
 }
 
-/// The install clause both verbs end their surface line with while this
-/// host's install is unfinished (NET-018, NET-122): the one command that
-/// finishes it. Empty on a finished host, so the line carries no pointer
-/// then.
+/// The pointer for this host: the names item is done exactly when the
+/// surface is native, and any other item not done counts the same.
 #[must_use]
-pub fn install_clause(unfinished: bool) -> &'static str {
-    if unfinished {
-        "; finish setup: min finalize-install"
+pub fn install_pointer(surface: &LiveSurface, host: HostInstall) -> InstallPointer {
+    if host.policy_loader_out_of_date {
+        InstallPointer::LoaderOutOfDate
+    } else if *surface != LiveSurface::Native || host.other_items_unfinished {
+        InstallPointer::FinishSetup
     } else {
-        ""
+        InstallPointer::Finished
     }
 }
 
-/// `line` with the install pointer after it while this host's install is
-/// unfinished (NET-018, NET-122), the same on both verbs. A line that ends
-/// a sentence, such as the held-port cause, gets the pointer as a sentence
-/// of its own. Any other line gets [`install_clause`]. A finished host
-/// gets the line unchanged.
+/// The install clause both verbs end their surface line with: the one
+/// command that finishes the install. Empty on a finished host.
 #[must_use]
-pub fn with_install_pointer(line: String, unfinished: bool) -> String {
-    if !unfinished {
-        line
-    } else if line.ends_with('.') {
-        format!("{line} Finish setup: min finalize-install")
-    } else {
-        format!("{line}{}", install_clause(true))
+pub fn install_clause(pointer: InstallPointer) -> &'static str {
+    match pointer {
+        InstallPointer::Finished => "",
+        InstallPointer::FinishSetup => "; finish setup: min finalize-install",
+        InstallPointer::LoaderOutOfDate => {
+            "; the network policy loader is out of date: min finalize-install"
+        }
+    }
+}
+
+/// `line` with the install pointer after it, the same on both verbs. A
+/// line that ends a sentence, such as the held-port cause, gets the
+/// pointer as a sentence of its own. Any other line gets
+/// [`install_clause`]. A finished host gets the line unchanged.
+#[must_use]
+pub fn with_install_pointer(line: String, pointer: InstallPointer) -> String {
+    if !line.ends_with('.') {
+        return format!("{line}{}", install_clause(pointer));
+    }
+    match pointer {
+        InstallPointer::Finished => line,
+        InstallPointer::FinishSetup => format!("{line} Finish setup: min finalize-install"),
+        InstallPointer::LoaderOutOfDate => {
+            format!("{line} The network policy loader is out of date: min finalize-install")
+        }
     }
 }
 
@@ -5198,7 +5247,7 @@ pub fn host_line_beside(
         Some(cause) => format!("{name}: the hostname proxy is not serving: {cause}"),
         None => box_name_opens(&name, surface, proxy_port, at_own_address),
     };
-    with_install_pointer(format!("names: {names}"), install_unfinished(surface, host))
+    with_install_pointer(format!("names: {names}"), install_pointer(surface, host))
 }
 
 /// How a box name opens on this host (T110): the one statement the
@@ -6174,6 +6223,7 @@ pub(crate) mod tests {
     fn activate_prints_one_host_line_per_install_state() {
         let others_open = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let unfinished = host_line("web", &LiveSurface::Proxy, Some(7654), others_open);
         assert_eq!(
@@ -6344,6 +6394,7 @@ pub(crate) mod tests {
             HostInstall::default(),
             HostInstall {
                 other_items_unfinished: true,
+                ..HostInstall::default()
             },
         ] {
             let native = host_line("api", &LiveSurface::Native, Some(7654), host);
@@ -6352,7 +6403,7 @@ pub(crate) mod tests {
                 format!(
                     "names: api.min.internal opens at its name on this machine; the HTTP \
                      proxy at 127.0.0.1:7654 opens it too{}",
-                    install_clause(host.other_items_unfinished)
+                    install_clause(install_pointer(&LiveSurface::Native, host))
                 ),
             );
             assert!(!native.contains("any browser"), "{native}");
@@ -6360,7 +6411,7 @@ pub(crate) mod tests {
                 host_line("api", &LiveSurface::Native, None, host),
                 format!(
                     "names: api.min.internal opens at its name on this machine{}",
-                    install_clause(host.other_items_unfinished)
+                    install_clause(install_pointer(&LiveSurface::Native, host))
                 ),
                 "with no proxy port the native line names no proxy"
             );
@@ -6395,6 +6446,7 @@ pub(crate) mod tests {
         const CLAUSE: &str = "; finish setup: min finalize-install";
         let others_open = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let cases = [
             (LiveSurface::Proxy, HostInstall::default(), true),
@@ -6446,9 +6498,12 @@ pub(crate) mod tests {
             );
             assert_eq!(lines[3], "set -eu", "{script}");
             assert!(sh_parses(script), "{script}");
+            // `sudo` as a word: the Linux removal names a sudoers file an
+            // earlier version left.
             for statement in script_statements(&without_heredoc_bodies(script)) {
                 assert!(
-                    !statement.contains("sh -c") && !statement.contains("sudo"),
+                    !statement.contains("sh -c")
+                        && !statement.split_whitespace().any(|word| word == "sudo"),
                     "{statement}"
                 );
             }
@@ -6552,11 +6607,10 @@ pub(crate) mod tests {
         );
         assert!(!linux.contains("rmdir \"/run\""), "{linux}");
         assert!(linux.contains(&linux_service_removal("", "")), "{linux}");
-        // Linux: the other items the step installs come away too — the
+        // Linux: the other items the step installs come away too: the
         // user-namespace profile unloaded and its files removed, the
-        // classifier tree by the step's own `--uninstall` (the script
-        // carried whole, run only while the tree exists), and the kvm
-        // membership the step recorded adding.
+        // network policy loader, and the kvm membership the step recorded
+        // adding.
         for step in [
             format!("if [ -f {APPARMOR_PROFILE_RECORD} ] ; then"),
             format!("  if [ -f {APPARMOR_DIR}/minimald ] ; then"),
@@ -6570,23 +6624,10 @@ pub(crate) mod tests {
             format!(
                 "  echo 'note: {APPARMOR_DIR}/minimald was not installed by min finalize-install"
             ),
-            format!("if [ -f {CLASSIFIER_TREE_RECORD} ] ; then"),
-            format!("  if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
-            format!(
-                "    bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1"
-            ),
-            format!("  [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}"),
-            format!("elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
-            format!(
-                "for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
-                 {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do"
-            ),
-            "  systemctl disable --now \"$unit\" 2>/dev/null || true".to_string(),
-            format!(
-                "rm -f {PLACE_UNIT_SOCKET_PATH} {PLACE_UNIT_SERVICE_PATH} \
-                 {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH} \
-                 {CLASSIFIER_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
-            ),
+            "systemctl disable --now minimal-policy-loader.socket 2>/dev/null || true".to_string(),
+            "rm -f /etc/systemd/system/minimal-policy-loader.socket \
+             /etc/systemd/system/minimal-policy-loader@.service /usr/local/lib/minimal/minimald"
+                .to_string(),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
             "  while IFS= read -r kvm_user ; do".to_string(),
             "    [ -z \"$kvm_user\" ] || gpasswd -d \"$kvm_user\" kvm 2>/dev/null || true"
@@ -6598,23 +6639,18 @@ pub(crate) mod tests {
                 "the Linux removal runs {step:?}: {linux}"
             );
         }
-        // The classifier's removal, the one that can fail while the tree
-        // is held, runs after every other item's.
+        // What an earlier version installed goes with the loader, by the
+        // same lines the install runs, after the loader's own files.
+        let earlier = earlier_install_removal("");
+        assert!(linux.contains(&earlier), "{linux}");
         assert!(
-            linux.find("gpasswd -d").unwrap() < linux.find("bash -s -- --uninstall").unwrap()
-                && linux.find("apparmor_parser --remove").unwrap()
-                    < linux.find("bash -s -- --uninstall").unwrap(),
+            linux.find("rm -f /etc/systemd/system/minimal-policy-loader.socket")
+                < linux.find(&earlier),
             "{linux}"
         );
         assert!(
-            linux.contains(&format!("{CLASSIFIER_SCRIPT}{CLASSIFIER_SCRIPT_HEREDOC}\n")),
-            "the classifier's own step rides whole under its delimiter"
-        );
-        assert!(
-            !CLASSIFIER_SCRIPT
-                .lines()
-                .any(|line| line == CLASSIFIER_SCRIPT_HEREDOC),
-            "the delimiter never occurs in the script it delimits"
+            !mac.contains("minimal-policy-loader") && !mac.contains("minimald-place"),
+            "{mac}"
         );
         assert!(
             !mac.contains("apparmor_parser") && !mac.contains("gpasswd"),
@@ -6629,17 +6665,15 @@ pub(crate) mod tests {
     /// The tools the removal scripts run by name that change the host.
     /// [`run_confined`] finds each one in the test's stand-ins directory:
     /// the test's own stand-in, or one it writes that fails the way the
-    /// real tool fails on a host without the item. `bash` is among them
-    /// because it runs the classifier's step, and that heredoc names the
-    /// real cgroup paths.
+    /// real tool fails on a host without the item.
     const HOST_TOOLS: &[&str] = &[
         "apparmor_parser",
-        "bash",
         "dscacheutil",
         "gpasswd",
         "ip",
         "killall",
         "launchctl",
+        "nft",
         "pgrep",
         "resolvectl",
         "systemctl",
@@ -6790,31 +6824,25 @@ pub(crate) mod tests {
         let root = "/minimal-undo-test-root";
         let linux = paths_outside(&linux_undo_command("/run/minimal/answerer.sock"), root);
         for path in [
-            PLACE_UNIT_SOCKET_PATH,
-            PLACE_UNIT_SERVICE_PATH,
-            LEGACY_PLACE_UNIT_PATH_PATH,
-            LEGACY_PLACE_UNIT_SERVICE_PATH,
-            CLASSIFIER_UNIT_SERVICE_PATH,
-            CLASSIFIER_PROGRAM_PATH,
+            POLICY_LOADER_UNIT_SOCKET_PATH,
+            POLICY_LOADER_UNIT_SERVICE_PATH,
+            paths::POLICY_LOADER_PROGRAM,
             ANSWERER_UNIT_SOCKET_PATH,
             ANSWERER_UNIT_SERVICE_PATH,
             ZONE_LINK_UNIT_PATH,
             KVM_GROUP_RECORD,
-            CLASSIFIER_TREE_ROOT,
+            EARLIER_INSTALL_CGROUP,
             "/run/minimal/answerer.sock",
-        ] {
+        ]
+        .into_iter()
+        .chain(EARLIER_INSTALL_FILES.iter().copied())
+        {
             assert!(linux.iter().any(|named| named == path), "{path}: {linux:?}");
         }
         let mac = paths_outside(&macos_undo_command("/run/answerer.sock"), root);
         for path in [RESOLVER_FILE, RANGE_PLIST_PATH, "/sbin/ifconfig"] {
             assert!(mac.iter().any(|named| named == path), "{path}: {mac:?}");
         }
-        // The classifier's own step in its heredoc is not scanned: `bash`,
-        // the command it is fed to, is always a stand-in.
-        assert!(
-            !linux.iter().any(|named| named.contains("cgroup.procs")),
-            "{linux:?}"
-        );
         assert_eq!(
             absolute_paths("rm -f /etc/x \"/usr/y\" 2>/dev/null\n# /var/z\ncat <<\\E\n/opt/w\nE\n"),
             ["/etc/x", "/usr/y", "/dev/null"]
@@ -7027,28 +7055,19 @@ exit 0
         );
     }
 
-    /// A classifier tree still held (minimald or a box has a leaf) fails
-    /// the step's own `--uninstall`, and the script is `set -e`: that
-    /// removal runs last, so the kvm membership and its record (and every
-    /// item before) still come away, and the script ends non-zero with
-    /// the note naming what to stop.
+    /// The removal takes away the loader's units and program copy and what
+    /// an earlier version installed, and leaves a neighbour of each alone.
+    /// A cgroup directory that will not go is named and does not fail the
+    /// script.
     #[test]
-    fn finalize_install_undo_removes_the_other_items_before_a_held_classifier_tree() {
+    fn finalize_install_undo_removes_the_policy_loader_and_earlier_pieces() {
         use std::os::unix::fs::PermissionsExt as _;
         let host = tempfile::tempdir().expect("a temp dir");
         let root = host.path();
         let stubs = root.join("stubs");
         std::fs::create_dir(&stubs).unwrap();
         let calls = root.join("calls");
-        // `bash` stands for the classifier's `--uninstall`, failing the way
-        // `die` does on a held tree; the service tools are absent-tolerant.
-        for (tool, code) in [
-            ("bash", 1),
-            ("gpasswd", 0),
-            ("systemctl", 1),
-            ("resolvectl", 1),
-            ("ip", 1),
-        ] {
+        for (tool, code) in [("systemctl", 0), ("nft", 1), ("resolvectl", 1), ("ip", 1)] {
             let path = stubs.join(tool);
             std::fs::write(
                 &path,
@@ -7060,116 +7079,122 @@ exit 0
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let tree = rooted(root, CLASSIFIER_TREE_ROOT);
-        std::fs::create_dir_all(&tree).unwrap();
-        let tree_record = rooted(root, CLASSIFIER_TREE_RECORD);
-        std::fs::create_dir_all(tree_record.parent().unwrap()).unwrap();
-        std::fs::write(&tree_record, "").unwrap();
-        let record = rooted(root, KVM_GROUP_RECORD);
-        // Two users ran the step: both memberships come away.
-        std::fs::write(&record, "alice\nbob\n").unwrap();
-        let script = linux_undo_command_under(root.to_str().unwrap(), "/run/minimal/answerer.sock");
-        let output = run_confined(root, &stubs, &script);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "a held tree ends the script non-zero: {stderr}"
-        );
-        assert!(
-            calls.contains("gpasswd -d alice kvm\n") && calls.contains("gpasswd -d bob kvm\n"),
-            "every recorded membership comes away before the classifier runs: {calls}"
-        );
-        assert!(!record.exists(), "its record goes with it");
-        assert!(calls.contains("bash -s -- --uninstall"), "{calls}");
-        assert!(
-            stderr.contains("classifier tree") && stderr.contains("still held"),
-            "the note names what to stop: {stderr}"
-        );
-        assert!(
-            tree_record.exists(),
-            "a held tree keeps its record, so the next --undo tries again"
-        );
-    }
-
-    /// The classifier tree comes away only when the step's record says
-    /// the step installed it: with the record, the step's own `--uninstall`
-    /// runs and the record goes; without, a tree that is there (the script
-    /// run by hand) stays, named in a note, and the script still exits 0.
-    #[test]
-    fn finalize_install_undo_removes_only_the_classifier_tree_it_recorded() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let host = tempfile::tempdir().expect("a temp dir");
-        let root = host.path();
-        let stubs = root.join("stubs");
-        std::fs::create_dir(&stubs).unwrap();
-        let calls = root.join("calls");
-        // `bash` stands for the classifier's `--uninstall`, succeeding.
-        for (tool, code) in [
-            ("bash", 0),
-            ("gpasswd", 0),
-            ("systemctl", 1),
-            ("resolvectl", 1),
-            ("ip", 1),
-        ] {
-            let path = stubs.join(tool);
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\necho \"{tool} $*\" >> {}\nexit {code}\n",
-                    calls.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed: Vec<std::path::PathBuf> = [
+            POLICY_LOADER_UNIT_SOCKET_PATH,
+            POLICY_LOADER_UNIT_SERVICE_PATH,
+            paths::POLICY_LOADER_PROGRAM,
+        ]
+        .into_iter()
+        .chain(EARLIER_INSTALL_FILES.iter().copied())
+        .map(|path| rooted(root, path))
+        .collect();
+        for file in &installed {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
         }
-        let tree = rooted(root, CLASSIFIER_TREE_ROOT);
-        std::fs::create_dir_all(&tree).unwrap();
-        let tree_record = rooted(root, CLASSIFIER_TREE_RECORD);
-        std::fs::create_dir_all(tree_record.parent().unwrap()).unwrap();
+        let neighbour = rooted(root, "/etc/systemd/system/other.service");
+        std::fs::write(&neighbour, "x").unwrap();
+        let tree = rooted(root, EARLIER_INSTALL_CGROUP);
+        std::fs::create_dir_all(tree.join("boxes/one")).unwrap();
+        std::fs::create_dir_all(tree.join("daemon")).unwrap();
         let script = linux_undo_command_under(root.to_str().unwrap(), "/run/minimal/answerer.sock");
         let run = || {
             let _ = std::fs::remove_file(&calls);
             let output = run_confined(root, &stubs, &script);
-            assert!(
-                output.status.success(),
-                "the removal succeeds: {}\n{script}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            (
-                std::fs::read_to_string(&calls).unwrap_or_default(),
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            )
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(output.status.success(), "{stderr}\n{script}");
+            (std::fs::read_to_string(&calls).unwrap_or_default(), stderr)
         };
 
-        // A tree the step did not record: it stays, with the note.
+        // A directory that will not go, as a cgroup that still holds a
+        // process will not: the note names it, and everything else goes.
+        let busy = tree.join("boxes/one/busy");
+        std::fs::write(&busy, "").unwrap();
         let (calls, stderr) = run();
+        for file in &installed {
+            assert!(!file.exists(), "{} is removed", file.display());
+        }
+        assert!(neighbour.is_file(), "a unit that is not Minimal's stays");
         assert!(
-            !calls.contains("bash -s -- --uninstall"),
-            "an unowned tree is not uninstalled: {calls}"
+            !rooted(root, ANSWERER_PROGRAM_DIR).exists(),
+            "the empty program directory goes too"
+        );
+        for call in [
+            "systemctl disable --now minimal-policy-loader.socket\n",
+            "systemctl disable --now minimald-classifier.service\n",
+            "systemctl disable --now minimald-place.socket\n",
+            "systemctl disable --now minimald-place.path\n",
+            "systemctl daemon-reload\n",
+            "nft delete table inet minimal_class\n",
+        ] {
+            assert!(calls.contains(call), "{call:?} in {calls}");
+        }
+        assert!(
+            stderr.contains("minimald.slice is still in use; it is gone after the next boot"),
+            "{stderr}"
+        );
+        assert!(!tree.join("daemon").exists(), "an empty directory goes");
+        assert!(tree.join("boxes/one").is_dir(), "the one in use stays");
+
+        // Nothing holds it any more: the tree goes whole, with no note.
+        std::fs::remove_file(&busy).unwrap();
+        let (_, stderr) = run();
+        assert!(!tree.exists(), "{stderr}");
+        assert!(!stderr.contains("still in use"), "{stderr}");
+    }
+
+    /// The unit texts, as the install writes them and the item compares
+    /// them: the socket in `/run` owned by the operator alone, and the
+    /// service running the root-owned copy with the connection on stdin.
+    #[test]
+    fn policy_loader_units_name_the_socket_the_operator_and_the_copy() {
+        let socket = policy_loader_socket_unit("alice");
+        for line in [
+            "ListenSequentialPacket=/run/minimal/policy-loader.sock\n",
+            "SocketUser=alice\n",
+            "SocketMode=0600\n",
+            "Accept=yes\n",
+            "RemoveOnStop=yes\n",
+            "WantedBy=sockets.target\n",
+        ] {
+            assert!(socket.contains(line), "{line:?} in {socket}");
+        }
+        let service = policy_loader_service_unit();
+        for line in [
+            "ExecStart=/usr/local/lib/minimal/minimald __policy-loader\n",
+            "StandardInput=socket\n",
+            "NoNewPrivileges=yes\n",
+            "PrivateNetwork=yes\n",
+        ] {
+            assert!(service.contains(line), "{line:?} in {service}");
+        }
+        for placeholder in ["__SOCKET__", "__OPERATOR__", "__PROGRAM__"] {
+            assert!(
+                !socket.contains(placeholder) && !service.contains(placeholder),
+                "{placeholder} is left"
+            );
+        }
+    }
+
+    /// The paths the policy engine item probes for are the ones the
+    /// removal lines take away.
+    #[test]
+    fn earlier_install_removal_names_every_probed_piece() {
+        let block = earlier_install_removal("");
+        for path in EARLIER_INSTALL_FILES {
+            assert!(block.contains(&format!(" {path}")), "{path}: {block}");
+        }
+        assert!(
+            block.contains(&format!(
+                "find {EARLIER_INSTALL_CGROUP} -depth -type d -exec rmdir"
+            )),
+            "{block}"
         );
         assert!(
-            stderr.contains("classifier tree")
-                && stderr.contains("was not installed by min finalize-install")
-                && stderr.contains("--uninstall"),
-            "the note names the tree and how to remove it: {stderr}"
+            block.starts_with("# what an earlier version installed\n"),
+            "{block}"
         );
-
-        // The same tree with the record: uninstalled, record gone.
-        std::fs::write(&tree_record, "").unwrap();
-        let (calls, stderr) = run();
-        assert!(calls.contains("bash -s -- --uninstall"), "{calls}");
-        assert!(!stderr.contains("note:"), "{stderr}");
-        assert!(!tree_record.exists(), "the record goes with the tree");
-
-        // A record over no tree (the tree removed by hand): the record
-        // goes, nothing runs.
-        std::fs::write(&tree_record, "").unwrap();
-        std::fs::remove_dir(&tree).unwrap();
-        let (calls, _) = run();
-        assert!(!calls.contains("bash -s -- --uninstall"), "{calls}");
-        assert!(!tree_record.exists(), "a stale record is cleared");
+        assert!(sh_parses(&block), "{block}");
     }
 
     /// The service is machine-wide and runs as one operator: `min
@@ -7468,17 +7493,63 @@ exit 0
     fn both_verbs_end_with_the_same_install_clause() {
         let host = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
-        let clause = install_clause(install_unfinished(&LiveSurface::Proxy, host));
+        let clause = install_clause(install_pointer(&LiveSurface::Proxy, host));
         assert_eq!(clause, "; finish setup: min finalize-install");
         assert!(
             host_line("web", &LiveSurface::Proxy, Some(15390), host).ends_with(clause),
             "the host line ends with the clause"
         );
+        let finished = install_pointer(&LiveSurface::Native, HostInstall::default());
         assert!(
-            !install_unfinished(&LiveSurface::Native, HostInstall::default())
-                && install_clause(false).is_empty(),
+            finished == InstallPointer::Finished && install_clause(finished).is_empty(),
             "a finished host has no clause"
+        );
+    }
+
+    /// After an upgrade the installed loader is from another version. The
+    /// line then names that and the command, as a clause or, after a
+    /// sentence, as a sentence, whatever else is unfinished.
+    #[test]
+    fn session_start_hint_names_an_out_of_date_policy_loader() {
+        const CLAUSE: &str = "; the network policy loader is out of date: min finalize-install";
+        let out_of_date = HostInstall {
+            other_items_unfinished: true,
+            policy_loader_out_of_date: true,
+        };
+        for surface in [LiveSurface::Native, LiveSurface::Proxy] {
+            assert_eq!(
+                install_pointer(&surface, out_of_date),
+                InstallPointer::LoaderOutOfDate
+            );
+            let line = host_line("web", &surface, Some(7654), out_of_date);
+            assert!(line.ends_with(CLAUSE), "{line}");
+            assert!(!line.contains("finish setup"), "{line}");
+        }
+        assert_eq!(
+            host_line("web", &LiveSurface::Native, None, out_of_date),
+            format!("names: web.min.internal opens at its name on this machine{CLAUSE}")
+        );
+        assert_eq!(
+            with_install_pointer(
+                "The port is held.".to_string(),
+                InstallPointer::LoaderOutOfDate
+            ),
+            "The port is held. The network policy loader is out of date: min finalize-install"
+        );
+        // The other cases keep their words.
+        assert_eq!(
+            with_install_pointer("The port is held.".to_string(), InstallPointer::FinishSetup),
+            "The port is held. Finish setup: min finalize-install"
+        );
+        assert_eq!(
+            with_install_pointer("a row".to_string(), InstallPointer::FinishSetup),
+            "a row; finish setup: min finalize-install"
+        );
+        assert_eq!(
+            with_install_pointer("The port is held.".to_string(), InstallPointer::Finished),
+            "The port is held."
         );
     }
 
@@ -7540,6 +7611,11 @@ exit 0
                     HostInstall::default(),
                     HostInstall {
                         other_items_unfinished: true,
+                        ..HostInstall::default()
+                    },
+                    HostInstall {
+                        other_items_unfinished: true,
+                        policy_loader_out_of_date: true,
                     },
                 ] {
                     for at_own_address in [true, false] {
@@ -7547,7 +7623,7 @@ exit 0
                             host_line_beside("web", &surface, port, host, None, at_own_address);
                         let row = with_install_pointer(
                             name_surface_line_at(surface.clone(), port, at_own_address),
-                            install_unfinished(&surface, host),
+                            install_pointer(&surface, host),
                         );
                         // The install pointer never follows a full stop as
                         // a clause: after a sentence it is a sentence.

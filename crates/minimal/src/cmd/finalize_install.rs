@@ -1,7 +1,7 @@
-//! `min finalize-install` — the one privileged step for every host need
-//! (NET-122): the user-namespace profile, names, the classifier tree and
-//! KVM group membership, each probed on this host and carried in one
-//! script only while it is missing.
+//! `min finalize-install`: the one privileged step for every host need.
+//! The user-namespace profile, names, the network policy engine and KVM
+//! group membership are each probed on this host and carried in one script
+//! only while they are missing.
 
 use serde::Serialize;
 
@@ -49,6 +49,9 @@ const DAEMON_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// The KVM item's id, read by the run to pick its closing line.
 pub(crate) const KVM_ID: &str = "kvm-group";
 
+/// The network policy engine item's id, read by the host line.
+pub(crate) const POLICY_ENGINE_ID: &str = "policy-engine";
+
 /// One item's state on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +60,9 @@ pub(crate) enum ItemState {
     Done,
     /// Wanted: the script carries this item's step.
     Missing,
+    /// Installed by another version: the script carries this item's step,
+    /// and what the item gives is refused until it runs.
+    OutOfDate,
     /// A host fact no script changes blocks it; `cause` says which.
     Cannot,
     /// Wanted, but not renderable until a daemon reports what the step
@@ -120,6 +126,20 @@ impl Item {
         }
     }
 
+    #[cfg(any(test, target_os = "linux"))]
+    fn out_of_date(
+        id: &'static str,
+        label: &'static str,
+        today: String,
+        step: String,
+        script: String,
+    ) -> Self {
+        Item {
+            state: ItemState::OutOfDate,
+            ..Item::missing(id, label, today, step, script)
+        }
+    }
+
     fn cannot(id: &'static str, label: &'static str, cause: String) -> Self {
         Item {
             id,
@@ -169,10 +189,11 @@ impl Plan {
         self.items.iter().all(|item| item.state == ItemState::Done)
     }
 
+    /// The items the script carries a step for.
     fn missing(&self) -> impl Iterator<Item = &Item> {
         self.items
             .iter()
-            .filter(|item| item.state == ItemState::Missing)
+            .filter(|item| matches!(item.state, ItemState::Missing | ItemState::OutOfDate))
     }
 
     fn cannot(&self) -> impl Iterator<Item = &Item> {
@@ -182,8 +203,8 @@ impl Plan {
     }
 
     /// The exit status `--show --json` and a run that runs nothing end
-    /// with: 0 once every item is done, 1 while any is not — missing,
-    /// waiting or blocked alike, since none of those is a finished host.
+    /// with: 0 once every item is done, 1 while any is missing, out of
+    /// date, waiting or blocked. None of those is a finished host.
     pub(crate) fn exit_code(&self) -> i32 {
         i32::from(!self.finished())
     }
@@ -215,17 +236,9 @@ impl Plan {
             labels.join(", ")
         );
         let mut script = crate::resolver::script_header(&what, crate::resolver::FINALIZE_SHOWN_BY);
-        // Two items can share one step (the classifier step installs the
-        // QUIC block helper too), and the script runs that step once.
-        let mut blocks: Vec<&str> = Vec::new();
         for item in missing {
-            let block = item.script.as_deref().unwrap_or_default();
-            if blocks.contains(&block) {
-                continue;
-            }
-            blocks.push(block);
             script.push('\n');
-            script.push_str(block);
+            script.push_str(item.script.as_deref().unwrap_or_default());
         }
         Some(script)
     }
@@ -353,7 +366,7 @@ pub async fn cmd_finalize_install(
     if args.undo {
         return cmd_finalize_install_undo(args.show);
     }
-    let plan = plan_for_this_host(global, args.ct_mark_mask).await;
+    let plan = plan_for_this_host(global).await;
     if args.json {
         println!("{}", plan.json());
         if plan.exit_code() != 0 {
@@ -418,22 +431,6 @@ pub(crate) fn closing_lines(installed_other_items: bool, added_kvm_group: bool) 
 pub(crate) fn undo_flags_refusal(args: &FinalizeInstallArgs) -> Option<&'static str> {
     (args.undo && args.show && !args.script)
         .then_some("--undo takes --show only with --script: `min finalize-install --undo --show --script` prints the removal script")
-}
-
-/// `--ct-mark-mask`'s value: a 0x-prefixed hex value naming exactly two
-/// contiguous bits of the 32-bit connection mark, the shape the install
-/// step itself requires. The step also refuses the ranges well-known
-/// components use, and names them, so that check stays in one place.
-pub(crate) fn parse_ct_mark_mask(value: &str) -> Result<u32, String> {
-    let bits = value
-        .strip_prefix("0x")
-        .filter(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
-        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-        .ok_or("use a 0x-prefixed hex value of at most 32 bits, such as 0x0c000000")?;
-    if bits == 0 || bits >> bits.trailing_zeros() != 0b11 {
-        return Err("name exactly two contiguous bits, such as 0x0c000000".to_string());
-    }
-    Ok(bits)
 }
 
 /// `min finalize-install --undo`: remove everything the step installs on
@@ -517,61 +514,64 @@ fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Every item this host has, probed in the order the summary lists them.
-/// `ct_mark_mask` is `--ct-mark-mask`, the bits the classifier step uses.
-async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> Plan {
-    // The names item sits after the user-namespace profile, ahead of the
-    // `kvm` group or the classifier tree and its QUIC block helper.
-    let mut items = other_items_for_this_host(global, ct_mark_mask);
+/// Every item this host has, probed.
+async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
+    plan_over(
+        other_items_for_this_host(global),
+        names_item_on_this_host(global).await,
+    )
+}
+
+/// The plan in the order the summary lists it: the user-namespace profile,
+/// the names item, then the rest.
+fn plan_over(mut items: Vec<Item>, names: Item) -> Plan {
     let at = items
         .iter()
         .take_while(|item| item.id == "userns-profile")
         .count();
-    items.insert(at, names_item_on_this_host(global).await);
+    items.insert(at, names);
     Plan { items }
 }
 
 /// Every item of this host's plan other than names, under the one per-host
 /// scoping both readers share: the user-namespace profile unless the
 /// configured provider is the Linux VM provider, then the `kvm` group
-/// membership for that provider or the classifier tree for the native one,
-/// in that order. [`plan_for_this_host`] slots the names item in among them
+/// membership for that provider or the network policy engine for the
+/// native one. [`plan_for_this_host`] slots the names item in among them
 /// and the host line ([`host_install_for_this_host`]) reads them whole, so
 /// the two read the same items by construction. Every item is Linux-only,
 /// so a macOS host reads none.
-fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> Vec<Item> {
-    let mut items = Vec::new();
+fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
     #[cfg(target_os = "linux")]
     {
-        if !global.use_minvmd() {
-            items.extend(linux::userns_item_on_this_host());
-        }
         if global.use_minvmd() {
-            // Formerly BEP-047 (gominimal/inbox#1184): the vm-users item is
-            // not offered until minvmd starts the VM and gvproxy through
-            // `sudo -n` (T66, #2566). Its drop-in names subcommands minvmd
-            // does not have at this head.
-            items.push(linux::kvm_item_on_this_host());
+            vec![linux::kvm_item_on_this_host()]
         } else {
-            items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
+            linux::userns_item_on_this_host()
+                .into_iter()
+                .chain([linux::policy_engine_item_on_this_host()])
+                .collect()
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (global, ct_mark_mask);
-    items
+    {
+        let _ = global;
+        Vec::new()
+    }
 }
 
-/// The install facts the host line reads beyond the surface verdict
-/// (NET-018): whether any item of this host's plan other than names is not
-/// done — the items [`other_items_for_this_host`] scopes for this host, the
-/// same ones [`plan_for_this_host`] carries, probed from this host alone (no
-/// daemon read: the names item is the surface verdict the line already
-/// holds). Every item is Linux-only, so a macOS host reads `false`.
+/// The install facts the host line reads beyond the surface verdict: the
+/// state of the items [`other_items_for_this_host`] scopes for this host,
+/// probed from this host alone. No daemon is read: the names item is the
+/// surface verdict the line already holds. Every item is Linux-only, so a
+/// macOS host reads the default.
 pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
+    let items = other_items_for_this_host(global);
     crate::resolver::HostInstall {
-        other_items_unfinished: other_items_for_this_host(global, None)
+        other_items_unfinished: items.iter().any(|item| item.state != ItemState::Done),
+        policy_loader_out_of_date: items
             .iter()
-            .any(|item| item.state != ItemState::Done),
+            .any(|item| item.id == POLICY_ENGINE_ID && item.state == ItemState::OutOfDate),
     }
 }
 
@@ -729,53 +729,23 @@ async fn answerer_port_from_daemons(global: &GlobalArgs) -> (Option<(u16, bool)>
     (answerer, held_no_channel)
 }
 
-/// The Linux-only items: the user-namespace profile, the classifier tree
-/// and KVM group membership. Each is pure over pre-read facts, so its
+/// The Linux-only items: the user-namespace profile, the network policy
+/// engine and KVM group membership. Each is pure over pre-read facts, so its
 /// table is unit-tested on every platform the suite runs on.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) mod linux {
     use super::*;
     use crate::resolver::{
-        ANSWERER_PROGRAM_DIR, APPARMOR_DIR, APPARMOR_PROFILE_RECORD, CLASSIFIER_PROGRAM_PATH,
-        CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC, CLASSIFIER_SYSTEMD_UNIT,
-        CLASSIFIER_TREE_RECORD, CLASSIFIER_TREE_ROOT, CLASSIFIER_UNIT_SERVICE_PATH,
-        KVM_GROUP_RECORD, LEGACY_PLACE_UNIT_PATH_PATH, LEGACY_PLACE_UNIT_SERVICE_PATH,
-        PLACE_SYSTEMD_UNIT, PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SOCKET_PATH,
+        ANSWERER_PROGRAM_DIR, APPARMOR_DIR, APPARMOR_PROFILE_RECORD, EARLIER_INSTALL_CGROUP,
+        EARLIER_INSTALL_FILES, KVM_GROUP_RECORD, POLICY_LOADER_SYSTEMD_UNIT,
+        POLICY_LOADER_UNIT_SERVICE_PATH, POLICY_LOADER_UNIT_SOCKET_PATH,
     };
-    use paths::PLACE_REQUEST_SOCKET;
-
-    /// gominimal/inbox#1054: what the classifier block prints when a daemon
-    /// was running while the step installed. That daemon read this machine
-    /// before the install. A daemon of this release reads it again once it is
-    /// placed, but one started by an earlier release does not. No single quote:
-    /// the block echoes it in one.
-    pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
-         you start next still says this machine cannot enforce its egress, restart the daemon: \
-         min stop (it refuses while boxes are live: stop them first, or min stop --force ends \
-         them), and your next min command starts it again.";
-
-    /// What the step's `--place-listener` prints when no process holds the
-    /// daemon's socket, so no daemon is running: the classifier block prints
-    /// [`DAEMON_RUNNING_NOTE`] for any other outcome, on a host where it
-    /// installed the socket unit that places the restarted daemon.
-    pub(crate) const PLACE_NO_HOLDER: &str = "no process holds ";
+    use paths::POLICY_LOADER_PROGRAM;
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
-    pub(crate) const CLASSIFIER_ID: &str = "classifier";
-    const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
-     machine's address (--network host_ip with --deny-all-egress)";
+    const POLICY_ENGINE_LABEL: &str = "network policy engine";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
-    pub(crate) const QUIC443_HELPER_ID: &str = "quic443-helper";
-    const QUIC443_HELPER_LABEL: &str = "QUIC block helper";
-    /// The root-owned helper minimald runs through `sudo -n` to block UDP
-    /// 443 for a box (BEP-018). Spelled as `QUIC443_HELPER` in
-    /// `scripts/install-host-classifier.sh` and `QUIC443_LEAF_HELPER` in
-    /// minimald.
-    pub(crate) const QUIC443_HELPER_PATH: &str = "/usr/local/lib/minimal/quic443-leaf";
-    /// The sudoers drop-in that lets the daemon's account run the helper,
-    /// spelled as `QUIC443_SUDOERS` in the classifier step.
-    pub(crate) const QUIC443_SUDOERS_PATH: &str = "/etc/sudoers.d/minimal-quic443-leaf";
 
     /// The profile the step installs, the very file the checkout ships.
     const APPARMOR_PROFILE: &str = include_str!("../../../../packaging/apparmor/minimald");
@@ -935,13 +905,18 @@ pub(crate) mod linux {
         script
     }
 
-    /// [`userns_item_over`] this host's reads.
-    pub(crate) fn userns_item_on_this_host() -> Option<Item> {
-        let daemon = std::env::current_exe()
+    /// The `minimald` beside this `min`, when there is one.
+    fn daemon_beside_min() -> Option<String> {
+        std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("minimald")))
             .filter(|path| path.is_file())
-            .and_then(|path| path.to_str().map(str::to_owned));
+            .and_then(|path| path.to_str().map(str::to_owned))
+    }
+
+    /// [`userns_item_over`] this host's reads.
+    pub(crate) fn userns_item_on_this_host() -> Option<Item> {
+        let daemon = daemon_beside_min();
         let tunables_name_daemon = daemon.as_deref().is_some_and(|d| {
             [
                 format!("{APPARMOR_DIR}/tunables/minimald"),
@@ -977,791 +952,344 @@ pub(crate) mod linux {
         })
     }
 
-    /// The cgroup2 mount the classifier tree needs, as `/proc/self/mountinfo`
-    /// reports it at the conventional mountpoint.
+    /// The oldest kernel the policy engine's programs load on.
+    const POLICY_ENGINE_KERNEL: (u32, u32) = (5, 19);
+
+    /// How long a `minimald` gets to print its loader identity. A binary
+    /// from a version without that mode may do anything with the arguments,
+    /// and this runs at every session start.
+    const IDENTITY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The delimiter both unit files are written under. It is quoted in the
+    /// script, so nothing in a unit expands.
+    const UNIT_HEREDOC: &str = "MINIMAL_UNIT_EOF";
+
+    /// The installed loader copy as `lstat` reads it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Cgroup2Mount {
-        /// No cgroup2 filesystem is mounted at `/sys/fs/cgroup`.
-        Absent,
-        /// Mounted without `nsdelegate`: a box's cgroup namespace is no
-        /// delegation boundary, so no leaf would hold a box for its life.
-        WithoutNsdelegate,
-        /// Mounted `nsdelegate`.
-        Delegated,
+    pub(crate) struct LoaderCopy {
+        /// A regular file, not a symlink or a directory.
+        pub(crate) regular_file: bool,
+        pub(crate) uid: u32,
+        /// The permission bits: `st_mode & 0o7777`.
+        pub(crate) mode: u32,
     }
 
-    /// [`Cgroup2Mount`] from the text of `/proc/self/mountinfo`: the line
-    /// whose mountpoint is `/sys/fs/cgroup` and whose filesystem type is
-    /// `cgroup2`, with `nsdelegate` among its super options.
-    pub(crate) fn cgroup2_mount_from(mountinfo: &str) -> Cgroup2Mount {
-        for line in mountinfo.lines() {
-            let Some((pre, post)) = line.split_once(" - ") else {
-                continue;
-            };
-            let mountpoint = pre.split_whitespace().nth(4);
-            let mut post = post.split_whitespace();
-            let fstype = post.next();
-            let super_options = post.nth(1).unwrap_or_default();
-            if mountpoint == Some("/sys/fs/cgroup") && fstype == Some("cgroup2") {
-                return if super_options.split(',').any(|opt| opt == "nsdelegate") {
-                    Cgroup2Mount::Delegated
-                } else {
-                    Cgroup2Mount::WithoutNsdelegate
-                };
-            }
-        }
-        Cgroup2Mount::Absent
+    /// The facts the network policy engine item decides on.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct PolicyEngineFacts {
+        /// The account the loader's socket is installed for.
+        pub(crate) operator: String,
+        /// `/run/systemd/system` is a directory: systemd is PID 1.
+        pub(crate) systemd: bool,
+        /// `/sys/fs/cgroup/cgroup.controllers` exists: cgroup v2 is mounted
+        /// there.
+        pub(crate) cgroup_v2: bool,
+        /// The kernel release, as `uname -r` prints it.
+        pub(crate) kernel_release: String,
+        /// The `minimald` beside this `min`, absolute, when there is one.
+        pub(crate) daemon: Option<String>,
+        /// The loader identity that `minimald` prints.
+        pub(crate) daemon_identity: Option<String>,
+        /// The copy at [`POLICY_LOADER_PROGRAM`], when anything is there.
+        pub(crate) copy: Option<LoaderCopy>,
+        /// The loader identity the copy prints.
+        pub(crate) copy_identity: Option<String>,
+        /// The installed socket unit's text, when the file reads.
+        pub(crate) socket_unit: Option<String>,
+        /// The installed service unit's text, when the file reads.
+        pub(crate) service_unit: Option<String>,
+        /// `systemctl is-active` says the socket unit is active.
+        pub(crate) socket_active: bool,
+        /// What an earlier version installed and is still there.
+        pub(crate) earlier_pieces: Vec<String>,
     }
 
-    /// The classifier item's facts, read once per plan and pure to decide
-    /// over.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct ClassifierFacts {
-        /// The table's presence marker is there with exactly one well-formed
-        /// `ct-mark-mask-0x…` record beside it ([`table_present`]): the
-        /// reading minimald's `table_marker_present` makes, so the item and
-        /// the daemon agree on what installed means. A marker without its
-        /// record is a step that did not finish.
-        pub(crate) table_present: bool,
-        /// The mask in that record, when the table is present: the bits
-        /// the loaded table classifies with. The step's block passes it
-        /// on when `--ct-mark-mask` does not name one, so a refresh and
-        /// the boot unit keep the operator's earlier choice.
-        pub(crate) recorded_mask: Option<u32>,
-        /// `--ct-mark-mask`: the bits this run installs with. A table
-        /// loaded with other bits is not done.
-        pub(crate) requested_mask: Option<u32>,
-        /// The copy at [`CLASSIFIER_PROGRAM_PATH`] reads as
-        /// [`CLASSIFIER_SCRIPT`] byte for byte: the copy outlives an
-        /// upgrade of this binary and the units run it, so one that differs
-        /// is a stale step.
-        pub(crate) copy_current: bool,
-        /// Whether the three units are installed and enabled; `None` where
-        /// the host has no systemctl and so is owed none.
-        pub(crate) units_enabled: Option<bool>,
-        /// The uid the tree is delegated to when it is not this process's.
-        pub(crate) other_owner: Option<u32>,
-        /// This process runs as root: the item is the account's, not root's.
-        pub(crate) root: bool,
-        /// The cgroup2 mount the tree needs.
-        pub(crate) mount: Cgroup2Mount,
-        /// The pid of the running daemon when it stands outside the tree's
-        /// daemon leaf: a daemon no placement reached, so it cannot decide a
-        /// host-address box's egress per box until it is placed.
-        pub(crate) unplaced_daemon: Option<u32>,
-        /// Whether the placement socket listens at
-        /// [`paths::PLACE_REQUEST_SOCKET`]; `None` where the host has no
-        /// systemctl and so is owed no placement unit. The unit file can be
-        /// installed and enabled while the socket is stopped (a boot that
-        /// dropped its job, or an operator's `systemctl stop`), and then no
-        /// later daemon start is placed. The unit sets `RemoveOnStop=yes`,
-        /// so the socket file is there exactly while the unit listens.
-        pub(crate) placer_listening: Option<bool>,
+    /// The major and minor version a kernel release starts with.
+    pub(crate) fn kernel_version(release: &str) -> Option<(u32, u32)> {
+        let number = |part: &str| {
+            let digits = part
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(part.len());
+            part[..digits].parse::<u32>().ok()
+        };
+        let mut parts = release.trim().split('.');
+        Some((number(parts.next()?)?, number(parts.next()?)?))
     }
 
-    /// The classifier item over its facts: done once the tree's marker,
-    /// this build's copy of the step, and (where systemd is there) its
-    /// enabled units are all present; blocked by another account's tree, by
-    /// running as root, by the mount the tree needs, or by an operator
-    /// name or socket path the block cannot spell; otherwise missing, with
-    /// the one block that installs or refreshes the lot for `operator`'s
-    /// daemon, whose listener lives at `socket`. An un-enrolled host has
-    /// no source identity, and needs none: the step classifies the two
-    /// identities as two cgroup matches and translates nothing, and an
-    /// association later adds the reserved addresses to the same matches
-    /// without a reinstall.
-    pub(crate) fn classifier_item_over(
-        facts: &ClassifierFacts,
-        operator: &str,
-        socket: &str,
-    ) -> Item {
-        if let Some(uid) = facts.other_owner {
-            return Item::cannot(
-                CLASSIFIER_ID,
-                CLASSIFIER_LABEL,
-                format!(
-                    "egress enforcement at {CLASSIFIER_TREE_ROOT} is installed for another \
-                     account (uid {uid}), and this step would replace it; that account must \
-                     run `min finalize-install --undo` first"
-                ),
-            );
-        }
-        if facts.root {
-            return Item::cannot(
-                CLASSIFIER_ID,
-                CLASSIFIER_LABEL,
-                "this command runs as root, but this step is installed for the account \
-                 that runs the Minimal daemon: run it as that account (it asks for sudo \
-                 itself)"
+    /// The identity in what `minimald __policy-loader --identity` printed:
+    /// one line, `abi=<decimal> object=<64 hex digits>`. Anything else is a
+    /// binary without that mode.
+    pub(crate) fn identity_line(stdout: &str) -> Option<&str> {
+        let line = stdout.strip_suffix('\n').unwrap_or(stdout);
+        let (abi, object) = line.strip_prefix("abi=")?.split_once(" object=")?;
+        let well_formed = !abi.is_empty()
+            && abi.bytes().all(|b| b.is_ascii_digit())
+            && object.len() == 64
+            && object.bytes().all(|b| b.is_ascii_hexdigit());
+        well_formed.then_some(line)
+    }
+
+    /// The network policy engine item over `facts`. Blocked where the host
+    /// cannot run the loader or the script cannot name what it installs.
+    /// Done when the root-owned copy is this host's minimald, both units
+    /// are the ones this version writes for the operator, the socket
+    /// listens, and nothing of an earlier version is left. Out of date when
+    /// an installed loader is another version's. Missing otherwise.
+    pub(crate) fn policy_engine_item_over(facts: &PolicyEngineFacts) -> Item {
+        let cannot = |cause: String| Item::cannot(POLICY_ENGINE_ID, POLICY_ENGINE_LABEL, cause);
+        if !facts.systemd {
+            return cannot(
+                "systemd is not this machine's init system, and the network policy loader \
+                 is a systemd socket unit"
                     .to_string(),
             );
         }
-        let mask_matches = facts
-            .requested_mask
-            .is_none_or(|mask| Some(mask) == facts.recorded_mask);
-        if facts.table_present
-            && mask_matches
-            && facts.copy_current
-            && facts.units_enabled != Some(false)
-        {
-            // gominimal/inbox#1206: the step is installed, but the running
-            // daemon is outside its leaf, or the placement socket that
-            // places each later start is not listening. Each is its own
-            // state, and the remedy is only what is missing: the socket
-            // started again, the step's --place-listener for the daemon
-            // holding the socket now, or both.
-            let placer_down = facts.placer_listening == Some(false);
-            // Placing the running daemon spells both names into the root
-            // block, so they pass the same check the install does. Only
-            // that remedy is held to it: a healthy install read through an
-            // unusual `--minimal-dir` stays done, and starting the socket
-            // names neither.
-            if facts.unplaced_daemon.is_some()
-                && let Some(cause) = unsafe_name_cause(operator, socket)
-            {
-                return Item::cannot(CLASSIFIER_ID, CLASSIFIER_LABEL, cause.to_string());
-            }
-            let start_placer = format!(
-                "# The placement socket is installed but not listening, so no daemon\n\
-                 # start is placed until it is started again.\n\
-                 systemctl start {PLACE_SYSTEMD_UNIT}.socket\n"
+        if !facts.cgroup_v2 {
+            return cannot(
+                "no cgroup2 filesystem is mounted at /sys/fs/cgroup, which the network \
+                 policy engine attaches to"
+                    .to_string(),
             );
-            // The daemon is found again when the block runs, by the socket
-            // it holds, never by the pid read now: the pid can be reused by
-            // then, and --place-listener moves only a holder of this
-            // account that stands outside the slice.
-            let place_daemon = format!(
-                "# The Minimal daemon running now is outside its egress-enforcement cgroup.\n\
-                 # This moves the process that owns its socket into that cgroup.\n\
-                 {CLASSIFIER_PROGRAM_PATH} --user '{operator}' --place-listener '{socket}'\n"
-            );
-            let placer_cause = format!(
-                "the placement socket ({PLACE_SYSTEMD_UNIT}.socket) is not listening, so \
-                 the next Minimal daemon start is not placed in its egress-enforcement cgroup"
-            );
-            let daemon_cause = |pid: u32| {
-                format!(
-                    "the running Minimal daemon (pid {pid}) is not placed in its \
-                     egress-enforcement cgroup, so it cannot enforce egress per box for \
-                     boxes that share this machine's address"
-                )
-            };
-            return match (facts.unplaced_daemon, placer_down) {
-                (None, false) => Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL),
-                (Some(pid), false) => Item::missing(
-                    CLASSIFIER_ID,
-                    CLASSIFIER_LABEL,
-                    daemon_cause(pid),
-                    format!(
-                        "places the running Minimal daemon (pid {pid}) in its egress-enforcement cgroup"
-                    ),
-                    place_daemon,
-                ),
-                (None, true) => Item::missing(
-                    CLASSIFIER_ID,
-                    CLASSIFIER_LABEL,
-                    placer_cause,
-                    "starts the placement socket, so every Minimal daemon start is placed in \
-                     its egress-enforcement cgroup"
-                        .to_string(),
-                    start_placer,
-                ),
-                // Two causes, one per line in the summary: the daemon that
-                // runs now, then the next start.
-                (Some(pid), true) => {
-                    let causes = vec![daemon_cause(pid), placer_cause];
-                    Item {
-                        today_list: causes.clone(),
-                        ..Item::missing(
-                            CLASSIFIER_ID,
-                            CLASSIFIER_LABEL,
-                            causes.join("; "),
-                            format!(
-                                "starts the placement socket and places the running Minimal \
-                                 daemon (pid {pid}) in its egress-enforcement cgroup"
-                            ),
-                            format!("{start_placer}{place_daemon}"),
-                        )
-                    }
-                }
-            };
         }
-        let cause = match facts.mount {
-            Cgroup2Mount::Absent => {
-                "no cgroup2 filesystem is mounted at /sys/fs/cgroup, which egress \
-                 enforcement needs"
-            }
-            Cgroup2Mount::WithoutNsdelegate => {
-                "cgroup2 is mounted without nsdelegate, which egress enforcement needs to \
-                 keep a box inside its own cgroup"
-            }
-            Cgroup2Mount::Delegated => {
-                if let Some(cause) = unsafe_name_cause(operator, socket) {
-                    cause
-                } else {
-                    return Item::missing(
-                        CLASSIFIER_ID,
-                        CLASSIFIER_LABEL,
-                        if !facts.table_present {
-                            "deny-all egress is not enforced for boxes that share this \
-                             machine's address: the step that enforces it is not \
-                             installed, or did not finish"
-                                .to_string()
-                        } else if !mask_matches {
-                            format!(
-                                "egress enforcement uses the connection-mark bits {}, and \
-                                 --ct-mark-mask asks for {}",
-                                mask_hex(facts.recorded_mask),
-                                mask_hex(facts.requested_mask),
-                            )
-                        } else if !facts.copy_current {
-                            "the installed copy of the step that enforces deny-all egress \
-                             is missing or out of date, so this version of min's step is \
-                             not what runs at boot or at daemon start"
-                                .to_string()
-                        } else {
-                            "the step that enforces deny-all egress is installed but its \
-                             systemd units are missing or not enabled, so a daemon restart \
-                             can leave deny-all boxes running unenforced, and a reboot can \
-                             leave deny-all egress not enforced"
-                                .to_string()
-                        },
-                        format!(
-                            "installs the cgroup tree and packet filter that enforce \
-                             deny-all egress for {operator}'s daemon, and systemd units \
-                             that restore them at boot and place the daemon under them on \
-                             every daemon start"
-                        ),
-                        classifier_steps(
-                            operator,
-                            socket,
-                            facts.requested_mask.or(facts.recorded_mask),
-                        ),
-                    );
-                }
-            }
+        if kernel_version(&facts.kernel_release).is_some_and(|v| v < POLICY_ENGINE_KERNEL) {
+            return cannot(format!(
+                "this machine's kernel ({}) is older than {}.{}, which the network policy \
+                 engine needs",
+                facts.kernel_release.trim(),
+                POLICY_ENGINE_KERNEL.0,
+                POLICY_ENGINE_KERNEL.1,
+            ));
+        }
+        let Some(daemon) = facts.daemon.as_deref() else {
+            return cannot(
+                "no minimald is installed beside this min, so there is no network policy \
+                 loader to install"
+                    .to_string(),
+            );
         };
-        Item::cannot(CLASSIFIER_ID, CLASSIFIER_LABEL, cause.to_string())
-    }
-
-    /// Why `operator` or `socket` cannot go into the step's block, or `None`
-    /// when both can. The two names ride in a shell single-quoted word in a
-    /// block run as root, in a unit file (systemd expands `%` specifiers
-    /// everywhere and `$` in `ExecStart=`), through `awk -v` (backslash
-    /// escapes), and the socket path as one whitespace-delimited field of
-    /// /proc/net/unix. Only the characters none of those read are admitted;
-    /// anything else is a name the block cannot spell safely, and the item
-    /// says so rather than rendering a line that never finds the daemon, or
-    /// one the shell reads as more than one word.
-    fn unsafe_name_cause(operator: &str, socket: &str) -> Option<&'static str> {
+        // The path goes into the root script inside double quotes.
+        if daemon.contains(['\'', '"', '$', '`', '\\', '\n', '\r', '\0']) {
+            return cannot(format!(
+                "minimald's path ({daemon}) holds a quote, a `$`, a backtick, a backslash or \
+                 a line break, which the install script cannot quote; install it under a \
+                 plain path"
+            ));
+        }
+        let operator = facts.operator.as_str();
         if operator.is_empty() {
-            Some(
+            return cannot(
                 "could not read this process's user name, so there is no account to \
-                 install this step for",
-            )
-        } else if !operator
+                 install the network policy loader for"
+                    .to_string(),
+            );
+        }
+        // The name goes into a unit file, where systemd expands `%`.
+        if !operator
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
         {
-            Some(
-                "this process's user name carries a character outside [A-Za-z0-9._-], \
-                 which the install script and its systemd units cannot handle",
-            )
-        } else if socket.is_empty() {
-            Some(
-                "could not work out this machine's daemon socket path, which the \
-                 placement socket needs to find the daemon",
-            )
-        } else if !socket
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+            return cannot(format!(
+                "this process's user name ({operator:?}) carries a character outside \
+                 [A-Za-z0-9._-], which a systemd unit cannot name"
+            ));
+        }
+        // Installing this minimald would leave a loader that never matches.
+        let Some(daemon_identity) = facts.daemon_identity.as_deref() else {
+            return cannot(format!(
+                "the minimald beside this min ({daemon}) does not report a network policy \
+                 loader, so it is from another version than this min; install both from \
+                 one release"
+            ));
+        };
+
+        let copy_trusted = facts
+            .copy
+            .is_some_and(|copy| copy.regular_file && copy.uid == 0 && copy.mode & 0o022 == 0);
+        let copy_current = facts.copy_identity.as_deref() == Some(daemon_identity);
+        let units_current = facts.socket_unit.as_deref()
+            == Some(crate::resolver::policy_loader_socket_unit(operator).as_str())
+            && facts.service_unit.as_deref()
+                == Some(crate::resolver::policy_loader_service_unit().as_str());
+        if copy_trusted
+            && copy_current
+            && units_current
+            && facts.socket_active
+            && facts.earlier_pieces.is_empty()
         {
-            Some(
-                "this machine's daemon socket path carries a character outside \
-                 [A-Za-z0-9._/-], which the install script and its systemd units \
-                 cannot handle",
+            return Item::done(POLICY_ENGINE_ID, POLICY_ENGINE_LABEL);
+        }
+
+        let step = format!(
+            "installs a root-owned copy of minimald at {POLICY_LOADER_PROGRAM} and the \
+             systemd units that run it as the network policy loader for {operator}'s \
+             daemon{}",
+            if facts.earlier_pieces.is_empty() {
+                ""
+            } else {
+                ", and removes what an earlier version installed"
+            }
+        );
+        let script = policy_engine_steps(operator, daemon);
+        if facts.copy.is_some()
+            && facts.socket_unit.is_some()
+            && facts.service_unit.is_some()
+            && !copy_current
+        {
+            return Item::out_of_date(
+                POLICY_ENGINE_ID,
+                POLICY_ENGINE_LABEL,
+                "the installed network policy loader is from another version of Minimal, \
+                 so boxes with a network policy are refused until `min finalize-install` \
+                 runs"
+                    .to_string(),
+                step,
+                script,
+            );
+        }
+        const REFUSED: &str = "boxes with a network policy are refused";
+        let today = if facts.copy.is_none() {
+            format!("{REFUSED}: the network policy loader is not installed")
+        } else if !copy_trusted {
+            format!(
+                "{REFUSED}: the loader at {POLICY_LOADER_PROGRAM} is not a root-owned file \
+                 that only root can write"
+            )
+        } else if !units_current {
+            format!(
+                "{REFUSED}: the loader's systemd units are missing, or are not the ones \
+                 this version installs for {operator}"
+            )
+        } else if !facts.socket_active {
+            format!(
+                "{REFUSED}: the loader's socket ({POLICY_LOADER_SYSTEMD_UNIT}.socket) is not active"
             )
         } else {
-            None
-        }
+            format!(
+                "what an earlier version installed for network enforcement is still on \
+                 this machine: {}",
+                facts.earlier_pieces.join(", ")
+            )
+        };
+        Item::missing(POLICY_ENGINE_ID, POLICY_ENGINE_LABEL, today, step, script)
     }
 
-    /// The step's block: the classifier's step written from the bytes this
-    /// binary carries to its root-owned copy (beside the target, then moved
-    /// over it) and run with no source identity; a run that fails puts the
-    /// previous copy back and stops the block, so the units already
-    /// installed keep the copy they were written for. Then the units — a boot
-    /// oneshot that re-runs the step, and the placement pair: a socket unit
-    /// the daemon connects to at start and the template service systemd
-    /// starts per connection — enabled, the path pair an earlier install
-    /// left removed, and the placement run once for the daemon that may
-    /// already be listening.
-    ///
-    /// `mask`, when there is one, is passed to the step as
-    /// `--ct-mark-mask` both now and in the boot unit: the mask's record
-    /// lives in cgroupfs, which a reboot empties, so the unit is what keeps
-    /// the operator's bits across one.
-    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>) -> String {
-        let mask = mask
-            .map(|bits| format!(" --ct-mark-mask 0x{bits:08x}"))
-            .unwrap_or_default();
+    /// The step's block: the copy of `daemon` put in place by a rename, so
+    /// a loader that is running keeps its file; both units; the socket
+    /// enabled and restarted, so a changed unit takes effect; then the
+    /// removal of what an earlier version installed.
+    fn policy_engine_steps(operator: &str, daemon: &str) -> String {
         format!(
-            "# The egress classifier: its privileged step, from a root-owned copy of the\n\
-             # bytes this binary carries, with no source identity (an un-enrolled host\n\
-             # translates nothing; an association adds the reserved addresses later).\n\
-             mkdir -p {ANSWERER_PROGRAM_DIR}\n\
-             cat > {CLASSIFIER_PROGRAM_PATH}.new <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n\
-             {CLASSIFIER_SCRIPT}\
-             {CLASSIFIER_SCRIPT_HEREDOC}\n\
-             chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n\
-             # The new copy stays only once its step has installed. A step that refuses\n\
-             # (a connection-mark conflict, say) changes nothing, and the units below are\n\
-             # not reached, so the copy they run goes back to the previous one (or away,\n\
-             # when there was none) and the next boot restores what this host had.\n\
-             rm -f {CLASSIFIER_PROGRAM_PATH}.prev\n\
-             [ ! -e {CLASSIFIER_PROGRAM_PATH} ] || cp -p {CLASSIFIER_PROGRAM_PATH} \
-             {CLASSIFIER_PROGRAM_PATH}.prev\n\
-             mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n\
-             if {CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}; then\n\
-             \x20 rm -f {CLASSIFIER_PROGRAM_PATH}.prev\n\
-             else\n\
-             \x20 classifier_status=$?\n\
-             \x20 if [ -e {CLASSIFIER_PROGRAM_PATH}.prev ]; then\n\
-             \x20   mv -f {CLASSIFIER_PROGRAM_PATH}.prev {CLASSIFIER_PROGRAM_PATH}\n\
-             \x20 else\n\
-             \x20   rm -f {CLASSIFIER_PROGRAM_PATH}\n\
-             \x20 fi\n\
-             \x20 exit \"$classifier_status\"\n\
-             fi\n\
-             # The record marks the tree as this step's, so --undo removes it; one\n\
-             # installed another way is left alone.\n\
-             mkdir -p /var/lib/minimal\n\
-             : > {CLASSIFIER_TREE_RECORD}\n\
-             # The systemd units. A boot service sets up egress enforcement again at\n\
-             # every boot, because neither the cgroups nor the packet filter survive a\n\
-             # reboot. The placement socket, in /run, is what each Minimal daemon start\n\
-             # connects to: systemd then runs a service that moves that daemon into its\n\
-             # egress-enforcement cgroup, so no daemon start needs sudo. Without systemd\n\
-             # the units are skipped, and each daemon start must be placed by hand with\n\
-             # the script above.\n\
-             if ! command -v systemctl >/dev/null 2>&1 ; then\n\
-             \x20 echo 'note: no systemctl on this host: the placement socket is not installed, so place each daemon start by hand with the install script'\n\
-             \x20 place_units=no\n\
-             else\n\
-             cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<\\MINIMAL_CLASSIFIER_SERVICE_EOF\n\
-             [Unit]\n\
-             Description=Install minimald's egress classifier tree and table\n\
-             \n\
-             [Service]\n\
-             Type=oneshot\n\
-             ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}\n\
-             \n\
-             [Install]\n\
-             WantedBy=multi-user.target\n\
-             MINIMAL_CLASSIFIER_SERVICE_EOF\n\
-             # The path pair an earlier install placed the daemon with goes first.\n\
-             systemctl disable --now {PLACE_SYSTEMD_UNIT}.path 2>/dev/null || true\n\
-             rm -f {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH}\n\
-             # A placement waits for the boot unit's tree. The order is on the service:\n\
-             # the socket sits before sockets.target, which basic.target and so the boot\n\
-             # unit come after, and ordering the socket after the boot unit is a cycle.\n\
-             cat > {PLACE_UNIT_SERVICE_PATH} <<\\MINIMAL_PLACE_SERVICE_EOF\n\
-             [Unit]\n\
-             Description=Place minimald's listener in its classifier leaf\n\
-             After={CLASSIFIER_SYSTEMD_UNIT}.service\n\
-             \n\
-             [Service]\n\
-             Type=oneshot\n\
-             StandardInput=socket\n\
-             StandardOutput=journal\n\
-             StandardError=journal\n\
-             ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}' --place-listener '{socket}'\n\
-             MINIMAL_PLACE_SERVICE_EOF\n\
-             cat > {PLACE_UNIT_SOCKET_PATH} <<\\MINIMAL_PLACE_SOCKET_EOF\n\
-             [Unit]\n\
-             Description=Take minimald's requests to place its listener\n\
-             \n\
-             [Socket]\n\
-             ListenStream={PLACE_REQUEST_SOCKET}\n\
-             SocketUser={operator}\n\
-             SocketMode=0600\n\
-             Accept=yes\n\
-             MaxConnections=4\n\
-             RemoveOnStop=yes\n\
-             \n\
-             [Install]\n\
-             WantedBy=sockets.target\n\
-             MINIMAL_PLACE_SOCKET_EOF\n\
-             chmod 0644 {CLASSIFIER_UNIT_SERVICE_PATH} {PLACE_UNIT_SERVICE_PATH} \
-             {PLACE_UNIT_SOCKET_PATH}\n\
+            "# policy-engine\n\
+             install -d -m 0755 -o root -g root {ANSWERER_PROGRAM_DIR}\n\
+             install -m 0755 -o root -g root \"{daemon}\" {POLICY_LOADER_PROGRAM}.new\n\
+             mv -f {POLICY_LOADER_PROGRAM}.new {POLICY_LOADER_PROGRAM}\n\
+             cat > {POLICY_LOADER_UNIT_SOCKET_PATH} <<'{UNIT_HEREDOC}'\n\
+             {socket}\
+             {UNIT_HEREDOC}\n\
+             cat > {POLICY_LOADER_UNIT_SERVICE_PATH} <<'{UNIT_HEREDOC}'\n\
+             {service}\
+             {UNIT_HEREDOC}\n\
+             chmod 0644 {POLICY_LOADER_UNIT_SOCKET_PATH} {POLICY_LOADER_UNIT_SERVICE_PATH}\n\
              systemctl daemon-reload\n\
-             systemctl enable {CLASSIFIER_SYSTEMD_UNIT}.service\n\
-             systemctl enable --now {PLACE_SYSTEMD_UNIT}.socket\n\
-             place_units=yes\n\
-             fi\n\
-             # The daemon that may already be listening is placed now; later starts ask\n\
-             # the socket unit. A daemon that was running read this machine before the\n\
-             # step installed, so the run says how to make it read the machine again: a\n\
-             # restart, which the socket unit places. Without the units a restarted\n\
-             # daemon stands outside its leaf, so the run does not advise one. A placement\n\
-             # that fails still prints what it said, and the run exits with its status.\n\
-             place_status=0\n\
-             place_out=$({CLASSIFIER_PROGRAM_PATH} --user '{operator}' \
-             --place-listener '{socket}') || place_status=$?\n\
-             printf '%s\\n' \"$place_out\"\n\
-             [ \"$place_status\" -eq 0 ] || exit \"$place_status\"\n\
-             case \"$place_units:$place_out\" in\n\
-             no:*) ;;\n\
-             *'{PLACE_NO_HOLDER}'*) ;;\n\
-             *) echo '{DAEMON_RUNNING_NOTE}' ;;\n\
-             esac\n"
+             systemctl enable --now {POLICY_LOADER_SYSTEMD_UNIT}.socket\n\
+             systemctl restart {POLICY_LOADER_SYSTEMD_UNIT}.socket\n\
+             \n\
+             {earlier}",
+            socket = crate::resolver::policy_loader_socket_unit(operator),
+            service = crate::resolver::policy_loader_service_unit(),
+            earlier = crate::resolver::earlier_install_removal(""),
         )
     }
 
-    /// The table's presence, as minimald's `table_marker_present` reads
-    /// it: the marker directory under `root`, and beside it exactly one
-    /// well-formed `ct-mark-mask-0x…` record naming the bits the loaded
-    /// table classifies with (the step writes both in one install). A
-    /// marker alone, a record that does not parse, or two that disagree
-    /// is a step that did not finish, and reads as not installed.
-    ///
-    /// The mask is the one the record names, and `None` reads as not
-    /// installed.
-    pub(crate) fn recorded_mask(root: &std::path::Path) -> Option<u32> {
-        if !root.join("classifier-table").is_dir() {
-            return None;
-        }
-        let entries = std::fs::read_dir(root).ok()?;
-        let mut mask = None;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(value) = name.to_str().and_then(|n| n.strip_prefix("ct-mark-mask-")) else {
-                continue;
-            };
-            let bits = value
-                .strip_prefix("0x")
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())?;
-            if mask.is_some_and(|other| other != bits) {
-                return None;
-            }
-            mask = Some(bits);
-        }
-        mask
-    }
-
-    /// A mask as the step spells it, or the step's default when there is
-    /// none.
-    fn mask_hex(mask: Option<u32>) -> String {
-        mask.map_or_else(|| "0x30000000".to_string(), |bits| format!("0x{bits:08x}"))
-    }
-
-    /// The QUIC block helper's facts: whether the helper and its sudoers
-    /// drop-in are each a file owned by root.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct Quic443HelperFacts {
-        /// [`QUIC443_HELPER_PATH`] is a root-owned file.
-        pub(crate) helper_root_owned: bool,
-        /// [`QUIC443_SUDOERS_PATH`] is a root-owned file. Where this account
-        /// cannot look inside its directory (some distributions make
-        /// `/etc/sudoers.d` root-only), `sudo -n -l` lists a NOPASSWD rule
-        /// that names the helper.
-        pub(crate) sudoers_root_owned: bool,
-    }
-
-    /// The QUIC block helper item (BEP-018): done when the helper and its
-    /// sudoers drop-in are installed root-owned. Otherwise it names the
-    /// helper's path and carries the classifier step, which installs both,
-    /// or it is blocked by what blocks that step.
-    pub(crate) fn quic443_helper_item_over(
-        helper: Quic443HelperFacts,
-        classifier: &ClassifierFacts,
-        operator: &str,
-        socket: &str,
-    ) -> Item {
-        if helper.helper_root_owned && helper.sudoers_root_owned {
-            return Item::done(QUIC443_HELPER_ID, QUIC443_HELPER_LABEL);
-        }
-        // The classifier item as if its table were absent: its step is the
-        // one that installs the helper, so its script or its cause is ours.
-        let step = classifier_item_over(
-            &ClassifierFacts {
-                table_present: false,
-                ..*classifier
-            },
-            operator,
-            socket,
-        );
-        match step.script {
-            // The wording is the task's diagnostics line (#2607).
-            Some(script) => Item::missing(
-                QUIC443_HELPER_ID,
-                QUIC443_HELPER_LABEL,
-                format!(
-                    "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to \
-                     install it."
-                ),
-                format!(
-                    "installs the helper at {QUIC443_HELPER_PATH} that blocks UDP port 443 \
-                     (QUIC) for boxes, and the sudoers rule at {QUIC443_SUDOERS_PATH} that \
-                     lets {operator}'s daemon run it"
-                ),
-                script,
-            ),
-            None => Item::cannot(
-                QUIC443_HELPER_ID,
-                QUIC443_HELPER_LABEL,
-                step.cause.unwrap_or_default(),
-            ),
-        }
-    }
-
-    /// The classifier item and the QUIC block helper item over this host's
-    /// reads, in that order.
-    pub(crate) fn classifier_items_on_this_host(
-        global: &GlobalArgs,
-        ct_mark_mask: Option<u32>,
-    ) -> [Item; 2] {
-        use std::os::unix::fs::MetadataExt as _;
-        let (facts, operator, socket) = classifier_facts_on_this_host(global, ct_mark_mask);
-        // Root-owned and writable by root alone: not a symlink, no group or
-        // other write bit, and the same of the directory that holds it.
-        let root_only = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
-        let root_owned_file = |path: &str| -> std::io::Result<bool> {
-            let path = std::path::Path::new(path);
-            let meta = std::fs::symlink_metadata(path)?;
-            let parent_root_only = path
-                .parent()
-                .and_then(|dir| std::fs::symlink_metadata(dir).ok())
-                .is_some_and(|dir| dir.is_dir() && root_only(&dir));
-            Ok(meta.file_type().is_file() && root_only(&meta) && parent_root_only)
-        };
-        let helper_root_owned = root_owned_file(QUIC443_HELPER_PATH).unwrap_or(false);
-        let helper = Quic443HelperFacts {
-            helper_root_owned,
-            sudoers_root_owned: match root_owned_file(QUIC443_SUDOERS_PATH) {
-                Ok(owned) => owned,
-                // Some distributions make `/etc/sudoers.d` root-only, so this
-                // account cannot stat the drop-in. Ask sudo instead whether
-                // this account may run the helper with no password: the
-                // rule is NOPASSWD, so `sudo -n -l` answers without a prompt,
-                // and only a rule that names the helper counts.
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    helper_root_owned && sudo_lets_this_account_run(QUIC443_HELPER_PATH)
-                }
-                Err(_) => false,
-            },
-        };
-        [
-            classifier_item_over(&facts, &operator, &socket),
-            quic443_helper_item_over(helper, &facts, &operator, &socket),
-        ]
-    }
-
-    /// Whether this account's sudo rules, listed by `sudo -n -l`, let it run
-    /// `path` with no password. A broad rule such as `NOPASSWD: ALL` does
-    /// not count: it says nothing of the drop-in. False when sudo is absent
-    /// or asks.
-    fn sudo_lets_this_account_run(path: &str) -> bool {
-        std::process::Command::new("sudo")
-            .args(["-n", "-l"])
+    /// What `program __policy-loader --identity` prints, when it is an
+    /// identity. The mode needs no privilege.
+    fn loader_identity(program: &str) -> Option<String> {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(program)
+            .args(["__policy-loader", "--identity"])
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .output()
-            .is_ok_and(|out| {
-                out.status.success()
-                    && sudo_listing_names_nopasswd(&String::from_utf8_lossy(&out.stdout), path)
-            })
-    }
-
-    /// Whether a `sudo -l` listing has a NOPASSWD rule whose commands name
-    /// `path` itself, as the drop-in's rule does.
-    pub(crate) fn sudo_listing_names_nopasswd(listing: &str, path: &str) -> bool {
-        listing.lines().any(|line| {
-            line.split_once("NOPASSWD:").is_some_and(|(_, commands)| {
-                commands
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .any(|token| token == path)
-            })
-        })
-    }
-
-    /// The pid of the running native daemon for `socket` when it stands
-    /// outside the tree's daemon leaf under `root`, and `None` when no such
-    /// daemon runs, when it is in its leaf, or when the leaf is not there.
-    /// The pid is the holder of the instance lock beside the socket, as the
-    /// kernel lists it in `/proc/locks`, never the pid written into the file:
-    /// the file is the account's to edit, and a lock no process holds names
-    /// nothing. It counts only while `/proc/<pid>/comm` reads `minimald`,
-    /// and only while its cgroup is readable and outside the tree: a holder
-    /// anywhere under `root` (a box leaf among them) is never reported, as
-    /// the step's `--place-listener` never moves it.
-    fn unplaced_daemon_pid(root: &std::path::Path, socket: &std::path::Path) -> Option<u32> {
-        use std::os::unix::fs::MetadataExt as _;
-        let lock = socket.parent()?.join(paths::MINIMALD_LOCK_FILE);
-        let meta = std::fs::metadata(lock).ok()?;
-        let locks = std::fs::read_to_string("/proc/locks").ok()?;
-        let pid = lock_holder(
-            std::path::Path::new("/proc"),
-            &locks,
-            meta.dev(),
-            meta.ino(),
-        )?;
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-        if comm.trim() != "minimald" {
-            return None;
-        }
-        let members = std::fs::read_to_string(root.join("daemon").join("cgroup.procs")).ok()?;
-        let placed = members
-            .lines()
-            .any(|member| member.trim().parse::<u32>() == Ok(pid));
-        if placed {
-            return None;
-        }
-        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        (!stands_in_tree(&cgroup, std::path::Path::new("/sys/fs/cgroup"), root)?).then_some(pid)
-    }
-
-    /// Whether a `/proc/<pid>/cgroup` listing places the process under
-    /// `root` in the cgroup2 hierarchy mounted at `mount`, read from its
-    /// one unified `0::` line. `None` when there is no such line, which is
-    /// unknown and so never reported as outside.
-    pub(crate) fn stands_in_tree(
-        cgroup: &str,
-        mount: &std::path::Path,
-        root: &std::path::Path,
-    ) -> Option<bool> {
-        let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
-        Some(
-            mount
-                .join(path.trim().trim_start_matches('/'))
-                .starts_with(root),
-        )
-    }
-
-    /// The pid holding an exclusive `flock` on the file at device `dev`
-    /// (`st_dev`) and inode `inode`: a holder [`lock_holders`] lists for
-    /// the inode that also has the file open, which one of its
-    /// `<proc>/<pid>/fd/*` entries statting to `dev` and `inode` shows.
-    /// The listing's device is not compared: `/proc/locks` prints the
-    /// superblock's, and on btrfs `stat` gives the subvolume's own
-    /// anonymous device instead, so the two differ for the same file.
-    pub(crate) fn lock_holder(
-        proc: &std::path::Path,
-        locks: &str,
-        dev: u64,
-        inode: u64,
-    ) -> Option<u32> {
-        use std::os::unix::fs::MetadataExt as _;
-        lock_holders(locks, inode).into_iter().find(|pid| {
-            std::fs::read_dir(proc.join(pid.to_string()).join("fd")).is_ok_and(|fds| {
-                fds.flatten().any(|fd| {
-                    std::fs::metadata(fd.path())
-                        .is_ok_and(|meta| meta.dev() == dev && meta.ino() == inode)
-                })
-            })
-        })
-    }
-
-    /// The pids holding an exclusive `flock` on an inode numbered `inode`
-    /// on any device, read from a `/proc/locks` listing: `<n>: FLOCK
-    /// ADVISORY WRITE <pid> <major>:<minor>:<inode> <start> <end>`.
-    /// Blocked waiters (`->` lines) are not holders.
-    pub(crate) fn lock_holders(locks: &str, inode: u64) -> Vec<u32> {
-        locks
-            .lines()
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                let [_, "FLOCK", _, "WRITE", pid, id, ..] = fields.as_slice() else {
-                    return None;
-                };
-                let mut parts = id.split(':');
-                let (Some(_), Some(_), Some(ino), None) =
-                    (parts.next(), parts.next(), parts.next(), parts.next())
-                else {
-                    return None;
-                };
-                if ino.parse::<u64>().ok()? == inode {
-                    pid.parse().ok()
-                } else {
-                    None
+            .spawn()
+            .ok()?;
+        let deadline = std::time::Instant::now() + IDENTITY_DEADLINE;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-            })
-            .collect()
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        };
+        if !status.success() {
+            return None;
+        }
+        // The line is far shorter than a pipe's buffer, so the child never
+        // blocked on it.
+        let mut stdout = String::new();
+        child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+        identity_line(&stdout).map(str::to_owned)
     }
 
-    /// [`classifier_item_over`]'s inputs from this host's reads: the table's
-    /// presence, the root-owned copy's bytes against this binary's, the
-    /// units and their `multi-user.target` links where the host has
-    /// systemctl, the tree's owner, this process's uid and account, the
-    /// cgroup2 mount, and the native daemon's socket path for this
-    /// `--minimal-dir`.
-    fn classifier_facts_on_this_host(
-        global: &GlobalArgs,
-        ct_mark_mask: Option<u32>,
-    ) -> (ClassifierFacts, String, String) {
+    /// [`policy_engine_item_over`] this host's reads.
+    pub(crate) fn policy_engine_item_on_this_host() -> Item {
         use std::os::unix::fs::MetadataExt as _;
-        let root = std::path::Path::new(CLASSIFIER_TREE_ROOT);
-        let copy_current = std::fs::read(CLASSIFIER_PROGRAM_PATH)
-            .is_ok_and(|bytes| bytes == CLASSIFIER_SCRIPT.as_bytes());
-        let systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
-            .iter()
-            .any(|path| std::path::Path::new(path).is_file());
-        let units_enabled = systemctl.then(|| {
-            let wants = "/etc/systemd/system/multi-user.target.wants";
-            let sockets = "/etc/systemd/system/sockets.target.wants";
-            [
-                CLASSIFIER_UNIT_SERVICE_PATH.to_string(),
-                PLACE_UNIT_SERVICE_PATH.to_string(),
-                PLACE_UNIT_SOCKET_PATH.to_string(),
-                format!("{wants}/{CLASSIFIER_SYSTEMD_UNIT}.service"),
-                format!("{sockets}/{PLACE_SYSTEMD_UNIT}.socket"),
-            ]
-            .iter()
-            .all(|path| std::path::Path::new(path).exists())
-                // The path pair an earlier install left is the placement
-                // that SELinux can stop (gominimal/inbox#1206), so an
-                // install that still carries it is not done.
-                && !std::path::Path::new(LEGACY_PLACE_UNIT_PATH_PATH).exists()
-        });
-        // The tree is delegated to one account: the step chowns the boxes
-        // subtree to it, so its owner is the account the install is for.
-        let me = nix::unistd::geteuid().as_raw();
-        let other_owner = std::fs::metadata(root.join("boxes"))
+        let daemon = daemon_beside_min();
+        let copy = std::fs::symlink_metadata(POLICY_LOADER_PROGRAM)
             .ok()
-            .map(|meta| meta.uid())
-            .filter(|uid| *uid != me);
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-        let recorded = recorded_mask(root);
-        let socket_path = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false);
-        let unplaced_daemon = socket_path
-            .as_deref()
-            .ok()
-            .and_then(|socket| unplaced_daemon_pid(root, socket));
-        let socket = socket_path
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
-        let placer_listening = systemctl.then(|| {
-            use std::os::unix::fs::FileTypeExt as _;
-            std::fs::symlink_metadata(paths::PLACE_REQUEST_SOCKET)
-                .is_ok_and(|meta| meta.file_type().is_socket())
-        });
-        (
-            ClassifierFacts {
-                table_present: recorded.is_some(),
-                recorded_mask: recorded,
-                requested_mask: ct_mark_mask,
-                copy_current,
-                units_enabled,
-                other_owner,
-                root: me == 0,
-                mount: cgroup2_mount_from(&mountinfo),
-                unplaced_daemon,
-                placer_listening,
-            },
-            crate::resolver::operator_name(),
-            socket,
-        )
+            .map(|meta| LoaderCopy {
+                regular_file: meta.file_type().is_file(),
+                uid: meta.uid(),
+                mode: meta.mode() & 0o7777,
+            });
+        let socket_unit = std::fs::read_to_string(POLICY_LOADER_UNIT_SOCKET_PATH).ok();
+        // A path this account may not look at reads as absent: it cannot
+        // tell, and the removal lines run with every install anyway.
+        let earlier_pieces = EARLIER_INSTALL_FILES
+            .iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .chain(
+                std::path::Path::new(EARLIER_INSTALL_CGROUP)
+                    .is_dir()
+                    .then_some(&EARLIER_INSTALL_CGROUP),
+            )
+            .map(|path| (*path).to_string())
+            .collect();
+        policy_engine_item_over(&PolicyEngineFacts {
+            operator: crate::resolver::operator_name(),
+            systemd: std::path::Path::new("/run/systemd/system").is_dir(),
+            cgroup_v2: std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
+            kernel_release: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .unwrap_or_default(),
+            daemon_identity: daemon.as_deref().and_then(loader_identity),
+            copy_identity: copy
+                .filter(|copy| copy.regular_file)
+                .and_then(|_| loader_identity(POLICY_LOADER_PROGRAM)),
+            socket_active: socket_unit.is_some()
+                && std::process::Command::new("systemctl")
+                    .args([
+                        "is-active",
+                        "--quiet",
+                        &format!("{POLICY_LOADER_SYSTEMD_UNIT}.socket"),
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success()),
+            daemon,
+            copy,
+            socket_unit,
+            service_unit: std::fs::read_to_string(POLICY_LOADER_UNIT_SERVICE_PATH).ok(),
+            earlier_pieces,
+        })
     }
+
     /// The KVM item over the result of opening `/dev/kvm` for reading:
     /// done when it opens; missing — the step adds `operator` to the `kvm`
     /// group — on `EACCES`, unless `already_member` says the group database
@@ -1863,527 +1391,6 @@ pub(crate) mod linux {
         let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
         kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
     }
-
-    // ── The VM's own users (formerly BEP-047, gominimal/inbox#1184) ────────
-    //
-    // The VMM child runs as `minimal-vmm` and gvproxy as `minimal-gvproxy`,
-    // each started by the login through `sudo -n -u` under a drop-in this
-    // item installs. The users, the directories and the modes are the ones
-    // `docs/design/2026-10-25-split-user-vmm-provider-dir.md` lays out.
-
-    pub(crate) const VM_USERS_ID: &str = "vm-users";
-    const VM_USERS_LABEL: &str = "separate users for the VM and its network switch";
-    /// The user the VMM child runs as.
-    pub(crate) const VMM_USER: &str = "minimal-vmm";
-    /// The user gvproxy and the EGW process run as.
-    pub(crate) const GVPROXY_USER: &str = "minimal-gvproxy";
-    /// The sudoers drop-in. Its name has no `.`, so `sudo` reads it.
-    pub(crate) const SUDOERS_DROP_IN: &str = "/etc/sudoers.d/minimal-vm";
-    /// A world-readable copy of the drop-in: `/etc/sudoers.d` is not
-    /// readable by the login, so the probe compares this copy. The gap is
-    /// accepted: a drop-in that root deletes or edits while the copy stays
-    /// reads as done, and the `sudo -n` spawn then fails and says so.
-    pub(crate) const VM_USERS_RECORD: &str = "/var/lib/minimal/finalize-install-vm-users";
-    /// The root-owned base of the gvproxy, gvproxy config and gate dirs.
-    pub(crate) const VM_USERS_BASE: &str = "/var/lib/minimal";
-    /// The `minvmd` subcommand of the EGW process the drop-in admits.
-    pub(crate) const EGW_SUBCOMMAND: &str = "__egw";
-    /// The `minvmd` subcommand of the two stop rules the drop-in admits.
-    pub(crate) const STOP_SUBCOMMAND: &str = "__stop-group";
-    /// The `minvmd` subcommand of the VMM child.
-    pub(crate) const VMM_SUBCOMMAND: &str = "__krun-vmm";
-    /// The test that follows every `cd -P` in the script: `..` is the
-    /// directory the walk was in, by device and inode. The caller ends it
-    /// with the message, `" >&2; exit 1; }`.
-    const CD_PARENT_CHECK: &str = "[ \"$(stat -c %d:%i ..)\" = \"$here\" ] || { echo \"";
-
-    /// One directory as `lstat` reads it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct DirFact {
-        pub uid: u32,
-        pub gid: u32,
-        /// The permission bits with setgid: `st_mode & 0o7777`.
-        pub mode: u32,
-        /// A directory, not a symlink or a file.
-        pub is_dir: bool,
-    }
-
-    /// The paths the item works on, for one login and one VM.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) struct VmUsersLayout {
-        pub host_dir: std::path::PathBuf,
-        pub vm_dir: std::path::PathBuf,
-        pub gvproxy_dir: std::path::PathBuf,
-        pub gvproxy_config_dir: std::path::PathBuf,
-        pub gate_dir: std::path::PathBuf,
-    }
-
-    impl VmUsersLayout {
-        /// The layout for `operator`'s `vm` with its host dir at
-        /// `host_dir`, under [`VM_USERS_BASE`].
-        pub(crate) fn new(host_dir: std::path::PathBuf, operator: &str, vm: &str) -> Self {
-            let vm_dir = std::path::Path::new(VM_USERS_BASE).join(operator).join(vm);
-            VmUsersLayout {
-                host_dir,
-                gvproxy_dir: vm_dir.join("gvproxy"),
-                gvproxy_config_dir: vm_dir.join("gvproxy-config"),
-                gate_dir: vm_dir.join("gate"),
-                vm_dir,
-            }
-        }
-
-        pub(crate) fn vmm_dir(&self) -> std::path::PathBuf {
-            self.host_dir.join("vmm")
-        }
-    }
-
-    /// The facts the VM users item decides on.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) struct VmUsersFacts {
-        pub operator: String,
-        pub operator_uid: u32,
-        /// `/etc/passwd`.
-        pub passwd: String,
-        /// `/etc/group`.
-        pub group: String,
-        /// The VM name the rules name.
-        pub vm: String,
-        pub layout: VmUsersLayout,
-        pub host_dir: Option<DirFact>,
-        pub vmm: Option<DirFact>,
-        pub gvproxy_dir: Option<DirFact>,
-        pub gvproxy_config_dir: Option<DirFact>,
-        pub gate_dir: Option<DirFact>,
-        /// [`VM_USERS_RECORD`], when readable.
-        pub record: Option<String>,
-        /// The `minvmd` the rules name, or why no rule can name it.
-        pub minvmd: Result<std::path::PathBuf, String>,
-        /// The gvproxy the rule names, or why no rule can name it.
-        pub gvproxy: Result<std::path::PathBuf, String>,
-    }
-
-    /// The uid and gid `/etc/passwd` gives `user`.
-    pub(crate) fn passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
-        passwd.lines().find_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            (fields.len() >= 4 && fields[0] == user)
-                .then(|| Some((fields[2].parse().ok()?, fields[3].parse().ok()?)))
-                .flatten()
-        })
-    }
-
-    /// The gid and the member list `/etc/group` gives `group_name`.
-    pub(crate) fn group_entry(group: &str, group_name: &str) -> Option<(u32, Vec<String>)> {
-        group.lines().find_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() < 4 || fields[0] != group_name {
-                return None;
-            }
-            let members = fields[3]
-                .split(',')
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-                .collect();
-            Some((fields[2].parse().ok()?, members))
-        })
-    }
-
-    /// `arg` escaped for a sudoers command line: `\`, `,`, `:` and `=`
-    /// take a backslash. `None` when it holds a character no rule can carry
-    /// as one literal argument: whitespace, a control character, a quote,
-    /// `#`, or one of the sudoers wildcard and negation characters `*`, `?`,
-    /// `[`, `]` and `!`, which make a rule match more than one command line.
-    pub(crate) fn sudoers_arg(arg: &str) -> Option<String> {
-        if arg.is_empty()
-            || arg.chars().any(|c| {
-                c.is_whitespace()
-                    || c.is_control()
-                    || matches!(c, '\'' | '"' | '#' | '*' | '?' | '[' | ']' | '!')
-            })
-        {
-            return None;
-        }
-        let mut out = String::with_capacity(arg.len());
-        for c in arg.chars() {
-            if matches!(c, '\\' | ',' | ':' | '=') {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        Some(out)
-    }
-
-    /// The drop-in for `operator`: the gvproxy, VMM child and EGW spawns
-    /// and the two stop rules, each with a root-owned absolute binary and
-    /// literal arguments, `env_reset` with an empty `env_keep`, and
-    /// `umask=0077` with `umask_override` for gvproxy. `None` when a path
-    /// or a name cannot be a literal sudoers argument.
-    pub(crate) fn sudoers_drop_in(
-        operator: &str,
-        vm: &str,
-        layout: &VmUsersLayout,
-        minvmd: &std::path::Path,
-        gvproxy: &std::path::Path,
-    ) -> Option<String> {
-        let path = |p: &std::path::Path| sudoers_arg(p.to_str()?);
-        let minvmd = path(minvmd)?;
-        let gvproxy = path(gvproxy)?;
-        let vm = sudoers_arg(vm)?;
-        let config = path(&layout.gvproxy_config_dir.join("gvproxy.yaml"))?;
-        let listen = sudoers_arg(&format!(
-            "unix://{}",
-            layout.gvproxy_dir.join("gvproxy-switch.sock").to_str()?
-        ))?;
-        let operator = sudoers_arg(operator)?;
-        Some(format!(
-            "# Written by min finalize-install. It lets {operator} start the Minimal VM as\n\
-             # {VMM_USER} and its network switch as {GVPROXY_USER}, and nothing else.\n\
-             Cmnd_Alias MINIMAL_GVPROXY_SPAWN = {gvproxy} -config {config} -listen {listen} -ssh-port -1\n\
-             Cmnd_Alias MINIMAL_EGW_SPAWN = {minvmd} {EGW_SUBCOMMAND} {vm}\n\
-             Cmnd_Alias MINIMAL_VMM_SPAWN = {minvmd} {VMM_SUBCOMMAND} {vm}\n\
-             Cmnd_Alias MINIMAL_STOP = {minvmd} {STOP_SUBCOMMAND} {vm}\n\
-             Defaults!MINIMAL_GVPROXY_SPAWN env_reset, !env_keep, umask=0077, umask_override\n\
-             Defaults!MINIMAL_EGW_SPAWN env_reset, !env_keep, !use_pty\n\
-             Defaults!MINIMAL_VMM_SPAWN env_reset, !env_keep, !use_pty\n\
-             Defaults!MINIMAL_STOP env_reset, !env_keep, !use_pty\n\
-             {operator} ALL = ({GVPROXY_USER}) NOPASSWD: MINIMAL_GVPROXY_SPAWN, MINIMAL_EGW_SPAWN\n\
-             {operator} ALL = ({VMM_USER}) NOPASSWD: MINIMAL_VMM_SPAWN\n\
-             {operator} ALL = ({GVPROXY_USER}) NOPASSWD: MINIMAL_STOP\n\
-             {operator} ALL = ({VMM_USER}) NOPASSWD: MINIMAL_STOP\n"
-        ))
-    }
-
-    /// Whether `fact` is a directory with this owner, group and mode.
-    fn dir_is(fact: Option<DirFact>, uid: u32, gid: u32, mode: u32) -> bool {
-        fact.is_some_and(|f| f.is_dir && f.uid == uid && f.gid == gid && f.mode == mode)
-    }
-
-    /// The script block that creates the users, the directories and the
-    /// drop-in. The host dir and `vmm/` sit in the login's state dir,
-    /// which the login can change while root works there. So root reaches
-    /// them by `cd -P`, checks that `pwd -P` is the path it means and
-    /// checks the owner of `.`, and changes only `.`.
-    fn vm_users_script(facts: &VmUsersFacts, drop_in: &str) -> String {
-        let op = &facts.operator;
-        let layout = &facts.layout;
-        let host_dir = layout.host_dir.display().to_string();
-        let components: Vec<String> = layout
-            .host_dir
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
-        let last = components.len();
-        let mut walk = String::new();
-        let mut here = String::new();
-        for (i, name) in components.iter().enumerate() {
-            let want = if i + 1 == last {
-                "[ \"$owner\" = \"$op_uid\" ]"
-            } else {
-                "[ \"$owner\" = 0 ] || [ \"$owner\" = \"$op_uid\" ]"
-            };
-            here.push('/');
-            here.push_str(name);
-            // The login can swap the entry for a symlink between the `-L`
-            // test and the `cd`. So the device and inode of `.` are kept
-            // before the `cd`, and `..` must have them after it: the `cd`
-            // went one level down from where the walk was. The physical
-            // path is checked too.
-            walk.push_str(&format!(
-                "  [ ! -L '{name}' ] || {{ echo \"{host_dir}: a component is a symlink\" >&2; exit 1; }}\n\
-                 \x20 here=$(stat -c %d:%i .)\n\
-                 \x20 cd -P -- '{name}'\n\
-                 \x20 {CD_PARENT_CHECK}{host_dir}: a component moved\" >&2; exit 1; }}\n\
-                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{host_dir}: a component is a symlink\" >&2; exit 1; }}\n\
-                 \x20 owner=$(stat -c %u .)\n\
-                 \x20 {want} || {{ echo \"{host_dir}: a component has another owner\" >&2; exit 1; }}\n"
-            ));
-        }
-        let base = VM_USERS_BASE;
-        let login_dir = std::path::Path::new(base).join(op);
-        format!(
-            "# Separate users for the VM: the VMM child runs as {VMM_USER} and gvproxy as\n\
-             # {GVPROXY_USER}, each started through sudo under a drop-in that permits\n\
-             # only those spawns. {op} is the one login member of both groups.\n\
-             getent group {VMM_USER} >/dev/null || groupadd --system {VMM_USER}\n\
-             getent passwd {VMM_USER} >/dev/null || useradd --system --gid {VMM_USER} \
-             --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {VMM_USER}\n\
-             getent group {GVPROXY_USER} >/dev/null || groupadd --system {GVPROXY_USER}\n\
-             getent passwd {GVPROXY_USER} >/dev/null || useradd --system --gid {GVPROXY_USER} \
-             --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {GVPROXY_USER}\n\
-             # Each group has one login member. Another member stops the script\n\
-             # here, and nobody is removed from a group.\n\
-             for group in {VMM_USER} {GVPROXY_USER}; do\n\
-             \x20 members=$(getent group \"$group\" | cut -d: -f4)\n\
-             \x20 [ -z \"$members\" ] || [ \"$members\" = '{op}' ] || \
-             {{ echo \"group $group already has the members $members\" >&2; exit 1; }}\n\
-             \x20 gpasswd -a '{op}' \"$group\" >/dev/null\n\
-             done\n\
-             # The provider dir and its vmm/ subdirectory, reached from / one checked\n\
-             # component at a time and checked with pwd -P; only . is changed.\n\
-             (\n\
-             \x20 op_uid=$(id -u '{op}')\n\
-             \x20 cd /\n\
-             {walk}\
-             \x20 chgrp {VMM_USER} .\n\
-             \x20 chmod 0710 .\n\
-             \x20 [ -e vmm ] || mkdir -m 0700 vmm\n\
-             \x20 [ ! -L vmm ] || {{ echo \"{host_dir}/vmm is a symlink\" >&2; exit 1; }}\n\
-             \x20 here=$(stat -c %d:%i .)\n\
-             \x20 cd -P vmm\n\
-             \x20 {CD_PARENT_CHECK}{host_dir}/vmm moved\" >&2; exit 1; }}\n\
-             \x20 [ \"$(pwd -P)\" = '{here}/vmm' ] || \
-             {{ echo \"{host_dir}/vmm is a symlink\" >&2; exit 1; }}\n\
-             \x20 owner=$(stat -c %u .)\n\
-             \x20 [ \"$owner\" = 0 ] || [ \"$owner\" = \"$(id -u {VMM_USER})\" ] || \
-             {{ echo \"{host_dir}/vmm has another owner\" >&2; exit 1; }}\n\
-             \x20 chown root:root .\n\
-             \x20 chmod 0700 .\n\
-             \x20 chown {VMM_USER}:{VMM_USER} .\n\
-             \x20 chmod 0750 .\n\
-             )\n\
-             # The gvproxy, gvproxy config and gate dirs, under root-owned parents.\n\
-             install -d -o root -g root -m 0755 {base} '{login_dir}' '{vm_dir}'\n\
-             install -d -o {GVPROXY_USER} -g {GVPROXY_USER} -m 0750 '{gvproxy_dir}'\n\
-             install -d -o '{op}' -g {GVPROXY_USER} -m 0750 '{config_dir}'\n\
-             install -d -o {GVPROXY_USER} -g {VMM_USER} -m 0710 '{gate_dir}'\n\
-             chmod 2710 '{gate_dir}'\n\
-             # The drop-in, checked by visudo before it is put in place.\n\
-             drop_in=$(mktemp)\n\
-             cat > \"$drop_in\" <<\\MINIMAL_VM_USERS_EOF\n\
-             {drop_in}\
-             MINIMAL_VM_USERS_EOF\n\
-             visudo -cqf \"$drop_in\"\n\
-             install -o root -g root -m 0440 \"$drop_in\" {SUDOERS_DROP_IN}\n\
-             install -o root -g root -m 0644 \"$drop_in\" {VM_USERS_RECORD}\n\
-             rm -f \"$drop_in\"\n",
-            login_dir = login_dir.display(),
-            vm_dir = layout.vm_dir.display(),
-            gvproxy_dir = layout.gvproxy_dir.display(),
-            config_dir = layout.gvproxy_config_dir.display(),
-            gate_dir = layout.gate_dir.display(),
-        )
-    }
-
-    /// The VM users item over pre-read facts: done when both users exist
-    /// with the login as the one member of each group, every directory has
-    /// the owner, group and mode of the design, and the installed drop-in
-    /// is the one this host needs. Missing otherwise, with the step that
-    /// makes it so. Blocked when no rule can name the binaries.
-    pub(crate) fn vm_users_item_over(facts: &VmUsersFacts) -> Item {
-        let op = &facts.operator;
-        if op.is_empty() {
-            return Item::cannot(
-                VM_USERS_ID,
-                VM_USERS_LABEL,
-                "could not read this process's user name, so there is no account to start \
-                 the VM for"
-                    .to_string(),
-            );
-        }
-        if op.contains(['\'', '\n', ' ', '/']) || sudoers_arg(op).is_none() {
-            return Item::cannot(
-                VM_USERS_ID,
-                VM_USERS_LABEL,
-                format!(
-                    "this process's user name ({op:?}) holds a character the script cannot \
-                     quote"
-                ),
-            );
-        }
-        let minvmd = match &facts.minvmd {
-            Ok(path) => path,
-            Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
-        };
-        let gvproxy = match &facts.gvproxy {
-            Ok(path) => path,
-            Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
-        };
-        // The script prints the host dir path inside double quotes, where
-        // `$`, a backtick and `\` keep a meaning to the shell. So those
-        // characters are refused too.
-        let paths_quotable = [&facts.layout.host_dir, &facts.layout.vm_dir]
-            .iter()
-            .all(|p| {
-                p.to_str()
-                    .is_some_and(|s| sudoers_arg(s).is_some() && !s.contains(['$', '`', '\\']))
-            });
-        let Some(drop_in) = sudoers_drop_in(op, &facts.vm, &facts.layout, minvmd, gvproxy)
-            .filter(|_| paths_quotable)
-        else {
-            return Item::cannot(
-                VM_USERS_ID,
-                VM_USERS_LABEL,
-                "a path the sudo rules or the setup script must name holds a space, a quote, \
-                 a newline, a `$`, a backtick or a backslash"
-                    .to_string(),
-            );
-        };
-
-        // The script walks into the host dir and does not create it.
-        if !facts.host_dir.is_some_and(|f| f.is_dir) {
-            return Item::cannot(
-                VM_USERS_ID,
-                VM_USERS_LABEL,
-                format!(
-                    "{} does not exist yet, so there is no VM directory to set up. minvmd \
-                     creates it the first time the VM starts",
-                    facts.layout.host_dir.display()
-                ),
-            );
-        }
-
-        let vmm = passwd_ids(&facts.passwd, VMM_USER);
-        let gvp = passwd_ids(&facts.passwd, GVPROXY_USER);
-        let vmm_group = group_entry(&facts.group, VMM_USER);
-        let gvp_group = group_entry(&facts.group, GVPROXY_USER);
-        // The design gives each group one login member. Another member is
-        // never removed: the item refuses and names it.
-        for (name, entry) in [(VMM_USER, &vmm_group), (GVPROXY_USER, &gvp_group)] {
-            let others: Vec<&str> = entry
-                .iter()
-                .flat_map(|(_, members)| members.iter())
-                .map(String::as_str)
-                .filter(|m| m != op)
-                .collect();
-            if !others.is_empty() {
-                let member = match others.as_slice() {
-                    [one] => *one,
-                    _ => "<member>",
-                };
-                return Item::cannot(
-                    VM_USERS_ID,
-                    VM_USERS_LABEL,
-                    format!(
-                        "the {name} group already has other members: {}. The group can have \
-                         one login member only. Remove each one with `sudo gpasswd -d {member} \
-                         {name}`, then run `min finalize-install` again",
-                        others.join(", ")
-                    ),
-                );
-            }
-        }
-        let one_member = |entry: &Option<(u32, Vec<String>)>| {
-            entry
-                .as_ref()
-                .is_some_and(|(_, members)| members.len() == 1 && members[0] == *op)
-        };
-        let done = match (vmm, gvp, &vmm_group, &gvp_group) {
-            (Some((vmm_uid, _)), Some((gvp_uid, _)), Some((vmm_gid, _)), Some((gvp_gid, _))) => {
-                let (vmm_gid, gvp_gid) = (*vmm_gid, *gvp_gid);
-                one_member(&vmm_group)
-                    && one_member(&gvp_group)
-                    && facts.host_dir.is_some_and(|f| {
-                        f.is_dir
-                            && f.uid == facts.operator_uid
-                            && f.gid == vmm_gid
-                            && f.mode == 0o710
-                    })
-                    && dir_is(facts.vmm, vmm_uid, vmm_gid, 0o750)
-                    && dir_is(facts.gvproxy_dir, gvp_uid, gvp_gid, 0o750)
-                    && dir_is(facts.gvproxy_config_dir, facts.operator_uid, gvp_gid, 0o750)
-                    && dir_is(facts.gate_dir, gvp_uid, vmm_gid, 0o2710)
-                    && facts.record.as_deref() == Some(drop_in.as_str())
-            }
-            _ => false,
-        };
-        if done {
-            return Item::done(VM_USERS_ID, VM_USERS_LABEL);
-        }
-        Item::missing(
-            VM_USERS_ID,
-            VM_USERS_LABEL,
-            format!(
-                "the VM and its network switch cannot start as their own users, because \
-                 {VMM_USER}, {GVPROXY_USER} or the sudo rule that starts them is not set up"
-            ),
-            format!(
-                "creates the {VMM_USER} and {GVPROXY_USER} users, adds {op} to their groups \
-                 (it takes effect at your next login), and installs {SUDOERS_DROP_IN}"
-            ),
-            vm_users_script(facts, &drop_in),
-        )
-    }
-
-    /// `path` when every component, from `/` down, is owned by root and
-    /// writable by nobody else, so a sudo rule can name it. The reason
-    /// otherwise.
-    pub(crate) fn root_owned_binary(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-        use std::os::unix::fs::MetadataExt as _;
-        let real = std::fs::canonicalize(path)
-            .map_err(|e| format!("{} cannot be read: {e}", path.display()))?;
-        for dir in real.ancestors() {
-            let meta = std::fs::symlink_metadata(dir)
-                .map_err(|e| format!("{} cannot be read: {e}", dir.display()))?;
-            if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-                return Err(format!(
-                    "{} is not a root-owned binary that only root can change, so no sudo rule \
-                     can start it as another user; install it under /usr/local/bin",
-                    real.display()
-                ));
-            }
-        }
-        Ok(real)
-    }
-
-    /// `minvmd` on `PATH`, the binary `min` starts.
-    fn minvmd_on_path() -> Result<std::path::PathBuf, String> {
-        std::env::var_os("PATH")
-            .and_then(|path| {
-                std::env::split_paths(&path)
-                    .map(|dir| dir.join("minvmd"))
-                    .find(|candidate| candidate.is_file())
-            })
-            .ok_or_else(|| "minvmd is not on PATH".to_string())
-    }
-
-    fn dir_fact(path: &std::path::Path) -> Option<DirFact> {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(DirFact {
-            uid: meta.uid(),
-            gid: meta.gid(),
-            mode: meta.mode() & 0o7777,
-            is_dir: meta.file_type().is_dir(),
-        })
-    }
-
-    /// [`vm_users_item_over`] this host's reads, for the default VM.
-    // Formerly BEP-047 (gominimal/inbox#1184): not offered until T66 (#2566)
-    // spawns through `sudo -n`, so no caller exists at this head. T66 adds
-    // the caller back.
-    #[allow(dead_code)]
-    pub(crate) fn vm_users_item_on_this_host() -> Item {
-        let operator = crate::resolver::operator_name();
-        let host_dir = paths::host_dir(&paths::minimal_state_dir(), paths::HostKind::Minvmd, 0)
-            .as_utf8_path()
-            .as_std_path()
-            .to_path_buf();
-        // The script refuses a symlink in the path, and `/home` is a
-        // symlink on some hosts. So the item works on the real path.
-        let host_dir = std::fs::canonicalize(&host_dir).unwrap_or(host_dir);
-        let vm = paths::host_name(paths::HostKind::Minvmd, 0);
-        let layout = VmUsersLayout::new(host_dir, &operator, &vm);
-        let facts = VmUsersFacts {
-            operator_uid: nix::unistd::getuid().as_raw(),
-            passwd: std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
-            group: std::fs::read_to_string("/etc/group").unwrap_or_default(),
-            vm,
-            host_dir: dir_fact(&layout.host_dir),
-            vmm: dir_fact(&layout.vmm_dir()),
-            gvproxy_dir: dir_fact(&layout.gvproxy_dir),
-            gvproxy_config_dir: dir_fact(&layout.gvproxy_config_dir),
-            gate_dir: dir_fact(&layout.gate_dir),
-            record: std::fs::read_to_string(VM_USERS_RECORD).ok(),
-            minvmd: minvmd_on_path().and_then(|p| root_owned_binary(&p)),
-            gvproxy: root_owned_binary(&switch::installed_gvproxy_bin()),
-            layout,
-            operator,
-        };
-        vm_users_item_over(&facts)
-    }
 }
 
 #[cfg(test)]
@@ -2430,18 +1437,18 @@ mod tests {
         let plan = Plan {
             items: vec![
                 missing("names", "names"),
-                cannot("classifier", "cgroup2 is mounted without nsdelegate"),
+                cannot("policy-engine", "no cgroup2 filesystem is mounted"),
             ],
         };
         let summary = plan.summary();
         assert!(summary.contains(CANNOT_HEADING), "{summary}");
         assert!(
-            summary.contains("✗ an unfixable item — cgroup2 is mounted without nsdelegate"),
+            summary.contains("✗ an unfixable item — no cgroup2 filesystem is mounted"),
             "{summary}"
         );
         let script = plan.script().expect("the fixable item still runs");
         assert!(script.contains("echo names"), "{script}");
-        assert!(!script.contains("nsdelegate"), "{script}");
+        assert!(!script.contains("cgroup2"), "{script}");
         assert_eq!(plan.exit_code(), 1);
     }
 
@@ -2550,7 +1557,6 @@ mod tests {
             script,
             json: false,
             undo,
-            ct_mark_mask: None,
         };
         assert!(undo_flags_refusal(&args(true, false, true)).is_some());
         assert_eq!(undo_flags_refusal(&args(true, true, true)), None);
@@ -2634,7 +1640,7 @@ mod tests {
             items: vec![
                 done("userns-profile"),
                 missing("names", "names"),
-                cannot("classifier", "no cgroup2 mount"),
+                cannot("policy-engine", "no cgroup2 mount"),
             ],
         };
         let json = plan.json();
@@ -2643,7 +1649,7 @@ mod tests {
         assert_eq!(value["finished"], false);
         let items = value["items"].as_array().unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["userns-profile", "names", "classifier"]);
+        assert_eq!(ids, ["userns-profile", "names", "policy-engine"]);
         assert_eq!(items[0]["state"], "done");
         assert_eq!(items[1]["state"], "missing");
         assert_eq!(items[1]["today"], "what it costs today");
@@ -2994,1183 +2000,463 @@ mod tests {
         }
     }
 
-    /// The table's presence reads the way minimald reads it: the marker
-    /// with exactly one well-formed mask record beside it. A marker alone
-    /// (a failed re-install), a malformed record, or two records that
-    /// disagree is not installed; one record, or two that agree, is.
-    #[test]
-    fn classifier_table_presence_needs_the_marker_and_one_mask_record() {
-        use linux::recorded_mask;
-        let root = tempfile::tempdir().expect("a temp dir");
-        let root = root.path();
-        assert_eq!(recorded_mask(root), None, "an empty root");
-        std::fs::create_dir(root.join("classifier-table")).unwrap();
-        assert_eq!(
-            recorded_mask(root),
-            None,
-            "the marker alone is a step that did not finish"
-        );
-        std::fs::create_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
-        assert_eq!(recorded_mask(root), None, "a record that does not parse");
-        std::fs::remove_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
-        std::fs::create_dir(root.join("ct-mark-mask-0x30000000")).unwrap();
-        assert_eq!(
-            recorded_mask(root),
-            Some(0x3000_0000),
-            "the marker and one record"
-        );
-        std::fs::create_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
-        assert_eq!(recorded_mask(root), None, "two records that disagree");
-        std::fs::remove_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
-        std::fs::remove_dir(root.join("classifier-table")).unwrap();
-        assert_eq!(recorded_mask(root), None, "a record without the marker");
+    const IDENTITY: &str =
+        "abi=3 object=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER_IDENTITY: &str =
+        "abi=4 object=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A host where the policy engine is installed for alice and current.
+    fn policy_engine_installed() -> linux::PolicyEngineFacts {
+        linux::PolicyEngineFacts {
+            operator: "alice".to_string(),
+            systemd: true,
+            cgroup_v2: true,
+            kernel_release: "6.8.0-45-generic\n".to_string(),
+            daemon: Some("/home/alice/.local/bin/minimald".to_string()),
+            daemon_identity: Some(IDENTITY.to_string()),
+            copy: Some(linux::LoaderCopy {
+                regular_file: true,
+                uid: 0,
+                mode: 0o755,
+            }),
+            copy_identity: Some(IDENTITY.to_string()),
+            socket_unit: Some(crate::resolver::policy_loader_socket_unit("alice")),
+            service_unit: Some(crate::resolver::policy_loader_service_unit()),
+            socket_active: true,
+            earlier_pieces: Vec::new(),
+        }
     }
 
-    /// BEP-018 (#2607): the QUIC block helper item is done when the helper
-    /// and its sudoers drop-in are root-owned. Otherwise it names the
-    /// helper's path and the step that installs it, which is the classifier
-    /// step, and a run carries that step once.
+    /// The policy engine item's table: done only when every installed
+    /// piece is this version's and trusted, missing with what a user gets
+    /// today for each piece that is not, out of date for a loader of
+    /// another version, and blocked by each host fact no script changes.
     #[test]
-    fn finalize_install_names_the_quic_block_helper() {
-        use linux::{
-            Cgroup2Mount, ClassifierFacts, QUIC443_HELPER_PATH, QUIC443_SUDOERS_PATH,
-            Quic443HelperFacts, classifier_item_over, quic443_helper_item_over,
-            sudo_listing_names_nopasswd,
-        };
-        // The paths are the ones the classifier step installs to.
-        let script = crate::resolver::CLASSIFIER_SCRIPT;
-        assert!(script.contains(&format!(
-            "QUIC443_HELPER=${{MINIMAL_OVERRIDE_QUIC443_HELPER:-{QUIC443_HELPER_PATH}}}"
-        )));
-        assert!(script.contains(&format!(
-            "QUIC443_SUDOERS=${{MINIMAL_OVERRIDE_QUIC443_SUDOERS:-{QUIC443_SUDOERS_PATH}}}"
-        )));
+    fn policy_engine_item_table() {
+        use linux::{LoaderCopy, PolicyEngineFacts, policy_engine_item_over};
+        let installed = policy_engine_installed();
+        let done = policy_engine_item_over(&installed);
+        assert_eq!(done.state, ItemState::Done);
+        assert_eq!(done.id, "policy-engine");
+        assert_eq!(done.label, "network policy engine");
+        assert!(done.script.is_none());
 
-        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
-        let classifier = ClassifierFacts {
-            table_present: true,
-            recorded_mask: Some(0x3000_0000),
-            requested_mask: None,
-            copy_current: true,
-            units_enabled: Some(true),
-            other_owner: None,
-            root: false,
-            mount: Cgroup2Mount::Delegated,
-            unplaced_daemon: None,
-            placer_listening: Some(true),
+        let copy = |regular_file, uid, mode| {
+            Some(LoaderCopy {
+                regular_file,
+                uid,
+                mode,
+            })
         };
-        let installed = Quic443HelperFacts {
-            helper_root_owned: true,
-            sudoers_root_owned: true,
-        };
-        let item = quic443_helper_item_over(installed, &classifier, "alice", sock);
-        assert_eq!(item.id, "quic443-helper");
-        assert_eq!(item.label, "QUIC block helper");
-        assert_eq!(item.state, ItemState::Done);
-
-        let wanted = format!(
-            "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to install it."
-        );
-        for helper in [
-            Quic443HelperFacts {
-                helper_root_owned: false,
-                ..installed
-            },
-            Quic443HelperFacts {
-                sudoers_root_owned: false,
-                ..installed
-            },
-        ] {
-            let item = quic443_helper_item_over(helper, &classifier, "alice", sock);
-            assert_eq!(item.state, ItemState::Missing, "{helper:?}");
-            assert_eq!(item.today.as_deref(), Some(wanted.as_str()));
-            let step = item.step.as_deref().unwrap_or_default();
-            assert!(step.contains(QUIC443_HELPER_PATH), "{step}");
-            assert!(step.contains(QUIC443_SUDOERS_PATH), "{step}");
-            assert!(
-                item.script
-                    .as_deref()
-                    .is_some_and(|block| block.contains(crate::resolver::CLASSIFIER_PROGRAM_PATH)),
-                "the step is the classifier step"
-            );
-            let summary = Plan {
-                items: vec![item.clone()],
-            }
-            .summary();
-            assert!(summary.contains("  ✗ QUIC block helper\n"), "{summary}");
-            assert!(
-                summary.contains(&format!("      today: {wanted}\n")),
-                "{summary}"
-            );
+        let missing: [(&str, PolicyEngineFacts, &str); 10] = [
+            (
+                "no copy",
+                PolicyEngineFacts {
+                    copy: None,
+                    copy_identity: None,
+                    socket_unit: None,
+                    service_unit: None,
+                    socket_active: false,
+                    ..installed.clone()
+                },
+                "boxes with a network policy are refused: the network policy loader is not \
+                 installed",
+            ),
+            (
+                "a copy the operator owns",
+                PolicyEngineFacts {
+                    copy: copy(true, 1000, 0o755),
+                    ..installed.clone()
+                },
+                "is not a root-owned file that only root can write",
+            ),
+            (
+                "a copy others can write",
+                PolicyEngineFacts {
+                    copy: copy(true, 0, 0o757),
+                    ..installed.clone()
+                },
+                "is not a root-owned file that only root can write",
+            ),
+            (
+                "a copy the group can write",
+                PolicyEngineFacts {
+                    copy: copy(true, 0, 0o775),
+                    ..installed.clone()
+                },
+                "is not a root-owned file that only root can write",
+            ),
+            (
+                "a symlink where the copy goes",
+                PolicyEngineFacts {
+                    copy: copy(false, 0, 0o777),
+                    ..installed.clone()
+                },
+                "is not a root-owned file that only root can write",
+            ),
+            (
+                "a socket unit for another operator",
+                PolicyEngineFacts {
+                    socket_unit: Some(crate::resolver::policy_loader_socket_unit("bob")),
+                    ..installed.clone()
+                },
+                "are not the ones this version installs for alice",
+            ),
+            (
+                "a service unit with another line",
+                PolicyEngineFacts {
+                    service_unit: installed
+                        .service_unit
+                        .as_ref()
+                        .map(|unit| unit.replace("PrivateNetwork=yes\n", "")),
+                    ..installed.clone()
+                },
+                "are not the ones this version installs for alice",
+            ),
+            (
+                "no service unit, under a copy of another version",
+                PolicyEngineFacts {
+                    service_unit: None,
+                    copy_identity: Some(OTHER_IDENTITY.to_string()),
+                    ..installed.clone()
+                },
+                "the loader's systemd units are missing",
+            ),
+            (
+                "a socket that is not active",
+                PolicyEngineFacts {
+                    socket_active: false,
+                    ..installed.clone()
+                },
+                "the loader's socket (minimal-policy-loader.socket) is not active",
+            ),
+            (
+                "a piece of an earlier version",
+                PolicyEngineFacts {
+                    earlier_pieces: vec!["/usr/local/lib/minimal/quic443-leaf".to_string()],
+                    ..installed.clone()
+                },
+                "what an earlier version installed for network enforcement is still on this \
+                 machine: /usr/local/lib/minimal/quic443-leaf",
+            ),
+        ];
+        for (case, facts, today) in &missing {
+            let item = policy_engine_item_over(facts);
+            assert_eq!(item.state, ItemState::Missing, "{case}");
+            let said = item.today.as_deref().unwrap();
+            assert!(said.contains(today), "{case}: {said}");
+            assert!(item.script.is_some() && item.step.is_some(), "{case}");
         }
-
-        // Where `/etc/sudoers.d` is root-only, only a NOPASSWD rule that
-        // names the helper stands in for the drop-in, not a broad one.
-        let drop_in = format!(
-            "User alice may run the following commands on host:\n    (root) NOPASSWD: \
-             {QUIC443_HELPER_PATH}\n"
-        );
-        assert!(sudo_listing_names_nopasswd(&drop_in, QUIC443_HELPER_PATH));
-        let among = format!("    (root) NOPASSWD: SETENV: /usr/bin/true, {QUIC443_HELPER_PATH}\n");
-        assert!(sudo_listing_names_nopasswd(&among, QUIC443_HELPER_PATH));
-        for broad in [
-            "User alice may run the following commands on host:\n    (ALL) NOPASSWD: ALL\n",
-            "    (ALL : ALL) NOPASSWD: ALL\n",
-            &format!("    (root) {QUIC443_HELPER_PATH}\n"),
-            &format!("    (root) NOPASSWD: {QUIC443_HELPER_PATH}.bak\n"),
-        ] {
-            assert!(
-                !sudo_listing_names_nopasswd(broad, QUIC443_HELPER_PATH),
-                "{broad}"
-            );
-        }
-
-        // What blocks the classifier step blocks the helper too.
-        let unmounted = ClassifierFacts {
-            mount: Cgroup2Mount::Absent,
-            ..classifier
-        };
-        let missing_helper = Quic443HelperFacts {
-            helper_root_owned: false,
-            sudoers_root_owned: false,
-        };
-        let blocked = quic443_helper_item_over(missing_helper, &unmounted, "alice", sock);
-        assert_eq!(blocked.state, ItemState::Cannot);
-        assert!(
-            blocked
-                .cause
-                .as_deref()
-                .is_some_and(|c| c.contains("cgroup2")),
-            "{blocked:?}"
-        );
-
-        // With the classifier missing as well, a run carries its step once.
-        let bare = ClassifierFacts {
-            table_present: false,
-            recorded_mask: None,
-            ..classifier
-        };
-        let plan = Plan {
-            items: vec![
-                classifier_item_over(&bare, "alice", sock),
-                quic443_helper_item_over(missing_helper, &bare, "alice", sock),
-            ],
-        };
-        let run = plan.script().expect("a script while items are missing");
-        let program = format!(
-            "if {} --user 'alice'; then\n",
-            crate::resolver::CLASSIFIER_PROGRAM_PATH
-        );
-        assert!(
-            run.contains("QUIC block helper"),
-            "the header names the item"
-        );
+        // Only a host that carries earlier pieces is told they go.
+        let step_of = |facts: &PolicyEngineFacts| policy_engine_item_over(facts).step.unwrap();
         assert_eq!(
-            run.matches(&format!("\n{program}")).count(),
-            1,
-            "one classifier step: {run}"
+            step_of(&missing[0].1),
+            "installs a root-owned copy of minimald at /usr/local/lib/minimal/minimald and \
+             the systemd units that run it as the network policy loader for alice's daemon"
         );
+        assert!(
+            step_of(&missing[9].1).ends_with(", and removes what an earlier version installed")
+        );
+
+        let out_of_date = [
+            (
+                "a copy of another version",
+                PolicyEngineFacts {
+                    copy_identity: Some(OTHER_IDENTITY.to_string()),
+                    ..installed.clone()
+                },
+            ),
+            (
+                "a copy that prints no identity",
+                PolicyEngineFacts {
+                    copy_identity: None,
+                    ..installed.clone()
+                },
+            ),
+            (
+                "a copy of another version under units that differ too",
+                PolicyEngineFacts {
+                    copy_identity: Some(OTHER_IDENTITY.to_string()),
+                    socket_unit: Some("[Socket]\n".to_string()),
+                    socket_active: false,
+                    ..installed.clone()
+                },
+            ),
+        ];
+        let fresh = policy_engine_item_over(&missing[0].1);
+        for (case, facts) in &out_of_date {
+            let item = policy_engine_item_over(facts);
+            assert_eq!(item.state, ItemState::OutOfDate, "{case}");
+            assert_eq!(
+                item.today.as_deref(),
+                Some(
+                    "the installed network policy loader is from another version of Minimal, \
+                     so boxes with a network policy are refused until `min finalize-install` \
+                     runs"
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                item.script, fresh.script,
+                "{case}: the step a fresh host runs"
+            );
+        }
+
+        let cannot = [
+            (
+                PolicyEngineFacts {
+                    systemd: false,
+                    ..installed.clone()
+                },
+                "systemd is not this machine's init system",
+            ),
+            (
+                PolicyEngineFacts {
+                    cgroup_v2: false,
+                    ..installed.clone()
+                },
+                "no cgroup2 filesystem is mounted at /sys/fs/cgroup",
+            ),
+            (
+                PolicyEngineFacts {
+                    kernel_release: "5.15.0-91-generic\n".to_string(),
+                    ..installed.clone()
+                },
+                "this machine's kernel (5.15.0-91-generic) is older than 5.19",
+            ),
+            (
+                PolicyEngineFacts {
+                    daemon: None,
+                    daemon_identity: None,
+                    ..installed.clone()
+                },
+                "no minimald is installed beside this min",
+            ),
+            (
+                PolicyEngineFacts {
+                    daemon: Some("/opt/min$(id)/minimald".to_string()),
+                    ..installed.clone()
+                },
+                "which the install script cannot quote",
+            ),
+            (
+                PolicyEngineFacts {
+                    operator: String::new(),
+                    ..installed.clone()
+                },
+                "could not read this process's user name",
+            ),
+            (
+                PolicyEngineFacts {
+                    operator: "al%ice".to_string(),
+                    ..installed.clone()
+                },
+                "which a systemd unit cannot name",
+            ),
+            (
+                PolicyEngineFacts {
+                    daemon_identity: None,
+                    ..installed.clone()
+                },
+                "does not report a network policy loader",
+            ),
+        ];
+        for (facts, cause) in &cannot {
+            let item = policy_engine_item_over(facts);
+            assert_eq!(item.state, ItemState::Cannot, "{cause}");
+            let said = item.cause.as_deref().unwrap();
+            assert!(said.contains(cause), "{said}");
+            assert!(item.script.is_none(), "{cause}");
+        }
+        // 5.19 itself and anything newer is not blocked, and neither is a
+        // release that does not read as a version.
+        for release in ["5.19.0", "6.18.58.1-microsoft-standard-WSL2", "7.0-rc1", ""] {
+            let item = policy_engine_item_over(&PolicyEngineFacts {
+                kernel_release: release.to_string(),
+                ..installed.clone()
+            });
+            assert_eq!(item.state, ItemState::Done, "{release:?}");
+        }
     }
 
-    /// The classifier item's table: done on the marker with a current copy
-    /// of the step and enabled units (or no systemctl to owe them to);
-    /// blocked by another account's tree, by root, by the mount, or by an
-    /// account or socket path outside the block's allowlists; otherwise
-    /// missing, with its step — a marker over a stale copy, or over units
-    /// that did not install, included, so a re-run refreshes what the units
-    /// run and retries what a failed run left out.
     #[test]
-    fn classifier_item_table() {
-        use linux::{Cgroup2Mount, ClassifierFacts, cgroup2_mount_from, classifier_item_over};
-        assert_eq!(
-            cgroup2_mount_from(
-                "38 30 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 \
-                 cgroup2 rw,nsdelegate,memory_recursiveprot\n"
-            ),
-            Cgroup2Mount::Delegated
-        );
-        assert_eq!(
-            cgroup2_mount_from(
-                "38 30 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 \
-                 cgroup2 rw\n"
-            ),
-            Cgroup2Mount::WithoutNsdelegate
-        );
-        assert_eq!(
-            cgroup2_mount_from("38 30 0:26 / / rw,relatime - ext4 /dev/root rw\n"),
-            Cgroup2Mount::Absent
-        );
-        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
-        let installed = ClassifierFacts {
-            table_present: true,
-            recorded_mask: Some(0x3000_0000),
-            requested_mask: None,
-            copy_current: true,
-            units_enabled: Some(true),
-            other_owner: None,
-            root: false,
-            mount: Cgroup2Mount::Delegated,
-            unplaced_daemon: None,
-            placer_listening: Some(true),
-        };
-        let bare = ClassifierFacts {
-            table_present: false,
-            recorded_mask: None,
-            copy_current: false,
-            units_enabled: Some(false),
-            ..installed
-        };
-        assert_eq!(
-            classifier_item_over(&installed, "alice", sock).state,
-            ItemState::Done
-        );
-        // No systemctl: no unit is owed, and the step alone is the install.
-        assert_eq!(
-            classifier_item_over(
-                &ClassifierFacts {
-                    units_enabled: None,
-                    ..installed
-                },
-                "alice",
-                sock
-            )
-            .state,
-            ItemState::Done
-        );
-        let outside = "carries a character outside";
-        for (facts, operator, socket, word) in [
-            (
-                ClassifierFacts {
-                    mount: Cgroup2Mount::Absent,
-                    ..bare
-                },
-                "alice",
-                sock,
-                "no cgroup2 filesystem",
-            ),
-            (
-                ClassifierFacts {
-                    mount: Cgroup2Mount::WithoutNsdelegate,
-                    ..bare
-                },
-                "alice",
-                sock,
-                "without nsdelegate",
-            ),
-            (bare, "", sock, "could not read this process's user name"),
-            (bare, "al ice", sock, outside),
-            (bare, "al'ice", sock, outside),
-            (bare, "al%ice", sock, outside),
-            (bare, "al$ice", sock, outside),
-            (bare, "al\\ice", sock, outside),
-            (
-                bare,
-                "alice",
-                "",
-                "could not work out this machine's daemon socket path, which the placement \
-                 socket needs to find the daemon",
-            ),
-            (bare, "alice", "/run/it's.sock", outside),
-            (bare, "alice", "/run/my dir/ssh.sock", outside),
-            (bare, "alice", "/run/my\tdir/ssh.sock", outside),
-            (bare, "alice", "/run/%h/ssh.sock", outside),
-            (bare, "alice", "/run/$HOME/ssh.sock", outside),
-            (bare, "alice", "/run/a\\b/ssh.sock", outside),
-            (bare, "alice", "/run/\"q\"/ssh.sock", outside),
-        ] {
-            let item = classifier_item_over(&facts, operator, socket);
-            assert_eq!(item.state, ItemState::Cannot, "{item:?}");
-            assert_eq!(item.id, "classifier");
-            assert!(item.cause.as_deref().unwrap().contains(word), "{item:?}");
-        }
-        // The installed step with the running daemon outside its leaf: its
-        // remedy spells both names into the root block, so an unsafe name is
-        // the same refusal there, with or without a stopped placer, and no
-        // block is rendered. A healthy install read under such a name stays
-        // done, and a stopped placer alone names neither.
-        let installed = ClassifierFacts {
-            table_present: true,
-            recorded_mask: Some(0x3000_0000),
-            copy_current: true,
-            units_enabled: Some(true),
-            placer_listening: Some(true),
-            ..bare
-        };
-        for placer_listening in [Some(true), Some(false)] {
-            let unplaced = ClassifierFacts {
-                unplaced_daemon: Some(4242),
-                placer_listening,
-                ..installed
-            };
-            for (operator, socket) in [
-                ("al'ice", sock),
-                ("", sock),
-                ("alice", "/tmp/it's/ssh.sock"),
-                ("alice", "/tmp/x'; touch /pwned; : '/ssh.sock"),
-                ("alice", "/tmp/my dir/ssh.sock"),
-                ("alice", ""),
-            ] {
-                let item = classifier_item_over(&unplaced, operator, socket);
-                assert_eq!(
-                    item.state,
-                    ItemState::Cannot,
-                    "{operator:?} {socket:?}: {item:?}"
-                );
-                assert_eq!(item.script, None, "{item:?}");
-            }
-        }
-        assert_eq!(
-            classifier_item_over(&installed, "alice", "/tmp/it's/ssh.sock").state,
-            ItemState::Done
-        );
-        let placer_down = classifier_item_over(
-            &ClassifierFacts {
-                placer_listening: Some(false),
-                ..installed
-            },
-            "alice",
-            "/tmp/it's/ssh.sock",
-        );
-        assert_eq!(placer_down.state, ItemState::Missing, "{placer_down:?}");
-        assert!(
-            !placer_down.script.as_deref().unwrap().contains("it's"),
-            "{placer_down:?}"
-        );
+    fn kernel_version_reads_major_and_minor() {
+        use linux::kernel_version;
+        assert_eq!(kernel_version("6.8.0-45-generic\n"), Some((6, 8)));
+        assert_eq!(kernel_version("5.19"), Some((5, 19)));
+        assert_eq!(kernel_version("6.12-rc3"), Some((6, 12)));
+        assert!(kernel_version("4.18.0") < Some((5, 19)));
+        assert_eq!(kernel_version("6"), None);
+        assert_eq!(kernel_version("generic"), None);
+    }
 
-        let item = classifier_item_over(&bare, "alice", sock);
-        assert_eq!(item.state, ItemState::Missing, "{item:?}");
-        assert!(item.today.as_deref().unwrap().contains("is not enforced"));
-        // The label prints after a done mark too, so it names the thing, not a state.
-        assert_eq!(
-            item.label,
-            "deny-all egress enforcement for boxes that share this machine's address \
-             (--network host_ip with --deny-all-egress)"
+    /// A loader identity is one line of the agreed shape. What a minimald
+    /// without that mode prints, such as a usage error, is none.
+    #[test]
+    fn identity_line_takes_one_well_formed_line() {
+        use linux::identity_line;
+        assert_eq!(identity_line(&format!("{IDENTITY}\n")), Some(IDENTITY));
+        assert_eq!(identity_line(IDENTITY), Some(IDENTITY));
+        for not_one in [
+            String::new(),
+            "\n".to_string(),
+            format!("{IDENTITY}\n{IDENTITY}\n"),
+            format!("note\n{IDENTITY}\n"),
+            format!("{IDENTITY} \n"),
+            IDENTITY.replace("abi=3", "abi="),
+            IDENTITY.replace("abi=3", "abi=0x3"),
+            IDENTITY.replace("object=0", "object=g"),
+            IDENTITY[..IDENTITY.len() - 1].to_string(),
+            "error: unrecognized subcommand '__policy-loader'\n".to_string(),
+        ] {
+            assert_eq!(identity_line(&not_one), None, "{not_one:?}");
+        }
+    }
+
+    /// The policy engine block, as a fresh host's script carries it: the
+    /// copy put in place by a rename, both units written whole for the
+    /// operator, the socket enabled, then what an earlier version
+    /// installed taken away. The script around it parses.
+    #[test]
+    fn policy_engine_script_installs_the_copy_and_units_for_the_operator() {
+        let item = linux::policy_engine_item_over(&linux::PolicyEngineFacts {
+            copy: None,
+            copy_identity: None,
+            socket_unit: None,
+            service_unit: None,
+            socket_active: false,
+            ..policy_engine_installed()
+        });
+        let block = item.script.clone().unwrap();
+        let socket_unit = crate::resolver::policy_loader_socket_unit("alice");
+        let service_unit = crate::resolver::policy_loader_service_unit();
+        assert!(socket_unit.contains("SocketUser=alice\n"), "{socket_unit}");
+        let earlier = crate::resolver::earlier_install_removal("");
+        let expected = format!(
+            "# policy-engine\n\
+             install -d -m 0755 -o root -g root /usr/local/lib/minimal\n\
+             install -m 0755 -o root -g root \"/home/alice/.local/bin/minimald\" \
+             /usr/local/lib/minimal/minimald.new\n\
+             mv -f /usr/local/lib/minimal/minimald.new /usr/local/lib/minimal/minimald\n\
+             cat > /etc/systemd/system/minimal-policy-loader.socket <<'MINIMAL_UNIT_EOF'\n\
+             {socket_unit}\
+             MINIMAL_UNIT_EOF\n\
+             cat > /etc/systemd/system/minimal-policy-loader@.service <<'MINIMAL_UNIT_EOF'\n\
+             {service_unit}\
+             MINIMAL_UNIT_EOF\n\
+             chmod 0644 /etc/systemd/system/minimal-policy-loader.socket \
+             /etc/systemd/system/minimal-policy-loader@.service\n\
+             systemctl daemon-reload\n\
+             systemctl enable --now minimal-policy-loader.socket\n\
+             systemctl restart minimal-policy-loader.socket\n\
+             \n\
+             {earlier}"
         );
-        assert!(item.step.as_deref().unwrap().contains("every daemon start"));
-        // The marker over a stale copy: the step is there, but the one the
-        // units run is not this build's, so it is missing again and the
-        // block (the same block) refreshes it. A host installed the old way
-        // (the script by hand, `--pid` per restart) has the marker and no
-        // copy, and reads the same.
-        let stale = classifier_item_over(
-            &ClassifierFacts {
-                table_present: true,
-                ..bare
-            },
-            "alice",
-            sock,
-        );
-        assert_eq!(stale.state, ItemState::Missing, "{stale:?}");
-        assert!(
-            stale
-                .today
-                .as_deref()
+        assert_eq!(block, expected);
+        for line in [
+            "for unit in minimald-classifier.service minimald-place.socket minimald-place.path; do\n",
+            "      /etc/sudoers.d/minimal-quic443-leaf /var/lib/minimal/finalize-install-classifier\n",
+            "nft delete table inet minimal_class 2>/dev/null || true; fi\n",
+            "if [ -d /sys/fs/cgroup/minimald.slice ]; then\n",
+        ] {
+            assert!(earlier.contains(line), "{line:?} in {earlier}");
+        }
+        // Neither unit can end its own heredoc early.
+        for unit in [&socket_unit, &service_unit] {
+            assert!(!unit.lines().any(|line| line == "MINIMAL_UNIT_EOF"));
+        }
+
+        let script = Plan {
+            items: vec![missing("names", "names"), item],
+        }
+        .script()
+        .unwrap();
+        assert!(script.ends_with(&expected), "{script}");
+        let mut sh = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh starts");
+        {
+            use std::io::Write as _;
+            sh.stdin
+                .take()
                 .unwrap()
-                .contains("missing or out of date"),
-            "{stale:?}"
-        );
-        assert_eq!(
-            stale.script, item.script,
-            "one block installs and refreshes"
-        );
-        // The marker and the copy over units that did not install (a run
-        // that died at systemctl): missing, so the next run retries them.
-        let unitless = classifier_item_over(
-            &ClassifierFacts {
-                units_enabled: Some(false),
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
-        // An unplaced daemon places no box, so its deny-all box runs
-        // unenforced (gominimal/minimal#3067), and so does one after a reboot
-        // that loses the tree. Any one missing unit or link lands here, so the
-        // sentence says "can".
-        let today = unitless.today.as_deref().unwrap();
-        for words in [
-            "units are missing or not enabled",
-            "a daemon restart can leave deny-all boxes running unenforced",
-            "a reboot can leave deny-all egress not enforced",
-        ] {
-            assert!(today.contains(words), "{unitless:?}");
+                .write_all(script.as_bytes())
+                .unwrap();
         }
-        // A stale copy on a mount the tree cannot live in is still the mount's fault.
-        assert_eq!(
-            classifier_item_over(
-                &ClassifierFacts {
-                    table_present: true,
-                    mount: Cgroup2Mount::Absent,
-                    ..bare
-                },
-                "alice",
-                sock
-            )
-            .state,
-            ItemState::Cannot
-        );
-        // A tree delegated to another account is that account's install:
-        // never Done for this one, never replaced by this one, whatever
-        // else the host looks like.
-        for facts in [
-            installed,
-            bare,
-            ClassifierFacts {
-                table_present: true,
-                mount: Cgroup2Mount::Absent,
-                ..bare
-            },
-        ] {
-            let theirs = classifier_item_over(
-                &ClassifierFacts {
-                    other_owner: Some(1001),
-                    ..facts
-                },
-                "alice",
-                sock,
-            );
-            assert_eq!(theirs.state, ItemState::Cannot, "{theirs:?}");
-            let cause = theirs.cause.as_deref().unwrap();
-            assert!(
-                cause.contains("installed for another account (uid 1001)")
-                    && cause.contains("--undo"),
-                "{cause}"
-            );
-        }
-        // Root is not the account whose daemon this is: `sudo min
-        // finalize-install` would install for root and place root's daemon,
-        // so it is refused before anything reads as done or missing.
-        for facts in [installed, bare] {
-            let as_root = classifier_item_over(
-                &ClassifierFacts {
-                    root: true,
-                    ..facts
-                },
-                "root",
-                sock,
-            );
-            assert_eq!(as_root.state, ItemState::Cannot, "{as_root:?}");
-            assert!(
-                as_root.cause.as_deref().unwrap().contains("runs as root"),
-                "{as_root:?}"
-            );
-        }
-    }
-
-    /// The classifier step leaves the daemon placed on every start without
-    /// a root step of its own, and the tree in place after a reboot: the
-    /// install writes the step from the bytes this binary carries to a
-    /// root-owned copy (atomically, beside the target then moved over it,
-    /// so a unit firing mid-write never runs half a script; no fetch, no
-    /// placeholder, no source identity), runs it, and installs a boot
-    /// oneshot that re-runs it plus a socket unit the daemon connects to at
-    /// start, whose per-connection service runs the step's
-    /// `--place-listener` — so a daemon restart is placed by the manager,
-    /// never by a per-restart `--pid`.
-    /// The boot unit and a refresh re-apply the mask the loaded table
-    /// records, since a reboot empties the cgroupfs record. A
-    /// `--ct-mark-mask` that differs from the record re-runs the step
-    /// with the new bits, and one that matches leaves the item done.
-    #[test]
-    fn classifier_boot_unit_reapplies_a_recorded_mask() {
-        use crate::resolver::CLASSIFIER_PROGRAM_PATH;
-        use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
-        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
-        let installed = ClassifierFacts {
-            table_present: true,
-            recorded_mask: Some(0x0c00_0000),
-            requested_mask: None,
-            copy_current: true,
-            units_enabled: Some(true),
-            other_owner: None,
-            root: false,
-            mount: Cgroup2Mount::Delegated,
-            unplaced_daemon: None,
-            placer_listening: Some(true),
-        };
-        let stale = classifier_item_over(
-            &ClassifierFacts {
-                copy_current: false,
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        let script = stale.script.expect("a stale copy carries the block");
+        let checked = sh.wait_with_output().unwrap();
         assert!(
-            script.contains(&format!(
-                "\nif {CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000; then\n"
-            )),
-            "the refresh runs the step with the recorded mask: {script}"
-        );
-        assert!(
-            script.contains(&format!(
-                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000\n"
-            )),
-            "the boot unit carries the recorded mask: {script}"
-        );
-
-        let same = ClassifierFacts {
-            requested_mask: Some(0x0c00_0000),
-            ..installed
-        };
-        assert_eq!(
-            classifier_item_over(&same, "alice", sock).state,
-            ItemState::Done,
-            "a requested mask the table already uses is done"
-        );
-
-        let other = classifier_item_over(
-            &ClassifierFacts {
-                requested_mask: Some(0x0300_0000),
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        assert_eq!(other.state, ItemState::Missing);
-        assert_eq!(
-            other.today.as_deref(),
-            Some(
-                "egress enforcement uses the connection-mark bits 0x0c000000, and \
-                 --ct-mark-mask asks for 0x03000000"
-            )
-        );
-        let script = other.script.expect("a new mask carries the block");
-        assert!(
-            script.contains(&format!(
-                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x03000000\n"
-            )),
-            "the boot unit carries the requested mask: {script}"
+            checked.status.success(),
+            "sh -n: {}\n{script}",
+            String::from_utf8_lossy(&checked.stderr)
         );
     }
 
-    /// gominimal/inbox#1206: a step that is installed while the running
-    /// daemon stands outside its leaf is its own state. The item names the
-    /// daemon by its pid, and its step is the step's --place-listener for
-    /// the holder of the daemon's socket alone, never the whole install
-    /// again and never a pid read before the block runs. A placed daemon, or none
-    /// running, leaves the item done.
+    /// A native Linux host that is offered every item lists them in this
+    /// order, whatever order they were probed in.
     #[test]
-    fn classifier_item_names_an_unplaced_daemon() {
-        use crate::resolver::CLASSIFIER_PROGRAM_PATH;
-        use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
-        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
-        let installed = ClassifierFacts {
-            table_present: true,
-            recorded_mask: Some(0x3000_0000),
-            requested_mask: None,
-            copy_current: true,
-            units_enabled: Some(true),
-            other_owner: None,
-            root: false,
-            mount: Cgroup2Mount::Delegated,
-            unplaced_daemon: None,
-            placer_listening: Some(true),
+    fn finalize_install_show_json_lists_the_item_ids_in_order() {
+        let plan = plan_over(
+            vec![
+                done(linux::USERNS_ID),
+                linux::policy_engine_item_over(&policy_engine_installed()),
+            ],
+            done("names"),
+        );
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(&plan.json()).unwrap();
+        let ids: Vec<&str> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["userns-profile", "names", "policy-engine"]);
+        assert_eq!(plan.exit_code(), 0);
+        // A host that needs no user-namespace profile has names first.
+        let plan = plan_over(vec![done(POLICY_ENGINE_ID)], done("names"));
+        let ids: Vec<&str> = plan.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, ["names", "policy-engine"]);
+    }
+
+    /// An out-of-date item is unfinished the way a missing one is: the
+    /// report says `out_of_date` and exits 1, the summary says what it
+    /// costs today, and the script carries its step.
+    #[test]
+    fn finalize_install_out_of_date_item_is_unfinished_and_carries_its_step() {
+        let item = linux::policy_engine_item_over(&linux::PolicyEngineFacts {
+            copy_identity: Some(OTHER_IDENTITY.to_string()),
+            ..policy_engine_installed()
+        });
+        let plan = Plan {
+            items: vec![done("names"), item],
         };
-        assert_eq!(
-            classifier_item_over(&installed, "alice", sock).state,
-            ItemState::Done,
-            "a placed daemon, or none running, leaves the item done"
-        );
-        let unplaced = classifier_item_over(
-            &ClassifierFacts {
-                unplaced_daemon: Some(4242),
-                placer_listening: Some(true),
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        assert_eq!(unplaced.state, ItemState::Missing);
-        assert_eq!(
-            unplaced.today.as_deref(),
-            Some(
-                "the running Minimal daemon (pid 4242) is not placed in its \
-                 egress-enforcement cgroup, so it cannot enforce egress per box for boxes \
-                 that share this machine's address"
-            )
-        );
-        assert_eq!(
-            unplaced.step.as_deref(),
-            Some("places the running Minimal daemon (pid 4242) in its egress-enforcement cgroup")
-        );
-        let script = unplaced
-            .script
-            .expect("an unplaced daemon carries its block");
-        let place_line =
-            format!("\n{CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}'\n");
-        assert!(
-            script.contains(&place_line),
-            "the block places the socket's holder with the step's --place-listener: {script}"
-        );
-        assert!(
-            !script.contains("--pid") && !script.contains("4242"),
-            "the block never names the pid read now, which may be reused by then: {script}"
-        );
-        assert!(
-            !script.contains("cat >"),
-            "the block writes no unit and no copy of the step: {script}"
-        );
-        assert!(
-            !script.contains("systemctl start"),
-            "a listening placer is not started again: {script}"
-        );
-        // The units are installed but the placement socket is stopped (a
-        // boot that dropped its job, or `systemctl stop`): the daemon that
-        // runs now may be placed, but the next start is not, so the item is
-        // not done and its block starts the socket again.
-        let placer_down = classifier_item_over(
-            &ClassifierFacts {
-                placer_listening: Some(false),
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        assert_eq!(placer_down.state, ItemState::Missing);
-        assert_eq!(
-            placer_down.today.as_deref(),
-            Some(
-                "the placement socket (minimald-place.socket) is not listening, so the next \
-                 Minimal daemon start is not placed in its egress-enforcement cgroup"
-            )
-        );
-        let script = placer_down
-            .script
-            .expect("a stopped placer carries its block");
-        assert!(
-            script.contains("\nsystemctl start minimald-place.socket\n"),
-            "the block starts the placement socket: {script}"
-        );
-        assert!(
-            !script.contains("--place-listener") && !script.contains("cat >"),
-            "the block only starts the socket: {script}"
-        );
-        // Both at once: the block starts the socket, then places the
-        // running daemon, so this daemon and every later start are placed.
-        let both = classifier_item_over(
-            &ClassifierFacts {
-                unplaced_daemon: Some(4242),
-                placer_listening: Some(false),
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        assert_eq!(both.state, ItemState::Missing);
-        let summary = Plan {
-            items: vec![both.clone()],
-        }
-        .summary();
+        assert!(!plan.finished());
+        assert_eq!(plan.exit_code(), 1);
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(&plan.json()).unwrap();
+        assert_eq!(value["finished"], false);
+        assert_eq!(value["items"][1]["id"], "policy-engine");
+        assert_eq!(value["items"][1]["state"], "out_of_date");
+        assert!(plan.json().contains("\"state\":\"out_of_date\""));
+        let summary = plan.summary();
         assert!(
             summary.contains(
-                "      today: 2 things to fix:\n        - the running Minimal daemon (pid \
-                 4242) is not placed"
-            ) && summary.contains(
-                "\n        - the placement socket (minimald-place.socket) is not listening"
+                "  ✗ network policy engine\n      today: the installed network policy loader \
+                 is from another version of Minimal, so boxes with a network policy are \
+                 refused until `min finalize-install` runs\n      this step: installs a \
+                 root-owned copy of minimald"
             ),
-            "each cause is its own line: {summary}"
+            "{summary}"
         );
-        let script = both.script.expect("both carry one block");
-        let start = script
-            .find("\nsystemctl start minimald-place.socket\n")
-            .expect("the block starts the socket");
-        let place = script
-            .find(&place_line)
-            .expect("the block places the daemon");
+        assert!(!summary.contains(CANNOT_HEADING), "{summary}");
+        let script = plan.script().expect("an out-of-date item has a step");
         assert!(
-            start < place,
-            "the socket starts before the daemon is placed: {script}"
+            script.contains("# Finish the Minimal install on this host: network policy engine.\n"),
+            "{script}"
         );
-        // No systemctl on the host: no placer is owed, so none is missing.
-        assert_eq!(
-            classifier_item_over(
-                &ClassifierFacts {
-                    units_enabled: None,
-                    placer_listening: None,
-                    ..installed
-                },
-                "alice",
-                sock,
-            )
-            .state,
-            ItemState::Done
-        );
-        // A step that is not installed is the install's item, whatever the
-        // daemon's placement: the install places the daemon too.
-        let bare = classifier_item_over(
-            &ClassifierFacts {
-                table_present: false,
-                unplaced_daemon: Some(4242),
-                placer_listening: Some(true),
-                ..installed
-            },
-            "alice",
-            sock,
-        );
-        assert!(
-            bare.script
-                .is_some_and(|script| script.contains("--place-listener")),
-            "the install's block places the listening daemon"
-        );
-    }
-
-    /// The daemon's pid is the lock's holder as the kernel lists it, never
-    /// a waiter and never a holder without the file open. The listing's
-    /// device is the superblock's, which on btrfs differs from the `st_dev`
-    /// a `stat` of the lock file gives (the subvolume's anonymous device),
-    /// so only the inode is matched and the holder is confirmed by its open
-    /// file.
-    #[test]
-    fn a_lock_holder_is_found_by_inode_and_confirmed_by_its_open_file() {
-        use std::os::unix::fs::MetadataExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join("minimald.lock");
-        let other = dir.path().join("other");
-        std::fs::write(&lock, b"").unwrap();
-        std::fs::write(&other, b"").unwrap();
-        let meta = std::fs::metadata(&lock).unwrap();
-        let (dev, ino) = (meta.dev(), meta.ino());
-        // A stand-in /proc: 4242 has the lock file open, 7373 only another
-        // file, and 5151 (the waiter) the lock file too.
-        let proc = dir.path().join("proc");
-        for (pid, target) in [(4242, &lock), (7373, &other), (5151, &lock)] {
-            let fd = proc.join(pid.to_string()).join("fd");
-            std::fs::create_dir_all(&fd).unwrap();
-            std::os::unix::fs::symlink(target, fd.join("3")).unwrap();
-        }
-        // The listing's device is never this file's st_dev, as on a btrfs
-        // subvolume: one major above it (glibc's decoding of st_dev).
-        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-        let listed = format!("{:02x}:{minor:02x}", major + 1);
-        let locks = format!(
-            "1: FLOCK  ADVISORY  WRITE 7373 {listed}:{ino} 0 EOF\n\
-             2: FLOCK  ADVISORY  WRITE 4242 {listed}:{ino} 0 EOF\n\
-             2: -> FLOCK  ADVISORY  WRITE 5151 {listed}:{ino} 0 EOF\n\
-             3: POSIX  ADVISORY  WRITE 6161 {listed}:{ino} 0 EOF\n"
-        );
-        assert_eq!(linux::lock_holders(&locks, ino), vec![7373, 4242]);
-        assert_eq!(linux::lock_holder(&proc, &locks, dev, ino), Some(4242));
-        // Another device's file with the same inode is not this lock.
-        assert_eq!(linux::lock_holder(&proc, &locks, dev ^ 1, ino), None);
-        // Nobody holds a lock on another inode.
-        assert_eq!(linux::lock_holder(&proc, &locks, dev, ino + 1), None);
-        // A holder whose fds cannot be read is not confirmed.
-        let only_unreadable = format!("1: FLOCK  ADVISORY  WRITE 9999 {listed}:{ino} 0 EOF\n");
-        assert_eq!(linux::lock_holder(&proc, &only_unreadable, dev, ino), None);
-    }
-
-    /// A lock holder anywhere under the tree, a box leaf among them, is not
-    /// an unplaced daemon: only a cgroup outside the tree is reported, and a
-    /// listing with no unified line is unknown, never outside.
-    #[test]
-    fn a_holder_under_the_tree_is_not_unplaced() {
-        use std::path::Path;
-        let mount = Path::new("/sys/fs/cgroup");
-        let root = Path::new("/sys/fs/cgroup/minimald.slice");
-        for (cgroup, wanted) in [
-            ("0::/minimald.slice/daemon\n", Some(true)),
-            ("0::/minimald.slice/box-17/leaf\n", Some(true)),
-            (
-                "0::/user.slice/user-1000.slice/session-2.scope\n",
-                Some(false),
-            ),
-            ("0::/minimald.slice-other\n", Some(false)),
-            ("1:name=systemd:/minimald.slice\n", None),
-        ] {
-            assert_eq!(
-                linux::stands_in_tree(cgroup, mount, root),
-                wanted,
-                "{cgroup:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn classifier_step_places_the_daemon_on_every_start() {
-        use crate::resolver::{
-            CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC,
-            CLASSIFIER_TREE_RECORD, CLASSIFIER_UNIT_SERVICE_PATH, LEGACY_PLACE_UNIT_PATH_PATH,
-            LEGACY_PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SOCKET_PATH,
-        };
-        use linux::{
-            Cgroup2Mount, ClassifierFacts, DAEMON_RUNNING_NOTE, PLACE_NO_HOLDER,
-            classifier_item_over,
-        };
-        use paths::PLACE_REQUEST_SOCKET;
-        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
-        let item = classifier_item_over(
-            &ClassifierFacts {
-                table_present: false,
-                recorded_mask: None,
-                requested_mask: None,
-                copy_current: false,
-                units_enabled: Some(false),
-                other_owner: None,
-                root: false,
-                mount: Cgroup2Mount::Delegated,
-                unplaced_daemon: None,
-                placer_listening: Some(true),
-            },
-            "alice",
-            sock,
-        );
-        let script = item.script.expect("a missing item carries its block");
-        for line in [
-            format!("cat > {CLASSIFIER_PROGRAM_PATH}.new <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n"),
-            format!("{CLASSIFIER_SCRIPT}{CLASSIFIER_SCRIPT_HEREDOC}\n"),
-            format!("chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n"),
-            format!("mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n"),
-            format!("if {CLASSIFIER_PROGRAM_PATH} --user 'alice'; then\n"),
-            format!(": > {CLASSIFIER_TREE_RECORD}\n"),
-            format!("cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<"),
-            format!("ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
-            // gominimal/inbox#1206: the earlier path pair goes, and the
-            // placement is a socket in /run the daemon connects to.
-            "systemctl disable --now minimald-place.path 2>/dev/null || true\n".to_string(),
-            format!("rm -f {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH}\n"),
-            format!("cat > {PLACE_UNIT_SERVICE_PATH} <<"),
-            "StandardInput=socket\nStandardOutput=journal\nStandardError=journal\n".to_string(),
-            format!(
-                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}'\n"
-            ),
-            format!("cat > {PLACE_UNIT_SOCKET_PATH} <<"),
-            format!("ListenStream={PLACE_REQUEST_SOCKET}\n"),
-            "SocketUser=alice\nSocketMode=0600\nAccept=yes\n".to_string(),
-            // The socket file goes with the unit, so --undo's
-            // `systemctl disable --now` leaves no /run/minimald-place.sock.
-            "RemoveOnStop=yes\n".to_string(),
-            "WantedBy=sockets.target\n".to_string(),
-            "WantedBy=multi-user.target\n".to_string(),
-            "systemctl daemon-reload\n".to_string(),
-            "systemctl enable minimald-classifier.service\n".to_string(),
-            "systemctl enable --now minimald-place.socket\nplace_units=yes\nfi\n".to_string(),
-            "if ! command -v systemctl >/dev/null 2>&1 ; then\n".to_string(),
-            "  place_units=no\nelse\n".to_string(),
-        ] {
-            assert!(script.contains(&line), "the block runs {line:?}: {script}");
-        }
-        assert!(
-            !script.contains(&format!("cat > {CLASSIFIER_PROGRAM_PATH} <<")),
-            "the copy is never rewritten in place: {script}"
-        );
-        // The step's own run is unconditional; only the units wait on
-        // systemd, so a host without it still gets the tree and the table.
-        let (step_part, unit_part) = script
-            .split_once("if ! command -v systemctl")
-            .expect("the unit guard splits the block");
-        let step_lines = step_part.replace(CLASSIFIER_SCRIPT, "");
-        assert!(
-            step_lines.contains("--user 'alice'; then\n")
-                && !step_lines
-                    .lines()
-                    .any(|line| !line.starts_with('#') && line.contains("systemctl")),
-            "the step runs before and outside the systemd guard: {step_part}"
-        );
-        // The daemon already listening is placed once the units are in,
-        // with or without systemd, and a run that found it running says how
-        // to restart it when the socket unit will place the restarted daemon
-        // (gominimal/inbox#1054).
-        let (_, after_units) = unit_part
-            .rsplit_once("\nfi\n")
-            .expect("the unit guard closes");
-        assert!(
-            after_units.starts_with(&format!(
-                "# The daemon that may already be listening is placed now; later starts ask\n\
-                 # the socket unit. A daemon that was running read this machine before the\n\
-                 # step installed, so the run says how to make it read the machine again: a\n\
-                 # restart, which the socket unit places. Without the units a restarted\n\
-                 # daemon stands outside its leaf, so the run does not advise one. A placement\n\
-                 # that fails still prints what it said, and the run exits with its status.\n\
-                 place_status=0\n\
-                 place_out=$({CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}') \
-                 || place_status=$?\n"
-            )) && after_units.ends_with(&format!(
-                "printf '%s\\n' \"$place_out\"\n\
-                 [ \"$place_status\" -eq 0 ] || exit \"$place_status\"\n\
-                 case \"$place_units:$place_out\" in\nno:*) ;;\n\
-                 *'{PLACE_NO_HOLDER}'*) ;;\n*) echo '{DAEMON_RUNNING_NOTE}' ;;\nesac\n"
-            )),
-            "{unit_part}"
-        );
-        // A placement waits for the boot unit, ordered on the template
-        // service alone: the socket is before sockets.target, which the boot
-        // unit comes after through basic.target, so an order between the
-        // socket and the boot unit closes a cycle at boot.
-        let unit_body = |heredoc: &str| -> String {
-            let start = script
-                .find(&format!("<<\\{heredoc}\n"))
-                .unwrap_or_else(|| panic!("the block writes {heredoc}: {script}"));
-            let body = &script[start..];
-            let body = &body[body.find('\n').unwrap() + 1..];
-            body[..body.find(&format!("\n{heredoc}\n")).unwrap()].to_string()
-        };
-        let boot = unit_body("MINIMAL_CLASSIFIER_SERVICE_EOF");
-        let place = unit_body("MINIMAL_PLACE_SERVICE_EOF");
-        let socket = unit_body("MINIMAL_PLACE_SOCKET_EOF");
-        assert!(
-            place.contains("\nAfter=minimald-classifier.service\n"),
-            "{place}"
-        );
-        for (name, body) in [("boot", &boot), ("socket", &socket)] {
-            assert!(
-                !body.contains("Before=") && !body.contains("After="),
-                "the {name} unit carries no order of its own: {body}"
-            );
-        }
-        assert!(
-            !script.contains("PathChanged="),
-            "no unit watches the daemon's socket: {script}"
-        );
-        for absent in [
-            "--pid",
-            "--cohort-address",
-            "--node-plane-address",
-            "curl",
-            "raw.githubusercontent.com",
-        ] {
-            assert!(
-                !script.replace(CLASSIFIER_SCRIPT, "").contains(absent),
-                "the block's own lines never carry {absent:?}: {script}"
-            );
-        }
-        assert!(
-            !CLASSIFIER_SCRIPT
-                .lines()
-                .any(|line| line == CLASSIFIER_SCRIPT_HEREDOC),
-            "the delimiter never occurs in the script it delimits"
-        );
-    }
-
-    /// The classifier block run for real under a scratch root, with the
-    /// step stubbed: one that refuses leaves the copy the units run and
-    /// the units themselves as they were, and one that installs replaces
-    /// the copy and goes on to the units.
-    #[test]
-    fn a_refused_classifier_step_keeps_the_installed_copy_and_units() {
-        use crate::resolver::{ANSWERER_PROGRAM_DIR, CLASSIFIER_SCRIPT};
-        use linux::{
-            Cgroup2Mount, ClassifierFacts, DAEMON_RUNNING_NOTE, PLACE_NO_HOLDER,
-            classifier_item_over,
-        };
-        use std::os::unix::fs::PermissionsExt;
-
-        const OLD_COPY: &str = "#!/bin/sh\necho the previous step\n";
-        const OLD_UNIT: &str = "[Unit]\nDescription=the previous unit\n";
-
-        /// Runs the block under a fresh scratch root, with the step
-        /// replaced by `stub` and, when `installed` is set, a previous copy
-        /// and units already in place. Without `systemd` the block takes its
-        /// no-systemctl branch. Returns the root, the exit code, the scratch
-        /// paths of the copy and the units directory, and what the block
-        /// printed.
-        fn run_block(
-            stub: &str,
-            installed: bool,
-            systemd: bool,
-        ) -> (
-            tempfile::TempDir,
-            Option<i32>,
-            std::path::PathBuf,
-            std::path::PathBuf,
-            String,
-        ) {
-            let root = tempfile::tempdir().expect("a temp dir");
-            let lib = root.path().join("lib");
-            let units = root.path().join("units");
-            let var = root.path().join("var");
-            let bin = root.path().join("bin");
-            for dir in [&lib, &units, &var, &bin] {
-                std::fs::create_dir_all(dir).expect("a scratch dir");
-            }
-            let copy = lib.join("install-host-classifier.sh");
-            if installed {
-                std::fs::write(&copy, OLD_COPY).expect("the previous copy");
-                for unit in ["minimald-classifier.service", "minimald-place.path"] {
-                    std::fs::write(units.join(unit), OLD_UNIT).expect("a previous unit");
-                }
-            }
-            let systemctl = bin.join("systemctl");
-            std::fs::write(
-                &systemctl,
-                format!(
-                    "#!/bin/sh\necho \"$*\" >> '{}'\n",
-                    root.path().join("systemctl.log").display()
-                ),
-            )
-            .expect("the systemctl stub");
-            std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
-                .expect("an executable stub");
-
-            // The daemon's socket is under the root too, so every path the
-            // block acts on is the root's.
-            let sock = root.path().join("home/alice/ssh.sock");
-            let item = classifier_item_over(
-                &ClassifierFacts {
-                    table_present: false,
-                    recorded_mask: None,
-                    requested_mask: None,
-                    copy_current: false,
-                    units_enabled: Some(false),
-                    other_owner: None,
-                    root: false,
-                    mount: Cgroup2Mount::Delegated,
-                    unplaced_daemon: None,
-                    placer_listening: Some(true),
-                },
-                "alice",
-                sock.to_str().expect("the temp root is UTF-8"),
-            );
-            let plan = Plan { items: vec![item] };
-            let guard = "if ! command -v systemctl >/dev/null 2>&1 ; then";
-            let script = plan.script().expect("a missing item carries its block");
-            assert!(
-                script.contains(guard),
-                "the block guards its units on systemctl"
-            );
-            // The host's own systemctl is on the confined PATH, so the
-            // no-systemctl branch is taken by rewriting the guard.
-            let script = if systemd {
-                script
-            } else {
-                script.replace(guard, "if true ; then")
-            };
-            let script = script
-                .replace(CLASSIFIER_SCRIPT, stub)
-                .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
-                .replace("/etc/systemd/system", &units.display().to_string())
-                .replace("/var/lib/minimal", &var.display().to_string());
-            // The guard refuses a block that still names a host path, and
-            // `bin` holds the systemctl stub ahead of the other stand-ins.
-            let output = crate::resolver::tests::run_confined(root.path(), &bin, &script);
-            let printed = String::from_utf8_lossy(&output.stdout).into_owned();
-            (root, output.status.code(), copy, units, printed)
-        }
-
-        let refusing = "#!/bin/sh\necho 'refusing: a connection-mark conflict' >&2\nexit 3\n";
-        let (root, code, copy, units, printed) = run_block(refusing, true, true);
-        assert_eq!(code, Some(3), "the block exits with the step's status");
-        assert_eq!(
-            std::fs::read_to_string(&copy).expect("the copy is still there"),
-            OLD_COPY,
-            "a refused step leaves the previous copy in place"
-        );
-        for unit in ["minimald-classifier.service", "minimald-place.path"] {
-            assert_eq!(
-                std::fs::read_to_string(units.join(unit)).expect("the unit is still there"),
-                OLD_UNIT,
-                "a refused step leaves {unit} as it was"
-            );
-        }
-        assert!(!units.join("minimald-place.socket").exists());
-        assert!(
-            !copy.with_extension("sh.new").exists(),
-            "no staged copy is left"
-        );
-        assert!(
-            !copy.with_extension("sh.prev").exists(),
-            "no kept copy is left"
-        );
-        assert!(
-            !root.path().join("var/finalize-install-classifier").exists(),
-            "a refused step writes no record"
-        );
-        assert!(
-            !root.path().join("systemctl.log").exists(),
-            "a refused step touches no unit"
-        );
-
-        let (_fresh, code, copy, _, _) = run_block(refusing, false, true);
-        assert_eq!(code, Some(3));
-        assert!(
-            !copy.exists(),
-            "a refused first install leaves no copy that never installed"
-        );
-
-        assert!(
-            !printed.contains(DAEMON_RUNNING_NOTE),
-            "a refused step never reaches the placement: {printed}"
-        );
-
-        // gominimal/inbox#1054: the step's --place-listener found the
-        // running daemon holding its socket, so the run says to restart it.
-        let installing = "#!/bin/sh\n[ \"${3:-}\" != --place-listener ] || \
-                          echo \"placed 4242 in the daemon leaf (it holds $4)\"\nexit 0\n";
-        let (root, code, copy, units, printed) = run_block(installing, true, true);
-        assert!(
-            printed.contains("placed 4242 in the daemon leaf")
-                && printed.contains(DAEMON_RUNNING_NOTE),
-            "the placement's own lines print, then the restart note: {printed}"
-        );
-        assert_eq!(code, Some(0));
-        assert_eq!(
-            std::fs::read_to_string(&copy).expect("the new copy"),
-            installing,
-            "an installed step replaces the copy"
-        );
-        assert!(
-            !copy.with_extension("sh.prev").exists(),
-            "no kept copy is left"
-        );
-        assert!(
-            !units.join("minimald-place.path").exists(),
-            "the install goes on to the units"
-        );
-        assert!(root.path().join("var/finalize-install-classifier").exists());
-        let log = std::fs::read_to_string(root.path().join("systemctl.log"))
-            .expect("the units are enabled");
-        assert!(log.contains("enable --now minimald-place.socket"), "{log}");
-
-        // No daemon holds the socket: the placement says so, and the run
-        // has no daemon to restart.
-        let nobody = "#!/bin/sh\n[ \"${3:-}\" != --place-listener ] || \
-                      echo \"no process holds $4: nothing to place\"\nexit 0\n";
-        let (_nobody, code, _, _, printed) = run_block(nobody, true, true);
-        assert_eq!(code, Some(0));
-        assert!(
-            printed.contains(PLACE_NO_HOLDER) && !printed.contains(DAEMON_RUNNING_NOTE),
-            "no daemon, no restart note: {printed}"
-        );
-        // A placement that fails: its own lines still print, the run exits
-        // with its status, and there is no restart note.
-        let failing = "#!/bin/sh\n[ \"${3:-}\" != --place-listener ] || \
-                       { echo \"could not place 4242 (it holds $4)\"; exit 5; }\nexit 0\n";
-        let (_failing, code, _, _, printed) = run_block(failing, true, true);
-        assert_eq!(code, Some(5), "the block exits with the placement's status");
-        assert!(
-            printed.contains("could not place 4242") && !printed.contains(DAEMON_RUNNING_NOTE),
-            "a failed placement prints its lines and no restart note: {printed}"
-        );
-        // No systemctl: the running daemon is placed live, but a restart
-        // would leave it outside its leaf with no unit to place it, so the
-        // run says nothing about restarting it.
-        let (_bare, code, _, _, printed) = run_block(installing, true, false);
-        assert_eq!(code, Some(0));
-        assert!(
-            printed.contains("the placement socket is not installed")
-                && printed.contains("placed 4242 in the daemon leaf")
-                && !printed.contains(DAEMON_RUNNING_NOTE),
-            "no units, no restart note: {printed}"
-        );
-        // The phrase the block matches is the one the step prints.
-        assert!(
-            CLASSIFIER_SCRIPT.contains(&format!(
-                "note \"{PLACE_NO_HOLDER}$listener: nothing to place\""
-            )),
-            "the step still says {PLACE_NO_HOLDER:?} when no process holds the socket"
-        );
-        // The note says to restart with plain `min stop` first and what `--force` costs, and
-        // the block can echo it whole.
-        assert!(
-            DAEMON_RUNNING_NOTE
-                .contains("restart the daemon: min stop (it refuses while boxes are live")
-        );
-        assert!(DAEMON_RUNNING_NOTE.contains("min stop --force ends them)"));
-        assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
-        assert!(!DAEMON_RUNNING_NOTE.contains('\''));
+        assert!(script.contains("\n# policy-engine\n"), "{script}");
+        assert!(plan.installs_other_items() && !plan.adds_kvm_group());
     }
 
     /// The KVM item's table: done when the device opens, a group step on
@@ -4230,234 +2516,5 @@ mod tests {
         assert!(!in_kvm_group(group, "ali"));
         assert!(!in_kvm_group("kvm:x:108:\n", ""));
         assert!(!in_kvm_group("", "alice"));
-    }
-
-    /// Formerly BEP-047 (gominimal/inbox#1184): the VM users item creates
-    /// `minimal-vmm` and `minimal-gvproxy`, the host dir at 0710 group
-    /// `minimal-vmm`, `vmm/`, the gvproxy, gvproxy config and gate dirs, and
-    /// the sudoers drop-in, and reads as done once all of them hold.
-    #[test]
-    fn finalize_install_creates_the_split_users_dirs_and_drop_in() {
-        use linux::*;
-        use std::path::{Path, PathBuf};
-        let layout = VmUsersLayout::new(
-            PathBuf::from("/home/alice/.local/state/minimal/providers/local-minvmd0"),
-            "alice",
-            "local-minvmd0",
-        );
-        let fresh = VmUsersFacts {
-            operator: "alice".to_string(),
-            operator_uid: 1000,
-            passwd: "root:x:0:0::/root:/bin/sh\nalice:x:1000:1000::/home/alice:/bin/sh\n"
-                .to_string(),
-            group: "root:x:0:\nalice:x:1000:\n".to_string(),
-            vm: "local-minvmd0".to_string(),
-            layout: layout.clone(),
-            host_dir: Some(DirFact {
-                uid: 1000,
-                gid: 1000,
-                mode: 0o700,
-                is_dir: true,
-            }),
-            vmm: None,
-            gvproxy_dir: None,
-            gvproxy_config_dir: None,
-            gate_dir: None,
-            record: None,
-            minvmd: Ok(PathBuf::from("/usr/local/bin/minvmd")),
-            gvproxy: Ok(PathBuf::from("/usr/local/bin/gvproxy-min")),
-        };
-        let item = vm_users_item_over(&fresh);
-        assert_eq!(item.state, ItemState::Missing);
-        assert_eq!(item.id, "vm-users");
-        let script = item.script.clone().unwrap();
-        for line in [
-            "getent group minimal-vmm >/dev/null || groupadd --system minimal-vmm\n",
-            "getent group minimal-gvproxy >/dev/null || groupadd --system minimal-gvproxy\n",
-            "for group in minimal-vmm minimal-gvproxy; do\n",
-            "  [ -z \"$members\" ] || [ \"$members\" = 'alice' ] || ",
-            "  gpasswd -a 'alice' \"$group\" >/dev/null\n",
-            "  chgrp minimal-vmm .\n  chmod 0710 .\n",
-            "  chown minimal-vmm:minimal-vmm .\n  chmod 0750 .\n",
-            "install -d -o minimal-gvproxy -g minimal-gvproxy -m 0750 \
-             '/var/lib/minimal/alice/local-minvmd0/gvproxy'\n",
-            "install -d -o 'alice' -g minimal-gvproxy -m 0750 \
-             '/var/lib/minimal/alice/local-minvmd0/gvproxy-config'\n",
-            "chmod 2710 '/var/lib/minimal/alice/local-minvmd0/gate'\n",
-            "visudo -cqf \"$drop_in\"\n",
-            "install -o root -g root -m 0440 \"$drop_in\" /etc/sudoers.d/minimal-vm\n",
-        ] {
-            assert!(script.contains(line), "missing {line:?} in:\n{script}");
-        }
-        // Root never changes the state dir by path: each component is
-        // entered with `cd -P` after a symlink check, and only `.` changes.
-        assert!(script.contains("  [ ! -L 'home' ] ||"), "{script}");
-        assert!(script.contains("  cd -P -- 'local-minvmd0'\n"), "{script}");
-        // A component swapped for a symlink after the `-L` test fails the
-        // physical path check, before root changes anything.
-        assert!(
-            script.contains("  [ \"$(pwd -P)\" = '/home' ] ||"),
-            "{script}"
-        );
-        let vmm_check = "[ \"$(pwd -P)\" = \
-                         '/home/alice/.local/state/minimal/providers/local-minvmd0/vmm' ] ||";
-        assert!(
-            script.contains(vmm_check),
-            "missing {vmm_check:?} in:\n{script}"
-        );
-        assert!(!script.contains("chmod 0710 /home"), "{script}");
-        // No member list is replaced, so no other login is removed.
-        assert!(!script.contains("gpasswd -M"), "{script}");
-        // A swap between the `-L` test and the `cd -P` moves the walk out
-        // of the directory it was in. Every `cd -P` keeps the inode of `.`
-        // first and requires it at `..` after.
-        let lines: Vec<&str> = script.lines().collect();
-        let cds: Vec<usize> = (0..lines.len())
-            .filter(|&i| lines[i].trim_start().starts_with("cd -P"))
-            .collect();
-        assert_eq!(cds.len(), 8, "seven components and vmm:\n{script}");
-        for i in cds {
-            assert_eq!(lines[i - 1].trim(), "here=$(stat -c %d:%i .)", "{script}");
-            assert!(
-                lines[i + 1]
-                    .trim()
-                    .starts_with("[ \"$(stat -c %d:%i ..)\" = \"$here\" ] || { echo \""),
-                "no parent check after {:?} in:\n{script}",
-                lines[i]
-            );
-            assert!(lines[i + 1].ends_with("\" >&2; exit 1; }"), "{script}");
-        }
-
-        let drop_in = sudoers_drop_in(
-            "alice",
-            "local-minvmd0",
-            &layout,
-            Path::new("/usr/local/bin/minvmd"),
-            Path::new("/usr/local/bin/gvproxy-min"),
-        )
-        .unwrap();
-        for line in [
-            "Cmnd_Alias MINIMAL_GVPROXY_SPAWN = /usr/local/bin/gvproxy-min -config \
-             /var/lib/minimal/alice/local-minvmd0/gvproxy-config/gvproxy.yaml -listen \
-             unix\\:///var/lib/minimal/alice/local-minvmd0/gvproxy/gvproxy-switch.sock \
-             -ssh-port -1\n",
-            "Cmnd_Alias MINIMAL_EGW_SPAWN = /usr/local/bin/minvmd __egw local-minvmd0\n",
-            "Cmnd_Alias MINIMAL_VMM_SPAWN = /usr/local/bin/minvmd __krun-vmm local-minvmd0\n",
-            "Cmnd_Alias MINIMAL_STOP = /usr/local/bin/minvmd __stop-group local-minvmd0\n",
-            "Defaults!MINIMAL_GVPROXY_SPAWN env_reset, !env_keep, umask=0077, umask_override\n",
-            "Defaults!MINIMAL_VMM_SPAWN env_reset, !env_keep, !use_pty\n",
-            "alice ALL = (minimal-gvproxy) NOPASSWD: MINIMAL_GVPROXY_SPAWN, MINIMAL_EGW_SPAWN\n",
-            "alice ALL = (minimal-vmm) NOPASSWD: MINIMAL_VMM_SPAWN\n",
-            "alice ALL = (minimal-gvproxy) NOPASSWD: MINIMAL_STOP\n",
-            "alice ALL = (minimal-vmm) NOPASSWD: MINIMAL_STOP\n",
-        ] {
-            assert!(drop_in.contains(line), "missing {line:?} in:\n{drop_in}");
-        }
-        assert!(!drop_in.contains('*'), "no wildcard: {drop_in}");
-        assert!(
-            script.contains(&drop_in),
-            "the script installs this drop-in"
-        );
-
-        // Every user, group, directory and the drop-in in place: done.
-        let dir = |uid, gid, mode| {
-            Some(DirFact {
-                uid,
-                gid,
-                mode,
-                is_dir: true,
-            })
-        };
-        let finished = VmUsersFacts {
-            passwd: format!(
-                "{}minimal-vmm:x:990:990::/nonexistent:/usr/sbin/nologin\n\
-                             minimal-gvproxy:x:991:991::/nonexistent:/usr/sbin/nologin\n",
-                fresh.passwd
-            ),
-            group: format!(
-                "{}minimal-vmm:x:990:alice\nminimal-gvproxy:x:991:alice\n",
-                fresh.group
-            ),
-            host_dir: dir(1000, 990, 0o710),
-            vmm: dir(990, 990, 0o750),
-            gvproxy_dir: dir(991, 991, 0o750),
-            gvproxy_config_dir: dir(1000, 991, 0o750),
-            gate_dir: dir(991, 990, 0o2710),
-            record: Some(drop_in.clone()),
-            ..fresh.clone()
-        };
-        assert_eq!(vm_users_item_over(&finished).state, ItemState::Done);
-        // A gate dir without setgid, a host dir at the wrong mode, or a
-        // stale drop-in each make the step run again.
-        for broken in [
-            VmUsersFacts {
-                gate_dir: dir(991, 990, 0o710),
-                ..finished.clone()
-            },
-            VmUsersFacts {
-                host_dir: dir(1000, 1000, 0o700),
-                ..finished.clone()
-            },
-            VmUsersFacts {
-                record: Some("old".to_string()),
-                ..finished.clone()
-            },
-        ] {
-            assert_eq!(vm_users_item_over(&broken).state, ItemState::Missing);
-        }
-        // A binary the login can change is no rule's binary.
-        let writable = VmUsersFacts {
-            minvmd: Err("/home/alice/.local/bin/minvmd is not a root-owned binary".to_string()),
-            ..fresh.clone()
-        };
-        let blocked = vm_users_item_over(&writable);
-        assert_eq!(blocked.state, ItemState::Cannot);
-        assert!(blocked.script.is_none());
-        assert!(root_owned_binary(Path::new("/nonexistent/minvmd")).is_err());
-        // Another login in a group is never removed: the item refuses and
-        // names it, and runs nothing.
-        let shared = VmUsersFacts {
-            group: finished
-                .group
-                .replace("minimal-vmm:x:990:alice", "minimal-vmm:x:990:alice,bob"),
-            ..finished.clone()
-        };
-        let refused = vm_users_item_over(&shared);
-        assert_eq!(refused.state, ItemState::Cannot);
-        assert!(refused.script.is_none());
-        let cause = refused.cause.unwrap();
-        assert!(
-            cause.contains("the minimal-vmm group already has other members: bob."),
-            "{cause}"
-        );
-        assert!(
-            cause.contains("`sudo gpasswd -d bob minimal-vmm`"),
-            "{cause}"
-        );
-        // No host dir yet: the script has nothing to walk into, so the
-        // item refuses, and the rest of the plan still runs.
-        let no_host_dir = VmUsersFacts {
-            host_dir: None,
-            ..fresh.clone()
-        };
-        let not_yet = vm_users_item_over(&no_host_dir);
-        assert_eq!(not_yet.state, ItemState::Cannot);
-        assert!(not_yet.script.is_none());
-        // The script prints the host dir path in double quotes, so a path
-        // the shell expands there is refused, and root runs nothing.
-        for active in ["/home/$(id)/p", "/home/`id`/p", "/home/a\\b/p"] {
-            let unsafe_path = VmUsersFacts {
-                layout: VmUsersLayout::new(PathBuf::from(active), "alice", "local-minvmd0"),
-                ..fresh.clone()
-            };
-            let refused = vm_users_item_over(&unsafe_path);
-            assert_eq!(refused.state, ItemState::Cannot, "{active}");
-            assert!(refused.script.is_none(), "{active}");
-        }
-        assert_eq!(sudoers_arg("a b"), None);
-        for wild in ["/opt/m*/minvmd", "/opt/m?", "/opt/[ab]", "!minvmd"] {
-            assert_eq!(sudoers_arg(wild), None, "{wild}");
-        }
-        assert_eq!(sudoers_arg("x=1,y:2").as_deref(), Some("x\\=1\\,y\\:2"));
     }
 }

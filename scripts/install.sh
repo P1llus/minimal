@@ -443,9 +443,8 @@ strip_rc_block() {
 # with root) points the host's resolver at the box zone and installs the
 # Minimal box-name service — on macOS, the boot unit that reserves the local
 # range too; on Linux, the user-namespace profile (recorded as the step's
-# own), the classifier tree (recorded the same way) with the units that
-# rebuild it at boot, and the kvm group membership. None of it is in
-# the install record, and all of it outlives `min`. The profile may instead
+# own), the network policy loader, and the kvm group membership. None of it
+# is in the install record, and all of it outlives `min`. The profile may instead
 # have been installed separately, with root, by install-apparmor-profile.sh
 # (no record): it outlives minimald the same way, so it rides in the same
 # prompt, removed through the shipped loader's own --uninstall (run here,
@@ -459,9 +458,8 @@ strip_rc_block() {
 # (linux_undo_command and macos_undo_command in
 # crates/minimal/src/resolver.rs): install_test.sh executes them against a
 # fake root and fails when that file names a path this advice does not. The
-# profile and the classifier tree come away only by the step's record; one
-# without its record was installed another way. The roots are overridable
-# for install_test.sh.
+# profile comes away only by the step's record; one without its record was
+# installed another way. The roots are overridable for install_test.sh.
 maybe_remove_finalize_install() {
     _fi_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
     _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
@@ -469,8 +467,6 @@ maybe_remove_finalize_install() {
     _aa_tunable="$_aa_dir/tunables/minimald"
     _aa_record="$_fi_root/var/lib/minimal/finalize-install-apparmor-profile"
     _kvm_record="$_fi_root/var/lib/minimal/finalize-install-kvm-group"
-    _cls_record="$_fi_root/var/lib/minimal/finalize-install-classifier"
-    _cls_root=/sys/fs/cgroup/minimald.slice
     _lib_dir="$_fi_root/usr/local/lib/minimal"
     # _ns_files are the files the DNS remedy removes; _ns_paths adds what else
     # says the setup is there. _ns_chan is the answerer's channel socket, kept
@@ -511,7 +507,6 @@ maybe_remove_finalize_install() {
     _fi_owned=
     _fi_undo=
     _aa_unowned=
-    _qb_found=
     for _ns_p in $_ns_paths; do
         if [ -e "$_fi_root$_ns_p" ]; then
             _fi_list="the host DNS setup ($_ns_p)"
@@ -534,58 +529,47 @@ maybe_remove_finalize_install() {
 }      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable")"
             fi
         fi
-        # The classifier's units, the boot unit first: it re-runs the step at
-        # every boot, so left enabled it lays the tree and the table out again.
-        # They are disabled before their files go, and before the tree's line.
-        # Only the units whose files are there are named: systemctl refuses a
-        # whole call that names a unit this host does not have, and an install
-        # carries either the placement socket pair or the earlier path pair.
-        _cls_rm=
-        _cls_found=
-        _cls_units=
-        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.socket /etc/systemd/system/minimald-place@.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
-            _cls_rm="$_cls_rm $(shq "$_fi_root$_cls_p")"
-            if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
-                _cls_found="$_cls_p"
+        # The network policy loader: the socket unit, the service it starts
+        # per connection, and the root-owned program copy both name.
+        _pl_rm=
+        _pl_found=
+        for _pl_p in /etc/systemd/system/minimal-policy-loader.socket /etc/systemd/system/minimal-policy-loader@.service /usr/local/lib/minimal/minimald; do
+            _pl_rm="$_pl_rm $(shq "$_fi_root$_pl_p")"
+            if [ -z "$_pl_found" ] && [ -e "$_fi_root$_pl_p" ]; then
+                _pl_found="$_pl_p"
             fi
-            case "$_cls_p" in
+        done
+        if [ -n "$_pl_found" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the network policy loader ($_pl_found)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo systemctl disable --now minimal-policy-loader.socket; sudo rm -f$_pl_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+        fi
+        # what an earlier version installed
+        # Only the units whose files are there are disabled: systemctl
+        # refuses a whole call that names a unit this host does not have. The
+        # cgroup directories go last, so a tree still in use fails the line.
+        _old_tree=/sys/fs/cgroup/minimald.slice
+        _old_rm=
+        _old_found=
+        _old_units=
+        for _old_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.socket /etc/systemd/system/minimald-place@.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf /var/lib/minimal/finalize-install-classifier; do
+            _old_rm="$_old_rm $(shq "$_fi_root$_old_p")"
+            [ -e "$_fi_root$_old_p" ] || continue
+            [ -n "$_old_found" ] || _old_found="$_old_p"
+            case "$_old_p" in
                 /etc/systemd/system/*@.service) ;;
-                /etc/systemd/system/*)
-                    if [ -e "$_fi_root$_cls_p" ]; then
-                        _cls_units="$_cls_units ${_cls_p##*/}"
-                    fi
-                    ;;
+                /etc/systemd/system/*) _old_units="$_old_units ${_old_p##*/}" ;;
             esac
         done
-        if [ -n "$_cls_found" ]; then
-            _fi_list="$_fi_list${_fi_list:+, }the classifier units ($_cls_found)"
-            _fi_owned=1
-            _fi_undo="$_fi_undo${_fi_undo:+
-}      ${_cls_units:+sudo systemctl disable --now$_cls_units; }sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+        if [ -z "$_old_found" ] && [ -d "$_fi_root$_old_tree" ]; then
+            _old_found="$_old_tree"
         fi
-        # The QUIC block helper and its sudoers rule, an item of their own.
-        # `min finalize-install --undo` does not remove them, so a yes
-        # removes them here, and either one left prints the manual remedy.
-        _qb_rm=
-        for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
-            _qb_rm="$_qb_rm $(shq "$_fi_root$_qb_p")"
-            if [ -z "$_qb_found" ] && [ -e "$_fi_root$_qb_p" ]; then
-                _qb_found="$_qb_p"
-            fi
-        done
-        if [ -n "$_qb_found" ]; then
-            _fi_list="$_fi_list${_fi_list:+, }the QUIC block helper and its sudoers rule ($_qb_found)"
+        if [ -n "$_old_found" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }what an earlier version installed ($_old_found)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo rm -f$_qb_rm; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
-        fi
-        # The tree, by the step's record only: a tree without the record was
-        # installed another way and stays. The record goes once the tree has.
-        if [ -e "$_cls_record" ]; then
-            _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
-            _fi_owned=1
-            _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo nft delete table inet minimal_class; { [ ! -d $(shq "$_fi_root$_cls_root") ] || sudo find $(shq "$_fi_root$_cls_root") -depth -type d -exec rmdir {} +; } && sudo rm -f $(shq "$_cls_record")"
+}      ${_old_units:+sudo systemctl disable --now$_old_units; }sudo rm -f$_old_rm; sudo systemctl daemon-reload; sudo nft delete table inet minimal_class; sudo rmdir $(shq "$_lib_dir") 2>/dev/null; [ ! -d $(shq "$_fi_root$_old_tree") ] || sudo find $(shq "$_fi_root$_old_tree") -depth -type d -exec rmdir {} +"
         fi
         if [ -e "$_kvm_record" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
@@ -615,17 +599,6 @@ maybe_remove_finalize_install() {
                 _fi_ok=1
                 if [ -n "$_fi_owned" ]; then
                     { [ -x "$_fi_min" ] && "$_fi_min" finalize-install --undo; } || _fi_ok=
-                fi
-                # `min finalize-install --undo` does not remove the QUIC
-                # block helper or its sudoers rule, so remove them here.
-                if [ -n "$_qb_found" ]; then
-                    for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
-                        if [ -e "$_fi_root$_qb_p" ]; then
-                            sudo rm -f "$_fi_root$_qb_p" || _fi_ok=
-                        fi
-                        [ ! -e "$_fi_root$_qb_p" ] || _fi_ok=
-                    done
-                    sudo rmdir "$_lib_dir" 2>/dev/null || true
                 fi
                 if [ -n "$_aa_unowned" ]; then
                     { [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
@@ -1660,8 +1633,8 @@ say "  ${dim}record: $(tilde "$prev_record")$rst"
 
 # The install itself never elevates, so a host may still lack a privileged
 # part: the user-namespace profile on Ubuntu 24.04+, the box-name resolver
-# link and answerer (every host, macOS included), the classifier tree, KVM
-# group membership. The just-installed `min` probes all of them in ONE call
+# link and answerer (every host, macOS included), the network policy loader,
+# KVM group membership. The just-installed `min` probes all of them in ONE call
 # (`finalize-install --show --script`, exit 0 whatever it finds): the summary
 # on stderr — a ✓/✗ line per item — and on stdout the one script a run
 # executes, printed only while some item is `missing`, the only state the

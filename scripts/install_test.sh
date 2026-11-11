@@ -956,127 +956,79 @@ EOF
     want_ok "the remedy unloads the profile" \
         grep -qxF "apparmor_parser -R $fake_aa3/minimald" "$remedy_calls"
 
-    # The classifier tree, by the step's record, with the units that rebuild it
-    # at boot: the units' line comes first, so the boot unit is disabled before
-    # the tree goes.
+    # The network policy loader: its units and the root-owned program copy.
     HNS4="$root/hns4"; mkdir -p "$HNS4"
     run ns4_seed "$HNS4"
     fake_ns4="$root/fake net root-4 \$HOME"
-    cls_tree="sys/fs/cgroup/minimald.slice"
-    cls_files="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.path etc/systemd/system/minimald-place.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
-    mkdir -p "$fake_ns4/$cls_tree/classifier-table" "$fake_ns4/$cls_tree/daemon" \
-        "$fake_ns4/$cls_tree/boxes/allow" "$fake_ns4/$cls_tree/boxes/deny"
-    for f in $cls_files; do
+    pl_files="etc/systemd/system/minimal-policy-loader.socket etc/systemd/system/minimal-policy-loader@.service usr/local/lib/minimal/minimald"
+    for f in $pl_files; do
         mkdir -p "$fake_ns4/$(dirname "$f")"
         printf 'unit\n' >"$fake_ns4/$f"
     done
     FINALIZE_INSTALL_ROOT="$fake_ns4"
     run ns4_run "$HNS4" --uninstall
     FINALIZE_INSTALL_ROOT=
-    check 0 "$rc" "uninstall with the classifier tree exits 0"
-    want_ok "the classifier units are advised" \
-        grep -q "still installed on this host.*classifier units" "$OUT"
-    want_ok "the classifier tree is advised" \
-        grep -q "still installed on this host.*classifier tree" "$OUT"
-    want_ok "the QUIC block helper is advised as its own item" \
-        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule" "$OUT"
-    want_ok "non-interactive uninstall never elevates (the tree survives)" \
-        test -d "$fake_ns4/$cls_tree/classifier-table"
-    apply_remedies 3
-    for f in $cls_files "$cls_tree" usr/local/lib/minimal; do
-        want_err "the printed remedies remove $f" test -e "$fake_ns4/$f"
+    check 0 "$rc" "uninstall with the network policy loader exits 0"
+    want_ok "the network policy loader is advised" \
+        grep -q "still installed on this host.*the network policy loader (/etc/systemd/system/minimal-policy-loader.socket)" "$OUT"
+    want_ok "the loader points at min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
+    for f in $pl_files; do
+        want_ok "non-interactive uninstall never elevates ($f survives)" test -f "$fake_ns4/$f"
     done
-    check "systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service" \
-        "$(head -n 1 "$remedy_calls")" "the boot unit is disabled before anything is removed"
-    want_ok "the remedy removes the classifier table" \
-        grep -qx "nft delete table inet minimal_class" "$remedy_calls"
+    apply_remedies 1
+    for f in $pl_files usr/local/lib/minimal; do
+        want_err "the printed remedy removes $f" test -e "$fake_ns4/$f"
+    done
+    check "systemctl disable --now minimal-policy-loader.socket" \
+        "$(head -n 1 "$remedy_calls")" "the loader's socket is disabled before its files go"
 
-    # The placement socket pair a current install leaves (gominimal/inbox#1206):
-    # the remedy disables the units whose files are there, never the earlier
-    # path pair this host does not carry, because systemctl refuses a whole
-    # call that names a unit it does not have.
+    # What an earlier version installed is still found on a host that upgraded
+    # and never ran the step again. The remedy disables the units whose files
+    # are there, and only those.
     HNS4S="$root/hns4s"; mkdir -p "$HNS4S"
     run ns4s_seed "$HNS4S"
     fake_ns4s="$root/fake net root-4s \$HOME"
-    cls_files_s="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.socket etc/systemd/system/minimald-place@.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
-    mkdir -p "$fake_ns4s/$cls_tree/classifier-table" "$fake_ns4s/$cls_tree/daemon" \
-        "$fake_ns4s/$cls_tree/boxes/allow" "$fake_ns4s/$cls_tree/boxes/deny"
-    for f in $cls_files_s; do
+    old_tree="sys/fs/cgroup/minimald.slice"
+    old_files="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.socket etc/systemd/system/minimald-place@.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4s/$old_tree/daemon" "$fake_ns4s/$old_tree/boxes/allow"
+    for f in $old_files; do
         mkdir -p "$fake_ns4s/$(dirname "$f")"
         printf 'unit\n' >"$fake_ns4s/$f"
     done
     FINALIZE_INSTALL_ROOT="$fake_ns4s"
     run ns4s_run "$HNS4S" --uninstall
     FINALIZE_INSTALL_ROOT=
-    check 0 "$rc" "uninstall with the placement socket pair exits 0"
-    want_ok "the socket pair's units are advised" \
-        grep -q "still installed on this host.*classifier units" "$OUT"
-    apply_remedies 3
-    for f in $cls_files_s "$cls_tree" usr/local/lib/minimal; do
-        want_err "the printed remedies remove $f" test -e "$fake_ns4s/$f"
+    check 0 "$rc" "uninstall with an earlier version's pieces exits 0"
+    want_ok "an earlier version's pieces are advised" \
+        grep -q "still installed on this host.*what an earlier version installed" "$OUT"
+    want_ok "non-interactive uninstall never elevates (the pieces survive)" \
+        test -f "$fake_ns4s/etc/sudoers.d/minimal-quic443-leaf"
+    apply_remedies 1
+    for f in $old_files "$old_tree" usr/local/lib/minimal; do
+        want_err "the printed remedy removes $f" test -e "$fake_ns4s/$f"
     done
     check "systemctl disable --now minimald-classifier.service minimald-place.socket" \
         "$(head -n 1 "$remedy_calls")" "the remedy disables the units this host carries, and only those"
 
-    # A tree without the step's record was installed another way: it is not
-    # the step's to remove, so nothing advises removing it.
-    HNS4B="$root/hns4b"; mkdir -p "$HNS4B"
-    run ns4b_seed "$HNS4B"
-    fake_ns4b="$root/fake-net-setup-root-4b"
-    mkdir -p "$fake_ns4b/$cls_tree/classifier-table"
-    FINALIZE_INSTALL_ROOT="$fake_ns4b"
-    run ns4b_run "$HNS4B" --uninstall
-    FINALIZE_INSTALL_ROOT=
-    check 0 "$rc" "uninstall with an unrecorded classifier tree exits 0"
-    want_err "an unrecorded classifier tree is not advised for removal" \
-        grep -q "classifier tree" "$OUT"
-    apply_remedies 0
-    want_ok "an unrecorded classifier tree stays" test -d "$fake_ns4b/$cls_tree/classifier-table"
-
-    # A tree something still holds stays, and so does its record: the record
-    # goes only once the tree has. The remedy's failure is counted here and
-    # then taken back out of the tally.
+    # The cgroup directories alone are found too, and a tree still in use
+    # fails its remedy. The failure is counted here and then taken back out
+    # of the tally.
     HNS4C="$root/hns4c"; mkdir -p "$HNS4C"
     run ns4c_seed "$HNS4C"
     fake_ns4c="$root/fake-net-setup-root-4c"
-    mkdir -p "$fake_ns4c/$cls_tree/daemon" "$fake_ns4c/var/lib/minimal"
-    printf 'held\n' >"$fake_ns4c/$cls_tree/daemon/held"
-    : >"$fake_ns4c/var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4c/$old_tree/daemon"
+    printf 'held\n' >"$fake_ns4c/$old_tree/daemon/held"
     FINALIZE_INSTALL_ROOT="$fake_ns4c"
     run ns4c_run "$HNS4C" --uninstall
     FINALIZE_INSTALL_ROOT=
+    want_ok "the cgroup directories alone are advised" \
+        grep -q "still installed on this host.*what an earlier version installed (/sys/fs/cgroup/minimald.slice)" "$OUT"
     _h_pass=$pass; _h_fail=$fail
     apply_remedies 0 >/dev/null 2>&1
     _h_failed=$((fail - _h_fail))
     pass=$_h_pass; fail=$_h_fail
-    check 1 "$_h_failed" "the tree's remedy fails while the tree is held"
-    want_ok "a held tree keeps its record" \
-        test -f "$fake_ns4c/var/lib/minimal/finalize-install-classifier"
-
-    # The QUIC block helper and its sudoers rule, on their own: they are found,
-    # named in the list, and the printed remedy removes both.
-    HNS4D="$root/hns4d"; mkdir -p "$HNS4D"
-    run ns4d_seed "$HNS4D"
-    fake_ns4d="$root/fake net root-4d \$HOME"
-    qb_files="usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf"
-    for f in $qb_files; do
-        mkdir -p "$fake_ns4d/$(dirname "$f")"
-        printf 'helper\n' >"$fake_ns4d/$f"
-    done
-    FINALIZE_INSTALL_ROOT="$fake_ns4d"
-    run ns4d_run "$HNS4D" --uninstall
-    FINALIZE_INSTALL_ROOT=
-    check 0 "$rc" "uninstall with only the QUIC block helper exits 0"
-    want_ok "the uninstall names the QUIC block helper and its sudoers rule" \
-        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule (/usr/local/lib/minimal/quic443-leaf)" "$OUT"
-    want_err "the QUIC block helper is not called a classifier unit" \
-        grep -q "classifier units" "$OUT"
-    want_ok "non-interactive uninstall never elevates (the helper survives)" \
-        test -f "$fake_ns4d/usr/local/lib/minimal/quic443-leaf"
-    apply_remedies 1
-    for f in $qb_files; do
-        want_err "the printed remedy removes $f" test -e "$fake_ns4d/$f"
-    done
+    check 1 "$_h_failed" "the remedy fails while the cgroup directories are in use"
 
     # The kvm group membership, by its record.
     HNS5="$root/hns5"; mkdir -p "$HNS5"
@@ -1104,8 +1056,8 @@ EOF
     fake_aa6="$root/fake-apparmor.d-6"; mkdir -p "$fake_aa6/tunables"
     printf 'profile\n' >"$fake_aa6/minimald"
     fake_ns6="$root/fake-net-setup-root-6"
-    mkdir -p "$fake_ns6/$cls_tree/classifier-table"
-    all_files="$ns_files $cls_files var/lib/minimal/finalize-install-kvm-group"
+    mkdir -p "$fake_ns6/$old_tree/daemon"
+    all_files="$ns_files $pl_files $old_files var/lib/minimal/finalize-install-kvm-group"
     for f in $all_files; do
         mkdir -p "$fake_ns6/$(dirname "$f")"
         printf 'alice\n' >"$fake_ns6/$f"
@@ -1115,16 +1067,16 @@ EOF
     APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with every artifact exits 0"
     check 1 "$(grep -c "still installed on this host" "$OUT")" "one advisory covers everything found"
-    for item in "host DNS setup" "system AppArmor profile" "classifier units" "classifier tree" "kvm group membership"; do
+    for item in "host DNS setup" "system AppArmor profile" "network policy loader" "what an earlier version installed" "kvm group membership"; do
         want_ok "the one advisory lists: $item" grep -q "still installed on this host.*$item" "$OUT"
     done
-    for f in $all_files "$cls_tree/classifier-table"; do
+    for f in $all_files "$old_tree/daemon"; do
         want_ok "non-interactive uninstall leaves $f in place" test -e "$fake_ns6/$f"
     done
     want_ok "non-interactive uninstall leaves the system profile in place" \
         test -f "$fake_aa6/minimald"
-    apply_remedies 6
-    for f in $all_files "$cls_tree" usr/local/lib/minimal run/minimal; do
+    apply_remedies 5
+    for f in $all_files "$old_tree" usr/local/lib/minimal run/minimal; do
         want_err "the printed remedies remove $f" test -e "$fake_ns6/$f"
     done
     want_err "the printed remedies remove the system profile" \
@@ -2603,890 +2555,6 @@ case_installer_switch_binary_executable() {
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
 }
 
-# --- NET-079: the host classifier tree --------------------------------------
-# install-host-classifier.sh is the privileged step that lays out the cgroup
-# tree minimald and its boxes are placed in, on a native host. CI cannot mount
-# cgroup2, so the case drives the script against a stand-in mount table through
-# its MINIMAL_OVERRIDE_CGROUP_MOUNTINFO seam, with stubbed `chown` and `nft`
-# recording their own argv, over a tree rooted in a temp dir: what is pinned
-# is the decision sequence a root run would take on the real mount — refuse an
-# undelegated hierarchy, refuse another namespace's view, delegate the slice
-# and every cgroup it lays out whole (each directory plus cgroup.procs,
-# cgroup.threads and cgroup.subtree_control, the cohort's two subtrees
-# included), leave the cgroup2 mount root above the slice root-owned, refuse
-# to render the cohort's two source identities half-done, load exactly one
-# packet-filter transaction that replaces the table rather than adding to
-# it, remove the presence marker before the load and write it again only
-# after, and print the very transaction it loads under --print-ruleset. The
-# one fact the stand-in cannot stand in for
-# is the kernel: it makes a cgroup's files at mkdir and dissolves them with the
-# cgroup at rmdir, so the case drops the modeled ones wherever a real rmdir
-# would have taken the cgroup too.
-case_host_classifier_tree_installed() {
-    command -v bash >/dev/null 2>&1 || {
-        echo "install_test: bash not found; skipping host_classifier_tree_installed" >&2
-        return 0
-    }
-    hc="$here/install-host-classifier.sh"
-    if [ ! -f "$hc" ]; then bad "install-host-classifier.sh is missing"; return 0; fi
-
-    cg="$root/cg"                      # the stand-in cgroup2 mountpoint
-    tree="$cg/minimald.slice"          # the tree the script installs
-    me="$(id -u)"
-
-    # Stand-in mount tables. Field 4 is the mount's root within the
-    # filesystem: "/" in the host's initial cgroup namespace, something else
-    # inside a container that mounts cgroup2 into its own — the case the
-    # script must refuse, or the tree would be created inside that namespace.
-    printf '38 30 0:25 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate\n' "$cg" >"$root/mi-on"
-    printf '38 30 0:25 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n' "$cg" >"$root/mi-off"
-    printf '38 30 0:25 /inner %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate\n' "$cg" >"$root/mi-nested"
-    printf '38 30 0:26 / %s rw,relatime - ext4 /dev/root rw\n' "$root" >"$root/mi-none"
-
-    # A recording chown stub: delegation is the point of the install, and on
-    # the stand-in filesystem the caller owns the files anyway, so the case
-    # reads what the script chowned rather than inferring it from their owner.
-    # It records and exits 0 without exec'ing the real chown: on the host this
-    # script installs on that chown runs as root, which CI's unprivileged
-    # lanes cannot stage, and where it lives is host-specific (/usr/bin on
-    # Linux, /usr/sbin on macOS), so exec'ing it would break the macOS lane
-    # while asserting nothing the case needs — the recorded argv is the whole
-    # delegation decision.
-    hcbin="$root/hcbin"; mkdir -p "$hcbin"
-    chown_calls="$root/chown.calls"; : >"$chown_calls"
-    cat >"$hcbin/chown" <<'STUB'
-#!/bin/sh
-printf '%s\n' "$*" >>"$CHOWN_CALLS"
-STUB
-    chmod +x "$hcbin/chown"
-
-    # A recording nft stub, in the chown stub's image: the step's second half
-    # is the packet-filter table, and what CI can pin of it without the
-    # capability to load one is the decision sequence — the transaction file
-    # that replaces the table, loaded exactly once, and the marker only
-    # after. The `-f` argument's file is captured whole: the case and the
-    # daemon's own ruleset tests read the transaction the step rendered.
-    # NFT_FAIL makes the load die, for the case that a failed re-load must
-    # leave no marker behind it. `list ruleset` serves the listing NFT_RULESET
-    # names, because the step now reads the ruleset it is about to load over
-    # — the scan for a ct-mark user of its bits is a real call, and the
-    # fixture is how a conflict is staged. Any other `list` says absent: no
-    # stand-in kernel holds a table, so the uninstall probes once, skips its
-    # delete, and reports nothing removed.
-    nft_calls="$root/nft.calls"; : >"$nft_calls"
-    nft_input="$root/nft.input"; : >"$nft_input"
-    cat >"$hcbin/nft" <<'STUB'
-#!/bin/sh
-printf '%s\n' "$*" >>"$NFT_CALLS"
-if [ "$1" = "-f" ] && [ -n "${2:-}" ]; then
-    cat "$2" >>"$NFT_INPUT"
-    exit "${NFT_FAIL:-0}"
-fi
-if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
-    cat "${NFT_RULESET:-/dev/null}"
-    exit 0
-fi
-if [ "$*" = "-a --debug=netlink list ruleset" ]; then
-    cat "${NFT_RULESET:-/dev/null}"
-    exit 0
-fi
-if [ "$1" = "-j" ] && [ "$2" = "list" ] && [ "$3" = "set" ]; then
-    [ -n "${NFT_LEAF_SET:-}" ] || exit 1
-    cat "$NFT_LEAF_SET"
-    exit 0
-fi
-[ "$1" = "list" ] && exit 1
-exit 0
-STUB
-    # The helper runs this nft as root, so the install checks that only its
-    # owner can write it and its directory. The modes are set here, not left
-    # to the umask.
-    chmod 0755 "$hcbin" "$hcbin/nft"
-
-    # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
-    run_hc() {
-        label="$1"; mi="$2"; shift 2
-        OUT="$root/hc.$label"
-        set +e
-        env -i \
-            PATH="${HC_PATH_PREFIX:+$HC_PATH_PREFIX:}$hcbin:/usr/bin:/bin" \
-            CHOWN_CALLS="$chown_calls" \
-            NFT_CALLS="$nft_calls" \
-            NFT_INPUT="$nft_input" \
-            NFT_FAIL="${NFT_FAIL:-0}" \
-            NFT_RULESET="${NFT_RULESET:-}" \
-            NFT_LEAF_SET="${NFT_LEAF_SET:-}" \
-            MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
-            MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
-            MINIMAL_OVERRIDE_QUIC443_HELPER="${HC_HELPER:-}" \
-            MINIMAL_OVERRIDE_QUIC443_SUDOERS="${HC_SUDOERS:-}" \
-            bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
-        rc=$?
-        set -e
-    }
-
-    # drop_cgroup_files <cgroup-dir> — what the kernel does at rmdir on the
-    # real mount: a cgroup's cgroup.procs, cgroup.threads and
-    # cgroup.subtree_control belong to the cgroup and go with it, while the
-    # stand-in is a plain directory that keeps them and would make every
-    # rmdir below fail for the stand-in's own reason, not the one pinned.
-    drop_cgroup_files() {
-        rm -f "$1/cgroup.procs" "$1/cgroup.threads" "$1/cgroup.subtree_control"
-    }
-
-    # --- Before the install: --check reports the missing tree, makes nothing.
-    run_hc pre_check "$root/mi-on" --check --user "$me"
-    check 1 "$rc" "check exits 1 before the tree exists"
-    want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
-    want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
-    want_err "the pre-install hint carries no placeholder: an install told no identity is the un-enrolled host's own" \
-        grep -q -- "<cohort address>" "$OUT"
-    want_err "the pre-install hint carries no node-plane placeholder either" \
-        grep -q -- "<node-plane address>" "$OUT"
-    want_err "check creates nothing" test -e "$tree"
-    # With one identity: the install would refuse it, so the hint drops it.
-    run_hc pre_check_lone "$root/mi-on" --check --user "$me" --cohort-address 100.72.0.9
-    check 1 "$rc" "check with a lone identity still exits 1 before the tree exists"
-    want_ok "the hint is still the install" grep -q "install it: sudo" "$OUT"
-    want_err "the hint carries no lone identity the install would refuse" \
-        grep -q -- "install it: sudo .*--cohort-address" "$OUT"
-    want_ok "the hint keeps the account asked about" grep -q -- "install it: sudo .*--user $me" "$OUT"
-
-    # --- Refusals: every one of them dies before a directory is made.
-    run_hc no_nsdelegate "$root/mi-off" --user "$me"
-    check 1 "$rc" "install dies on a cgroup2 mount without nsdelegate"
-    want_ok "the refusal names nsdelegate" grep -q "nsdelegate" "$OUT"
-    want_err "an undelegated hierarchy gets no tree" test -e "$tree"
-
-    run_hc unmounted "$root/mi-none" --user "$me"
-    check 1 "$rc" "install dies when no cgroup2 mount covers the tree"
-    want_ok "the refusal names the hierarchy it needs" grep -q "cgroup2 mount" "$OUT"
-
-    run_hc nested_ns "$root/mi-nested" --user "$me"
-    check 1 "$rc" "install dies inside another cgroup namespace's view"
-    want_ok "the refusal names the namespace" grep -q "another cgroup namespace" "$OUT"
-
-    run_hc nested_check "$root/mi-nested" --check --user "$me"
-    check 1 "$rc" "check reports the namespace view too"
-    want_ok "check names the mount's root within it" grep -q "root /inner" "$OUT"
-
-    run_hc no_owner "$root/mi-on"
-    check 1 "$rc" "install dies without an account to delegate to"
-    want_ok "the refusal asks for --user" grep -q -- "--user NAME" "$OUT"
-
-    run_hc root_owner "$root/mi-on" --user root
-    check 1 "$rc" "install refuses to delegate to root"
-    want_ok "the refusal says what delegating to root means" \
-        grep -q "same as not delegating" "$OUT"
-
-    run_hc bogus_owner "$root/mi-on" --user no-such-account-net079
-    check 1 "$rc" "install dies for an unknown account"
-    want_ok "the refusal names the account" grep -q "no such account" "$OUT"
-    want_err "a bad account still creates nothing" test -e "$tree"
-
-    # --- The two source identities go together: a table that translates its
-    # cohort while the rest of the slice keeps the host's own source identity
-    # is half of the classification, so the step refuses to render half of
-    # it. Neither given is whole: the un-enrolled host (NET-078), whose two
-    # identities are the classify chain's cgroup matches with no source
-    # translation, and whose postrouting chain stands empty for an
-    # association to fill without a reinstall.
-    run_hc half_identity "$root/mi-on" --user "$me" --cohort-address 100.72.0.9
-    check 1 "$rc" "install dies with one of the two identities missing"
-    want_ok "the refusal says they go together" grep -q "both source identities or neither" "$OUT"
-    want_err "half an identity still creates nothing" test -e "$tree"
-
-    run_hc unenrolled_print "$root/mi-on" --print-ruleset
-    check 0 "$rc" "--print-ruleset renders with no source identity"
-    want_err "no identity renders no source translation" grep -q "snat" "$OUT"
-    want_ok "the postrouting chain stands, empty, for an association to fill" \
-        grep -q "chain postrouting" "$OUT"
-    want_ok "the cohort is still its cgroup subtree's match" \
-        grep -q 'socket cgroupv2 level 2 "minimald.slice/boxes"' "$OUT"
-    want_ok "the node plane is still the slice's remaining match" \
-        grep -q 'ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice"' "$OUT"
-
-    run_hc unenrolled "$root/mi-on" --user "$me"
-    check 0 "$rc" "install exits 0 with neither identity"
-    want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
-    want_ok "the un-enrolled install lays out the QUIC block leaf" \
-        test -d "$tree/boxes/quic443-blocked"
-    want_ok "the un-enrolled install writes the marker" test -d "$tree/classifier-table"
-    want_err "the un-enrolled transaction carries no SNAT rule" grep -q "snat" "$nft_input"
-    want_ok "the un-enrolled install says nothing is translated" \
-        grep -q "nothing is translated" "$OUT"
-    want_ok "the un-enrolled install names the placement unit, not a per-restart root step alone" \
-        grep -q "min finalize-install" "$OUT"
-    want_err "the un-enrolled install prints no placeholder" grep -q "<cohort address>" "$OUT"
-    # Taken down again so the enrolled install below starts from nothing, and
-    # the recorders emptied so its transaction is the only one they hold.
-    for _cg in "$tree" "$tree/daemon" "$tree/boxes" "$tree/boxes/deny" "$tree/boxes/allow" \
-        "$tree/boxes/quic443-blocked"; do
-        drop_cgroup_files "$_cg"
-    done
-    run_hc unenrolled_uninstall "$root/mi-on" --uninstall
-    check 0 "$rc" "the un-enrolled tree uninstalls"
-    : >"$nft_input"; : >"$nft_calls"; : >"$chown_calls"
-
-    # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
-    # and the whole v2 contract delegated to the account minimald runs as.
-    # The QUIC block helper and its sudoers rule go under the scratch root,
-    # through the step's own override knobs: a rehearsal writes nothing to
-    # /usr/local or /etc.
-    HC_HELPER="$root/hclib/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    run_hc install "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    unset HC_HELPER HC_SUDOERS
-    check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
-    want_ok "the daemon leaf exists" test -d "$tree/daemon"
-    want_ok "the box cohort exists"   test -d "$tree/boxes"
-    want_ok "the deny subtree exists"  test -d "$tree/boxes/deny"
-    want_ok "the allow subtree exists" test -d "$tree/boxes/allow"
-    want_ok "the host-address QUIC block leaf exists" test -d "$tree/boxes/quic443-blocked"
-    want_ok "the table's marker exists once the transaction succeeded" \
-        test -d "$tree/classifier-table"
-    want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
-    want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
-    want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
-    want_ok "install says what a daemon in the slice does per launch, not on its next start" \
-        grep -q "once minimald is in the slice, each box it launches" "$OUT"
-    want_ok "install names the loaded table" grep -q "loaded the classifier table" "$OUT"
-    want_ok "install names the marker minimald probes" \
-        grep -q "presence marker at $tree/classifier-table" "$OUT"
-    want_ok "the slice's cgroup.procs is there for the daemon to write" \
-        test -e "$tree/cgroup.procs"
-    want_ok "the daemon leaf's cgroup.procs is there for --pid to write" \
-        test -e "$tree/daemon/cgroup.procs"
-    # Delegation handed over each cgroup whole — its directory plus
-    # cgroup.procs, cgroup.threads and cgroup.subtree_control, because a
-    # migration into a leaf needs write access to the common ancestor's
-    # cgroup.procs, and that ancestor is the slice itself — and never
-    # reached above the slice: a box runs as the daemon's uid, so a mount
-    # root owned by that account is every cgroup on the host. The two
-    # subtrees and the QUIC block leaf are delegated like the cohort they
-    # live under.
-    _o="$(id -u):$(id -g)"
-    _want=""
-    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow" "/boxes/quic443-blocked"; do
-        for _f in cgroup.procs cgroup.threads cgroup.subtree_control; do
-            _want="$_want$_o $tree$_cg/$_f "
-        done
-        _want="$_want$_o $tree$_cg "
-    done
-    # One recorded call per line, compared as one line: the file is the stub's
-    # ledger, not a shell variable, so fold it rather than word-split it.
-    _got="$(awk '{printf "%s%s", sep, $0; sep = " "}' "$chown_calls")"
-    check "${_want% }" "$_got" \
-        "delegation reached the slice and every leaf whole, never above the slice"
-    # The one packet-filter transaction, loaded exactly once, and nothing
-    # per-box in it — every rule is keyed on a cgroup path. The daemon's own
-    # ruleset tests read the same input in depth; this pins what the step
-    # decided, at the layer the installer owns: the transaction replaces the
-    # table rather than adding to it, the cohort's two identities, the
-    # answerer as the deny subtree's one destination, and the steer that
-    # makes the answerer the destination a deny-all box's lookups reach.
-    want_ok "the step loaded one transaction, exactly once" \
-        [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
-    want_ok "the step probes for no previous table: the transaction deletes it in-batch" \
-        [ "$(grep -c '^list table' "$nft_calls")" -eq 0 ]
-    want_ok "the transaction replaces the table: it declares what it deletes" \
-        grep -q '^add table inet minimal_class$' "$nft_input"
-    want_ok "the delete travels with the definition, before it" \
-        awk '/^delete table inet minimal_class$/ {d = NR}
-             /^table inet minimal_class \{/ {t = NR}
-             END {exit !(d && t && d < t)}' "$nft_input"
-    want_ok "the transaction keys its deny rule on the deny subtree" \
-        grep -q 'cgroupv2 level 3 "minimald.slice/boxes/deny" jump deny_out' "$nft_input"
-    # deny_out's first rule is pinned as the exact line it must be: the
-    # reply leg of a connection someone else opened to the box — the
-    # hostname proxy's to its loopback listener — is admitted, and nothing
-    # the box itself originates is, so the refusal falls on it.
-    check "$(awk '/chain deny_out \{/ {ch = 1; next}
-                  ch && /^\}/ {exit}
-                  ch && NF {sub(/^[ \t]+/, ""); print; exit}' "$nft_input")" \
-          "ct state established,related ct direction reply accept" \
-          "deny_out admits the reply direction only as its first rule"
-    want_err "the deny chain admits no direction-less flow: what the box \
-originates is refused" \
-        grep -q 'ct state established,related accept' "$nft_input"
-    want_ok "the deny rule admits the answerer by address and port only" \
-        grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
-    want_ok "the deny subtree's DNS-port lookups are steered onto the answerer" \
-        grep -q 'level 3 "minimald.slice/boxes/deny" udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
-    want_ok "the steer runs at dstnat's -100, before the filter chain decides" \
-        grep -q 'type nat hook output priority -100;' "$nft_input"
-    # nft before 1.0.9 refuses a priority name on a hook its matrix does not
-    # pair it with (dstnat is prerouting's, srcnat postrouting's), and one
-    # refusal fails the whole transaction, so no base chain may spell one.
-    want_err "no chain names dstnat off prerouting: nft before 1.0.9 refuses it" \
-        grep -qE 'hook (input|forward|output|postrouting) priority dstnat' "$nft_input"
-    want_err "no chain names srcnat off postrouting: nft before 1.0.9 refuses it" \
-        grep -qE 'hook (prerouting|input|forward|output) priority srcnat' "$nft_input"
-    want_ok "the deny rule refuses actively, never a silent drop" \
-        grep -q 'reject with icmpx admin-prohibited' "$nft_input"
-    # NET-078, translated: classification and translation are two chains,
-    # because the kernel admits a socket-cgroup match only before
-    # postrouting — a rule keyed on one there has never been loadable. The
-    # classify chain runs at output's mangle priority, classes only a
-    # connection that is new, and writes only the mask's two bits (the `and
-    # ~mask or bit` shape, so bits another component classes with survive);
-    # the slice's rule is guarded by the mask so it never re-decides a flow
-    # the boxes rule already classed. The postrouting chain reads the mark,
-    # never a socket, and gives the two planes their distinct sources.
-    want_ok "the classify chain runs at output's mangle priority, ahead of the filter" \
-        grep -q 'type filter hook output priority mangle' "$nft_input"
-    want_ok "the cohort is classed by its subtree on a new connection, its bit written" \
-        grep -q 'ct state new socket cgroupv2 level 2 "minimald.slice/boxes" ct mark set ct mark and 0xcfffffff or 0x10000000' "$nft_input"
-    want_ok "the slice's rule is guarded by the mask, so the boxes rule's mark is final" \
-        grep -q 'ct state new ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice" ct mark set ct mark and 0xcfffffff or 0x20000000' "$nft_input"
-    want_err "no postrouting rule matches a socket: the kernel refuses one there" \
-        awk '/chain postrouting \{/ {p = 1; next}
-             p && /^\}/ {exit}
-             p && /socket/ {found = 1}
-             END {exit found ? 0 : 1}' "$nft_input"
-    want_ok "the cohort leaves as its own address, translated by its ct-mark bit, loopback excluded" \
-        grep -q 'ct mark and 0x30000000 == 0x10000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
-    want_ok "the node plane leaves as its own address, translated by its own bit" \
-        grep -q 'ct mark and 0x30000000 == 0x20000000 oifname != "lo" snat ip to 100.72.0.1' "$nft_input"
-    # The scan is a real decision, not a decoration: the step read the
-    # ruleset it was about to load over, and recorded the two bits it chose
-    # beside the marker the daemon probes.
-    want_ok "the step read the ruleset it loads over, exactly once" \
-        [ "$(grep -c '^list ruleset' "$nft_calls")" -eq 1 ]
-    want_ok "the install records the ct-mark mask beside the marker" \
-        test -d "$tree/ct-mark-mask-0x30000000"
-
-    # BEP-018: a socket keeps the cgroup it was created in, so the table
-    # also rejects UDP 443 from a socket whose box leaf is in the
-    # blocked-leaves set, declared before the rule that names it.
-    want_ok "the table declares the blocked-leaves set of box leaves" \
-        awk '/set quic443_blocked_leaves \{/ {s = NR}
-             s && NR == s + 1 && /typeof socket cgroupv2 level 4$/ {ok = 1}
-             /chain output \{/ {o = NR}
-             END {exit !(ok && s < o)}' "$nft_input"
-    want_ok "the output chain rejects UDP 443 from a leaf in the set" \
-        grep -q 'socket cgroupv2 level 4 @quic443_blocked_leaves udp dport 443 reject with icmpx port-unreachable' "$nft_input"
-    hc_helper="$root/hclib/quic443-leaf"
-    want_ok "the install writes the QUIC block helper" test -x "$hc_helper"
-    want_ok "the sudoers rule lets the account run the helper alone" \
-        grep -qx "#$me ALL=(root) NOPASSWD: $hc_helper" "$root/hcsudoers/minimal-quic443-leaf"
-    want_ok "the install names the helper it wrote" grep -q "installed $hc_helper" "$OUT"
-    # run_helper <label> <verb> <leaf> ; sets rc, output in $OUT.
-    run_helper() {
-        OUT="$root/helper.$1"
-        set +e
-        env -i PATH="$hcbin:/usr/bin:/bin" NFT_CALLS="$nft_calls" \
-            "$hc_helper" "$2" "$3" </dev/null >"$OUT" 2>&1
-        rc=$?
-        set -e
-    }
-    mkdir -p "$tree/boxes/allow/grant"
-    : >"$nft_calls"
-    run_helper add add "$tree/boxes/allow/grant"
-    check 0 "$rc" "the helper adds a box leaf under the allow subtree"
-    run_helper remove remove "$tree/boxes/allow/grant"
-    check 0 "$rc" "the helper removes a box leaf under the allow subtree"
-    check 'add element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }
-delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }' \
-        "$(cat "$nft_calls")" "the helper changes one element of the set"
-    : >"$nft_calls"
-    for _leaf in "$cg" "/etc" "$tree/daemon" "$tree/boxes/deny" "$tree/boxes/quic443-blocked" \
-        "$tree/boxes/allow" "$tree/boxes/allow/../deny" "$tree/boxes/allow/grant/x"; do
-        run_helper refused add "$_leaf"
-        check 2 "$rc" "the helper refuses $_leaf"
-        want_ok "the refusal for $_leaf says so" grep -q "refused" "$OUT"
-    done
-    rmdir "$tree/boxes/allow/grant"
-    want_ok "no refused path reaches nft" [ ! -s "$nft_calls" ]
-
-    # --- --print-ruleset prints the same transaction the install loaded:
-    # the daemon's own ruleset tests read this mode, so the two spellings
-    # cannot drift.
-    run_hc print_ruleset "$root/mi-on" --print-ruleset \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "--print-ruleset exits 0"
-    check "$(cat "$nft_input")" "$(cat "$OUT")" \
-        "print-ruleset prints exactly the transaction the install loaded"
-
-    run_hc installed_check "$root/mi-on" --check --user "$me"
-    check 0 "$rc" "check exits 0 once the tree is installed"
-    want_ok "check reports the delegation it verified" grep -q "delegated:" "$OUT"
-    want_ok "check names the contract it verified" grep -q "cgroup.threads" "$OUT"
-    want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
-    want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
-    want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
-
-    # --user takes an account name too, resolved to the same uid and group;
-    # only when the caller's uid has a passwd entry to name it by (a cross
-    # container runs as the host's uid, which has none).
-    if me_name="$(id -un 2>/dev/null)"; then
-        run_hc named_check "$root/mi-on" --check --user "$me_name"
-        check 0 "$rc" "check by account name verifies the same delegation"
-    fi
-
-    # A numeric uid that is neither an account nor the caller has no group
-    # to delegate to: refused, never handed the caller's group.
-    stranger=4000000000
-    if ! id -g "$stranger" >/dev/null 2>&1 && [ "$stranger" != "$(id -u)" ]; then
-        run_hc stranger_check "$root/mi-on" --check --user "$stranger"
-        check 1 "$rc" "check refuses a numeric uid with no account behind it"
-        want_ok "the refusal names the uid" grep -q "no account with uid $stranger" "$OUT"
-    fi
-
-    # --- A re-install whose transaction dies leaves no marker: the step
-    # removes it before the load and writes it only after, so the daemon
-    # reads a host that decides nothing per box rather than a marker that
-    # vouches for a table this step did not render. The tree's half is
-    # already done, and stays.
-    NFT_FAIL=1
-    # The pair from the first install is in place. A failed load must leave
-    # it as it was: mv replaces a file's inode, so the same inode says the
-    # install did not write it again.
-    HC_HELPER="$root/hclib/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    _helper_ino="$(ls -i "$HC_HELPER")"
-    _sudoers_ino="$(ls -i "$HC_SUDOERS")"
-    run_hc reload_failed "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 1 "$rc" "a re-install whose nft transaction dies exits 1"
-    check "$_helper_ino" "$(ls -i "$HC_HELPER")" \
-        "a failed re-load leaves the existing QUIC block helper as it was"
-    check "$_sudoers_ino" "$(ls -i "$HC_SUDOERS")" \
-        "a failed re-load leaves the existing sudoers rule as it was"
-    # A first install whose load dies writes neither the helper nor its
-    # passwordless sudoers rule.
-    HC_HELPER="$root/hcfresh/lib/quic443-leaf"
-    HC_SUDOERS="$root/hcfresh/sudoers/minimal-quic443-leaf"
-    run_hc load_failed_fresh "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 1 "$rc" "an install whose nft transaction dies exits 1"
-    want_err "a failed load writes no QUIC block helper" test -e "$HC_HELPER"
-    want_err "a failed load writes no sudoers rule for it" test -e "$HC_SUDOERS"
-    want_ok "a failed load leaves no staging file for either" \
-        [ -z "$(ls -A "$root/hcfresh" 2>/dev/null)" ]
-    unset HC_HELPER HC_SUDOERS
-    want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
-    want_err "a failed re-load leaves no ct-mark mask record either" \
-        test -e "$tree/ct-mark-mask-0x30000000"
-    want_ok "the failure says neither the marker nor its record was written" \
-        grep -q "neither the marker nor its ct-mark mask record was written" "$OUT"
-    want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
-    NFT_FAIL=0
-
-    # --- Root runs the helper for the delegated account, so the install
-    # refuses a helper directory that another account can write: that
-    # account could replace the helper, or plant its staging name.
-    mkdir -p "$root/hcopen"
-    chmod 0777 "$root/hcopen"
-    HC_HELPER="$root/hcopen/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    run_hc open_helper_dir "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    unset HC_HELPER HC_SUDOERS
-    check 1 "$rc" "an install whose helper directory others can write exits 1"
-    want_ok "the refusal names the directory and the fix" \
-        grep -q "$(cd -P "$root/hcopen" && pwd -P) can be written by accounts other than its owner (mode 777)" "$OUT"
-    want_err "no helper is written into a directory others can write" \
-        test -e "$root/hcopen/quic443-leaf"
-    want_ok "no staging file is left behind either" \
-        [ -z "$(ls -A "$root/hcopen")" ]
-    rmdir "$root/hcopen"
-
-    run_hc reloaded "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "the next good re-install exits 0"
-    want_ok "the next good re-install restores the marker" \
-        test -d "$tree/classifier-table"
-    want_ok "the next good re-install restores the mask record beside it" \
-        test -d "$tree/ct-mark-mask-0x30000000"
-
-    # --- The helper runs nft as root for the delegated account, so the
-    # install refuses an nft that another account can write, or one in a
-    # directory another account can write. It refuses before the load.
-    for _open in dir file; do
-        _nftdir="$root/hcnft-$_open"
-        mkdir -p "$_nftdir"
-        cp "$hcbin/nft" "$_nftdir/nft"
-        if [ "$_open" = dir ]; then
-            chmod 0777 "$_nftdir"; chmod 0755 "$_nftdir/nft"; _named="$_nftdir"
-        else
-            chmod 0755 "$_nftdir"; chmod 0777 "$_nftdir/nft"; _named="$_nftdir/nft"
-        fi
-        # The install names the nft by its physical path: on macOS the
-        # scratch root sits under /var, a symlink to /private/var.
-        _named="$(cd -P "$_nftdir" && pwd -P)${_named#"$_nftdir"}"
-        : >"$nft_input"
-        HC_PATH_PREFIX="$_nftdir"
-        HC_HELPER="$root/hcnftlib/quic443-leaf"
-        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-        run_hc "open_nft_$_open" "$root/mi-on" --user "$me" \
-            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-        unset HC_PATH_PREFIX HC_HELPER HC_SUDOERS
-        check 1 "$rc" "an install whose nft $_open others can write exits 1"
-        want_ok "the refusal names the writable nft $_open and the fix" \
-            grep -q "cannot install the QUIC block helper at $root/hcnftlib/quic443-leaf: $_named can be written by accounts other than its owner (mode 777)" "$OUT"
-        want_err "no helper runs an nft $_open others can write" \
-            test -e "$root/hcnftlib/quic443-leaf"
-        want_ok "a refused nft $_open loads no table" [ ! -s "$nft_input" ]
-        rm -rf "$_nftdir"
-    done
-
-    # --- A re-install while the daemon runs keeps the leaves in the
-    # blocked-leaves set: the set is declared with them in the same
-    # transaction that replaces the table. A leaf whose directory is gone,
-    # and a path outside the allow subtree, are not carried over.
-    mkdir -p "$tree/boxes/allow/grant"
-    nft_leaf_set="$root/nft-leaf-set.json"
-    printf '%s' '{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet", "name": "quic443_blocked_leaves", "table": "minimal_class", "type": "cgroupsv2", "handle": 4, "elem": ["minimald.slice/boxes/allow/grant", "minimald.slice/boxes/allow/gone", "minimald.slice/boxes/deny"]}}]}' \
-        >"$nft_leaf_set"
-    : >"$nft_input"
-    NFT_LEAF_SET="$nft_leaf_set"
-    HC_HELPER="$root/hclib/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    run_hc reload_kept "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    unset NFT_LEAF_SET HC_HELPER HC_SUDOERS
-    check 0 "$rc" "a re-install with a leaf in the blocked-leaves set exits 0"
-    # shellcheck disable=SC2016 # $0 is awk's line, not a shell expansion
-    want_ok "the re-install declares the set with the leaf still in it" \
-        awk '/set quic443_blocked_leaves \{/ {s = NR}
-             s && NR == s + 2 && $0 == "        elements = { \"minimald.slice/boxes/allow/grant\" }" {ok = 1}
-             END {exit !ok}' "$nft_input"
-    want_ok "the leaf is kept in the same transaction that deletes the table" \
-        [ "$(grep -c '^delete table inet minimal_class$' "$nft_input")" -eq 1 ]
-    want_ok "the re-install names the leaf it kept" \
-        grep -q "kept the box leaves that are refused UDP to port 443: minimald.slice/boxes/allow/grant$" "$OUT"
-    rmdir "$tree/boxes/allow/grant"
-
-    # --- A set listing that fails while the loaded table declares the set
-    # stops the install before the load: rendering the set empty would let
-    # a blocked box send UDP to port 443 again. The stub's `-j list set`
-    # fails when NFT_LEAF_SET is unset.
-    nft_ruleset_with_set="$root/nft-ruleset-with-set"
-    printf '%s\n' 'table inet minimal_class {' '	set quic443_blocked_leaves {' \
-        '		typeof socket cgroupv2 level 4' '	}' '}' >"$nft_ruleset_with_set"
-    : >"$nft_input"
-    NFT_RULESET="$nft_ruleset_with_set"
-    HC_HELPER="$root/hclib/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    run_hc leaf_set_unreadable "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    unset HC_HELPER HC_SUDOERS
-    NFT_RULESET=
-    check 1 "$rc" "an install that cannot list the declared blocked-leaves set exits 1"
-    want_ok "the refusal says it cannot read the blocked box leaves" \
-        grep -q "cannot read the box leaves that are refused UDP to port 443 from inet minimal_class: nft -j list set inet minimal_class quic443_blocked_leaves failed" "$OUT"
-    want_ok "the refusal says the loaded table is unchanged" \
-        grep -q "The loaded table is unchanged.$" "$OUT"
-    want_ok "an unreadable blocked-leaves set loads no table" [ ! -s "$nft_input" ]
-
-    # --- The ct-mark bits are a shared namespace: a component already
-    # classing with one of them would be silently overwritten by the
-    # classify chain (and would overwrite it back), so the step reads the
-    # ruleset it is about to load over and refuses, naming the rule and the
-    # override. The fixture's rule is the stand-in for that component; the
-    # escape is --ct-mark-mask naming bits nobody else classes with, and it
-    # must be recorded, not just rendered.
-    nft_ruleset_fixture="$root/nft-ruleset-conflict"
-    printf 'table inet other_component {\n    chain classify {\n        ct mark set ct mark or 0x10000000\n    }\n}\n' \
-        >"$nft_ruleset_fixture"
-    NFT_RULESET="$nft_ruleset_fixture"
-    run_hc conflict "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 1 "$rc" "the install refuses to load over a ct-mark user of its bits"
-    want_ok "the refusal names the conflicting rule itself" \
-        grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
-    want_ok "the refusal names the override it would take instead" \
-        grep -q -- "Choose two contiguous bits that no rule above uses and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
-    want_ok "the refusal dies before touching anything: the previous marker \
-still vouches for the table it loaded" \
-        test -d "$tree/classifier-table"
-    run_hc conflict_escaped "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x03000000
-    check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
-    want_ok "the escape renders its own bits, both identities on them" \
-        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
-    want_ok "the escape records the bits it chose" \
-        test -d "$tree/ct-mark-mask-0x03000000"
-    want_err "the escape left no record of the refused mask" \
-        test -e "$tree/ct-mark-mask-0x30000000"
-    # --- With no --ct-mark-mask, the next install re-applies the mask the
-    # previous install recorded, so a re-run keeps the operator's bits
-    # rather than falling back to the default that conflicts.
-    : >"$nft_input"
-    run_hc conflict_recorded "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "an install with no mask re-applies the recorded mask over the conflict"
-    want_ok "the install says which recorded mask it uses" \
-        grep -q "using the ct-mark mask 0x03000000 that the previous install recorded" "$OUT"
-    want_ok "the install renders the recorded bits" \
-        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
-    want_ok "the recorded mask is still the one record" \
-        test -d "$tree/ct-mark-mask-0x03000000"
-    want_err "the install wrote no default-mask record" \
-        test -e "$tree/ct-mark-mask-0x30000000"
-    run_hc conflict_back "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x30000000
-    check 1 "$rc" "an explicit default-mask install refuses again"
-    NFT_RULESET=
-
-    # --- A CONNMARK --restore-mark copies the connection mark into the
-    # packet mark and never writes the connection mark, so a restore with
-    # no mask is no conflict. A stand-in iptables-save serves the listing.
-    _iptdir="$root/hc-iptables-save"; mkdir -p "$_iptdir"
-    cat >"$_iptdir/iptables-save" <<'STUB'
-#!/bin/sh
-cat "$(dirname "$0")/listing"
-STUB
-    chmod 0755 "$_iptdir/iptables-save"
-    HC_PATH_PREFIX="$_iptdir"
-    printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n' \
-        >"$_iptdir/listing"
-    run_hc restore_mark_nomask "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "a --restore-mark with no mask does not block the install"
-    unset HC_PATH_PREFIX
-
-    # --- A mask in a range a well-known component classes with is refused
-    # even when no loaded rule uses it yet: the component can start after
-    # the install. The refusal names the range and the component.
-    run_hc well_known_range "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x0000c000
-    check 1 "$rc" "an install with a mask in kube-proxy's range exits 1"
-    want_ok "the refusal names the range and the component" \
-        grep -q "uses bits in 0x0000c000, the range kube-proxy marks connections with" "$OUT"
-    want_ok "the refusal names min finalize-install with another mask" \
-        grep -q -- "two contiguous bits outside 0x0000c000 and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
-    want_err "the refused mask is not recorded" \
-        test -e "$tree/ct-mark-mask-0x0000c000"
-
-    # --- --ct-mark-mask is validated before anything is made: exactly two
-    # contiguous set bits inside the 32 a connection mark holds, nothing
-    # else, each refused with the reason. A rule classing on one bit is no
-    # classification of two identities, three is a spelling mistake, two
-    # that are not adjacent is a mis-typed pair, and a bit the kernel cannot
-    # hold is not a mask this step can render. A value that is not
-    # hexadecimal at all is refused for that reason, its own.
-    for bad_mask in 0x10000000 0x70000000 0x50000000 0x100000000 0x0 0x3000000f; do
-        run_hc "bad_mask_$bad_mask" "$root/mi-on" --user "$me" \
-            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-            --ct-mark-mask "$bad_mask"
-        check 1 "$rc" "--ct-mark-mask $bad_mask is refused"
-        want_ok "the refusal of $bad_mask says what a mask is" \
-            grep -q -- "--ct-mark-mask must name" "$OUT"
-        want_err "the refused mask $bad_mask made nothing" \
-            test -e "$tree/ct-mark-mask-$bad_mask"
-    done
-    for bad_mask in not-hex 30000000 0xzz; do
-        run_hc "bad_mask_$bad_mask" "$root/mi-on" --user "$me" \
-            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-            --ct-mark-mask "$bad_mask"
-        check 1 "$rc" "--ct-mark-mask $bad_mask is refused for its spelling"
-        want_ok "the refusal of $bad_mask names the spelling it needs" \
-            grep -q -- "--ct-mark-mask needs a" "$OUT"
-        want_err "the refused mask $bad_mask made nothing" \
-            test -e "$tree/ct-mark-mask-$bad_mask"
-    done
-
-    # --- Uninstall: the tree comes away whole — the two subtrees and the
-    # table's marker with it — but a leaf the script did not place (a live
-    # session's) stops it rather than tearing the box down. The kernel
-    # dissolves a cgroup's own files with it, so the case drops the modeled
-    # ones first and the rmdir rehearsed is the real one.
-    drop_cgroup_files "$tree"
-    drop_cgroup_files "$tree/daemon"
-    drop_cgroup_files "$tree/boxes"
-    drop_cgroup_files "$tree/boxes/deny"
-    drop_cgroup_files "$tree/boxes/allow"
-    drop_cgroup_files "$tree/boxes/quic443-blocked"
-    # The probe leaf a daemon stopped mid-probe leaves behind
-    # (gominimal/inbox#1206) is the probe's own, so it does not stop the
-    # uninstall.
-    mkdir "$tree/boxes/deny/filter-probe-4242"
-    run_hc uninstall "$root/mi-on" --uninstall
-    check 0 "$rc" "uninstall removes the installed tree"
-    want_err "uninstall leaves no tree behind" test -e "$tree"
-
-    run_hc reinstalled "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "install after an uninstall exits 0"
-
-    # --- --pid: the daemon's first hop into the slice is the one migration
-    # the delegated account cannot make itself — the common ancestor of the
-    # cgroup a daemon starts in and the slice is the root-owned hierarchy
-    # root — so the installer offers to make it for the running daemon.
-    run_hc place "$root/mi-on" --pid "$$"
-    check 0 "$rc" "--pid places the running daemon in its leaf"
-    want_ok "the daemon leaf holds exactly that pid" \
-        grep -qx "$$" "$tree/daemon/cgroup.procs"
-    want_ok "the placement names the leaf it wrote" grep -q "placed .* in .*daemon" "$OUT"
-    want_ok "the placement says it takes effect on the next launch, not the next start" \
-        grep -q "per launch" "$OUT"
-    want_ok "the placement says a plain restart loses it" \
-        grep -q "Delegate=yes unit" "$OUT"
-
-    run_hc place_dead "$root/mi-on" --pid 999999999
-    check 1 "$rc" "--pid dies for a process that does not exist"
-    want_ok "the refusal names the pid it could not find" \
-        grep -q "no process 999999999" "$OUT"
-
-    run_hc place_nonnumeric "$root/mi-on" --pid not-a-pid
-    check 1 "$rc" "--pid dies for a pid that is not one"
-    want_ok "the refusal asks for a numeric process id" \
-        grep -q "numeric process id" "$OUT"
-
-    # --- --place-listener: the same placement, found from the daemon's own
-    # listener so the manager-held placement unit can make it at every start
-    # the daemon asks for (no per-restart --pid). Over a stand-in process table:
-    # the holder of the socket that runs as the delegated account outside
-    # the slice is placed; a holder of another uid, a holder of another
-    # socket, a same-uid holder already inside the slice (a box in
-    # boxes/deny that bound a socket spelled like the listener), and a
-    # holder whose cgroup cannot be read are left alone; a second run is
-    # idempotent; and a socket nobody holds is nothing to place rather than
-    # a failure.
-    fproc="$root/proc"; rm -rf "$fproc"
-    lsock="$root/state/providers/local-minimald0/ssh.sock"
-    mkdir -p "$fproc/net" "$fproc/4242/fd" "$fproc/4243/fd" "$fproc/4244/fd" \
-        "$fproc/4245/fd" "$fproc/4246/fd"
-    {
-        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
-        printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
-        printf '0000 00000002 00000000 00010000 0001 01 778 /run/other.sock\n'
-    } >"$fproc/net/unix"
-    ln -s 'socket:[777]' "$fproc/4242/fd/5"
-    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
-    ln -s 'socket:[777]' "$fproc/4243/fd/3"
-    printf 'Name:\tother\nUid:\t0\t0\t0\t0\n' >"$fproc/4243/status"
-    ln -s 'socket:[778]' "$fproc/4244/fd/3"
-    printf 'Name:\tother\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4244/status"
-    for p in 4242 4243 4244; do
-        printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/$p/cgroup"
-    done
-    # A box: the delegated account, the listener's own path string, but
-    # already placed in a deny leaf under the slice.
-    ln -s 'socket:[777]' "$fproc/4245/fd/7"
-    printf 'Name:\tbash\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4245/status"
-    printf '0::/minimald.slice/boxes/deny/box-1\n' >"$fproc/4245/cgroup"
-    # A holder whose cgroup cannot be read: unknown, so not moved.
-    ln -s 'socket:[777]' "$fproc/4246/fd/7"
-    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4246/status"
-    : >"$tree/daemon/cgroup.procs"
-    HC_PROC="$fproc"
-    run_hc place_listener "$root/mi-on" --user "$me" --place-listener "$lsock"
-    check 0 "$rc" "--place-listener exits 0"
-    want_ok "the delegated account's holder of the socket is placed" \
-        grep -qx 4242 "$tree/daemon/cgroup.procs"
-    want_err "a holder of another uid is left alone" grep -qx 4243 "$tree/daemon/cgroup.procs"
-    want_ok "the placement says what it left alone and why" grep -q "left 4243 alone" "$OUT"
-    want_err "a holder of another socket is not placed" grep -qx 4244 "$tree/daemon/cgroup.procs"
-    want_err "a same-uid holder inside boxes/deny is never moved" \
-        grep -qx 4245 "$tree/daemon/cgroup.procs"
-    want_ok "the placement says the box stands inside the slice" \
-        grep -q "left 4245 alone: .*inside the slice at /minimald.slice/boxes/deny/box-1" "$OUT"
-    want_err "a holder whose cgroup cannot be read is not moved" \
-        grep -qx 4246 "$tree/daemon/cgroup.procs"
-    want_ok "the placement says the cgroup could not be read" \
-        grep -q "left 4246 alone: .*cgroup could not be read" "$OUT"
-    want_ok "exactly one holder was placed" \
-        [ "$(grep -c . "$tree/daemon/cgroup.procs")" -eq 1 ]
-    # A scan that find reports as failed (an fd table that changed under it,
-    # which a live process table does all the time): the holders it printed
-    # are still placed and the step still exits 0. The stand-in find prints
-    # what the real one does and then fails the way a vanished entry does.
-    : >"$tree/daemon/cgroup.procs"
-    printf '#!/bin/sh\n/usr/bin/find "$@"\nexit 1\n' >"$hcbin/find"
-    chmod +x "$hcbin/find"
-    run_hc place_listener_racy "$root/mi-on" --user "$me" --place-listener "$lsock"
-    rm -f "$hcbin/find"
-    check 0 "$rc" "--place-listener exits 0 when the fd scan reports a failure"
-    want_ok "the holder the failed scan still printed is placed" \
-        grep -qx 4242 "$tree/daemon/cgroup.procs"
-    run_hc place_listener_again "$root/mi-on" --user "$me" --place-listener "$lsock"
-    check 0 "$rc" "a second --place-listener exits 0"
-    want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
-    want_ok "the second run writes the pid no second time" \
-        [ "$(grep -cx 4242 "$tree/daemon/cgroup.procs")" -eq 1 ]
-    # Only holders that are left alone (the daemon gone, a box on the same
-    # path still there): the closing line says so, not that nobody holds it.
-    rm -rf "$fproc/4242"
-    : >"$tree/daemon/cgroup.procs"
-    run_hc place_listener_skipped "$root/mi-on" --user "$me" --place-listener "$lsock"
-    check 0 "$rc" "--place-listener over holders it leaves alone exits 0"
-    want_ok "the closing line says the holders were left where they stand" \
-        grep -q "every holder of .* was left where it stands" "$OUT"
-    want_err "and does not claim the socket is unheld" grep -q "no process holds" "$OUT"
-    want_err "and places nothing" [ -s "$tree/daemon/cgroup.procs" ]
-    printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
-    run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
-    check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
-    want_ok "nobody holding it is nothing to place, said so" grep -q "no process holds .*: nothing to place" "$OUT"
-    want_err "an unbound socket is not scanned twice" grep -q "scanned again" "$OUT"
-    # A listed inode whose holder is not in any fd table (it vanished under
-    # the scan): one more pass after a moment, then nothing to place, and
-    # still not a failure.
-    {
-        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
-        printf '0000 00000002 00000000 00010000 0001 01 779 %s\n' "$lsock"
-    } >"$fproc/net/unix"
-    run_hc place_listener_vanished "$root/mi-on" --user "$me" --place-listener "$lsock"
-    check 0 "$rc" "--place-listener over a socket whose holder vanished exits 0"
-    want_ok "the vanished holder is looked for once more" grep -q "scanned again" "$OUT"
-    want_ok "and then it is nothing to place" grep -q "nothing to place" "$OUT"
-    HC_PROC=
-    : >"$tree/daemon/cgroup.procs"
-
-    drop_cgroup_files "$tree"
-    drop_cgroup_files "$tree/daemon"
-    drop_cgroup_files "$tree/boxes"
-    drop_cgroup_files "$tree/boxes/deny"
-    drop_cgroup_files "$tree/boxes/allow"
-    drop_cgroup_files "$tree/boxes/quic443-blocked"
-    mkdir "$tree/boxes/deny/a-session"
-    run_hc uninstall_live "$root/mi-on" --uninstall
-    check 1 "$rc" "uninstall dies while a box leaf survives"
-    want_ok "the refusal says what is holding the tree" grep -q "stop minimald" "$OUT"
-    want_ok "the live leaf survives the refused uninstall" test -d "$tree/boxes/deny/a-session"
-    rm -rf "$tree"   # the sweep this case alone owns; the refused uninstall could not
-
-    # --- --pid with no tree to place into names the step that is missing.
-    run_hc place_no_tree "$root/mi-on" --pid "$$"
-    check 1 "$rc" "--pid dies when the tree is not installed"
-    want_ok "the refusal names the install it still needs" \
-        grep -q "is not installed" "$OUT"
-
-    # --- --help prints the script's own header as its usage.
-    run_hc help "$root/mi-on" --help
-    check 0 "$rc" "--help exits 0"
-    want_ok "usage shows the sudo form" grep -q "sudo scripts/install-host-classifier.sh" "$OUT"
-    want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
-    want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
-    want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
-    want_ok "usage shows the --place-listener step" grep -q -- "--place-listener SOCK" "$OUT"
-    want_err "the step's own remedies carry no placeholder a person must fill" \
-        grep -q "<the account" "$hc"
-    want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
-
-    # --- Without the rehearsal seam the script demands root, like the other
-    # privileged loaders; nothing is created either way.
-    OUT="$root/hc.rootcheck"
-    set +e
-    env -i PATH="/usr/bin:/bin" bash "$hc" --root "$tree" --user "$me" </dev/null >"$OUT" 2>&1
-    rc=$?
-    set -e
-    want_err "an unprivileged real-host run creates nothing" test -e "$tree"
-    if [ "$(id -u)" -eq 0 ]; then
-        ok "root check skipped: this harness already runs as root"
-    else
-        check 1 "$rc" "an unprivileged real-host run dies"
-        want_ok "the refusal asks for sudo" grep -q "must run as root" "$OUT"
-    fi
-}
-
 # --- NET-048 / NET-050: Linux amd64 and arm64 releases ship the VM stack -----
 # The proof is the release components table itself: every Linux architecture
 # carries minvmd, the guest kernel, initramfs, rootfs image, and the switch.
@@ -3759,7 +2827,6 @@ case_for() {
         uninstall)                          case_uninstall ;;
         gvproxy_rename_migration)           case_gvproxy_rename_migration ;;
         installer_switch_binary_executable) case_installer_switch_binary_executable ;;
-        host_classifier_tree_installed)  case_host_classifier_tree_installed ;;
         answerer_source_installed)      case_answerer_source_installed ;;
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
@@ -3779,7 +2846,7 @@ case "${1:-}" in
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
-            host_classifier_tree_installed answerer_source_installed \
+            answerer_source_installed \
             linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack \
             bep_installs_beside_minvmd; do
             case_for "$_c"

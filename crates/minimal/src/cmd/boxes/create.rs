@@ -3793,7 +3793,7 @@ pub(crate) async fn activate_box(
             // about to rely on the names. Its surface half is decided in the one
             // function both verbs share (`resolver`) and its install clause lists
             // this host's missing finalize-install items — names while the surface
-            // is not native, the classifier while a native daemon's host says so
+            // is not native, any other item while it is not done
             // (`host_install_for_this_host`, the same scoping `min finalize-install`
             // applies) — so the two verbs print the same words (NET-122's pointer
             // is the line's tail). Host DNS is opt-in: the start never prints the
