@@ -215,10 +215,10 @@ fn http_get(addr: SocketAddrV4) -> Option<String> {
     (!answer.is_empty()).then_some(answer)
 }
 
-/// A service on the host's loopback: it answers every connection with a
-/// megabyte and closes first.
-fn loopback_megabyte() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+/// A service on the host's loopback at `address`: it answers every
+/// connection with a megabyte and closes at once.
+fn loopback_megabyte(address: std::net::IpAddr) -> u16 {
+    let listener = TcpListener::bind((address, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -227,6 +227,26 @@ fn loopback_megabyte() -> u16 {
         }
     });
     port
+}
+
+/// A service on the host's loopback that stops sending first: it writes
+/// one line, shuts down its write half, and hands the test what the client
+/// sent after that.
+fn loopback_half_close() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let _ = stream.write_all(b"early\n");
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest);
+            let _ = tx.send(rest);
+        }
+    });
+    (port, rx)
 }
 
 fn boot(gvproxy: &Path, probe: &Path) -> Vm {
@@ -375,7 +395,7 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
 
     // The host's loopback: no route through the virtual network, and the
     // stream door only at an exposed port.
-    let service = loopback_megabyte();
+    let service = loopback_megabyte(Ipv4Addr::LOCALHOST.into());
     let direct = shell.run(&format!(
         "curl -s -m 4 -o /dev/null -w 'code=%{{http_code}}' http://{HOST_ALIAS}:{service}/"
     ));
@@ -408,6 +428,68 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
         "stream door, port exposed: {}",
         open.trim().replace('\n', " | ")
     );
+
+    // The same again, several times: the guest stops sending before the
+    // host side answers, and the host side closes right behind its last
+    // byte. Not one byte may be lost.
+    for round in 0..5 {
+        let again = shell.stream(&host_port);
+        assert!(again.contains("1000000"), "round {round}: {again}");
+    }
+    println!("stream door, a megabyte written and closed at once: 5 of 5 complete");
+
+    // A service that listens on the IPv6 loopback alone.
+    let v6_service = loopback_megabyte(std::net::Ipv6Addr::LOCALHOST.into());
+    // A service that stops sending first and keeps reading.
+    let (half, sent_late) = loopback_half_close();
+    vm.set_exposures(&[service, v6_service, half]);
+    let host_port_at = |port: u16| {
+        format!(
+            r#"{{"box_id":"{}","purpose":{{"kind":"host_port","port":{port}}}}}"#,
+            web.box_id
+        )
+    };
+    let over_v6 = shell.stream(&host_port_at(v6_service));
+    assert!(over_v6.contains(r#"{"stream":"open"}"#), "{over_v6}");
+    assert!(over_v6.contains("1000000"), "{over_v6}");
+    println!(
+        "stream door, service on ::1 only: {}",
+        over_v6.trim().replace('\n', " | ")
+    );
+
+    // The guest reads the host side's end of file and still sends.
+    let half_closed = shell.run(&format!(
+        "(printf '%s\\n' '{}'; sleep 2; printf late) | socat -t10 - VSOCK-CONNECT:2:{}",
+        host_port_at(half),
+        minimald_rpc::VM_HOST_STREAM_PORT
+    ));
+    assert!(half_closed.contains("early"), "{half_closed}");
+    let late = sent_late
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the service reads the guest's end of file");
+    assert_eq!(
+        late, b"late",
+        "what the guest sent after the host's end of file"
+    );
+    println!(
+        "stream door, host side stops sending first: guest read {:?}, then sent {:?}",
+        half_closed.trim().replace('\n', " | "),
+        String::from_utf8_lossy(&late)
+    );
+
+    // The control door from inside the guest. The client stops sending
+    // behind its request and the door closes behind its reply.
+    let standing = serde_json_lenient::to_string(&GuestDoorRequest::BoxStanding(
+        minimald_rpc::BoxStandingRequest { box_id: web.box_id },
+    ))
+    .unwrap();
+    let replies = shell.run(&format!(
+        "for i in {{1..20}}; do printf '%s\\n' '{standing}' | socat -t10 - VSOCK-CONNECT:2:{}; done",
+        minimald_rpc::VM_HOST_BOX_REPORT_PORT
+    ));
+    let answered = replies.matches(r#""standing":true"#).count();
+    assert_eq!(answered, 20, "{replies}");
+    println!("control door from the guest, reply then close: {answered} of 20 replies arrived");
 
     vm.set_exposures(&[]);
     let closed_again = shell.stream(&host_port);

@@ -196,13 +196,6 @@ impl ControlDoor {
 /// forever.
 const REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the guest door waits for the in-VM daemon to close its end
-/// after its reply is written. The wait is the G-N8 workaround's other
-/// half, so the bound only ends a client that read its reply and never
-/// closed: a wedged reporter cannot pin its connection's thread, and the
-/// door slot it holds, the way an honest one never does.
-const GUEST_REPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// The largest request line the server will read. A registration carries a
 /// name, a port list, and a policy; anything past this bound is not one.
 const MAX_REQUEST_LINE: usize = 64 * 1024;
@@ -424,8 +417,7 @@ pub fn spawn(
 /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] to.
 ///
 /// What a publish binds is decided by the box's registration, never by the
-/// peer. The door does not close a connection first: libkrun drops the
-/// bytes it has not read yet when the host side closes.
+/// peer.
 ///
 /// The bind happens on the calling thread, so a failure is a startup error.
 pub fn spawn_guest_reports_door(
@@ -690,7 +682,8 @@ fn serve_connection(
     // connection's own thread, so a connection that never sends one holds
     // only that thread, never the accept loop.
     let gauges = boxes.ask_gauges();
-    let served = match (&request, door) {
+
+    match (&request, door) {
         // A held registration keeps its connection as the row's lease until
         // its client commits it, so it too runs on a thread of its own under
         // its kind's cap ([`MAX_REGISTRATION_LEASES`]), freeing this door's
@@ -699,14 +692,7 @@ fn serve_connection(
         (BoxControlRequest::Register(register), ControlDoor::Host) if register.hold => {
             match gauges.leases.try_acquire(gauges.lease_cap()) {
                 Some(slot) => {
-                    return serve_held_registration(
-                        stream,
-                        boxes,
-                        answerer,
-                        order,
-                        register.clone(),
-                        slot,
-                    );
+                    serve_held_registration(stream, boxes, answerer, order, register.clone(), slot)
                 }
                 None => refuse_past_cap(
                     &mut stream,
@@ -720,18 +706,16 @@ fn serve_connection(
         (BoxControlRequest::SubscribeAsks(subscribe), ControlDoor::Host) => {
             let box_id = subscribe.box_id;
             match gauges.subscriptions.try_acquire(gauges.subscription_cap()) {
-                Some(slot) => {
-                    return spawn_ask_thread(
-                        stream,
-                        "minvmd-ask-client",
-                        boxes,
-                        audit_path,
-                        move |s, b, a| {
-                            let _slot = slot;
-                            serve_ask_subscription(s, b, a, box_id);
-                        },
-                    );
-                }
+                Some(slot) => spawn_ask_thread(
+                    stream,
+                    "minvmd-ask-client",
+                    boxes,
+                    audit_path,
+                    move |s, b, a| {
+                        let _slot = slot;
+                        serve_ask_subscription(s, b, a, box_id);
+                    },
+                ),
                 None => refuse_past_cap(
                     &mut stream,
                     "ask subscription",
@@ -751,42 +735,6 @@ fn serve_connection(
             order,
             request,
         ),
-    };
-    // The guest door never closes a connection first (G-N8): on the KVM
-    // libkrun shuttle a server-initiated close drops the reply's
-    // still-buffered bytes on their way to the guest, and the in-VM daemon
-    // reads an immediate EOF with nothing in it — the answer a report's
-    // unwind depends on, lost to the close that carried it. So the door
-    // holds the connection open until the reporter, which has its reply,
-    // closes from its side. The host socket's peers are on the same host,
-    // not behind a shuttle, and close as they always did.
-    if door == ControlDoor::GuestReports {
-        drain_until_peer_closes(&mut stream);
-    }
-    served
-}
-
-/// Wait for the peer's close on a guest-door connection whose reply was
-/// already written: read until EOF — the reporter closing its end, which
-/// it does once it has the reply — or until the drain bound ends a client
-/// that never closes, so a wedged reporter cannot pin its connection's
-/// thread and door slot. Bytes past the request line, if any, are discarded: the
-/// door's protocol is one line each way.
-fn drain_until_peer_closes(stream: &mut UnixStream) {
-    if let Err(error) = stream.set_read_timeout(Some(GUEST_REPORT_DRAIN_TIMEOUT)) {
-        // Without the bound a reporter that never closes would pin its
-        // connection's thread and door slot, so a timeout that cannot be set ends
-        // the drain here: the reply is already written, and the peer's
-        // close ends the connection all the same.
-        tracing::debug!(error = %error, "the guest report drain could not arm its bound");
-        return;
-    }
-    let mut sink = [0u8; 1024];
-    loop {
-        match std::io::Read::read(stream, &mut sink) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
     }
 }
 
@@ -2752,8 +2700,7 @@ static QUEUE_FULL_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 /// The queue-full warn line's rate limit.
 const QUEUE_FULL_WARN_EVERY: Duration = Duration::from_secs(10);
 
-/// Serve one guest door request. The guest door never closes a connection
-/// first: the reply is written, then the door waits for the guest to close.
+/// Serves one guest door request.
 fn serve_guest_door(
     mut stream: UnixStream,
     boxes: &BoxRegistry,
@@ -2785,17 +2732,13 @@ fn serve_guest_door(
                             },
                         )
                     }
-                    None => {
-                        let served = refuse_past_cap(
-                            &mut stream,
-                            "guest ask",
-                            ControlDoor::GuestReports.name(),
-                            gauges.guest_ask_cap(),
-                            &ASK_CAP_WARNED,
-                        );
-                        drain_until_peer_closes(&mut stream);
-                        served
-                    }
+                    None => refuse_past_cap(
+                        &mut stream,
+                        "guest ask",
+                        ControlDoor::GuestReports.name(),
+                        gauges.guest_ask_cap(),
+                        &ASK_CAP_WARNED,
+                    ),
                 };
             }
             order.apply(|| publish_reply(publisher.as_ref(), &publish))
@@ -2821,9 +2764,8 @@ fn serve_guest_door(
             }
         }
     };
-    let served = write_json_line(&mut stream, &reply);
-    drain_until_peer_closes(&mut stream);
-    served
+
+    write_json_line(&mut stream, &reply)
 }
 
 /// The reply to a publish: the forward, or the refusal.
@@ -2961,13 +2903,11 @@ fn serve_asked_publish(
         Decision::Bind(grant) => {
             let reply = published_reply(&publish, publisher.bind(&grant, false));
             let _ = write_json_line(&mut stream, &reply);
-            drain_until_peer_closes(&mut stream);
             return;
         }
         Decision::Refuse(refusal) => {
             publisher.audit_refusal(&publish, &refusal);
             let _ = write_json_line(&mut stream, &published_reply(&publish, Err(refusal)));
-            drain_until_peer_closes(&mut stream);
             return;
         }
     };
@@ -2998,7 +2938,6 @@ fn serve_asked_publish(
                 publisher.audit_refusal(&publish, &refused);
                 let _ = write_json_line(&mut stream, &published_reply(&publish, Err(refused)));
                 drop(unaudited);
-                drain_until_peer_closes(&mut stream);
                 return;
             }
         };
@@ -3015,10 +2954,10 @@ fn serve_asked_publish(
         log_and_audit_offer(audit_path, offered);
     }
     // The guest's close is its withdrawal: it cancels the ask when it comes
-    // first, and is the drain's end when it comes after the reply.
+    // before the answer.
     let watcher_boxes = boxes.clone();
     let watcher_audit = audit_path.to_path_buf();
-    let closed = match watch_peer_close(&stream, move || {
+    if let Err(error) = watch_peer_close(&stream, move || {
         if let Some(ended) = watcher_boxes.cancel_ask(ask_id) {
             tracing::info!(
                 %ask_id,
@@ -3032,15 +2971,11 @@ fn serve_asked_publish(
             }
         }
     }) {
-        Ok(closed) => closed,
-        Err(error) => {
-            // Without the watcher a withdrawn ask would stay offered, so the
-            // ask is cancelled now rather than left with no way to end.
-            tracing::warn!(%ask_id, %error, "could not watch the asking connection");
-            let _ = boxes.cancel_ask(ask_id);
-            std::sync::mpsc::channel().1
-        }
-    };
+        // Without the watcher a withdrawn ask would stay offered, so the
+        // ask is cancelled now rather than left with no way to end.
+        tracing::warn!(%ask_id, %error, "could not watch the asking connection");
+        let _ = boxes.cancel_ask(ask_id);
+    }
     // The book sends every ask's end exactly once; a closed channel means
     // the registry itself went away, which is the daemon's stop.
     let outcome = outcome
@@ -3072,11 +3007,8 @@ fn serve_asked_publish(
         }
     };
     let _ = write_json_line(&mut stream, &reply);
-    if closed.recv_timeout(GUEST_REPORT_DRAIN_TIMEOUT).is_err() {
-        // A guest that holds its end past the drain bound is ended here,
-        // which also releases the watcher's read.
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    }
+    // Ends the watcher's read.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 /// Serve an attached host client's subscription to one row's pending asks
@@ -5780,9 +5712,7 @@ mod tests {
         let mut guest = guest_ask(&host, &web, ASK_PORT);
         let offer = expect_offer(&mut client);
         assert!(
-            guest
-                .next_within(GUEST_REPORT_DRAIN_TIMEOUT + Duration::from_secs(1))
-                .is_none(),
+            guest.next_within(Duration::from_secs(3)).is_none(),
             "nothing answers the ask while the human has not"
         );
         assert_eq!(host.boxes.pending_ask_count(), 1);

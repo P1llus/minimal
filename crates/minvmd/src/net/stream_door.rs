@@ -4,9 +4,9 @@
 //! and none to the credential proxy. The guest daemon opens a stream here
 //! instead, with a header that names the box and one of two purposes. Where
 //! the stream lands is decided on the host: the credential proxy's own
-//! socket, or `127.0.0.1` at a port the `[host-exposures]` table lists at
-//! that moment. The header carries no host address, so the guest cannot
-//! choose another target.
+//! socket, or the host's own loopback (`127.0.0.1`, then `::1`) at a port
+//! the `[host-exposures]` table lists at that moment. The header carries no
+//! host address, so the guest cannot choose another target.
 //!
 //! It does not decide which box may open which stream beyond what the box's
 //! registration says (a credentialed grant). Whether a box's policy lets it
@@ -15,7 +15,7 @@
 #![cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,24 +41,13 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the connect on the host side may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the guest side may read nothing of what the door wrote before
-/// the door closes anyway.
-#[cfg(target_os = "linux")]
-const UNREAD_STALL: Duration = Duration::from_secs(10);
-
-/// How often the door looks at what is still unread.
-#[cfg(target_os = "linux")]
-const UNREAD_TICK: Duration = Duration::from_millis(5);
-
-/// How long the host side may stay silent once the guest has stopped
-/// sending.
+/// How long the open direction of a half-closed stream may stay silent.
 #[cfg(not(test))]
 const HALF_CLOSED_IDLE: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const HALF_CLOSED_IDLE: Duration = Duration::from_millis(400);
 
-/// How often the silent host side checks whether the guest has stopped
-/// sending.
+/// How often a silent direction checks whether the other one has ended.
 const IDLE_TICK: Duration = Duration::from_millis(200);
 
 /// The streams the door carries at once.
@@ -331,12 +320,11 @@ impl Door {
                 if !open_now {
                     return Err(StreamRefusal::PortNotExposed);
                 }
-                // Always the host's IPv4 loopback. The header names a port
+                // Always the host's own loopback. The header names a port
                 // and nothing else.
-                let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-                match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(target)).await {
-                    Ok(Ok(stream)) => Ok((Target::Host(stream), None)),
-                    _ => Err(StreamRefusal::ConnectFailed),
+                match dial_loopback(port).await {
+                    Ok(stream) => Ok((Target::Host(stream), None)),
+                    Err(_) => Err(StreamRefusal::ConnectFailed),
                 }
             }
         }
@@ -356,14 +344,14 @@ impl Door {
     }
 }
 
-/// Copies bytes both ways until the host side stops sending, a side fails,
-/// or the guest has stopped sending and the host side stays silent for
-/// [`HALF_CLOSED_IDLE`].
+/// Copies bytes both ways until both directions have ended or one fails.
 ///
-/// The guest's end of file is passed on as a shutdown of the host side's
-/// write half, so a box that sends a request and half-closes still gets its
-/// answer. The host side's end of file ends the stream: libkrun turns it
-/// into a reset of the guest's connection, so nothing could follow it.
+/// Each side's end of file is passed on as a shutdown of the other side's
+/// write half, so a half-closed connection keeps its open direction. Once
+/// one direction has ended, the other may stay silent for
+/// [`HALF_CLOSED_IDLE`] and is then ended too: a side that closed entirely
+/// looks the same as one that only stopped sending, and a peer that never
+/// answers must not hold the stream's place for good.
 async fn splice<H>(guest: BufReader<UnixStream>, host: H) -> io::Result<()>
 where
     H: tokio::io::AsyncRead + tokio::io::AsyncWrite,
@@ -371,100 +359,73 @@ where
     // Bytes the guest sent behind its header are the stream's first bytes.
     let early = guest.buffer().to_vec();
     let mut guest = guest.into_inner();
+    let (mut guest_read, mut guest_write) = guest.split();
     let (mut host_read, mut host_write) = tokio::io::split(host);
-    let guest_ended = std::sync::atomic::AtomicBool::new(false);
-    let result = {
-        let (mut guest_read, mut guest_write) = guest.split();
-        let up = async {
-            host_write.write_all(&early).await?;
-            let copied = tokio::io::copy(&mut guest_read, &mut host_write).await;
-            guest_ended.store(true, Ordering::Release);
-            copied?;
-            host_write.shutdown().await?;
-            std::future::pending::<io::Result<()>>().await
-        };
-        let down = async {
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut idle = Duration::ZERO;
-            loop {
-                match tokio::time::timeout(IDLE_TICK, host_read.read(&mut buf)).await {
-                    Ok(Ok(0)) => return Ok(()),
-                    Ok(Ok(n)) => {
-                        idle = Duration::ZERO;
-                        guest_write.write_all(&buf[..n]).await?;
-                    }
-                    Ok(Err(error)) => return Err(error),
-                    Err(_tick) if guest_ended.load(Ordering::Acquire) => {
-                        idle += IDLE_TICK;
-                        if idle >= HALF_CLOSED_IDLE {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                    }
-                    Err(_tick) => {}
+    let half_closed = std::sync::atomic::AtomicBool::new(false);
+    let up = async {
+        if let Err(error) = host_write.write_all(&early).await {
+            half_closed.store(true, Ordering::Release);
+            return Err(error);
+        }
+        copy_one_way(&mut guest_read, &mut host_write, &half_closed).await
+    };
+    let down = copy_one_way(&mut host_read, &mut guest_write, &half_closed);
+    let (up, down) = tokio::join!(up, down);
+    up.and(down)
+}
+
+/// Copies `from` to `to` until `from` ends, then shuts down `to`'s write
+/// half.
+async fn copy_one_way<R, W>(
+    from: &mut R,
+    to: &mut W,
+    half_closed: &std::sync::atomic::AtomicBool,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut idle = Duration::ZERO;
+    let result = loop {
+        match tokio::time::timeout(IDLE_TICK, from.read(&mut buf)).await {
+            Ok(Ok(0)) => break Ok(()),
+            Ok(Ok(n)) => {
+                idle = Duration::ZERO;
+                if let Err(error) = to.write_all(&buf[..n]).await {
+                    break Err(error);
                 }
             }
-        };
-        tokio::select! {
-            failed = up => failed,
-            ended = down => ended,
+            Ok(Err(error)) => break Err(error),
+            Err(_tick) => {
+                if half_closed.load(Ordering::Acquire) {
+                    idle += IDLE_TICK;
+                    if idle >= HALF_CLOSED_IDLE {
+                        break Err(io::ErrorKind::TimedOut.into());
+                    }
+                }
+            }
         }
     };
-    wait_until_read(&guest).await;
+    half_closed.store(true, Ordering::Release);
+    let _ = to.shutdown().await;
     result
 }
 
-/// Waits until libkrun has read everything the door wrote to `guest`, so
-/// the door can close the socket.
-///
-/// When that socket hangs up, libkrun resets the guest's connection at once
-/// and drops what it had not yet read. A socket hangs up as soon as both of
-/// its directions are shut, so once the guest has stopped sending, a close
-/// or shutdown here would cut the tail of what the host side sent. The wait
-/// ends early when the guest closed its end or reads nothing for
-/// [`UNREAD_STALL`].
-#[cfg(target_os = "linux")]
-async fn wait_until_read(guest: &UnixStream) {
-    let mut unread = unread_bytes(guest);
-    let mut stalled = Duration::ZERO;
-    while unread > 0 && stalled < UNREAD_STALL {
-        let closed = tokio::time::timeout(
-            UNREAD_TICK,
-            guest.ready(tokio::io::Interest::WRITABLE | tokio::io::Interest::ERROR),
-        )
-        .await;
-        match closed {
-            Ok(Ok(ready)) if ready.is_write_closed() || ready.is_error() => return,
-            Ok(Err(_)) => return,
-            Ok(Ok(_)) => tokio::time::sleep(UNREAD_TICK).await,
-            Err(_tick) => {}
+/// Connects to `port` on the host's loopback: `127.0.0.1` first, then `::1`
+/// when nothing listens on the port there, so a service bound to one family
+/// alone is reachable.
+async fn dial_loopback(port: u16) -> io::Result<TcpStream> {
+    let dial = |address: std::net::IpAddr| async move {
+        tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((address, port)))
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+    };
+    match dial(Ipv4Addr::LOCALHOST.into()).await {
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            dial(Ipv6Addr::LOCALHOST.into()).await
         }
-        let now = unread_bytes(guest);
-        stalled = if now < unread {
-            Duration::ZERO
-        } else {
-            stalled + UNREAD_TICK
-        };
-        unread = now;
-    }
-}
-
-/// libkrun on macOS sees the end of file behind the data it has not read
-/// yet, so the door can close at once.
-#[cfg(not(target_os = "linux"))]
-async fn wait_until_read(_guest: &UnixStream) {}
-
-/// The bytes written to `sock` that its peer has not read yet.
-#[cfg(target_os = "linux")]
-fn unread_bytes(sock: &UnixStream) -> usize {
-    use std::os::fd::AsRawFd as _;
-    let mut unread: libc::c_int = 0;
-    // SAFETY: the descriptor is open for as long as `sock` is borrowed, and
-    // the request writes one int to the pointer it is given.
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::TIOCOUTQ, &raw mut unread) };
-    if rc == 0 {
-        usize::try_from(unread).unwrap_or(0)
-    } else {
-        0
+        dialled => dialled,
     }
 }
 
@@ -506,14 +467,9 @@ async fn write_reply(guest: &mut BufReader<UnixStream>, reply: StreamReply) -> i
     guest.get_mut().write_all(&line).await
 }
 
-/// Answers a refusal and closes once the guest side has read it.
+/// Answers a refusal. The caller then closes the connection.
 async fn refuse(guest: &mut BufReader<UnixStream>, reason: StreamRefusal) {
-    if write_reply(guest, StreamReply::Refused { reason })
-        .await
-        .is_ok()
-    {
-        wait_until_read(guest.get_ref()).await;
-    }
+    let _ = write_reply(guest, StreamReply::Refused { reason }).await;
 }
 
 #[cfg(test)]
@@ -650,6 +606,13 @@ mod tests {
     fn loopback_service() -> u16 {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        reverse_on(listener, b"");
+        port
+    }
+
+    /// Answers each connection on `listener` with its request reversed and
+    /// `mark` behind it.
+    fn reverse_on(listener: std::net::TcpListener, mark: &'static [u8]) {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
@@ -659,11 +622,59 @@ mod tests {
                     let mut request = Vec::new();
                     stream.read_to_end(&mut request).unwrap();
                     request.reverse();
+                    request.extend_from_slice(mark);
                     stream.write_all(&request).unwrap();
                 });
             }
         });
-        port
+    }
+
+    #[test]
+    fn a_host_port_stream_tries_the_ipv4_loopback_first_and_the_ipv6_one_when_refused() {
+        use std::net::TcpListener;
+        // A service on `::1` alone, and one port with a different service
+        // in each family.
+        let Ok(v6_only) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            eprintln!("skipped: this machine has no IPv6 loopback");
+            return;
+        };
+        let v6_port = v6_only.local_addr().unwrap().port();
+        assert!(
+            std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, v6_port)).is_err(),
+            "nothing listens on the port in IPv4"
+        );
+        reverse_on(v6_only, b"6");
+        let (both_v4, both_v6) = std::iter::repeat_with(|| {
+            let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+            let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, v4.local_addr().ok()?.port())).ok()?;
+            Some((v4, v6))
+        })
+        .take(20)
+        .flatten()
+        .next()
+        .expect("one port free in both families");
+        let both_port = both_v4.local_addr().unwrap().port();
+        reverse_on(both_v4, b"4");
+        reverse_on(both_v6, b"6");
+
+        let bed = bed(HostExposures::fixed(vec![
+            HostExposure::tcp(v6_port),
+            HostExposure::tcp(both_port),
+        ]));
+        let web = bed.boxes.register_client_box(spec("web", false)).unwrap();
+        let answer = |port| {
+            let (mut guest, reply) = Guest::open(&bed.door, &host_port(web.box_id(), port));
+            assert_eq!(reply, StreamReply::Open);
+            guest.write(b"ab");
+            guest
+                .reader
+                .get_ref()
+                .shutdown(std::net::Shutdown::Write)
+                .unwrap();
+            guest.read_to_end()
+        };
+        assert_eq!(answer(v6_port), b"ba6");
+        assert_eq!(answer(both_port), b"ba4");
     }
 
     #[test]
@@ -961,35 +972,5 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(guest.reply(), refused(StreamRefusal::Malformed));
         assert!(started.elapsed() + Duration::from_millis(200) >= HEADER_TIMEOUT);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_door_holds_a_socket_until_its_peer_has_read_or_closed() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            for peer_reads in [true, false] {
-                let (mut door, mut peer) = UnixStream::pair().unwrap();
-                door.write_all(&[7u8; 50_000]).await.unwrap();
-                let waiting = wait_until_read(&door);
-                tokio::pin!(waiting);
-                // Nothing was read yet, so the wait holds.
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(100), &mut waiting)
-                        .await
-                        .is_err()
-                );
-                if peer_reads {
-                    let mut tail = vec![0u8; 50_000];
-                    peer.read_exact(&mut tail).await.unwrap();
-                } else {
-                    drop(peer);
-                }
-                tokio::time::timeout(WAIT, waiting).await.unwrap();
-            }
-        });
     }
 }

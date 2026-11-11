@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Marius Iversen <marius.iversen@elastic.co>
+Date: Wed, 11 Nov 2026 16:49:55 +0100
+Subject: [PATCH] virtio/vsock: deliver what a unix proxy's host wrote before
+ it closed
+
+When the host end of a stream mapped to a unix socket closes, the socket
+hangs up. process_event() took the HANG_UP arm first, reset the guest's
+connection and never read what the host had written just before closing.
+A socket also hangs up when the guest has shut down its send direction and
+the host then shuts down its own, so a request and response exchange in
+which the guest half-closes first lost the tail of the response. With one
+megabyte written and closed at once, the guest received about 890 kB.
+
+A hang-up on a connected proxy is now handled like readable data: the
+proxy reads until recv() returns end of file and only then ends the
+connection. The macOS epoll emulation reports end of file as IN, so it
+takes the same path.
+
+End of file without a hang-up means the host only stopped sending. The
+guest is now told so with VSOCK_OP_SHUTDOWN and can keep sending, where it
+was reset before. The connection is reset when the guest stops sending
+too, or when a later send to the host socket fails.
+---
+ src/devices/src/virtio/vsock/muxer.rs     |   6 ++
+ src/devices/src/virtio/vsock/muxer_rxq.rs |  17 ++++
+ src/devices/src/virtio/vsock/unix.rs      | 104 +++++++++++++++++++---
+ 3 files changed, 113 insertions(+), 14 deletions(-)
+
+diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+index 2a8a68e..fb051f7 100644
+--- a/src/devices/src/virtio/vsock/muxer.rs
++++ b/src/devices/src/virtio/vsock/muxer.rs
+@@ -52,6 +52,12 @@ pub enum MuxerRx {
+         local_port: u32,
+         peer_port: u32,
+     },
++    Shutdown {
++        local_port: u32,
++        peer_port: u32,
++        flags: u32,
++        fwd_cnt: u32,
++    },
+     CreditRequest {
+         local_port: u32,
+         peer_port: u32,
+diff --git a/src/devices/src/virtio/vsock/muxer_rxq.rs b/src/devices/src/virtio/vsock/muxer_rxq.rs
+index ef1f7d7..443fc50 100644
+--- a/src/devices/src/virtio/vsock/muxer_rxq.rs
++++ b/src/devices/src/virtio/vsock/muxer_rxq.rs
+@@ -150,6 +150,23 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+ 
+             pkt.set_len(0);
+         }
++        MuxerRx::Shutdown {
++            local_port,
++            peer_port,
++            flags,
++            fwd_cnt,
++        } => {
++            pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
++                .set_src_cid(uapi::VSOCK_HOST_CID)
++                .set_dst_cid(cid)
++                .set_src_port(local_port)
++                .set_dst_port(peer_port)
++                .set_len(0)
++                .set_type(uapi::VSOCK_TYPE_STREAM)
++                .set_flags(flags)
++                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
++                .set_fwd_cnt(fwd_cnt);
++        }
+         MuxerRx::GetnameResponse {
+             local_port,
+             peer_port,
+diff --git a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
+index 90550de..867e391 100644
+--- a/src/devices/src/virtio/vsock/unix.rs
++++ b/src/devices/src/virtio/vsock/unix.rs
+@@ -53,6 +53,9 @@ pub struct UnixProxy {
+     /// dropped here once `peer_fwd_cnt` passes it. Used to bound outstanding
+     /// packets below the guest's per-skb receive-queue ceiling.
+     outstanding: VecDeque<Wrapping<u32>>,
++    /// The host side reached the end of its stream: everything it wrote has
++    /// been read and it will write no more.
++    host_eof: bool,
+ }
+ 
+ fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
+@@ -129,6 +132,7 @@ impl UnixProxy {
+             push_cnt: Wrapping(0),
+             rx_cnt: Wrapping(0),
+             outstanding: VecDeque::new(),
++            host_eof: false,
+         })
+     }
+ 
+@@ -164,6 +168,7 @@ impl UnixProxy {
+             push_cnt: Wrapping(0),
+             path: Default::default(),
+             outstanding: VecDeque::new(),
++            host_eof: false,
+         }
+     }
+ 
+@@ -211,6 +216,62 @@ impl UnixProxy {
+         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+     }
+ 
++    /// Tell the guest that the host side will send no more data. The guest
++    /// reads what was delivered, then end of file, and can still send.
++    fn push_shutdown_send(&self) {
++        debug!(
++            "push_shutdown_send: id: {}, peer_port: {}, local_port: {}",
++            self.id, self.peer_port, self.local_port
++        );
++
++        let rx = MuxerRx::Shutdown {
++            local_port: self.local_port,
++            peer_port: self.peer_port,
++            flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
++            // The guest takes its send credit from every packet's header.
++            fwd_cnt: self.tx_cnt.0,
++        };
++
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++    }
++
++    /// The host side's stream has been read to its end. If the host socket
++    /// hung up, or the guest has already stopped sending, nothing can flow
++    /// in either direction and the connection is reset. Otherwise only the
++    /// guest's receive direction ends.
++    fn host_ended(&mut self, hung_up: bool, mut update: ProxyUpdate) -> ProxyUpdate {
++        let guest_done_sending = self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
++
++        if hung_up || guest_done_sending {
++            debug!("host_ended: sending reset: id={}", self.id);
++            self.push_reset();
++            self.status = ProxyStatus::Closed;
++            if hung_up {
++                update.remove_proxy = ProxyRemoval::Deferred;
++            }
++        } else {
++            debug!("host_ended: sending shutdown: id={}", self.id);
++            self.push_shutdown_send();
++        }
++
++        // End of file stays readable, so stop polling for it.
++        update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
++        update.signal_queue = true;
++        update
++    }
++
++    /// The host socket refused data from the guest after the host side had
++    /// ended its own stream: the host closed completely. Reset the guest.
++    fn host_gone(&mut self) -> ProxyUpdate {
++        self.push_reset();
++        self.status = ProxyStatus::Closed;
++        ProxyUpdate {
++            signal_queue: true,
++            remove_proxy: ProxyRemoval::Deferred,
++            ..Default::default()
++        }
++    }
++
+     fn peer_avail_credit(&self) -> usize {
+         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+     }
+@@ -327,7 +388,7 @@ impl UnixProxy {
+                         pkt.hdr().len() + cnt
+                     }
+                     RecvPkt::Close => {
+-                        self.status = ProxyStatus::Closed;
++                        self.host_eof = true;
+                         0
+                     }
+                     RecvPkt::Error => 0,
+@@ -519,6 +580,10 @@ impl Proxy for UnixProxy {
+ 
+         debug!("sendmsg ret={ret}");
+ 
++        if ret < 0 && self.host_eof && self.status != ProxyStatus::Closed {
++            return self.host_gone();
++        }
++
+         update
+     }
+ 
+@@ -550,6 +615,11 @@ impl Proxy for UnixProxy {
+         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+         self.drain_forwarded();
+ 
++        // Nothing is left to read once the host side has ended.
++        if self.host_eof {
++            return ProxyUpdate::default();
++        }
++
+         self.status = ProxyStatus::Connected;
+ 
+         ProxyUpdate {
+@@ -607,7 +677,11 @@ impl Proxy for UnixProxy {
+         self.peer_shutdown |= shutdown;
+         self.do_shutdown(pkt);
+ 
+-        if self.peer_shutdown != SHUTDOWN_MASK {
++        // Both sides have stopped sending once the guest does so after the
++        // host side has ended.
++        let both_ended =
++            self.host_eof && self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
++        if self.peer_shutdown != SHUTDOWN_MASK && !both_ended {
+             return ProxyUpdate::default();
+         }
+ 
+@@ -643,7 +717,17 @@ impl Proxy for UnixProxy {
+     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
+         let mut update = ProxyUpdate::default();
+ 
+-        if evset.contains(EventSet::HANG_UP) {
++        // A connected proxy whose host socket hung up may still hold data the
++        // host wrote before it closed. It is read to the end below, like any
++        // readable socket, and the connection ends once the read returns end
++        // of file. A proxy that waits for credit is not polled, and reads the
++        // rest when its credit arrives.
++        let draining = matches!(
++            self.status,
++            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
++        );
++
++        if evset.contains(EventSet::HANG_UP) && !draining {
+             debug!("process_event: HANG_UP");
+ 
+             if self.status == ProxyStatus::Connecting {
+@@ -660,7 +744,7 @@ impl Proxy for UnixProxy {
+             return update;
+         }
+ 
+-        if evset.contains(EventSet::IN) {
++        if evset.intersects(EventSet::IN | EventSet::HANG_UP) {
+             debug!("process_event: IN");
+             if self.status == ProxyStatus::Connected {
+                 let (signal_queue, wait_credit) = self.recv_pkt();
+@@ -686,16 +770,8 @@ impl Proxy for UnixProxy {
+                     update.signal_queue = true;
+                 }
+ 
+-                if self.status == ProxyStatus::Closed {
+-                    debug!(
+-                        "process_event: endpoint closed, sending reset: id={}",
+-                        self.id
+-                    );
+-
+-                    self.push_reset();
+-                    update.signal_queue = true;
+-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+-                    return update;
++                if self.host_eof {
++                    return self.host_ended(evset.contains(EventSet::HANG_UP), update);
+                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
+                     debug!("process_event: WaitingCreditUpdate");
+                     update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
