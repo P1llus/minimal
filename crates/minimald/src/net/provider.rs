@@ -374,26 +374,6 @@ impl OwnAddressReporter {
         self.runtime_ingress.attached();
     }
 
-    /// Marks this box as attaching, with its lease not reported yet
-    /// (NET-070). While the mark stands, the hostname proxy refuses a peer
-    /// off the node, because it cannot tell this box's connections from one.
-    /// [`Self::report`] ends the mark, and so does [`Self::attach_ended`].
-    pub(crate) fn attach_started(&self) {
-        self.registry
-            .write()
-            .expect("hostname registry lock poisoned")
-            .begin_lease_attach(self.session_id);
-    }
-
-    /// Ends the mark [`Self::attach_started`] set, for an attach that failed
-    /// or was abandoned before it reported a lease (NET-070).
-    pub(crate) fn attach_ended(&self) {
-        self.registry
-            .write()
-            .expect("hostname registry lock poisoned")
-            .end_lease_attach(self.session_id);
-    }
-
     /// The switch lease the attach reported for this box ([`Self::report`]),
     /// or `None` before an attach reported one. On a VM host the daemon
     /// builds the box's tap itself after the spawn
@@ -757,39 +737,14 @@ impl Network for OwnIpNetwork {
     /// one of the session's task addresses for a task launch (NET-138), and
     /// a self-allocated one otherwise, which only a native switch draws.
     fn plan(&self) -> PlanFuture<'_> {
-        Box::pin(async move {
-            // NET-070: from here until the attach reports the lease, the box's
-            // connections come from a lease the node does not hold. A failed
-            // plan never reaches `attach` or `abandon`, so it ends the mark
-            // itself.
-            if let Some(own_address) = &self.own_address {
-                own_address.attach_started();
-            }
-            let planned = self.reserve().await;
-            if planned.is_err()
-                && let Some(own_address) = &self.own_address
-            {
-                own_address.attach_ended();
-            }
-            planned
-        })
+        Box::pin(self.reserve())
     }
 
     /// Relay the sandbox's tap onto the switch and apply its ingress. The
     /// reservation is read, not taken, until the attach has succeeded: a
     /// failed attach hands the release to [`abandon`](Self::abandon) (017-008).
     fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
-        Box::pin(async move {
-            let attached = self.attach_reserved(spawned).await;
-            // NET-070: a successful attach ended the mark when it reported
-            // the lease. A failed one ends it here.
-            if attached.is_err()
-                && let Some(own_address) = &self.own_address
-            {
-                own_address.attach_ended();
-            }
-            attached
-        })
+        Box::pin(self.attach_reserved(spawned))
     }
 
     /// Give the lease back; the sandbox layer runs this on every path out of a
@@ -799,10 +754,6 @@ impl Network for OwnIpNetwork {
     /// which is what lets the same box's re-attach re-hand its address.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(async move {
-            // NET-070: an abandoned launch reports no lease.
-            if let Some(own_address) = &self.own_address {
-                own_address.attach_ended();
-            }
             let Some(reserved) = self
                 .reserved
                 .lock()

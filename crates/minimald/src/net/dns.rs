@@ -977,10 +977,6 @@ pub struct HostnameRegistry {
     /// the node's own listener at that port keeps answering and the stopped
     /// box is not silently impersonated by it.
     stopped: HashSet<SessionId>,
-    /// Boxes whose host launch has started and has not reached
-    /// [`Self::mark_running`] yet ([`Self::begin_host_launch`]). Nothing
-    /// reads this set.
-    launching: HashSet<SessionId>,
     /// Each box's current host launch number ([`Self::begin_host_launch`]).
     /// A host loop that a newer launch replaced holds an older number, so its
     /// late stop mark ([`Self::mark_host_stopped`]) changes nothing (NET-070).
@@ -1004,10 +1000,6 @@ pub struct HostnameRegistry {
     /// ([`Self::register_host_net`]). On a VM node the host answers their
     /// names, so this registry's zone holds no address for them.
     host_net: HashSet<SessionId>,
-    /// The own-address boxes whose attach is running and has not reported
-    /// its switch lease yet ([`Self::begin_lease_attach`]). Nothing reads
-    /// this set.
-    attaching: HashSet<SessionId>,
     /// The lease-to-session map that names a caller (NET-070): the switch
     /// address a proxied request's peer resolves to a session with. Reserved
     /// switch addresses never appear in it — the switch hands a PTask a lease
@@ -1169,7 +1161,6 @@ impl HostnameRegistry {
             publish_moves: None,
             hands: HashMap::new(),
             stopped: HashSet::new(),
-            launching: HashSet::new(),
             host_launches: HashMap::new(),
             last_host_launch: 0,
             by_host: HashMap::new(),
@@ -1177,7 +1168,6 @@ impl HostnameRegistry {
             own: HashMap::new(),
             callers: HashMap::new(),
             host_net: HashSet::new(),
-            attaching: HashSet::new(),
             by_lease: HashMap::new(),
             zone_track: ZoneTrack::default(),
         }
@@ -1478,40 +1468,14 @@ impl HostnameRegistry {
         })
     }
 
-    /// Marks `session_id` as an own-address box whose attach has started and
-    /// whose switch lease is not reported yet (NET-070). The mark ends at
-    /// [`Self::report_own_address`], at [`Self::end_lease_attach`] when the
-    /// attach fails or is abandoned, at [`Self::mark_stopped`] and at
-    /// [`Self::forget_own_address`].
-    pub fn begin_lease_attach(&mut self, session_id: SessionId) {
-        self.attaching.insert(session_id);
-    }
-
-    /// Marks `session_id` as a box whose host launch has started. The mark
-    /// ends at [`Self::mark_running`], at [`Self::mark_stopped`], at
-    /// [`Self::forget_own_address`] and at [`Self::end_host_launch`] when the
-    /// launch fails.
-    ///
-    /// Returns this launch's number, which becomes the box's current launch.
+    /// Numbers a host launch of `session_id`, and makes that number the
+    /// box's current launch.
     /// The host's loop passes it to [`Self::mark_host_stopped`], so the loop
     /// of a host this launch replaced cannot mark the new host's box stopped.
     pub fn begin_host_launch(&mut self, session_id: SessionId) -> u64 {
         self.last_host_launch += 1;
         self.host_launches.insert(session_id, self.last_host_launch);
-        self.launching.insert(session_id);
         self.last_host_launch
-    }
-
-    /// Ends the launch mark [`Self::begin_host_launch`] set, for a launch
-    /// that failed (NET-070).
-    pub fn end_host_launch(&mut self, session_id: SessionId) {
-        self.launching.remove(&session_id);
-    }
-
-    /// Ends the attach mark [`Self::begin_lease_attach`] set, for an attach
-    /// that failed or was abandoned before it reported a lease (NET-070).
-    pub fn end_lease_attach(&mut self, session_id: SessionId) {
-        self.attaching.remove(&session_id);
     }
 
     /// The own-address publishes standing inside the reserved local range, as
@@ -1678,7 +1642,6 @@ impl HostnameRegistry {
             ports: ports.clone(),
         };
         self.by_lease.insert(lease, session_id);
-        self.attaching.remove(&session_id);
         // Recorded before the route is derived from it, so the route this
         // registration installs already targets the lease it is reporting:
         // [`Self::own_route`] reads the box's lease from this map, and a box
@@ -1706,8 +1669,6 @@ impl HostnameRegistry {
         }
         self.callers.remove(&session_id);
         self.host_net.remove(&session_id);
-        self.attaching.remove(&session_id);
-        self.launching.remove(&session_id);
         self.host_launches.remove(&session_id);
         self.stopped.remove(&session_id);
     }
@@ -2098,7 +2059,6 @@ impl HostnameRegistry {
     /// state every box is in from finalize, so a caller that never saw a stop
     /// changes nothing (NET-011).
     pub fn mark_running(&mut self, session_id: SessionId) {
-        self.launching.remove(&session_id);
         if self.stopped.remove(&session_id) {
             tracing::info!(
                 session_id = %session_id,
@@ -2141,8 +2101,6 @@ impl HostnameRegistry {
     /// [`Self::mark_host_stopped`].
     pub fn mark_stopped(&mut self, session_id: SessionId) {
         // A stopped box has no attach in flight (NET-070).
-        self.attaching.remove(&session_id);
-        self.launching.remove(&session_id);
         if self.stopped.insert(session_id) {
             tracing::info!(
                 session_id = %session_id,

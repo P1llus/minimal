@@ -962,12 +962,6 @@ impl BoxActor {
             None => (None, spawn.await),
         };
         let (host, task) = spawned.map_err(|e| {
-            // A failed spawn reaches no host loop, so nothing else ends the
-            // launch mark (NET-070).
-            self.hostnames
-                .write()
-                .expect("hostname registry lock poisoned")
-                .end_host_launch(record.id);
             AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
         })?;
         // The confirmation was a read, not a reservation: the VM host daemon
