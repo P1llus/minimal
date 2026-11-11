@@ -64,11 +64,6 @@ pub struct BoxCfg {
     /// Indexed by [`Direction::code`].
     pub default_action: [u8; 3],
     pub _pad: [u8; 5],
-    /// All zero: the box has no address of that kind.
-    pub addr4: [u8; 4],
-    pub addr6: [u8; 16],
-    /// The box's link-local address.
-    pub ll6: [u8; 16],
 }
 
 #[repr(C)]
@@ -510,7 +505,7 @@ fn line(out: &mut String, condition: &str) {
 }
 
 fn constants(out: &mut String) {
-    let pairs: [(&str, u64); 16] = [
+    let pairs: [(&str, u64); 17] = [
         ("BP_ABI_VERSION", u64::from(VERSION)),
         ("BP_ENDPOINTS_MAX", u64::from(ENDPOINTS_MAX)),
         ("BP_RULES_MAX", RULES_MAX as u64),
@@ -522,6 +517,7 @@ fn constants(out: &mut String) {
         ("BP_DENY", u64::from(ACTION_DENY)),
         ("BP_ALLOW", u64::from(ACTION_ALLOW)),
         ("BP_REDIRECT", u64::from(ACTION_REDIRECT)),
+        ("BP_SET_OWN", SetId::OWN.0),
         ("BP_EV_NET", u64::from(EVENT_NET)),
         ("BP_EV_LISTEN", u64::from(EVENT_LISTEN)),
         ("BP_P_TCP", u64::from(Protocols::TCP.bits())),
@@ -547,7 +543,7 @@ fn constants(out: &mut String) {
 }
 
 layouts! {
-    BoxCfg = "bp_box_cfg", 52 { flags, generation, default_action, addr4, addr6, ll6 }
+    BoxCfg = "bp_box_cfg", 16 { flags, generation, default_action }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
     Rules = "bp_rules", 388 { count, r }
     Rule4Key = "bp_rule4_key", 24 { prefixlen, box_id, generation, dir, addr }
@@ -736,9 +732,6 @@ pub fn box_cfg(compiled: &Compiled, generation: u32) -> BoxCfg {
             verdict_code(c.defaults.bind),
         ],
         _pad: [0; 5],
-        addr4: c.addrs.v4.map_or([0; 4], |a| a.octets()),
-        addr6: c.addrs.v6.map_or([0; 16], |a| a.octets()),
-        ll6: c.addrs.link_local6.map_or([0; 16], |a| a.octets()),
     }
 }
 
@@ -831,6 +824,16 @@ pub fn pin_key(box_id: u64, addr: IpAddr) -> PinKey {
     }
 }
 
+/// The value that makes an address one of the box's own. It never expires:
+/// the daemon takes it out when the address is no longer the box's.
+#[must_use]
+pub const fn own_address_val() -> PinVal {
+    PinVal {
+        expiry_ns: u64::MAX,
+        set_id: SetId::OWN.0,
+    }
+}
+
 #[must_use]
 pub const fn pin_val(set: SetId, expiry_ns: u64) -> PinVal {
     PinVal {
@@ -871,7 +874,7 @@ mod tests {
     #[test]
     fn asserts_cover_every_struct_and_constant() {
         let c = c_static_asserts();
-        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 52,"));
+        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 16,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
         assert!(c.contains("BP_ABI_VERSION == 4"));

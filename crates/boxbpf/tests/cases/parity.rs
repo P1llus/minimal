@@ -7,7 +7,7 @@ use boxbpf::BoxId;
 use netpol::{
     Action, Compiled, Defaults, Direction, Flow, FlowVerdict, Origin, PortRange, Prefix, Protocol,
     Protocols, Rule, Target, Verdict,
-    base::{BasePolicy, BoxAddrs},
+    base::BasePolicy,
     compile::{Options, compile},
     policy::{BoxAction, BoxPolicy, BoxRule},
 };
@@ -19,8 +19,10 @@ fn kernel_denies(result: &str) -> bool {
 }
 
 fn evaluator_denies(h: &Harness, id: BoxId, compiled: &Compiled, flow: &Flow) -> bool {
-    let pinned = h.handles.pinned_set(id, flow.remote);
-    compiled.evaluate(flow, pinned).verdict == FlowVerdict::Deny
+    compiled
+        .evaluate(flow, |addr| h.handles.pinned_set(id, addr))
+        .verdict
+        == FlowVerdict::Deny
 }
 
 #[test]
@@ -58,7 +60,6 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         },
         endpoints: Vec::new(),
         source_check: false,
-        addrs: BoxAddrs::default(),
     };
     let policy = BoxPolicy {
         rules: vec![
@@ -263,7 +264,6 @@ fn a_rule_that_names_no_protocol_does_not_end_the_list() {
         },
         endpoints: Vec::new(),
         source_check: false,
-        addrs: BoxAddrs::default(),
     };
     let policy = BoxPolicy {
         rules: vec![BoxRule {
@@ -301,7 +301,7 @@ fn a_rule_that_names_no_protocol_does_not_end_the_list() {
         port: 9,
         local: None,
     };
-    let decision = compiled.evaluate(&flow, None);
+    let decision = compiled.evaluate(&flow, |_| None);
     assert_eq!(
         (decision.verdict, decision.rule),
         (FlowVerdict::Deny, Some(1))

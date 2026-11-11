@@ -289,7 +289,7 @@ mod guest {
                         local: None,
                     };
                     let expect_deny =
-                        live.compiled().evaluate(&flow, None).verdict == FlowVerdict::Deny;
+                        live.compiled().evaluate(&flow, |_| None).verdict == FlowVerdict::Deny;
                     total += 1;
                     denied += usize::from(out == refused);
                     if (out == refused) != expect_deny {

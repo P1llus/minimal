@@ -957,7 +957,7 @@ impl Engine {
                     .expect("engine lock")
                     .pinned_set(of.id, flow.remote)
             });
-        compiled.evaluate(flow, pinned)
+        compiled.evaluate(flow, |_| pinned)
     }
 
     /// Makes the box's entry match `facts`, when a launch finds the entry

@@ -122,11 +122,32 @@ fn pins_follow_their_names_through_a_change_of_policy() {
         };
         let verdict = live
             .compiled()
-            .evaluate(&flow, h.handles.pinned_set(id, addr))
+            .evaluate(&flow, |addr| h.handles.pinned_set(id, addr))
             .verdict;
         assert_eq!(verdict == FlowVerdict::Deny, denied, "{addr}");
     }
     assert_eq!(h.handles.usage(id).expect("usage").pins, 2);
+
+    // An address of the box itself is its own whatever names resolve to
+    // it, through a pin and through a change of policy.
+    let itself = IpAddr::V4(h.v4(5, 9));
+    h.handles.add_own_address(id, itself).expect("own address");
+    h.handles
+        .pin(id, itself, "kept.test", Duration::from_millis(1))
+        .expect("a name that resolves to the box itself");
+    assert_eq!(h.handles.pinned_set(id, itself), Some(netpol::SetId::OWN));
+    assert_eq!(h.handles.usage(id).expect("usage").pins, 2);
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(h.handles.sweep_pins().expect("sweep"), 0);
+    let again = live.spec().clone();
+    h.handles
+        .reconfigure(&mut live, again)
+        .expect("reconfigure");
+    assert_eq!(h.handles.pinned_set(id, itself), Some(netpol::SetId::OWN));
+    h.handles
+        .remove_own_address(id, itself)
+        .expect("remove the address");
+    assert_eq!(h.handles.pinned_set(id, itself), None);
 }
 
 fn prefixes(h: &Harness, group: u8, count: u8) -> Vec<Prefix> {

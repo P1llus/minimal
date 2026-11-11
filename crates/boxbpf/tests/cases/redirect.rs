@@ -175,7 +175,7 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
         local: None,
     };
     assert_eq!(
-        box_a.compiled().evaluate(&flow, None).verdict,
+        box_a.compiled().evaluate(&flow, |_| None).verdict,
         FlowVerdict::Redirect(SocketAddr::V4(ep_a.v4.expect("v4")))
     );
 }

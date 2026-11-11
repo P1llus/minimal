@@ -8,7 +8,7 @@
 //! it per box and never read a policy back from the kernel.
 
 use std::{
-    collections::HashMap as StdHashMap,
+    collections::{BTreeSet, HashMap as StdHashMap},
     io,
     net::{IpAddr, SocketAddr},
     os::fd::{BorrowedFd, OwnedFd},
@@ -93,6 +93,9 @@ struct Held {
     /// set an address is pinned to, what to delete, and when.
     pins: PinTable,
     pins_refused: u64,
+    /// The box's own addresses. They are in the kernel's pin map too, in
+    /// the set [`SetId::OWN`].
+    own: BTreeSet<IpAddr>,
 }
 
 /// A box whose policy is in the maps, with what is needed to change it.
@@ -530,6 +533,7 @@ impl Handles {
                         keys,
                         pins: PinTable::new(),
                         pins_refused: 0,
+                        own: BTreeSet::new(),
                     },
                 );
             }
@@ -543,7 +547,7 @@ impl Handles {
         absent_ok(self.box_cfg.remove(&id.0)).map_err(Error::map("box_cfg"))?;
         if let Some(held) = self.boxes.remove(&id.0) {
             self.discard(held.keys);
-            for addr in held.pins.addresses() {
+            for addr in held.pins.addresses().chain(held.own.iter().copied()) {
                 absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
                     .map_err(Error::map("pins"))?;
             }
@@ -607,6 +611,44 @@ impl Handles {
         self.remove(live.id)
     }
 
+    /// Makes `addr` one of the box's own addresses: a source its packets
+    /// may have, and an address the rules for [`netpol::Target::OwnAddresses`]
+    /// apply to. It takes effect with the one map write, with no change of
+    /// the box's policy. A box has one for each of its network namespaces:
+    /// call this when a namespace gets its address, before anything runs
+    /// in it, and [`Self::remove_own_address`] when the namespace is gone.
+    ///
+    /// An address has one place in the engine's table. If it was pinned
+    /// for a name, it is the box's own from now on.
+    pub fn add_own_address(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
+        let addr = netpol::eval::canonical(addr);
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Err(Error::UnknownBox);
+        };
+        self.pins
+            .insert(
+                &Raw(abi::pin_key(id.0, addr)),
+                &Raw(abi::own_address_val()),
+                0,
+            )
+            .map_err(Error::map("pins"))?;
+        held.pins.remove(addr);
+        held.own.insert(addr);
+        Ok(())
+    }
+
+    pub fn remove_own_address(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
+        let addr = netpol::eval::canonical(addr);
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Ok(());
+        };
+        if held.own.remove(&addr) {
+            absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
+                .map_err(Error::map("pins"))?;
+        }
+        Ok(())
+    }
+
     /// Pins an address the resolver answered for `name` to the set of that
     /// name in the box's policy, for `ttl` from now. A pin of the same
     /// address replaces the earlier one.
@@ -616,6 +658,9 @@ impl Handles {
     ///
     /// A box at its pin limit gets [`Error::PinLimit`], and the refusal is
     /// counted in [`Self::usage`].
+    ///
+    /// One of the box's own addresses stays its own: a name that resolves
+    /// to the box itself needs no pin, since a box may always reach itself.
     pub fn pin(&mut self, id: BoxId, addr: IpAddr, name: &str, ttl: Duration) -> Result<(), Error> {
         let limit = self.limits.pins;
         let now = sys::boot_time_ns();
@@ -625,6 +670,9 @@ impl Handles {
         let Some(set) = held.compiled.set_for_name(name) else {
             return Err(Error::NameWithoutRule(name.to_owned()));
         };
+        if held.own.contains(&netpol::eval::canonical(addr)) {
+            return Ok(());
+        }
         if held.pins.len() >= limit && !held.pins.contains(addr) {
             // Pins that have run out give their room back first.
             for dead in held.pins.take_expired(now) {
@@ -649,19 +697,27 @@ impl Handles {
     }
 
     pub fn unpin(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
-        absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr)))).map_err(Error::map("pins"))?;
-        if let Some(held) = self.boxes.get_mut(&id.0) {
-            held.pins.remove(addr);
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Ok(());
+        };
+        if held.own.contains(&netpol::eval::canonical(addr)) {
+            return Ok(());
         }
+        absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr)))).map_err(Error::map("pins"))?;
+        held.pins.remove(addr);
         Ok(())
     }
 
-    /// The set an address is pinned to right now, for the evaluator.
+    /// The set an address is in right now: the set of the name it is
+    /// pinned for, or [`SetId::OWN`] for one of the box's own addresses.
+    /// This is the table the evaluator asks.
     #[must_use]
     pub fn pinned_set(&self, id: BoxId, addr: IpAddr) -> Option<SetId> {
-        self.boxes
-            .get(&id.0)
-            .and_then(|held| held.pins.live(addr, sys::boot_time_ns()))
+        let held = self.boxes.get(&id.0)?;
+        if held.own.contains(&netpol::eval::canonical(addr)) {
+            return Some(SetId::OWN);
+        }
+        held.pins.live(addr, sys::boot_time_ns())
     }
 
     /// Deletes pins whose time has passed. The programs already ignore

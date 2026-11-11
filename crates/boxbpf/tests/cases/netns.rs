@@ -7,7 +7,7 @@ use std::process::Command;
 use netpol::{
     Direction, Flow, FlowVerdict, PortRange, Protocol, Protocols, Target,
     abi::{Hook, Reason},
-    base::{BoxAddrs, Deployment, Mode, NodeKind, PortOf, VirtualNetwork},
+    base::{Deployment, Mode, NodeKind, PortOf, VirtualNetwork},
     policy::{BoxAction, BoxPolicy, BoxRule},
 };
 
@@ -80,11 +80,6 @@ fn a_box_in_its_own_network_namespace() {
     let mut events = h.handles.take_events().expect("event source");
 
     let mut deployment = Deployment::new(NodeKind::Guest, Mode::OwnIp);
-    deployment.addrs = BoxAddrs {
-        v4: Some(BOX4.parse().expect("address")),
-        v6: Some(BOX6.parse().expect("address")),
-        link_local6: Some(BOX_LL6.parse().expect("address")),
-    };
     deployment.network = Some(VirtualNetwork {
         subnet: "10.99.0.0/24".parse().expect("prefix"),
         gateway: ip(GATEWAY4),
@@ -99,6 +94,13 @@ fn a_box_in_its_own_network_namespace() {
         v6: None,
     });
     let mut live = h.install("own", deployment, policy(8, 128));
+    // The addresses of the box's namespace, as the daemon adds them when
+    // it gives the namespace its interface.
+    for own in [BOX4, BOX6, BOX_LL6] {
+        h.handles
+            .add_own_address(live.id(), ip(own))
+            .expect("own address");
+    }
 
     // The peer's namespaces belong to a process outside any box. The box's
     // network namespace is created by a process inside the box cgroup, as
@@ -371,6 +373,33 @@ fn a_box_in_its_own_network_namespace() {
             && e.src == ip(BOX4_OTHER)),
         "{seen:?}"
     );
+    // The box talks to its own address and not to the other one on its
+    // interface, which is just an address of the virtual network.
+    let refused_by_peer = format!("err {}", libc::ECONNREFUSED);
+    assert_eq!(probe(&["tcp", BOX4, "9", "500"]), refused_by_peer);
+    assert_eq!(probe(&["tcp", BOX4_OTHER, "9", "500"]), refused());
+    // A second address of the box, as a task run in a namespace of its
+    // own gets one: a source and "itself" from the one write on, and
+    // neither once it is taken away. The policy is not compiled again.
+    let generation = live.compiled().clone();
+    h.handles
+        .add_own_address(live.id(), ip(BOX4_OTHER))
+        .expect("a second address");
+    assert_eq!(
+        probe(&["tcp-from", BOX4_OTHER, PEER4, "18080", "700"]),
+        "ok connected"
+    );
+    assert_eq!(probe(&["tcp", BOX4_OTHER, "9", "500"]), refused_by_peer);
+    h.handles
+        .remove_own_address(live.id(), ip(BOX4_OTHER))
+        .expect("remove the address");
+    assert_eq!(
+        probe(&["tcp-from", BOX4_OTHER, PEER4, "18080", "700"]),
+        "err timeout"
+    );
+    assert_eq!(probe(&["tcp", BOX4_OTHER, "9", "500"]), refused());
+    assert!(std::sync::Arc::ptr_eq(&generation, live.compiled()));
+    let _drops = Harness::drain(&mut events);
 
     // A box can give itself any link-local address. Only the one the
     // engine knows as the box's is a source.
@@ -427,7 +456,7 @@ fn a_box_in_its_own_network_namespace() {
     };
     assert_eq!(inbound(BOX4), "err timeout");
     assert_eq!(
-        live.compiled().evaluate(&ingress, None).verdict,
+        live.compiled().evaluate(&ingress, |_| None).verdict,
         FlowVerdict::Deny
     );
     let seen = Harness::drain(&mut events);
@@ -452,7 +481,7 @@ fn a_box_in_its_own_network_namespace() {
         inbound(BOX6)
     );
     assert_eq!(
-        live.compiled().evaluate(&ingress, None).verdict,
+        live.compiled().evaluate(&ingress, |_| None).verdict,
         FlowVerdict::Allow
     );
 

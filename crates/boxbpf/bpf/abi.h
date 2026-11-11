@@ -32,7 +32,7 @@
 #define BP_REDIRECT 2 /* egress only: rewrite the destination to an endpoint */
 
 /* bp_box_cfg.flags */
-#define BP_F_CHECK_SRC (1u << 0) /* egress source must be addr4 or addr6 */
+#define BP_F_CHECK_SRC (1u << 0) /* egress source must be one of the box's own addresses */
 #define BP_F_LOG_FLOWS (1u << 1) /* event for each allowed connect and send */
 #define BP_F_HAS_SETS  (1u << 2) /* the box has name-set rules: look up pins */
 
@@ -50,9 +50,6 @@ struct bp_box_cfg {
 	__u32 generation;
 	__u8  default_action[BP_DIR_COUNT];
 	__u8  _pad[5];
-	__u32 addr4;     /* the box's addresses; all zero: none of that kind */
-	__u8  addr6[16];
-	__u8  ll6[16];   /* its link-local address */
 };
 
 #define BP_RULES_MAX 32
@@ -104,7 +101,16 @@ struct bp_rule6_key {
 	__u8  addr[16];
 };
 
-/* An address the resolver answered for a name, and the set of that name. */
+/*
+ * An address in one of the box's sets: one the resolver answered for a
+ * name, with the set of that name, or one of the box's own addresses, with
+ * BP_SET_OWN and an expiry that never comes. A box has an own address for
+ * each of its network namespaces, and userspace adds and removes them while
+ * the box runs. The source check reads them, and so do the rules for "the
+ * box's own addresses", which are the rules of that set.
+ */
+#define BP_SET_OWN 0
+
 struct bp_pin_key {
 	__u64 box_id;
 	__u8  addr[16];

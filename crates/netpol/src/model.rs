@@ -577,7 +577,8 @@ impl NamePattern {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        SetId(hash)
+        // Not the id of the box's own addresses.
+        SetId(hash.max(1))
     }
 }
 
@@ -639,6 +640,10 @@ pub enum Target {
     Net(Prefix),
     /// The addresses the resolver has pinned for names the pattern matches.
     Names(NamePattern),
+    /// The addresses of the box itself: the set the daemon keeps with
+    /// `add_own_address`. A box with several network namespaces has
+    /// several, and they come and go while the box runs.
+    OwnAddresses,
 }
 
 impl fmt::Display for Target {
@@ -647,6 +652,7 @@ impl fmt::Display for Target {
             Self::Any => f.write_str("any"),
             Self::Net(p) => write!(f, "{p}"),
             Self::Names(n) => write!(f, "{n}"),
+            Self::OwnAddresses => f.write_str("own addresses"),
         }
     }
 }
@@ -808,7 +814,7 @@ impl Rule {
             return true;
         }
         match &self.target {
-            Target::Names(_) => true,
+            Target::Names(_) | Target::OwnAddresses => true,
             Target::Any => false,
             Target::Net(prefix) => range.covers(prefix),
         }
@@ -878,11 +884,18 @@ impl Endpoint {
     }
 }
 
-/// Identifies the rules of one name pattern in a compiled policy. See
-/// [`NamePattern::set_id`].
+/// Identifies a set of addresses and the rules for it in a compiled policy:
+/// the addresses pinned for one name pattern ([`NamePattern::set_id`]), or
+/// the box's own addresses ([`SetId::OWN`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SetId(pub u64);
+
+impl SetId {
+    /// The box's own addresses. Their entries never expire, and the source
+    /// check reads them.
+    pub const OWN: Self = Self(0);
+}
 
 #[cfg(test)]
 mod tests {

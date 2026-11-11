@@ -146,7 +146,7 @@ fn a_socket_is_judged_as_the_box_that_created_it() {
 fn a_udp_socket_gets_the_answers_of_many_peers() {
     use netpol::{
         Defaults, Verdict,
-        base::{BasePolicy, BoxAddrs},
+        base::BasePolicy,
         compile::{Options, compile},
     };
 
@@ -166,7 +166,6 @@ fn a_udp_socket_gets_the_answers_of_many_peers() {
         },
         endpoints: Vec::new(),
         source_check: false,
-        addrs: BoxAddrs::default(),
     };
     let compiled = compile(&base, &BoxPolicy::default(), Options::default()).expect("compile");
     let id = h.new_box("u");

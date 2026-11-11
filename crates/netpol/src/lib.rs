@@ -25,7 +25,7 @@ pub mod pins;
 pub mod policy;
 
 pub use compile::{CompileError, Compiled, NetEntry, SetEntry, Slot, Spec, compile};
-pub use eval::{Decision, Flow, FlowVerdict, Reason, evaluate_ordered};
+pub use eval::{Decision, Flow, FlowVerdict, Pinned, Reason, evaluate_ordered};
 pub use model::{
     Action, Defaults, Direction, Endpoint, EndpointIndex, Family, ModelError, NamePattern, Origin,
     PortRange, Prefix, Protocol, Protocols, Rule, SetId, Target, Verdict,

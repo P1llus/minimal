@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     abi,
-    base::{BasePolicy, BoxAddrs, Deployment, base_policy},
+    base::{BasePolicy, Deployment, base_policy},
     model::{
         Action, Defaults, Direction, Endpoint, EndpointIndex, Family, NamePattern, PortRange,
         Prefix, Protocols, Rule, SetId, Target, Verdict,
@@ -122,7 +122,6 @@ pub struct BoxConfig {
     pub defaults: Defaults,
     pub source_check: bool,
     pub log_flows: bool,
-    pub addrs: BoxAddrs,
 }
 
 /// Everything the engine holds for one box, as plain data.
@@ -290,7 +289,7 @@ fn validate(rules: &[Rule], endpoints: &[(EndpointIndex, Endpoint)]) -> Result<(
             Target::Any => &[Family::V4, Family::V6],
             Target::Net(p) if p.family() == Family::V4 => &[Family::V4],
             Target::Net(_) => &[Family::V6],
-            Target::Names(_) => &[],
+            Target::Names(_) | Target::OwnAddresses => &[],
         };
         if let Some(family) = needed.iter().copied().find(|f| !endpoint.has(*f)) {
             return Err(CompileError::EndpointFamily {
@@ -374,7 +373,7 @@ pub fn compile(
                 .filter_map(|(slot, r)| match &r.target {
                     Target::Any => Some((*slot, Prefix::all(family), *r)),
                     Target::Net(p) if p.family() == family => Some((*slot, *p, *r)),
-                    Target::Net(_) | Target::Names(_) => None,
+                    Target::Net(_) | Target::Names(_) | Target::OwnAddresses => None,
                 })
                 .collect();
             let prefixes: BTreeSet<Prefix> = scoped.iter().map(|(_, p, _)| *p).collect();
@@ -419,22 +418,32 @@ pub fn compile(
         }
         names.push((n.clone(), id));
     }
+    // The sets: one per name pattern, and the box's own addresses.
+    let own = (None, SetId::OWN);
+    let by_name = names.iter().map(|(pattern, id)| (Some(pattern), *id));
     let mut sets = Vec::new();
-    for (pattern, id) in &names {
+    for (pattern, id) in std::iter::once(own).chain(by_name) {
         for direction in Direction::ALL {
             let list = prune(
                 numbered
                     .iter()
                     .filter(|(_, r)| r.direction == direction)
-                    .filter(|(_, r)| matches!(&r.target, Target::Names(n) if n.covers(pattern)))
+                    .filter(|(_, r)| match (&r.target, pattern) {
+                        (Target::Names(n), Some(pattern)) => n.covers(pattern),
+                        (Target::OwnAddresses, None) => true,
+                        _ => false,
+                    })
                     .map(|(s, _)| *s),
             );
             if list.is_empty() {
                 continue;
             }
-            check_len(direction, pattern, &list, &rules)?;
+            match pattern {
+                Some(pattern) => check_len(direction, pattern, &list, &rules)?,
+                None => check_len(direction, &Target::OwnAddresses, &list, &rules)?,
+            }
             sets.push(SetEntry {
-                id: *id,
+                id,
                 direction,
                 rules: list,
             });
@@ -450,7 +459,6 @@ pub fn compile(
             },
             source_check: base.source_check,
             log_flows: options.log_flows,
-            addrs: base.addrs,
         },
         rules,
         protected,
@@ -864,7 +872,7 @@ mod tests {
             port: 443,
             local: None,
         };
-        c.evaluate(&flow, pinned).verdict
+        c.evaluate(&flow, |_| pinned).verdict
     }
 
     #[test]
@@ -902,7 +910,7 @@ mod tests {
                 port: 443,
                 local: None,
             },
-            None,
+            |_| None,
         );
         let by = &c.rules[usize::from(d.rule.unwrap())];
         assert_eq!(
@@ -1017,7 +1025,6 @@ mod tests {
     #[test]
     fn a_box_whose_transport_enforces_gets_an_entry_that_refuses_nothing() {
         let mut deployment = Deployment::new(NodeKind::Native, Mode::OwnIp);
-        deployment.addrs.v4 = Some("100.64.7.2".parse().unwrap());
         deployment.transport_enforces = true;
         let spec = Spec {
             deployment,

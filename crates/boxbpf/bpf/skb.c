@@ -178,21 +178,32 @@ static __always_inline int addr_eq(const __u32 *a, const __u32 *b)
 #define ICMPV6_NEIGHBOUR_SOL 135
 #define ICMPV6_MLD2_REPORT  143
 
+/* Whether the packet's source is one of the box's own addresses. */
+static __always_inline int from_own(__u64 box, const struct pkt *p)
+{
+	struct bp_pin_key pk = {};
+	struct bp_pin_val *pin;
+
+	pk.box_id = box;
+	__builtin_memcpy(pk.addr, p->saddr, 16);
+	pk.family = p->family;
+	pin = bpf_map_lookup_elem(&pins, &pk);
+	return pin && pin->set_id == BP_SET_OWN;
+}
+
 /*
  * Sources a box with BP_F_CHECK_SRC may use: its own addresses and loopback.
  * A box can bind any link-local address (IPV6_FREEBIND needs no privilege),
- * so of those only its own passes. The unspecified IPv6 address passes for
- * what the kernel sends before the interface has an address: duplicate
- * address detection and the multicast reports that go with it.
+ * so of those only one in its own set passes. The unspecified IPv6 address
+ * passes for what the kernel sends before the interface has an address:
+ * duplicate address detection and the multicast reports that go with it.
  */
-static __always_inline int src_ok(const struct bp_box_cfg *cfg, const struct pkt *p)
+static __always_inline int src_ok(__u64 box, const struct pkt *p)
 {
-	__u32 own[4];
-
-	if (p->family == 4)
-		return (cfg->addr4 && p->saddr[0] == cfg->addr4) ||
-		       (p->saddr[0] & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
-	if (!(p->saddr[0] | p->saddr[1] | p->saddr[2])) {
+	if (p->family == 4) {
+		if ((p->saddr[0] & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000))
+			return 1;
+	} else if (!(p->saddr[0] | p->saddr[1] | p->saddr[2])) {
 		if (p->saddr[3] == bpf_htonl(1))
 			return 1;
 		if (!p->saddr[3])
@@ -203,14 +214,7 @@ static __always_inline int src_ok(const struct bp_box_cfg *cfg, const struct pkt
 				p->icmp_type == ICMPV6_NEIGHBOUR_SOL ||
 				p->icmp_type == ICMPV6_MLD2_REPORT);
 	}
-	/* Word compares: older clang turns a memcmp builtin into a call, which
-	 * BPF does not have. An all-zero config address matches nothing here:
-	 * the unspecified source was dealt with above. */
-	__builtin_memcpy(own, cfg->addr6, 16);
-	if (addr_eq(p->saddr, own))
-		return 1;
-	__builtin_memcpy(own, cfg->ll6, 16);
-	return addr_eq(p->saddr, own);
+	return from_own(box, p);
 }
 
 static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struct pkt *p)
@@ -328,7 +332,7 @@ int bp_egress(struct __sk_buff *skb)
 		return drop(skb, box, BP_H_EGRESS, &p, &v, BP_R_MALFORMED);
 	if (!cfg)
 		return drop(skb, box, BP_H_EGRESS, &p, &v, BP_R_NO_CFG);
-	if ((cfg->flags & BP_F_CHECK_SRC) && !src_ok(cfg, &p))
+	if ((cfg->flags & BP_F_CHECK_SRC) && !src_ok(box, &p))
 		return drop(skb, box, BP_H_EGRESS, &p, &v, BP_R_SRC_ADDR);
 
 	if (p.pbit == BP_P_TCP && (p.later_frag || (p.tcp_flags & (TCP_SYN | TCP_ACK)) != TCP_SYN))

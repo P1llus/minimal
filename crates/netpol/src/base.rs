@@ -49,16 +49,6 @@ impl Mode {
     }
 }
 
-/// The addresses of the box itself. Empty for `host_ip` and `none`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoxAddrs {
-    pub v4: Option<Ipv4Addr>,
-    pub v6: Option<Ipv6Addr>,
-    /// The link-local address of the box's interface. The kernel sends
-    /// neighbour discovery from it, so the source check must know it.
-    pub link_local6: Option<Ipv6Addr>,
-}
-
 /// The virtual network a box, or the node of a `host_ip` box, sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualNetwork {
@@ -100,7 +90,6 @@ pub struct EndpointRange {
 pub struct Deployment {
     pub node: NodeKind,
     pub mode: Mode,
-    pub addrs: BoxAddrs,
     pub network: Option<VirtualNetwork>,
     /// Whether the transport under the box carries IPv6 at all.
     pub transport_ipv6: bool,
@@ -128,11 +117,6 @@ impl Deployment {
         Self {
             node,
             mode,
-            addrs: BoxAddrs {
-                v4: None,
-                v6: None,
-                link_local6: None,
-            },
             network: None,
             transport_ipv6: false,
             host_exposures: Vec::new(),
@@ -160,9 +144,9 @@ pub struct BasePolicy {
     pub protected: Vec<Prefix>,
     pub defaults: Defaults,
     pub endpoints: Vec<(EndpointIndex, Endpoint)>,
-    /// Packets must leave from the box's own addresses.
+    /// Packets must leave from the box's own addresses: the set the daemon
+    /// keeps for the box.
     pub source_check: bool,
-    pub addrs: BoxAddrs,
 }
 
 impl BasePolicy {
@@ -181,11 +165,6 @@ impl BasePolicy {
             },
             endpoints: Vec::new(),
             source_check: false,
-            addrs: BoxAddrs {
-                v4: None,
-                v6: None,
-                link_local6: None,
-            },
         }
     }
 }
@@ -366,16 +345,17 @@ fn steering(proxy: Option<Endpoint>, names: &[NamePattern], out: &mut Vec<Rule>)
 
 /// A box with its own namespace may always talk to itself: its loopback
 /// and its own addresses, both ways.
-fn own_addresses(addrs: &BoxAddrs, out: &mut Vec<Rule>) {
-    let own = [addrs.v4.map(IpAddr::V4), addrs.v6.map(IpAddr::V6)]
-        .into_iter()
-        .flatten()
-        .map(Prefix::host);
-    for prefix in [LOOPBACK4, LOOPBACK6].into_iter().chain(own) {
+fn own_addresses(out: &mut Vec<Rule>) {
+    let itself = [
+        Target::Net(LOOPBACK4),
+        Target::Net(LOOPBACK6),
+        Target::OwnAddresses,
+    ];
+    for target in itself {
         for direction in [Direction::Egress, Direction::Ingress] {
             out.push(Rule::new(
                 direction,
-                Target::Net(prefix),
+                target.clone(),
                 Action::Allow,
                 Origin::OwnAddresses,
             ));
@@ -508,7 +488,7 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
     );
     steering(d.services.credential_proxy, &d.steered, &mut before);
     if d.mode.own_namespace() {
-        own_addresses(&d.addrs, &mut before);
+        own_addresses(&mut before);
     }
     if d.mode == Mode::OwnIp && d.transport_ipv6 {
         neighbour_discovery(&mut before);
@@ -536,7 +516,6 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
         defaults: defaults(d.mode),
         endpoints,
         source_check: d.mode == Mode::OwnIp,
-        addrs: d.addrs,
     }
 }
 
@@ -584,7 +563,6 @@ mod tests {
 
     fn own_ip() -> Deployment {
         let mut d = Deployment::new(NodeKind::Guest, Mode::OwnIp);
-        d.addrs.v4 = Some(Ipv4Addr::new(192, 168, 127, 5));
         d.network = Some(VirtualNetwork {
             subnet: "192.168.127.0/24".parse().unwrap(),
             gateway: "192.168.127.1".parse().unwrap(),
@@ -722,7 +700,6 @@ mod tests {
     fn ipv6_transport_adds_neighbour_discovery_and_drops_the_ipv6_limit() {
         let mut d = own_ip();
         d.transport_ipv6 = true;
-        d.addrs.v6 = Some("fd00::5".parse().unwrap());
         d.services.resolver = Some(Endpoint {
             v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
             v6: Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0)),

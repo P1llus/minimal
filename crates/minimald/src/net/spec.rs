@@ -370,7 +370,10 @@ mod tests {
             port: 443,
             local: None,
         };
-        assert_eq!(compiled.evaluate(&flow, None).verdict, FlowVerdict::Allow);
+        assert_eq!(
+            compiled.evaluate(&flow, |_| None).verdict,
+            FlowVerdict::Allow
+        );
     }
 
     #[test]
@@ -398,10 +401,10 @@ mod tests {
             local: None,
         };
         assert!(matches!(
-            compiled.evaluate(&to(53, Protocol::Udp), None).verdict,
+            compiled.evaluate(&to(53, Protocol::Udp), |_| None).verdict,
             FlowVerdict::Redirect(_)
         ));
-        let api = compiled.evaluate(&to(80, Protocol::Tcp), None);
+        let api = compiled.evaluate(&to(80, Protocol::Tcp), |_| None);
         assert_eq!(api.verdict, FlowVerdict::Deny);
         let rule = &compiled.rules[usize::from(api.rule.expect("a rule decided"))];
         assert_eq!(
