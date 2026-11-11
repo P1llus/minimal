@@ -20,6 +20,9 @@ use super::{ExitStatus, title};
 /// The descriptor a spawner process finds its peer's socket on.
 pub(crate) const SOCKET_FD: libc::c_int = 3;
 
+/// How often a running foreground job is looked at, in milliseconds.
+const FOREGROUND_WATCH: libc::c_int = 100;
+
 /// What a job's direct child is.
 enum Process {
     Container(Box<core::Container>),
@@ -114,8 +117,12 @@ impl Server {
             events: libc::POLLIN,
             revents: 0,
         }));
+        // A foreground job can stop without ending, which no descriptor
+        // reports, so it is looked at between waits.
+        let foreground = self.jobs.values().any(|job| job.foreground);
+        let wait = if foreground { FOREGROUND_WATCH } else { -1 };
         // SAFETY: `poll` reads and writes the `pollfd`s of the vector.
-        let ready = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, -1) };
+        let ready = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, wait) };
         if ready < 0 {
             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 self.peer_gone = true;
@@ -127,10 +134,27 @@ impl Server {
                 self.reap(*id);
             }
         }
+        if foreground {
+            self.watch_foreground();
+        }
         if polled[0].revents != 0 {
             match wire::recv::<Request>(&mut self.sock) {
                 Ok(Some((request, fds))) => self.handle(request, fds),
                 Ok(None) | Err(_) => self.peer_gone = true,
+            }
+        }
+    }
+
+    /// Suspends this process's own job with any foreground job whose
+    /// program the terminal's stop key has stopped. Returns once the job
+    /// is continued.
+    fn watch_foreground(&mut self) {
+        for job in self.jobs.values_mut().filter(|job| job.foreground) {
+            let Some((init, _)) = job.init() else {
+                continue;
+            };
+            if core::foreground_program(init).is_some_and(core::stopped) {
+                core::suspend_with(init);
             }
         }
     }
@@ -164,8 +188,10 @@ impl Server {
                 Err(error) => ExitStatus::failure(format!("waiting for the enter shim: {error}")),
             },
         };
-        if job.foreground {
-            core::retake_foreground();
+        if job.foreground
+            && let Some((init, _)) = &job.init
+        {
+            core::retake_foreground(*init);
         }
         self.jobs.remove(&id);
         self.send(&Event::Exited { id, status }, &[]);
@@ -198,6 +224,12 @@ impl Server {
                                 foreground,
                             },
                         );
+                        // The group a foreground job runs in is its first
+                        // process's, which is needed even after a job that
+                        // ends at once.
+                        if foreground && let Some(job) = self.jobs.get_mut(&id) {
+                            job.init();
+                        }
                     }
                     Err(error) => self.fail(id, &error),
                 }

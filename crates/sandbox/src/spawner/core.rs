@@ -217,18 +217,18 @@ pub(crate) fn pinned_init(supervisor: u32) -> Option<(u32, OwnedFd)> {
     (enter::init_of(supervisor).ok()? == pid).then_some((pid, pinned))
 }
 
-/// Makes this process's group the foreground group of its terminal again,
-/// once a job that had taken the foreground is gone. Does nothing for a
-/// process with no terminal.
-pub(crate) fn retake_foreground() {
-    let Ok(terminal) = std::fs::File::options()
+/// The terminal of this process's session, if it has one.
+fn terminal() -> Option<std::fs::File> {
+    std::fs::File::options()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOCTTY)
         .open("/dev/tty")
-    else {
-        return;
-    };
+        .ok()
+}
+
+/// Makes `group` the foreground process group of `terminal`.
+fn set_foreground(terminal: &std::fs::File, group: libc::pid_t) {
     // SAFETY: plain syscalls on this thread's signal mask and the terminal.
     unsafe {
         // A background group that changes the foreground group is stopped
@@ -238,8 +238,78 @@ pub(crate) fn retake_foreground() {
         libc::sigemptyset(&raw mut ttou);
         libc::sigaddset(&raw mut ttou, libc::SIGTTOU);
         libc::pthread_sigmask(libc::SIG_BLOCK, &raw const ttou, &raw mut before);
-        libc::tcsetpgrp(terminal.as_raw_fd(), libc::getpgrp());
+        libc::tcsetpgrp(terminal.as_raw_fd(), group);
         libc::pthread_sigmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
+    }
+}
+
+/// Makes this process's group the foreground group of its terminal again,
+/// once a job that had taken the foreground is gone. Does nothing for a
+/// process with no terminal, and nothing while another group, such as the
+/// user's shell, has the foreground.
+pub(crate) fn retake_foreground(job_group: u32) {
+    let Some(terminal) = terminal() else {
+        return;
+    };
+    // SAFETY: `tcgetpgrp` and `getpgrp` only read.
+    if unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) } == job_group as libc::pid_t {
+        set_foreground(&terminal, unsafe { libc::getpgrp() });
+    }
+}
+
+/// The program a foreground job's first process runs: its one long-lived
+/// child. `None` before it is started and once it is gone.
+pub(crate) fn foreground_program(init: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{init}/task/{init}/children"))
+        .ok()?
+        .split_ascii_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether `pid` is stopped by a job control signal.
+pub(crate) fn stopped(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('T'))
+    })
+}
+
+/// Does for a stopped foreground job what a shell's job expects of the
+/// command in front of it, as `sudo` does for the command it runs.
+///
+/// The job's process group `job_group` holds the terminal and has stopped,
+/// which the user's shell cannot see: the shell waits for the process that
+/// asked for the job. So this process takes the terminal back and stops
+/// its own process group, the requester included. The shell then sees its
+/// job stopped and takes the terminal. When the shell continues the job,
+/// this process runs on from here: it hands the terminal back to the job's
+/// group, if the shell continued it in the foreground, and continues it.
+///
+/// Does nothing unless the job's group is the terminal's foreground group.
+pub(crate) fn suspend_with(job_group: u32) {
+    let job_group = job_group as libc::pid_t;
+    let Some(terminal) = terminal() else {
+        return;
+    };
+    // SAFETY: plain syscalls on the terminal and on process groups this
+    // process started or belongs to.
+    unsafe {
+        if libc::tcgetpgrp(terminal.as_raw_fd()) != job_group {
+            return;
+        }
+        let own = libc::getpgrp();
+        set_foreground(&terminal, own);
+        libc::kill(0, libc::SIGTSTP);
+        // A process with one thread has stopped inside the call above. One
+        // with more stops a moment after it. Both run on from here only
+        // once they are continued.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if libc::tcgetpgrp(terminal.as_raw_fd()) == own {
+            set_foreground(&terminal, job_group);
+        }
+        libc::kill(-job_group, libc::SIGCONT);
     }
 }
 
