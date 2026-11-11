@@ -194,10 +194,8 @@ impl EgressPolicy {
     }
 
     /// The deny-all section: `Some(vec![])` on every `allow_*` dimension —
-    /// the shape `--deny-all-egress` writes and
-    /// [`crate::core::egress::EgressRules::from_policy`] compiles to rules
-    /// admitting nothing — with nothing denied, because there is nothing
-    /// left to subtract from. The materialized form of
+    /// the shape `--deny-all-egress` writes, which admits nothing — with
+    /// nothing denied, because there is nothing left to subtract from. The materialized form of
     /// [`EffectiveEgress::DenyAll`], built as a real section so the gate
     /// compiles the default through the same path a declared one takes.
     ///
@@ -2463,15 +2461,6 @@ mod tests {
     /// admit nothing.
     #[test]
     fn effective_egress_by_phase_and_opt_out() {
-        use crate::core::egress::EgressRules;
-
-        // The address of the resolver Minimal owns for a box: the switch
-        // gateway, whose value only shapes the carve-out's key.
-        let resolver = [100, 64, 0, 1];
-        // The box's lease, whose value only shapes the source check
-        // (NET-084), proven in `core::egress`; what is asserted here is the
-        // egress dimensions the deny-all arm materializes to.
-        let lease = [100, 64, 0, 9];
         let declared = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".into()]),
             ..EgressPolicy::default()
@@ -2543,136 +2532,9 @@ mod tests {
             );
         }
 
-        // The deny-all arm materializes to the section that compiles to
-        // rules admitting nothing: `Some(vec![])` on every allow dimension,
-        // nothing denied — the shape `EgressRules::from_policy` builds and
-        // `verdict` holds every external destination against, the resolver
-        // carve-out excepted.
-        assert_eq!(
-            EgressRules::from_policy(Some(&EgressPolicy::deny_all()), resolver, lease),
-            EgressRules::new(Some(Vec::new()), Some(Vec::new()), None, resolver, lease),
-            "the deny-all section must compile to rules that admit nothing",
-        );
-    }
-
-    /// NET-074 per list, under the NET-077 opt-out: in the expanded spec —
-    /// the policy the daemon receives — a destination list the section
-    /// leaves absent grants nothing in its dimension, on an own-address and
-    /// a host-address box alike, so a box with a name allow list and no
-    /// `allow_subnets` reaches no address directly; the opt-out keeps the
-    /// earlier allow-all reading of the absent list; and allow-all is
-    /// written out as `0.0.0.0/0`, which admits every address.
-    #[test]
-    fn absent_destination_lists_grant_nothing_once_merged() {
-        use crate::core::egress::{DropReason, EgressRules, FrameVerdict, summarize, verdict};
-
-        let resolver = [100, 64, 0, 1];
-        let lease = [100, 64, 0, 9];
-        // A TCP SYN from the lease to a public address, port 443: the direct
-        // connection a name allow list does not grant.
-        let direct_to_ip = {
-            let mut frame = vec![0u8; 14 + 20 + 20];
-            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            frame[14] = 0x45;
-            frame[23] = 6;
-            frame[26..30].copy_from_slice(&lease);
-            frame[30..34].copy_from_slice(&[203, 0, 113, 7]);
-            frame[36..38].copy_from_slice(&443u16.to_be_bytes());
-            summarize(&frame)
-        };
-        let reach_on = |section: &EgressPolicy, network: NetworkMode, opt_out: bool| {
-            let EffectiveEgress::Declared(merged) =
-                effective_egress(Some(section), network, EgressDefaultPhase::InForce, opt_out)
-            else {
-                panic!("a declared section stays declared");
-            };
-            let rules = EgressRules::from_policy(Some(&merged), resolver, lease);
-            (merged, verdict(&direct_to_ip, &rules))
-        };
-        let reach =
-            |section: &EgressPolicy, opt_out: bool| reach_on(section, NetworkMode::OwnIp, opt_out);
-
-        // Names only: the absent `allow_subnets` resolves to present and
-        // empty, and the direct connection drops on the subnet dimension —
-        // the one drop a DNS pin lifts, so the name grant still works and
-        // nothing else does. `allow_protocols` is a filter, not a grant, and
-        // stays as declared.
-        let names_only = EgressPolicy {
-            allow_dns_hosts: Some(vec!["github.com".into()]),
-            ..EgressPolicy::default()
-        };
-        let (merged, direct) = reach(&names_only, false);
-        assert_eq!(
-            merged,
-            EgressPolicy {
-                allow_subnets: Some(Vec::new()),
-                allow_dns_hosts: Some(vec!["github.com".into()]),
-                allow_protocols: None,
-                deny_subnets: None,
-            },
-            "an absent destination list is present and empty once merged",
-        );
-        assert!(
-            matches!(
-                direct,
-                FrameVerdict::Drop(DropReason::UndeclaredSubnet {
-                    dst: [203, 0, 113, 7],
-                    ..
-                })
-            ),
-            "a name allow list grants no direct-to-address reach: {direct:?}",
-        );
-        assert!(
-            !merged.admits_nothing(),
-            "a section with a name allow list is not the deny-all shape",
-        );
-        // The same on a host-address box: the half-open shape survives on
-        // no mode. (A host that decides per box refuses the narrowing
-        // natively, NET-079; the resolved shape is what a VM host's cohort
-        // and an unenforced box are held to.)
-        let (on_host_address, direct) = reach_on(&names_only, NetworkMode::HostNet, false);
-        assert_eq!(
-            on_host_address, merged,
-            "a host-address declaration resolves the same"
-        );
-        assert!(
-            matches!(
-                direct,
-                FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
-            ),
-            "names-only on a host-address box grants no direct-to-address reach: {direct:?}",
-        );
-
-        // Behind the opt-out (NET-077) the absent list keeps its earlier
-        // allow-all reading, so the same section still reaches the address.
-        let (opted_out, direct) = reach(&names_only, true);
-        assert_eq!(
-            opted_out, names_only,
-            "the opt-out leaves the section as declared"
-        );
-        assert_eq!(direct, FrameVerdict::Admit, "the opt-out keeps allow-all");
-
-        // Allow-all is written out, and the written-out list admits every
-        // address, under the deny-all default and without the opt-out.
-        let written_out = EgressPolicy {
-            allow_subnets: Some(vec!["0.0.0.0/0".into(), "::/0".into()]),
-            ..EgressPolicy::default()
-        };
-        let (merged, direct) = reach(&written_out, false);
-        assert_eq!(
-            merged.allow_subnets, written_out.allow_subnets,
-            "a written-out list is carried as declared",
-        );
-        assert_eq!(
-            merged.allow_dns_hosts,
-            Some(Vec::new()),
-            "the names the written-out box did not list grant nothing",
-        );
-        assert_eq!(
-            direct,
-            FrameVerdict::Admit,
-            "`0.0.0.0/0` admits every address"
-        );
+        // The deny-all arm is the section with an empty list on each allow
+        // dimension and nothing denied.
+        assert!(EgressPolicy::deny_all().admits_nothing());
     }
 
     #[test]

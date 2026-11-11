@@ -465,6 +465,10 @@ pub struct ActivationSpec<'a> {
     pub secrets: &'a SecretGrants,
 }
 
+/// The port the Box Egress Proxy's listener answers on, which a box with a
+/// credentialed upstream is pointed at.
+pub const PROXY_LISTENER_PORT: u16 = 8118;
+
 /// Whether a box's egress admits every name without listing any: a
 /// `host_ip` box with no `egress` section. That box shares its host's
 /// address, so the absent section stays allow-all in every phase

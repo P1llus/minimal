@@ -1,10 +1,10 @@
 pub mod bep;
 pub mod compose;
 pub mod decision;
-pub mod egress;
 pub mod enumerate;
 pub mod expansion;
 pub mod hooks;
+pub mod host_exposures;
 pub mod ingress;
 pub mod lifecyclehook;
 pub mod loadout;

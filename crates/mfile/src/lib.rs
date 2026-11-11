@@ -1684,11 +1684,13 @@ impl File {
             boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
             // NET-159: a project cannot open host ports to its boxes. The
             // table is ignored with its own warning, as the store rules are.
-            boxes::core::egress::warn_project_host_exposures(self.extra.keys().map(String::as_str));
+            boxes::core::host_exposures::warn_project_host_exposures(
+                self.extra.keys().map(String::as_str),
+            );
             let mut unknown = Vec::new();
             for key in self.extra.keys().filter(|key| {
                 *key != boxes::core::bep::STORE_RULES_TABLE
-                    && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+                    && *key != boxes::core::host_exposures::HOST_EXPOSURES_TABLE
                     // The entry tables and the project's Box Types are read
                     // by `entry` and `expand`, not by this struct.
                     && !entry::EntryTable::ALL.iter().any(|t| t.key() == key.as_str())
@@ -3436,7 +3438,7 @@ mod tests {
         drop(guard);
         let out = capture.contents();
         assert_eq!(
-            out.matches(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED)
+            out.matches(boxes::core::host_exposures::PROJECT_HOST_EXPOSURES_IGNORED)
                 .count(),
             1,
             "{out}"

@@ -280,6 +280,13 @@ const _: () = assert!(
     REUSE_QUARANTINE.as_millis() > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
     "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
 );
+// A pin a box holds for the address of a peer that is gone must have run
+// out before another box gets the address.
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    REUSE_QUARANTINE.as_millis() >= netpol::pins::PIN_TTL.as_millis(),
+    "the reuse quarantine must outlast a pin for a peer's address"
+);
 
 /// Hands out switch addresses, each to one live attach at a time, and
 /// reuses a released drawn one only under an allocation epoch and a

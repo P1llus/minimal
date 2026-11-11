@@ -479,7 +479,7 @@ pub(crate) fn launch_proxy_env(
     let proxy = format!(
         "http://{}:{}",
         subnet.box_egress_proxy_address(),
-        boxes::core::egress::PROXY_LISTENER_PORT
+        boxes::core::bep::PROXY_LISTENER_PORT
     );
     let no_proxy = NO_PROXY_DEFAULTS
         .iter()

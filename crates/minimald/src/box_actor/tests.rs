@@ -3530,33 +3530,6 @@ async fn box_has_no_idle_stop() {
     }
 }
 
-/// An Ethernet II frame carrying an IPv4 packet to `dst` under `proto`, with
-/// `dst_port` where the L4 header has one — the shape
-/// [`boxes::core::egress::summarize`] extracts a verdict's inputs from.
-/// Everything the verdict reads is filled in; the unread fields are zeroes.
-fn ipv4_frame(proto: u8, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
-    let mut f = Vec::new();
-    f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
-    f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
-    f.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
-    // IPv4 header, IHL = 5 (20 bytes), fragment offset 0.
-    f.push(0x45);
-    f.push(0x00);
-    f.extend_from_slice(&40u16.to_be_bytes()); // total length (unread)
-    f.extend_from_slice(&0u16.to_be_bytes()); // identification
-    f.extend_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
-    f.push(64); // TTL
-    f.push(proto);
-    f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
-    f.extend_from_slice(&[10, 0, 0, 5]); // src: the box itself
-    f.extend_from_slice(&dst);
-    // L4 header: enough of one for the port to be readable.
-    f.extend_from_slice(&40000u16.to_be_bytes()); // src port
-    f.extend_from_slice(&dst_port.to_be_bytes());
-    f.extend_from_slice(&[0u8; 12]); // seq/ack (unread)
-    f
-}
-
 /// NET-074: an own-address box created with no `egress` section reaches
 /// nothing outside itself, and this build ships the deny-all default in
 /// force (asserted first, so the constant cannot slip back unnoticed). The
@@ -3570,18 +3543,7 @@ fn ipv4_frame(proto: u8, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
 /// say why the box reaches what it does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_ip_default_deny_all() {
-    use boxes::core::egress::{EgressRules, FrameVerdict};
     use minimald_rpc::{CreateSession, CreateSessionRequest};
-
-    // The address of the resolver Minimal owns for a box: the switch
-    // gateway, as the relay hands it to the gate.
-    let resolver = [100, 64, 0, 1];
-    // Something the box did not declare: an address out in the world.
-    let external = [93, 184, 216, 34];
-    // The box's lease — the source address `ipv4_frame` writes, so the
-    // verdicts below turn on the egress dimension alone. The lease check
-    // itself (NET-084) is proven in `boxes::core::egress`.
-    let lease = [10, 0, 0, 5];
 
     assert_eq!(
         boxes::EGRESS_DEFAULT_PHASE,
@@ -3606,37 +3568,16 @@ async fn own_ip_default_deny_all() {
     );
     assert_eq!(effective.ingress, None);
 
-    // What that section enforces: every frame to an external address drops,
-    // in every transport — the carve-out excepted, keyed to both the
-    // resolver's address and DNS's port, so no other address at :53 and no
-    // other port on the resolver slips through.
-    let rules = EgressRules::from_policy(effective.egress.as_ref(), resolver, lease);
-    let verdict_on = |proto: u8, dst: [u8; 4], port: u16| {
-        boxes::core::egress::verdict(
-            &boxes::core::egress::summarize(&ipv4_frame(proto, dst, port)),
-            &rules,
-        )
-    };
-    for (proto, name) in [(6u8, "tcp"), (17, "udp"), (1, "icmp")] {
-        assert!(
-            matches!(verdict_on(proto, external, 443), FrameVerdict::Drop(_)),
-            "a deny-all box must not reach an external address over {name}",
-        );
-    }
-    assert!(
-        matches!(verdict_on(17, external, 53), FrameVerdict::Drop(_)),
-        "the carve-out is keyed to the resolver's address: DNS's port alone \
-         admits nothing",
+    // What that section is to the engine: a policy that denies what it
+    // does not list, and lists nothing.
+    let policy =
+        crate::net::spec::box_policy(effective.egress.as_ref(), boxes::NetworkMode::OwnIp, false)
+            .expect("the deny-all section is a policy");
+    assert_eq!(
+        policy.egress_default(netpol::Verdict::Allow),
+        netpol::Verdict::Deny
     );
-    assert!(
-        matches!(verdict_on(17, resolver, 54), FrameVerdict::Drop(_)),
-        "the carve-out is keyed to DNS's port: the resolver's address alone \
-         admits nothing",
-    );
-    assert!(
-        matches!(verdict_on(17, resolver, 53), FrameVerdict::Admit),
-        "a deny-all box must still resolve (NET-079)",
-    );
+    assert!(policy.allow.is_empty() && policy.names.is_empty());
 
     // The same posture, observed where a diagnostics bundle reads it: the
     // one line every session start logs, naming all three facts as this

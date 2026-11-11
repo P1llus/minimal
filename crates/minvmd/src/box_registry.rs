@@ -1215,28 +1215,7 @@ fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// How long a released hand-out address waits before it is handed again:
 /// the switch crate's one quarantine, shared with the daemon's
 /// self-allocation reserve ([`switch::SWITCH_ADDRESS_REUSE_QUARANTINE`]).
-/// Asserted below to outlast every timer on this host that keys state by a
-/// box's switch address past its row: the gate's reply-flow records (both
-/// windows a replied flow lives under) and the DNS admission window a pin
-/// lives under. Pins and reply flows are also retired when the relay that
-/// carried them ends ([`crate::net::dns_pins`]) — the only end an
-/// established pinned flow's day-long idle cap gets short of a FIN — so the
-/// quarantine is the bound for a row withdrawn while its relay lives on.
 const SWITCH_REUSE_QUARANTINE: Duration = switch::SWITCH_ADDRESS_REUSE_QUARANTINE;
-
-const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis()
-        >= boxes::core::egress::REPLY_UDP_REPLIED_WINDOW.as_millis(),
-    "the switch address quarantine must outlast a replied UDP flow's record"
-);
-const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis() >= boxes::core::egress::REPLY_TCP_IDLE_CAP.as_millis(),
-    "the switch address quarantine must outlast an idle TCP flow's record"
-);
-const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis() >= boxes::core::egress::DNS_ADMISSION_WINDOW.as_millis(),
-    "the switch address quarantine must outlast a DNS pin's admission window"
-);
 
 /// How many hand-out addresses a task-slot draw always leaves for a new
 /// box's own address (NET-138): task slots are best-effort, so the
