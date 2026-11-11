@@ -2006,6 +2006,7 @@ impl<C: Channel> Sandbox<C> {
             container_path,
             "",
             flags,
+            None,
         );
         Ok(())
     }
@@ -2061,8 +2062,7 @@ impl<C: Channel> Sandbox<C> {
             .uidmap(config::BOX_UID)
             .gidmap(config::BOX_GID)
             .devfsmount("/dev")
-            .tmpfsmount("/tmp")
-            .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
+            .tmpfsmount("/tmp");
 
         // The IPC namespace is part of box isolation, whatever the network
         // plan: every box gets its own System V message queues, semaphores
@@ -2412,36 +2412,6 @@ impl<C: Channel> Sandbox<C> {
         // The plan's static hosts entries, written the same way — a name the
         // box's resolver does not know still answers from `/etc/hosts`.
         write_hosts(&self.rootfs(), plan.hosts(), ipv6_disabled())?;
-
-        // A box's leaf is the one cgroup its processes may sit in, and a
-        // weight's scope would move the first of them out of the daemon's
-        // tree before the closure joins the leaf, which the kernel then
-        // refuses (gominimal/inbox#1219). See `Config::hakoniwa_cpu_weight`.
-        // Without systemd no weight is ever applied, so there is nothing to
-        // drop and nothing to log.
-        if let Some(weight) = self.config.cpu_weight
-            && booted_with_systemd()
-        {
-            match self.config.hakoniwa_cpu_weight() {
-                Some(s) => {
-                    container.cgroups_resources({
-                        let mut resources = hakoniwa::cgroups::Resources::default();
-                        resources.cpu({
-                            let mut cpu = hakoniwa::cgroups::Cpu::default();
-                            cpu.shares(s);
-                            cpu
-                        });
-                        resources
-                    });
-                }
-                None => tracing::debug!(
-                    leaf = ?self.config.classifier_leaf.as_ref().map(|l| l.dir()),
-                    cpu_weight = weight,
-                    "sandbox launch: the build's CPU weight is not applied: it runs in the box's \
-                     classifier leaf, which a cgroup scope of its own would take it out of"
-                ),
-            }
-        }
 
         Ok(Container {
             container,
@@ -2837,21 +2807,6 @@ impl Sandbox {
     }
 }
 
-// Matches the logic in the libcgroups crate. If we do not conditionally
-// set cpu resources, the underlying code in libcgroups will panic :(
-#[cfg(target_os = "linux")]
-fn booted_with_systemd() -> bool {
-    std::fs::symlink_metadata("/run/systemd/system")
-        .map(|p| p.is_dir())
-        .unwrap_or_default()
-}
-
-/// Copy `src` to `dest` as a new file with `src`'s permission bits. Returns
-/// `false`, touching nothing, when `dest` already exists: two inputs with one
-/// basename keep the first, as a hardlinked `File` input does. `fs::copy`
-/// would truncate an existing `dest`, and a `dest` hardlinked in from a mapped
-/// directory shares its inode with that directory's source, so the copy would
-/// have rewritten the source in place.
 fn copy_input_file(src: &Path, dest: &Path) -> std::io::Result<bool> {
     let mut out = match fs::OpenOptions::new()
         .write(true)

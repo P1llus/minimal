@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: minimal <noreply@minimal.dev>
+Date: Wed, 11 Nov 2026 13:50:00 +0100
+Subject: [PATCH] feat(container): join a caller-supplied cgroup before
+ unsharing
+
+Container::cgroup takes an open cgroup v2 directory. The container's
+first process writes itself into that cgroup before it creates any
+namespace, so every process of the container starts in the cgroup and
+a new cgroup namespace is rooted there.
+---
+ hakoniwa/src/container.rs        | 15 ++++++++
+ hakoniwa/src/runc.rs             |  5 +++
+ hakoniwa/src/runc/sys.rs         |  8 +++++
+ hakoniwa/tests/container_test.rs | 62 ++++++++++++++++++++++++++++++++
+ 4 files changed, 90 insertions(+)
+
+diff --git a/hakoniwa/src/container.rs b/hakoniwa/src/container.rs
+index 02a96b8..b7cc84d 100644
+--- a/hakoniwa/src/container.rs
++++ b/hakoniwa/src/container.rs
+@@ -2,7 +2,9 @@ use nix::sched::CloneFlags;
+ use nix::unistd::{Gid, Uid};
+ use std::collections::{HashMap, HashSet};
+ use std::fs;
++use std::os::fd::OwnedFd;
+ use std::path::{Path, PathBuf};
++use std::sync::Arc;
+ 
+ use crate::{
+     Command, FsOperation, IdMap, Mount, MountOptions, Namespace, Network, Rlimit, Runctl, error::*,
+@@ -52,6 +54,7 @@ pub struct Container {
+     pub(crate) group: Option<String>,
+     pub(crate) supplementary_groups: Vec<String>,
+     pub(crate) hostname: Option<String>,
++    pub(crate) cgroup: Option<Arc<OwnedFd>>,
+     pub(crate) network: Option<Network>,
+     pub(crate) rlimits: HashMap<Rlimit, (u64, u64)>,
+     #[cfg(feature = "cgroups")]
+@@ -116,6 +119,7 @@ impl Container {
+             group: None,
+             supplementary_groups: vec![],
+             hostname: None,
++            cgroup: None,
+             network: None,
+             rlimits: HashMap::new(),
+             #[cfg(feature = "cgroups")]
+@@ -402,6 +406,17 @@ impl Container {
+         self
+     }
+ 
++    /// Moves the container into an existing cgroup. `dir` is an open cgroup v2
++    /// directory.
++    ///
++    /// The container's first process writes itself into that cgroup before it
++    /// creates any namespace, so every process of the container starts in the
++    /// cgroup, and a new CGROUP namespace has it as its root.
++    pub fn cgroup<F: Into<OwnedFd>>(&mut self, dir: F) -> &mut Self {
++        self.cgroup = Some(Arc::new(dir.into()));
++        self
++    }
++
+     /// Change the network mode in new NETWORK namespace.
+     pub fn network<T: Into<Network>>(&mut self, network: T) -> &mut Self {
+         self.network = Some(network.into());
+diff --git a/hakoniwa/src/runc.rs b/hakoniwa/src/runc.rs
+index 67c2f63..52d19ac 100644
+--- a/hakoniwa/src/runc.rs
++++ b/hakoniwa/src/runc.rs
+@@ -99,6 +99,11 @@ fn exec_imp(
+     reader: PipeReader,
+     writer: &mut Option<PipeWriter>,
+ ) -> Result<ExitStatus> {
++    // Join the caller's cgroup, before anything else is set up.
++    if let Some(dir) = &container.cgroup {
++        sys::join_cgroup(dir.as_raw_fd())?;
++    }
++
+     // Redirect standard I/O stream.
+     if let Some(stdin) = stdin.take() {
+         sys::dup2_stdin(stdin.as_raw_fd())?;
+diff --git a/hakoniwa/src/runc/sys.rs b/hakoniwa/src/runc/sys.rs
+index f4fe92c..1ff0c39 100644
+--- a/hakoniwa/src/runc/sys.rs
++++ b/hakoniwa/src/runc/sys.rs
+@@ -61,6 +61,14 @@ macro_rules! map_err {
+     };
+ }
+ 
++pub(crate) fn join_cgroup(dir: RawFd) -> Result<()> {
++    let procs = format!("/proc/self/fd/{dir}/cgroup.procs");
++    fs::write(&procs, "0").map_err(|err| {
++        let err = format!("write({procs:?}, \"0\") => {err}");
++        Error::SysError(err)
++    })
++}
++
+ pub(crate) fn unshare(clone_flags: CloneFlags) -> Result<()> {
+     map_err!(sched::unshare(clone_flags))
+ }
+diff --git a/hakoniwa/tests/container_test.rs b/hakoniwa/tests/container_test.rs
+index 57e540e..e20e9ec 100644
+--- a/hakoniwa/tests/container_test.rs
++++ b/hakoniwa/tests/container_test.rs
+@@ -882,6 +882,68 @@ mod container_test {
+         assert_eq!(String::from_utf8_lossy(&output.stdout), "myhost\n");
+     }
+ 
++    // A cgroup this test may create and enter: a child of its own. `None`
++    // where the host does not delegate the test's cgroup to its user.
++    fn scratch_cgroup(name: &str) -> Option<PathBuf> {
++        let own = fs::read_to_string("/proc/self/cgroup").ok()?;
++        let own = own.lines().find_map(|line| line.strip_prefix("0::"))?;
++        let dir = PathBuf::from(format!("/sys/fs/cgroup{own}"))
++            .join(format!("{name}-{}", std::process::id()));
++        fs::create_dir(&dir).ok()?;
++        Some(dir)
++    }
++
++    #[test]
++    fn test_cgroup() {
++        let Some(dir) = scratch_cgroup("hakoniwa-cgroup") else {
++            return;
++        };
++        let output = Container::new()
++            .rootfs("/")
++            .unwrap()
++            .cgroup(File::open(&dir).unwrap())
++            .command("/bin/cat")
++            .arg("/proc/self/cgroup")
++            .output()
++            .unwrap();
++        fs::remove_dir(&dir).unwrap();
++        assert!(output.status.success());
++        let name = dir.file_name().unwrap().to_string_lossy();
++        assert!(String::from_utf8_lossy(&output.stdout).ends_with(&format!("/{name}\n")));
++    }
++
++    #[test]
++    fn test_cgroup_is_the_root_of_a_new_cgroup_namespace() {
++        let Some(dir) = scratch_cgroup("hakoniwa-cgroupns") else {
++            return;
++        };
++        let output = Container::new()
++            .rootfs("/")
++            .unwrap()
++            .unshare(Namespace::Cgroup)
++            .cgroup(File::open(&dir).unwrap())
++            .command("/bin/cat")
++            .arg("/proc/self/cgroup")
++            .output()
++            .unwrap();
++        fs::remove_dir(&dir).unwrap();
++        assert!(output.status.success());
++        assert_eq!(String::from_utf8_lossy(&output.stdout), "0::/\n");
++    }
++
++    #[test]
++    fn test_cgroup_runc_error() {
++        let output = Container::new()
++            .rootfs("/")
++            .unwrap()
++            .cgroup(File::open("/proc/self").unwrap())
++            .command("/bin/true")
++            .output()
++            .unwrap();
++        assert!(!output.status.success());
++        assert_contains!(output.status.reason, "cgroup.procs");
++    }
++
+     #[test]
+     fn test_network_pasta() {
+         let output = Container::new()

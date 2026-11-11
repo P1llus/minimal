@@ -34,9 +34,10 @@ members = [
     "crates/switch",
     "crates/version",
 ]
-# Local checkout of our ChrisTitusTech/vt100-rust fork (vt100-ctt); built and
-# published standalone.
-exclude = ["vt100-rust"]
+# vt100-rust: local checkout of our ChrisTitusTech/vt100-rust fork (vt100-ctt),
+# built and published standalone. vendor/hakoniwa/crate: a third-party crate,
+# kept out of the workspace's lints and formatting.
+exclude = ["vt100-rust", "vendor/hakoniwa/crate"]
 resolver = "3"
 
 package.edition = "2024"
@@ -154,9 +155,9 @@ google-cloud-gax = "1.13"
 google-cloud-auth = "1.15"
 google-cloud-storage = "1.17"
 
-# Tracked as a git rev, not the crates.io release, update when they publish next.
-# Current rev is master @ 2026-08-03.
-hakoniwa = { features = ["cgroups", "rustslirp"], git = "https://github.com/souk4711/hakoniwa.git", rev = "0810ffa37620ef5c57de263c8eaa1f4d7633c14a" }
+# The upstream release pinned in vendor/hakoniwa/hakoniwa.lock plus the patches
+# beside it; scripts/vendor-hakoniwa.sh regenerates the tree.
+hakoniwa = { features = ["rustslirp"], path = "vendor/hakoniwa/crate" }
 # DNS message parsing/encoding only (the box-zone answerer in `minimald`): no
 # resolver, no server, no async runtime features — the message types are all
 # `net::answerer` needs, and `default-features = false` keeps them that way.

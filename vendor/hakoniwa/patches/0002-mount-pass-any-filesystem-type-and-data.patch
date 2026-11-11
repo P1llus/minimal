@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: minimal <noreply@minimal.dev>
+Date: Wed, 11 Nov 2026 13:50:31 +0100
+Subject: [PATCH] feat(mount): pass any filesystem type and its data to
+ mount(2)
+
+A mount that names a filesystem type other than proc and devfs was
+mounted with its data only for overlay and tmpfs, and treated as a bind
+mount otherwise. Any named type now takes that path, so a caller can
+mount for example devpts with a max= option, or cgroup2.
+---
+ hakoniwa/src/runc/unshare.rs     |  4 ++--
+ hakoniwa/tests/container_test.rs | 23 ++++++++++++++++++++++-
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/hakoniwa/src/runc/unshare.rs b/hakoniwa/src/runc/unshare.rs
+index 868b7f1..f80f574 100644
+--- a/hakoniwa/src/runc/unshare.rs
++++ b/hakoniwa/src/runc/unshare.rs
+@@ -130,8 +130,8 @@ fn initialize_rootfs(command: &Command, container: &Container) -> Result<()> {
+             continue;
+         }
+ 
+-        // Mount overlay, tmpfs.
+-        if mount.fstype == "overlay" || mount.fstype == "tmpfs" {
++        // Mount any other filesystem type: overlay, tmpfs, devpts, cgroup2, ...
++        if !mount.fstype.is_empty() {
+             sys::mkdir_p(target_relpath)?;
+             sys::mount_with_data(
+                 &mount.fstype,
+diff --git a/hakoniwa/tests/container_test.rs b/hakoniwa/tests/container_test.rs
+index e20e9ec..95fc033 100644
+--- a/hakoniwa/tests/container_test.rs
++++ b/hakoniwa/tests/container_test.rs
+@@ -7,7 +7,7 @@ mod container_test {
+     use std::fs::{self, File};
+     use std::path::PathBuf;
+ 
+-    use hakoniwa::{Container, Namespace, Pasta, Rlimit, Runctl};
++    use hakoniwa::{Container, MountOptions, Namespace, Pasta, Rlimit, Runctl};
+ 
+     fn current_dir() -> PathBuf {
+         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR")))
+@@ -639,6 +639,27 @@ mod container_test {
+         assert!(output.status.success());
+     }
+ 
++    #[test]
++    fn test_mount_fstype_with_data() {
++        let output = Container::new()
++            .rootfs("/")
++            .unwrap()
++            .mount(
++                "devpts",
++                "/mypts",
++                "devpts",
++                MountOptions::NOSUID | MountOptions::NOEXEC,
++                Some("newinstance,ptmxmode=0666,mode=620,max=7".to_string()),
++            )
++            .command("/bin/findmnt")
++            .args(["-T", "/mypts"])
++            .output()
++            .unwrap();
++        assert!(output.status.success());
++        assert_contains!(String::from_utf8_lossy(&output.stdout), "devpts");
++        assert_contains!(String::from_utf8_lossy(&output.stdout), "max=7");
++    }
++
+     #[test]
+     fn test_procfsmount_mount_options() {
+         let output = Container::new()

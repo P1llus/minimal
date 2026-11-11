@@ -1,0 +1,52 @@
+use std::cmp;
+use std::fs;
+use std::path::PathBuf;
+
+use super::{error::*, typeparser::*};
+
+#[derive(Debug, Clone)]
+pub(crate) struct GroupEntry {
+    pub(crate) name: String,
+    pub(crate) gid: u32,
+    pub(crate) members: Vec<String>,
+}
+
+impl GroupEntry {
+    fn from_line(line: &str) -> Result<Self> {
+        let mut parts = line.split(':');
+        let name = to_string(parts.next())?;
+        let _password = to_string(parts.next())?;
+        let gid = to_u32(parts.next())?;
+        let members = to_string(parts.next())?
+            .split(',')
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>();
+        Ok(Self { name, gid, members })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GroupFile {
+    path: PathBuf,
+}
+
+impl GroupFile {
+    pub(crate) fn new(path: &str) -> Self {
+        let path = PathBuf::from(path);
+        Self { path }
+    }
+
+    pub(crate) fn entries(&self) -> Result<Vec<GroupEntry>> {
+        let mut entries = vec![];
+        let content = fs::read_to_string(&self.path)?;
+        for line in content.lines() {
+            entries.push(
+                GroupEntry::from_line(line).map_err(|err| Error::InvalidLine {
+                    line: line[..cmp::min(line.len(), 8)].to_string(),
+                    errmsg: err.to_string(),
+                })?,
+            );
+        }
+        Ok(entries)
+    }
+}

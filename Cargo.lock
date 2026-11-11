@@ -2720,17 +2720,14 @@ dependencies = [
 
 [[package]]
 name = "hakoniwa"
-version = "1.7.2"
-source = "git+https://github.com/souk4711/hakoniwa.git?rev=0810ffa37620ef5c57de263c8eaa1f4d7633c14a#0810ffa37620ef5c57de263c8eaa1f4d7633c14a"
+version = "1.8.1"
 dependencies = [
  "bitflags 2.13.1",
  "caps",
  "close_fds",
  "libc",
- "libcgroups",
  "log",
  "nix 0.29.0",
- "oci-spec",
  "postcard",
  "procfs",
  "route_manager",
@@ -3365,15 +3362,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3770,22 +3758,6 @@ name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
-
-[[package]]
-name = "libcgroups"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d85e8f0bca12f0d04fdd8f14858022018cd1667b4f971d6b09058fe90323e19d"
-dependencies = [
- "fixedbitset 0.5.7",
- "nix 0.29.0",
- "oci-spec",
- "pathrs",
- "procfs",
- "serde",
- "thiserror 2.0.21",
- "tracing",
-]
 
 [[package]]
 name = "libloading"
@@ -5307,24 +5279,6 @@ name = "path-dedot"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03351d0f1c066c114015408dc6a3e101f080fc03ef9d8d799aa58ec760cac5a6"
-
-[[package]]
-name = "pathrs"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b1c0fdecdba7e25990ddca671cd555d0b081252f4052f73df485263ef229d2d"
-dependencies = [
- "bitflags 2.13.1",
- "itertools 0.15.0",
- "libc",
- "memchr",
- "once_cell",
- "rustix",
- "rustversion",
- "static_assertions",
- "tempfile",
- "thiserror 2.0.21",
-]
 
 [[package]]
 name = "paths"
