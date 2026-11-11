@@ -110,6 +110,41 @@ pub(crate) trait Dial: Send + Sync {
     ) -> BoxFuture<'_, Result<Dialled, Refused>>;
 }
 
+/// The ports of the host's loopback that this daemon's own listeners hold:
+/// its hostname proxy and the box-name answerer. An exposure never opens
+/// one, whatever the table says: a box would get the daemon's own surface,
+/// as a program of the host.
+#[derive(Debug)]
+pub(crate) struct OwnListeners(std::sync::Mutex<std::collections::BTreeSet<u16>>);
+
+impl OwnListeners {
+    /// The listeners of this daemon. The answerer's default port is held
+    /// from the start, because the answerer may be another process's.
+    pub(crate) fn daemon() -> &'static Self {
+        static DAEMON: std::sync::LazyLock<OwnListeners> = std::sync::LazyLock::new(|| {
+            OwnListeners(std::sync::Mutex::new(
+                [crate::net::answerer::ANSWERER_PORT].into(),
+            ))
+        });
+        &DAEMON
+    }
+
+    /// Records that a listener of the daemon holds `port` from now on.
+    pub(crate) fn hold(&self, port: u16) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(port);
+    }
+
+    fn holds(&self, port: u16) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&port)
+    }
+}
+
 /// The host's loopback on a native node: a connection to the host alias at
 /// a port goes to the same port of the host, when the user's host exposures
 /// table opens it.
@@ -190,7 +225,7 @@ impl Dial for NativeHostPorts {
             let port = original.port();
             // Subscribed before the read, so no change after it is missed.
             let mut table = self.table.subscribe();
-            if !self.refresh().opens(TCP, port) {
+            if !self.refresh().opens(TCP, port) || OwnListeners::daemon().holds(port) {
                 return Err(Refused::NotExposed);
             }
             let stream = dial_loopback(port).await.map_err(Refused::Unreachable)?;
@@ -516,6 +551,25 @@ mod tests {
         let (read, reset) = read_to_end(client).await;
         assert!(read.is_empty());
         assert!(reset, "the box must not read an orderly close");
+        assert_eq!(
+            *bench.reports.lock().unwrap(),
+            [(alias(port), "host_port_not_exposed")]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exposure_at_a_listener_of_the_daemon_opens_nothing() {
+        let (port, _service) = service(false).await;
+        OwnListeners::daemon().hold(port);
+        let dir = tempfile::tempdir().unwrap();
+        let table = exposures(
+            dir.path(),
+            &format!("[host-exposures]\nproxy = {{ port = {port} }}\n"),
+        );
+        let bench = bench(NativeHostPorts::new(table), alias(port)).await;
+        let client = TcpStream::connect(bench.at).await.unwrap();
+        let (read, reset) = read_to_end(client).await;
+        assert!(read.is_empty() && reset);
         assert_eq!(
             *bench.reports.lock().unwrap(),
             [(alias(port), "host_port_not_exposed")]

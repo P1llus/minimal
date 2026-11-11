@@ -817,6 +817,9 @@ impl ServerStateHandle {
     /// Records the port the box-zone answerer actually listens on (UDP),
     /// once its startup has bound (and, in a microVM, published) it.
     pub(crate) async fn set_zone_answerer_port(&self, port: u16) {
+        // No host exposure reaches the answerer.
+        #[cfg(target_os = "linux")]
+        crate::net::relay::OwnListeners::daemon().hold(port);
         self.0.lock().await.zone_answerer_port = Some(port);
     }
 
@@ -2389,6 +2392,9 @@ pub(crate) async fn drive_proxy_until_serving(
                             // its handle is dropped on purpose — nothing ever
                             // aborts it, because nothing ever rebinds.
                             drop(proxy.spawn_serve(&state, listener).await);
+                            // No host exposure reaches the proxy itself.
+                            #[cfg(target_os = "linux")]
+                            crate::net::relay::OwnListeners::daemon().hold(bound_port);
                             bound = true;
                             if !publish_on_host {
                                 break;
