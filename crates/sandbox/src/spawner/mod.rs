@@ -422,6 +422,19 @@ fn spawner_process(
             } else if libc::dup2(fd, server::SOCKET_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // The spawner gets its stdio and its socket. Anything else the
+            // caller has open without close-on-exec, say another box's
+            // terminal caught between its open and its flag, stops at the
+            // exec.
+            if libc::syscall(
+                libc::SYS_close_range,
+                server::SOCKET_FD + 1,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             Ok(())
         });
     }

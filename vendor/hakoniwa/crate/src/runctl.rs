@@ -33,4 +33,12 @@ pub enum Runctl {
 
     /// Mount root dir with read-write access.
     RootdirRW,
+
+    /// Run the container's supervisor process in a session of its own.
+    ///
+    /// The supervisor calls `setsid(2)` before it creates the container, so
+    /// neither it nor the internal process shares a session or a process
+    /// group with the caller. A signal the container sends to its own
+    /// process group, such as `kill(0, sig)`, then cannot reach the caller.
+    SupervisorNewSession,
 }

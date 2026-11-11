@@ -264,6 +264,10 @@ pub enum EnterError {
     #[error("the enter shim was started with bad arguments: {0}")]
     Usage(String),
 
+    /// The shim could not close what it inherited or start its own session.
+    #[error("the enter shim could not detach from its spawner")]
+    Detach(#[source] std::io::Error),
+
     /// The injected program could not be started for a reason a shell would
     /// not report as its own (those are exit codes 127/126). `ENOMEM` from the
     /// fork means the sandbox's PID namespace has no live init left to
@@ -465,9 +469,9 @@ fn release_stdin() {
 ///
 /// # Errors
 ///
-/// [`EnterError::JoinDenyLeaf`] if the box is deny-all and its classifier
-/// leaf cannot be joined, [`EnterError::Setns`] if the namespaces cannot be
-/// joined, [`EnterError::Spawn`] if the program cannot be started for a
+/// [`EnterError::Detach`] if the shim cannot leave the spawner's session,
+/// [`EnterError::Setns`] if the namespaces cannot be joined,
+/// [`EnterError::Spawn`] if the program cannot be started for a
 /// reason a shell would not report, and [`EnterError::Wait`] if the started
 /// program cannot be reaped. A program that is missing, not executable, or not
 /// an executable format is reported on stderr and returned as the shell's exit
@@ -476,6 +480,21 @@ fn shim_main(args: ShimArgs) -> Result<i32, EnterError> {
     // SAFETY: whoever started this shim placed the box init's pidfd on this
     // descriptor, and nothing else in this freshly exec'd process owns it.
     let pidfd = unsafe { OwnedFd::from_raw_fd(PIDFD_FD) };
+
+    // The shim needs its stdio and the pidfd. Whatever else the spawner
+    // held open without close-on-exec ends here, so the program gets none
+    // of it.
+    // SAFETY: `close_range` closes descriptors this process does not use.
+    if unsafe { libc::syscall(libc::SYS_close_range, PIDFD_FD + 1, u32::MAX, 0) } != 0 {
+        return Err(EnterError::Detach(std::io::Error::last_os_error()));
+    }
+    // A session of its own: the shim and its program share no process
+    // group and no session with the spawner, so a signal the program sends
+    // to its group or its session stays in the box.
+    // SAFETY: `setsid` takes no arguments.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(EnterError::Detach(std::io::Error::last_os_error()));
+    }
 
     // The daemon's procfs, opened before the join: the grace period below scans
     // it for live members of the injected group, by the pids and group ids this

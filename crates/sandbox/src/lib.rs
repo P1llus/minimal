@@ -505,11 +505,14 @@ impl Container {
         self.launch.session = spawner::Session::NewWithTerminal;
     }
 
-    /// Makes each command from this container the leader of a new session
-    /// and process group, without a controlling terminal. For a program
-    /// whose stdin is not a terminal, where taking one fails.
-    pub fn set_session_leader_without_terminal(&mut self) {
-        self.launch.session = spawner::Session::New;
+    /// Runs each command from this container as a shell runs a foreground
+    /// job: in the session of the process that asked for it, in a process
+    /// group of its own, which is the foreground group of that session's
+    /// terminal while the command runs. For a tool that runs one program on
+    /// its user's terminal. Every other container leads a session of its
+    /// own with no terminal.
+    pub fn set_foreground(&mut self) {
+        self.launch.session = spawner::Session::Foreground;
     }
 }
 
@@ -533,7 +536,7 @@ pub(crate) fn with_box_closure(
     command: &mut hakoniwa::Command,
     lo_up: bool,
     start_gate: Option<PathBuf>,
-    new_session: bool,
+    session: spawner::Session,
 ) {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -553,7 +556,7 @@ pub(crate) fn with_box_closure(
                 seccomp_program,
                 lo_up,
                 start_gate.as_deref(),
-                new_session,
+                session,
             )
         })
     };
@@ -625,6 +628,29 @@ fn bring_lo_up() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Puts this process in a process group of its own and, when its stdin is
+/// the session's terminal, makes that group the terminal's foreground group.
+#[cfg(target_os = "linux")]
+fn take_foreground() -> std::io::Result<()> {
+    // SAFETY: plain syscalls on this process and its stdin.
+    unsafe {
+        if libc::setpgid(0, 0) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // A background group that changes the foreground group is stopped
+        // with SIGTTOU unless it blocks the signal.
+        let mut ttou: libc::sigset_t = std::mem::zeroed();
+        let mut before: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut ttou);
+        libc::sigaddset(&raw mut ttou, libc::SIGTTOU);
+        libc::sigprocmask(libc::SIG_BLOCK, &raw const ttou, &raw mut before);
+        // Not a terminal, or not this session's: nothing to take.
+        libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
+        libc::sigprocmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
+    }
+    Ok(())
+}
+
 /// The box's pre-exec steps, then the exec of its program. Never returns: a
 /// failure is reported on the child's stderr and exits the child with the
 /// shell's "cannot run" status.
@@ -635,17 +661,28 @@ fn exec_box_program(
     seccomp_program: &'static seccomp::Program,
     lo_up: bool,
     start_gate: Option<&Path>,
-    new_session: bool,
+    session: spawner::Session,
 ) -> ! {
-    // A new session and process group for the program, with no controlling
-    // terminal: the box's processes then share neither with the daemon.
-    // SAFETY: `setsid(2)` takes no arguments. It fails only for a process
-    // group leader, which this forked child is not.
-    if new_session && unsafe { libc::setsid() } == -1 {
-        exit_child(
-            "starting the box's own session",
-            &std::io::Error::last_os_error(),
-        );
+    match session {
+        // A new session and process group for the program, with no
+        // controlling terminal.
+        // SAFETY: `setsid(2)` takes no arguments. It fails only for a
+        // process group leader, which this forked child is not.
+        spawner::Session::New => {
+            if unsafe { libc::setsid() } == -1 {
+                exit_child(
+                    "starting the box's own session",
+                    &std::io::Error::last_os_error(),
+                );
+            }
+        }
+        // hakoniwa has started the session and taken the terminal.
+        spawner::Session::NewWithTerminal => {}
+        spawner::Session::Foreground => {
+            if let Err(e) = take_foreground() {
+                exit_child("taking the terminal's foreground", &e);
+            }
+        }
     }
     // A box whose `lo` stays down still runs, without loopback.
     if lo_up && let Err(e) = bring_lo_up() {
@@ -985,7 +1022,7 @@ impl<C: Channel> Sandbox<C> {
                     mount_fallback,
                 },
                 gate: None,
-                session: spawner::Session::Inherit,
+                session: spawner::Session::New,
                 // hakoniwa brings `lo` up only where it builds a tap.
                 lo_up: isolate && plan.tap().is_none(),
                 cgroup: self.config.box_cgroup.clone(),
@@ -3474,6 +3511,113 @@ ff02::2\tip6-allrouters
             "the released program never ran: no mark at {}",
             first_mark.display()
         );
+    }
+
+    /// A program that runs as a foreground job is in a process group of its
+    /// own, in the requester's session. A signal it sends to its group does
+    /// not reach the requester, which is this test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreground_program_has_a_process_group_of_its_own() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping a_foreground_program_has_a_process_group_of_its_own: this host \
+                 denies the unprivileged user namespace every sandbox starts by \
+                 unsharing: {reason}"
+            );
+            return;
+        }
+        let ids = |pid: u32| -> (String, String) {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("the process runs");
+            let fields: Vec<String> = stat
+                .rsplit_once(')')
+                .expect("a stat line")
+                .1
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            (fields[2].clone(), fields[3].clone())
+        };
+
+        let name = "foreground";
+        let base_dir = box_base_dir(name);
+        let build = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let probe = compile_cgroup_probe(build.path());
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &probe);
+        let mut sandbox = Config::new(name)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .build(build.path().join("sandbox"), ())
+            .await
+            .expect("building the box");
+        let run = sandbox.base_dir.join("run");
+        let plan = sandbox.built_in_plan();
+        let mut container = sandbox
+            .new_container(&plan)
+            .expect("building the box's container");
+        container.set_foreground();
+        let mut held = sandbox
+            .command(
+                &container,
+                "/usr/bin/probe",
+                ["HOLD:/run/go"],
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .expect("building the probe command");
+        held.stdin(Stdio::Null).stdout(Stdio::Null);
+        let child = held.spawn().expect("spawning the probe in the box");
+        let supervisor = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let program = loop {
+            if let Ok(program) = spawner::enter::init_of(supervisor) {
+                break program;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the box never had a program"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let own = ids(std::process::id());
+        // The program takes its group just before it execs.
+        while ids(program).0 != program.to_string() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the program never led a process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(ids(program).1, own.1, "the program is in this session");
+        assert_eq!(
+            ids(supervisor),
+            own,
+            "the supervisor stays with the requester"
+        );
+        fs::write(run.join("go"), "").expect("releasing the probe");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), child.exited())
+            .await
+            .expect("the program ends");
+        assert!(status.success(), "{status:?}");
+
+        // A signal to the program's group does not reach this test. The
+        // program itself survives it: it is the init of its PID namespace,
+        // which the kernel shields from signals sent inside the namespace.
+        let mut noisy = sandbox
+            .command(
+                &container,
+                "/usr/bin/probe",
+                ["KILL0:9"],
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .expect("building the probe command");
+        noisy.stdin(Stdio::Null).stdout(Stdio::Null);
+        let child = noisy.spawn().expect("spawning the probe in the box");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.exited())
+            .await
+            .expect("the program ends");
+        assert!(status.success(), "{status:?}");
     }
 
     /// A spawner whose requester is gone reads the end of its socket and

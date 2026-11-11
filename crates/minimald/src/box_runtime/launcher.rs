@@ -1111,9 +1111,7 @@ impl BoxLauncher for SandboxLauncher {
             // The entrypoint leads a session of its own either way. Only a
             // terminal can be its controlling terminal: on pipes, taking one
             // fails with ENOTTY and the entrypoint never runs.
-            if on_pipes {
-                container.set_session_leader_without_terminal();
-            } else {
+            if !on_pipes {
                 container.set_session_leader();
             }
             // A launch minted only for hooks holds its shell at the gate: the

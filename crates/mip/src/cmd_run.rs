@@ -296,9 +296,11 @@ pub async fn run_task(
         // One launch per invocation, as `sandbox::run_with_cancel` does: a
         // spawn is what gets a namespace, so each needs its own plan.
         let planned = env.plan_launch().await?;
-        let container = env
+        let mut container = env
             .container(planned.plan())
             .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
+        // The task runs on this terminal as a shell's foreground job does.
+        container.set_foreground();
         let mut cmd = env
             .invocation_command(&container, inv)
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;

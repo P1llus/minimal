@@ -15,6 +15,7 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use super::enter::{self, ShimArgs};
@@ -134,8 +135,17 @@ pub(crate) fn run(
     titled: bool,
 ) -> io::Result<Container> {
     let mut container = hakoniwa_container(&run.container, cgroup)?;
-    if run.session == Session::NewWithTerminal {
-        container.runctl(hakoniwa::Runctl::NewSession);
+    match run.session {
+        Session::New => {
+            container.runctl(hakoniwa::Runctl::SupervisorNewSession);
+        }
+        Session::NewWithTerminal => {
+            container.runctl(hakoniwa::Runctl::SupervisorNewSession);
+            container.runctl(hakoniwa::Runctl::NewSession);
+        }
+        // The supervisor stays in the session whose terminal the program
+        // takes the foreground of.
+        Session::Foreground => {}
     }
     let mut command = container.command(&run.program);
     command.args(&run.args);
@@ -152,7 +162,7 @@ pub(crate) fn run(
         &mut command,
         run.lo_up,
         run.gate.clone(),
-        run.session == Session::New,
+        run.session,
     );
     let [stdin, stdout, stderr] = stdio;
     command
@@ -187,6 +197,32 @@ pub(crate) fn pinned_init(supervisor: u32) -> Option<(u32, OwnedFd)> {
     let pid = enter::init_of(supervisor).ok()?;
     let pinned = enter::pidfd_open(pid).ok()?;
     (enter::init_of(supervisor).ok()? == pid).then_some((pid, pinned))
+}
+
+/// Makes this process's group the foreground group of its terminal again,
+/// once a job that had taken the foreground is gone. Does nothing for a
+/// process with no terminal.
+pub(crate) fn retake_foreground() {
+    let Ok(terminal) = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty")
+    else {
+        return;
+    };
+    // SAFETY: plain syscalls on this thread's signal mask and the terminal.
+    unsafe {
+        // A background group that changes the foreground group is stopped
+        // with SIGTTOU unless it blocks the signal.
+        let mut ttou: libc::sigset_t = std::mem::zeroed();
+        let mut before: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut ttou);
+        libc::sigaddset(&raw mut ttou, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const ttou, &raw mut before);
+        libc::tcsetpgrp(terminal.as_raw_fd(), libc::getpgrp());
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
+    }
 }
 
 /// Whether the process a pidfd names has exited.

@@ -31,6 +31,9 @@ struct Fixture {
     /// Holds the probe and every box.
     dir: tempfile::TempDir,
     probe: PathBuf,
+    /// A descriptor this process, which plays the daemon, held open without
+    /// close-on-exec when it started its spawner.
+    planted: OwnedFd,
 }
 
 impl Fixture {
@@ -47,6 +50,11 @@ impl Fixture {
         } else {
             None
         };
+        // SAFETY: `open` with a NUL-terminated path, and no `O_CLOEXEC`.
+        let planted = unsafe { libc::open(c"/etc/hostname".as_ptr(), libc::O_RDONLY) };
+        assert!(planted >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: a fresh descriptor that nothing else owns.
+        let planted = unsafe { OwnedFd::from_raw_fd(planted) };
         // After the root is open, so the spawner starts in `supervisor`.
         let spawner = Spawner::process(
             env!("CARGO_BIN_EXE_minimald"),
@@ -75,6 +83,7 @@ impl Fixture {
             root,
             dir,
             probe,
+            planted,
         })
     }
 
@@ -232,6 +241,17 @@ fn stat_fields(pid: u32) -> Option<Vec<String>> {
 /// Whether `pid` exists and is not a zombie.
 fn running(pid: u32) -> bool {
     stat_fields(pid).is_some_and(|fields| fields[0] != "Z")
+}
+
+/// The process group and the session of `pid`.
+fn group_and_session(pid: u32) -> (u32, u32) {
+    let fields = stat_fields(pid).expect("the process runs");
+    (fields[2].parse().unwrap(), fields[3].parse().unwrap())
+}
+
+/// Whether `pid` is stopped by a signal.
+fn stopped(pid: u32) -> bool {
+    stat_fields(pid).is_some_and(|fields| fields[0] == "T")
 }
 
 fn parent_of(pid: u32) -> u32 {
@@ -416,6 +436,154 @@ async fn everything_of_a_box_starts_in_its_cgroup() {
         .destroy(DESTROY_LIMIT)
         .await
         .expect("the sibling's cgroup goes");
+}
+
+/// A box runs with the daemon's uid, so a signal it sends to its own process
+/// group reaches every member of that group, in whatever namespace. No
+/// process of a box shares a group or a session with the spawner, with the
+/// daemon or with another box: `kill(0, sig)` from a box's first program,
+/// from a container that belongs to no box, as a build is, and from an
+/// entered program reaches nothing outside the box, for a signal that kills
+/// and for one that stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signal_to_a_boxs_own_process_group_stays_in_the_box() {
+    let Some(fixture) = Fixture::new(
+        "a_signal_to_a_boxs_own_process_group_stays_in_the_box",
+        true,
+    ) else {
+        return;
+    };
+    let root = fixture.root();
+    let bystander_cgroup = root.create_box(SIBLING_ID).expect("the bystander's cgroup");
+    let bystander = fixture
+        .launch(
+            "bystander",
+            Some(&bystander_cgroup),
+            None,
+            &[],
+            &["HOLD:/run/release"],
+        )
+        .await;
+    let bystander_supervisor = bystander.child.id();
+    let bystander_program = eventually("the bystander has its program", || {
+        init_of(bystander_supervisor).ok()
+    });
+    let spawner = parent_of(bystander_supervisor);
+    let daemon = std::process::id();
+    let outside = [group_and_session(spawner), group_and_session(daemon)];
+    let untouched = |what: &str| {
+        for pid in [spawner, bystander_supervisor, bystander_program] {
+            assert!(running(pid), "{what} ended process {pid}");
+            assert!(!stopped(pid), "{what} stopped process {pid}");
+        }
+    };
+    // A process of a box: in no group and no session of the spawner or the
+    // daemon.
+    let apart = |pid: u32, what: &str| -> (u32, u32) {
+        let (group, session) = group_and_session(pid);
+        for (other_group, other_session) in outside {
+            assert_ne!(group, other_group, "{what} shares a process group");
+            assert_ne!(session, other_session, "{what} shares a session");
+        }
+        (group, session)
+    };
+    let bystander_ids = [
+        apart(bystander_supervisor, "the bystander's supervisor"),
+        apart(bystander_program, "the bystander's program"),
+    ];
+
+    for signal in [libc::SIGKILL, libc::SIGSTOP] {
+        let kill0 = format!("KILL0:{signal}");
+        let cgroup = root.create_box(BOX_ID).expect("the box's cgroup");
+        // A box's first program, and the first program of a container that
+        // belongs to no box. The program is the init of its PID namespace,
+        // which the kernel shields from a signal sent inside the
+        // namespace, so it outlives its own signal and ends by itself.
+        for (name, cgroup) in [("first", Some(&cgroup)), ("unboxed", None)] {
+            let name = format!("{name}-{signal}");
+            let noisy = fixture
+                .launch(&name, cgroup, None, &[], &[&kill0, "HOLD:/run/release"])
+                .await;
+            let supervisor = noisy.child.id();
+            let ids = apart(supervisor, "a supervisor");
+            assert!(!bystander_ids.contains(&ids), "two boxes share a session");
+            noisy.report.wait_for(&format!("kill0 {signal}: errno 0"));
+            untouched(&format!("{name}'s signal to its group"));
+            noisy.release("release");
+            assert!(noisy.child.exited().await.success());
+        }
+        cgroup
+            .destroy(DESTROY_LIMIT)
+            .await
+            .expect("the box's cgroup goes");
+
+        // A program entered into the bystander is no init, so its signal
+        // takes effect on its own group. The bystander's own program is
+        // outside that group too.
+        let mut enter = bystander
+            .child
+            .entrance()
+            .command("/usr/bin/probe", [kill0.as_str(), "HOLD:/run/never"]);
+        enter.stdin(Stdio::Null).stdout(Stdio::MakePipe);
+        let mut entered = enter.spawn().expect("entering the box");
+        let entered_report = Report::read(entered.stdout.take().unwrap());
+        let shim = entered.id();
+        entered_report.wait_for(&format!("kill0 {signal}: sending"));
+        if signal == libc::SIGKILL {
+            let status = entered.exited().await;
+            assert_eq!(status.code, 128 + libc::SIGKILL, "{status:?}");
+        } else {
+            let program = eventually("the shim has its program", || init_of(shim).ok());
+            eventually("the entered program stopped itself", || {
+                stopped(program).then_some(())
+            });
+            assert!(!stopped(shim), "the entered program stopped its shim");
+            apart(shim, "the shim");
+            apart(program, "the entered program");
+            entered.kill();
+            entered.exited().await;
+        }
+        untouched("an entered program's signal to its group");
+    }
+
+    bystander.release("release");
+    assert!(bystander.child.exited().await.success());
+    bystander_cgroup
+        .destroy(DESTROY_LIMIT)
+        .await
+        .expect("the bystander's cgroup goes");
+}
+
+/// A program gets the descriptors its request passed and no other: not one
+/// the daemon held open without close-on-exec when it started the spawner,
+/// and none of the spawner's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_program_gets_no_descriptor_but_its_own() {
+    let Some(fixture) = Fixture::new("a_program_gets_no_descriptor_but_its_own", false) else {
+        return;
+    };
+    // The planted descriptor is open here, and inheritable.
+    // SAFETY: `fcntl` on a live descriptor.
+    let flags = unsafe { libc::fcntl(fixture.planted.as_raw_fd(), libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, 0);
+
+    let boxed = fixture
+        .launch("fds", None, None, &[], &["FDS", "HOLD:/run/release"])
+        .await;
+    boxed.report.wait_for("fds");
+    let mut enter = boxed.child.entrance().command("/usr/bin/probe", ["FDS"]);
+    enter.stdin(Stdio::Null);
+    let output = tokio::task::block_in_place(|| enter.output()).expect("entering the box");
+    assert!(output.status.success(), "{:?}", output.status);
+    let entered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        entered.lines().any(|line| line == "fds: 0 1 2"),
+        "the entered program has other descriptors:\n{entered}"
+    );
+
+    boxed.release("release");
+    assert!(boxed.child.exited().await.success());
+    assert_eq!(boxed.report.finish()["fds"], "0 1 2");
 }
 
 /// A daemon with a cgroup root runs no container in its own cgroup: a
