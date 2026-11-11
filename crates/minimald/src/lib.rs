@@ -24,8 +24,6 @@ mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;
 #[cfg(target_os = "linux")]
-pub mod policy_loader;
-#[cfg(target_os = "linux")]
 pub mod reaper;
 pub mod rpc;
 mod sandbox_progress;

@@ -1041,15 +1041,19 @@ pub(crate) mod linux {
     }
 
     /// The identity in what `minimald __policy-loader --identity` printed:
-    /// one line, `abi=<decimal> object=<64 hex digits>`. Anything else is a
-    /// binary without that mode.
+    /// one line, `abi=<decimal> object=<64 hex digits> loader=<64 hex
+    /// digits>`: the layouts, the programs, and the loader's own code.
+    /// Anything else is a binary without that mode, or a loader from
+    /// before the line had all three.
     pub(crate) fn identity_line(stdout: &str) -> Option<&str> {
         let line = stdout.strip_suffix('\n').unwrap_or(stdout);
-        let (abi, object) = line.strip_prefix("abi=")?.split_once(" object=")?;
+        let (abi, rest) = line.strip_prefix("abi=")?.split_once(" object=")?;
+        let (object, loader) = rest.split_once(" loader=")?;
+        let hash = |text: &str| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit());
         let well_formed = !abi.is_empty()
             && abi.bytes().all(|b| b.is_ascii_digit())
-            && object.len() == 64
-            && object.bytes().all(|b| b.is_ascii_hexdigit());
+            && hash(object)
+            && hash(loader);
         well_formed.then_some(line)
     }
 
@@ -2035,10 +2039,12 @@ mod tests {
         }
     }
 
-    const IDENTITY: &str =
-        "abi=3 object=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const OTHER_IDENTITY: &str =
-        "abi=4 object=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const IDENTITY: &str = "abi=3 object=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+         loader=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    /// The same layouts and programs, other loader code: what a fix inside
+    /// the loader looks like.
+    const OTHER_IDENTITY: &str = "abi=3 object=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+         loader=0000ba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     /// A host where the policy engine is installed for alice and current.
     fn policy_engine_installed() -> linux::PolicyEngineFacts {
@@ -2341,6 +2347,13 @@ mod tests {
             IDENTITY.replace("abi=3", "abi="),
             IDENTITY.replace("abi=3", "abi=0x3"),
             IDENTITY.replace("object=0", "object=g"),
+            IDENTITY.replace("loader=f", "loader=g"),
+            // A loader from before the line named its own code.
+            IDENTITY
+                .split(" loader=")
+                .next()
+                .unwrap_or_default()
+                .to_string(),
             IDENTITY[..IDENTITY.len() - 1].to_string(),
             "error: unrecognized subcommand '__policy-loader'\n".to_string(),
         ] {

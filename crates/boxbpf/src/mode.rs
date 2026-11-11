@@ -1,18 +1,22 @@
-//! The root loader of the network policy engine: this binary in an
-//! internal mode.
+//! The root loader as a mode of the daemon's binary.
 //!
 //! An unprivileged daemon cannot load the engine's programs. It asks this
 //! loader, which systemd starts as root for each connection on the loader
 //! socket. The loader checks who asks, loads the programs at the daemon's
 //! `boxes` cgroup, hands the maps back, and exits. It keeps no state.
+//!
+//! Everything that runs as root for a daemon is in this crate, so one hash
+//! over the crate ([`crate::loader_id`]) says whether an installed copy
+//! still runs the code this build has.
 
 use std::{
     os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
     path::{Path, PathBuf},
 };
 
-use boxbpf::loader::{ServeOptions, Served, serve};
 use nix::sys::socket::{self, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
+
+use crate::loader::{ServeOptions, Served, serve};
 
 /// The first argument that selects this mode.
 pub const MODE: &str = "__policy-loader";
@@ -21,14 +25,17 @@ pub const MODE: &str = "__policy-loader";
 /// cgroup mount.
 const HANDOVER_BASE: &str = "minimal";
 
-/// What this build loads and speaks, on one line. A loader and a daemon
-/// with the same line work together.
+/// What this build is as a loader, on one line: the layouts it speaks, the
+/// programs it loads, and its own code. A daemon works with a loader of
+/// the same `abi` and `object`. An installed copy with another `loader`
+/// still works and is out of date.
 #[must_use]
 pub fn identity() -> String {
     format!(
-        "abi={} object={}",
+        "abi={} object={} loader={}",
         netpol::abi::VERSION,
-        boxbpf::object_id()
+        crate::object_id(),
+        crate::loader_id()
     )
 }
 
@@ -192,10 +199,20 @@ mod tests {
     #[test]
     fn the_identity_line_names_the_layouts_and_the_programs() {
         let line = identity();
-        let (abi, object) = line.split_once(' ').expect("two fields");
-        assert_eq!(abi, format!("abi={}", netpol::abi::VERSION));
-        let hash = object.strip_prefix("object=").expect("object field");
-        assert_eq!(hash.len(), 64);
-        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        let fields: Vec<&str> = line.split(' ').collect();
+        let [abi, object, loader] = fields.as_slice() else {
+            panic!("three fields: {line}");
+        };
+        assert_eq!(*abi, format!("abi={}", netpol::abi::VERSION));
+        for (field, key) in [(object, "object="), (loader, "loader=")] {
+            let hash = field.strip_prefix(key).expect(key);
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        // The two name different things and are not the same hash.
+        assert_ne!(
+            object.strip_prefix("object="),
+            loader.strip_prefix("loader=")
+        );
     }
 }

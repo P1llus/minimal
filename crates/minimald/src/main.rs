@@ -370,7 +370,7 @@ fn main() -> Result<(), MainError> {
     // And the root loader of the policy engine, when systemd starts the
     // root-owned copy for a daemon's request.
     #[cfg(target_os = "linux")]
-    minimald::policy_loader::run_internal_mode();
+    boxbpf::mode::run_internal_mode();
 
     // As the microVM's init, fork the daemon off before anything else, while
     // this process is still single-threaded: pid 1 stays behind and reaps

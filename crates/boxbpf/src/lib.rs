@@ -22,10 +22,12 @@ mod handles;
 #[cfg(target_os = "linux")]
 pub mod loader;
 #[cfg(target_os = "linux")]
+pub mod mode;
+#[cfg(target_os = "linux")]
 mod sys;
 
 #[cfg(target_os = "linux")]
-pub use engine::{Engine, MapSizes, object_id};
+pub use engine::{Engine, MapSizes, loader_id, object_id};
 #[cfg(target_os = "linux")]
 pub use error::Error;
 #[cfg(target_os = "linux")]

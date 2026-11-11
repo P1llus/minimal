@@ -19,6 +19,15 @@ pub const fn object_id() -> &'static str {
     env!("BOXBPF_OBJECT_ID")
 }
 
+/// Names the code that runs as root when this crate is the loader: the
+/// SHA-256 over this crate's sources, its programs and the layouts it
+/// shares with them. It changes when that code changes and not otherwise,
+/// so an installed loader is out of date exactly when it differs.
+#[must_use]
+pub const fn loader_id() -> &'static str {
+    env!("BOXBPF_LOADER_ID")
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Sock,

@@ -5,7 +5,11 @@
 //! programs include is in `bpf/`. `BOXBPF_CLANG` names another compiler.
 //! On targets other than Linux there is nothing to build.
 
-use std::{env, fs, io, path::PathBuf, process::Command};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use sha2::{Digest as _, Sha256};
 
@@ -16,6 +20,9 @@ fn fail(message: &str) -> ! {
 
 fn main() {
     println!("cargo::rerun-if-changed=bpf");
+    for path in LOADER_SOURCES {
+        println!("cargo::rerun-if-changed={path}");
+    }
     println!("cargo::rerun-if-env-changed=BOXBPF_CLANG");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
@@ -69,4 +76,78 @@ fn main() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     println!("cargo::rustc-env=BOXBPF_OBJECT_ID={id}");
+
+    match loader_id(&manifest) {
+        Ok(id) => println!("cargo::rustc-env=BOXBPF_LOADER_ID={id}"),
+        Err(e) => fail(&format!("cannot hash the loader's sources: {e}")),
+    }
+}
+
+/// What the root loader is built from, relative to this crate: the crate
+/// itself, the layouts it checks its programs against, and the lock file.
+const LOADER_SOURCES: [&str; 6] = [
+    "src",
+    "bpf",
+    "build.rs",
+    "Cargo.toml",
+    "../netpol/src/abi.rs",
+    LOCK_FILE,
+];
+
+const LOCK_FILE: &str = "../../Cargo.lock";
+
+/// The packages whose code the loader runs with the kernel and the socket.
+/// Of the lock file only their entries count: it changes with every
+/// release, and the loader does not.
+const LOADER_PACKAGES: [&str; 4] = ["aya", "aya-obj", "libc", "nix"];
+
+/// The lock file's entries for [`LOADER_PACKAGES`].
+fn locked_versions(lock: &str) -> String {
+    lock.split("[[package]]")
+        .filter(|entry| {
+            LOADER_PACKAGES.iter().any(|name| {
+                entry
+                    .trim_start()
+                    .starts_with(&format!("name = \"{name}\"\n"))
+            })
+        })
+        .collect()
+}
+
+fn files_below(path: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            files_below(&entry?.path(), out)?;
+        }
+    } else {
+        out.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
+/// One hash over the loader's sources: each file's path and content, in
+/// path order.
+fn loader_id(manifest: &Path) -> io::Result<String> {
+    let mut files = Vec::new();
+    for source in LOADER_SOURCES {
+        files_below(&manifest.join(source), &mut files)?;
+    }
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        let name = file.strip_prefix(manifest).unwrap_or(&file);
+        hash.update(name.to_string_lossy().as_bytes());
+        hash.update([0]);
+        if file.ends_with("Cargo.lock") {
+            hash.update(locked_versions(&fs::read_to_string(&file)?).as_bytes());
+        } else {
+            hash.update(fs::read(&file)?);
+        }
+        hash.update([0]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
