@@ -39,6 +39,17 @@ pub fn udp_echo(at: IpAddr) -> u16 {
     port
 }
 
+/// A UDP socket at exactly `at` that answers every datagram.
+pub fn udp_echo_at(at: SocketAddr) {
+    let sock = UdpSocket::bind(at).expect("bind a UDP echo socket");
+    thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        while let Ok((_, peer)) = sock.recv_from(&mut buf) {
+            let _sent = sock.send_to(b"pong", peer);
+        }
+    });
+}
+
 fn dns_answer(query: &[u8], answer: Ipv4Addr) -> Vec<u8> {
     let mut reply = query.to_vec();
     if let Some(flags) = reply.get_mut(2..4) {

@@ -121,7 +121,7 @@ struct {
  * at the same time loses the reply exemption for the oldest, and their
  * replies are judged by the rules alone.
  */
-#define UDP_PEERS 16 /* a power of two */
+#define UDP_PEERS 64 /* a power of two */
 
 struct udp_peer {
 	__u32 addr[4];
@@ -413,7 +413,8 @@ static __always_inline void peer_admit(void *sk, const __u32 *addr, __u16 port, 
 	if (!us)
 		return;
 	if (us->generation != generation) {
-		__builtin_memset(us->peer, 0, sizeof(us->peer));
+		for (__u32 i = 0; i < UDP_PEERS; i++)
+			us->peer[i].dirs = 0;
 		us->next = 0;
 		us->generation = generation;
 	}

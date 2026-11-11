@@ -140,3 +140,66 @@ fn a_socket_is_judged_as_the_box_that_created_it() {
         format!("err {}", libc::EINVAL)
     );
 }
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_udp_socket_gets_the_answers_of_many_peers() {
+    use netpol::{
+        Defaults, Verdict,
+        base::{BasePolicy, BoxAddrs},
+        compile::{Options, compile},
+    };
+
+    let Some(mut h) = Harness::start("cases::sockets::a_udp_socket_gets_the_answers_of_many_peers")
+    else {
+        return;
+    };
+    // Nothing may come in but an answer: every datagram the box gets
+    // back passes because its socket remembers the peer.
+    let base = BasePolicy {
+        before: Vec::new(),
+        protected: Vec::new(),
+        defaults: Defaults {
+            egress: Verdict::Allow,
+            ingress: Verdict::Deny,
+            bind: Verdict::Allow,
+        },
+        endpoints: Vec::new(),
+        source_check: false,
+        addrs: BoxAddrs::default(),
+    };
+    let compiled = compile(&base, &BoxPolicy::default(), Options::default()).expect("compile");
+    let id = h.new_box("u");
+    h.handles
+        .apply(id, std::sync::Arc::new(compiled))
+        .expect("apply");
+
+    // Forty peers on consecutive ports, as a resolver or a peer-to-peer
+    // client has them.
+    let at = IpAddr::V4(h.v4(1, 1));
+    let count = 40u16;
+    let first = (20_000..40_000u16)
+        .step_by(100)
+        .find(|first| {
+            (*first..*first + count)
+                .all(|port| std::net::UdpSocket::bind(SocketAddr::new(at, port)).is_ok())
+        })
+        .expect("forty free ports in a row");
+    for port in first..first + count {
+        servers::udp_echo_at(SocketAddr::new(at, port));
+    }
+    assert_eq!(
+        h.probe(
+            "u",
+            &[
+                "udp-many",
+                &at.to_string(),
+                &first.to_string(),
+                &count.to_string()
+            ]
+        ),
+        format!("ok answers={count}")
+    );
+    let stats = h.handles.stats(id).expect("stats").expect("counters");
+    assert_eq!(stats.rx_drop, 0, "{stats:?}");
+}

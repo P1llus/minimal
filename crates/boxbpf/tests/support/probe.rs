@@ -301,6 +301,22 @@ fn flood(to: SocketAddr, count: usize) -> std::io::Result<String> {
     Ok(refused.to_string())
 }
 
+/// One socket that writes to `count` ports of one address, then counts the
+/// answers it gets.
+fn udp_many(ip: IpAddr, first: u16, count: u16) -> std::io::Result<String> {
+    let sock = UdpSocket::bind(unspecified(&SocketAddr::new(ip, 0)))?;
+    for port in first..first + count {
+        sock.send_to(b"ping", SocketAddr::new(ip, port))?;
+    }
+    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut buf = [0u8; 64];
+    let mut answered = std::collections::BTreeSet::new();
+    while let Ok((_, from)) = sock.recv_from(&mut buf) {
+        answered.insert(from.port());
+    }
+    Ok(format!("answers={}", answered.len()))
+}
+
 /// Hands sockets to whoever holds the other end of `channel`.
 pub fn send_sockets(channel: BorrowedFd<'_>, socks: &[OwnedFd]) -> std::io::Result<()> {
     let raw: Vec<_> = socks.iter().map(AsRawFd::as_raw_fd).collect();
@@ -595,6 +611,11 @@ pub fn run() {
         ["hold-udp", ip, port] => return hold_udp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
+        ["udp-many", ip, first, count] => report(udp_many(
+            ip.parse().expect("address"),
+            first.parse().expect("port"),
+            count.parse().expect("count"),
+        )),
         ["flood", ip, port, count] => report(flood(addr(ip, port), count.parse().expect("count"))),
         ["make-sockets", kind, count] => report(make_sockets(kind, count.parse().expect("count"))),
         ["use-socket", kind, ip, port] => report(use_socket(kind, addr(ip, port))),
