@@ -214,7 +214,25 @@ mod guest {
         report.check(
             "load",
             true,
-            "13 programs passed the verifier and attached at boxes/",
+            "every program passed the verifier and attached at boxes/",
+        );
+        // A second engine at the same cgroup would judge every flow too,
+        // from maps nobody writes.
+        let again = fs::File::open(format!("{CGROUP}/boxes"))
+            .map_err(|source| Error::Sys {
+                what: "open boxes/",
+                source,
+            })
+            .and_then(|boxes| Engine::start(boxes.as_fd(), &MapSizes::default()));
+        report.check(
+            "in_use",
+            matches!(again, Err(Error::InUse)),
+            &format!(
+                "a cgroup with an engine gets no second one: {}",
+                again
+                    .err()
+                    .map_or_else(|| "it did".to_owned(), |e| e.to_string())
+            ),
         );
         let mut events = handles.take_events();
 
@@ -314,8 +332,11 @@ mod guest {
         let mut buf = [0u8; 16];
         let origin = match resolver.recv_from(&mut buf) {
             Ok((n, peer)) => {
+                // The entry goes with the box's socket, which closes once
+                // the reply is in: ask first.
+                let origin = handles.original_destination(peer, Protocol::Udp)?;
                 let _sent = resolver.send_to(buf.get(..n).unwrap_or_default(), peer);
-                handles.original_destination(peer, Protocol::Udp)?
+                origin
             }
             Err(_) => None,
         };

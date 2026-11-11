@@ -15,8 +15,10 @@ mod cases {
     pub mod loader;
     pub mod netns;
     pub mod parity;
+    pub mod reconfigure;
     pub mod redirect;
     pub mod rules;
+    pub mod sockets;
 }
 
 /// Not a test: the entry point of the helper processes the tests start.

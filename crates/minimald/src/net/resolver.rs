@@ -21,7 +21,7 @@ use hickory_proto::{
     op::{Message, MessageType, Metadata, OpCode, ResponseCode},
     rr::{RData, Record, RecordType, rdata::A},
 };
-use netpol::{Compiled, Prefix, Protocol, SetId, pins};
+use netpol::{Compiled, Prefix, Protocol, pins};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -212,7 +212,7 @@ pub(crate) struct ZoneAdmission {
     /// What the box is told.
     pub(crate) answer: ZoneAnswer,
     /// The address to admit for the box.
-    pub(crate) pin: Option<(IpAddr, SetId)>,
+    pub(crate) pin: Option<IpAddr>,
     /// The address the zone holds and the box is not told: one its policy
     /// would have to allow by prefix before a name may open it.
     pub(crate) refused: Option<IpAddr>,
@@ -228,14 +228,13 @@ pub(crate) fn admit_zone(answer: ZoneAnswer, name: &str, view: &View<'_>) -> Zon
         pin: None,
         refused: None,
     };
-    let (ZoneAnswer::Address(address), Some(set)) = (answer, view.compiled.set_for_name(name))
-    else {
+    let (ZoneAnswer::Address(address), Some(_)) = (answer, view.compiled.set_for_name(name)) else {
         return told;
     };
     let address = IpAddr::V4(address);
     if pins::may_pin(address, view.allowed, view.infrastructure) {
         ZoneAdmission {
-            pin: Some((address, set)),
+            pin: Some(address),
             ..told
         }
     } else {
@@ -281,8 +280,8 @@ pub(crate) fn zone_reply(query: &Message, answer: ZoneAnswer) -> Option<Vec<u8>>
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Vetted {
     pub(crate) reply: Vec<u8>,
-    /// Addresses to admit for the box, with the name set they belong to.
-    pub(crate) pins: Vec<(IpAddr, SetId)>,
+    /// Addresses to admit for the box as addresses of the name asked for.
+    pub(crate) pins: Vec<IpAddr>,
     /// Addresses taken out of the reply: the name resolved to something a
     /// public name has no business pointing at.
     pub(crate) refused: Vec<IpAddr>,
@@ -307,12 +306,12 @@ fn address_of(record: &Record) -> Option<IpAddr> {
 /// A name no rule of the box names is pinned nowhere and passes unchanged:
 /// such a box is judged by address alone.
 pub(crate) fn vet(reply: Vec<u8>, name: &str, view: &View<'_>) -> Vetted {
-    let Some(set) = view.compiled.set_for_name(name) else {
+    if view.compiled.set_for_name(name).is_none() {
         return Vetted {
             reply,
             ..Vetted::default()
         };
-    };
+    }
     let Ok(mut message) = Message::from_vec(&reply) else {
         // Nothing can be pinned from what cannot be read, so the box could
         // connect to none of it. Say so in a way it understands.
@@ -344,7 +343,7 @@ pub(crate) fn vet(reply: Vec<u8>, name: &str, view: &View<'_>) -> Vetted {
             continue;
         }
         if vetted.pins.len() < MAX_PINS {
-            vetted.pins.push((address, set));
+            vetted.pins.push(address);
             kept.push(record);
         }
     }
@@ -510,8 +509,8 @@ impl Resolver {
         );
     }
 
-    fn pin(&self, of: &Installed, address: IpAddr, set: SetId) {
-        if let Err(error) = self.engine.pin(of, address, set) {
+    fn pin(&self, of: &Installed, address: IpAddr, name: &str) {
+        if let Err(error) = self.engine.pin(of, address, name) {
             tracing::warn!(
                 box_id = %of.session(),
                 %address,
@@ -545,8 +544,8 @@ impl Resolver {
             }
             Decided::Zone { name, query } => {
                 let admitted = admit_zone(self.zone.lookup(&name), &name, &view);
-                if let Some((address, set)) = admitted.pin {
-                    self.pin(of, address, set);
+                if let Some(address) = admitted.pin {
+                    self.pin(of, address, &name);
                 }
                 if let Some(address) = admitted.refused {
                     self.refused(of, &name, "rebinding", Some(address));
@@ -562,8 +561,8 @@ impl Resolver {
                     return encoded(&empty(&query, ResponseCode::ServFail));
                 };
                 let vetted = vet(reply, &name, &view);
-                for (address, set) in &vetted.pins {
-                    self.pin(of, *address, *set);
+                for address in &vetted.pins {
+                    self.pin(of, *address, &name);
                 }
                 for address in &vetted.refused {
                     self.refused(of, &name, "rebinding", Some(*address));
@@ -954,7 +953,6 @@ mod tests {
     #[test]
     fn a_zone_name_opens_no_more_than_an_upstream_name_would() {
         let listed = by_name(&["peer.min.internal"]);
-        let set = listed.set_for_name("peer.min.internal").expect("set");
         let loopback = ZoneAnswer::Address(Ipv4Addr::new(127, 0, 64, 9));
         // An internal address is told and pinned only inside a prefix the
         // box allows. Otherwise the box learns the name exists and gets no
@@ -969,10 +967,7 @@ mod tests {
         open.allowed = &allowed;
         let admitted = admit_zone(loopback, "peer.min.internal", &open);
         assert_eq!(admitted.answer, loopback);
-        assert_eq!(
-            admitted.pin,
-            Some(("127.0.64.9".parse().expect("address"), set))
-        );
+        assert_eq!(admitted.pin, Some("127.0.64.9".parse().expect("address")));
         // A box that allows everything pins nothing and is told the answer.
         let everything = compiled(BoxPolicy::default());
         let told = admit_zone(loopback, "peer.min.internal", &view(&everything));
@@ -1045,7 +1040,6 @@ mod tests {
     #[test]
     fn addresses_of_a_listed_name_are_pinned_through_its_cname_chain() {
         let policy = by_name(&["api.example.com"]);
-        let set = policy.set_for_name("api.example.com").expect("set");
         let reply = upstream_reply(
             "api.example.com",
             vec![
@@ -1060,8 +1054,8 @@ mod tests {
         assert_eq!(
             vetted.pins,
             vec![
-                ("198.51.100.7".parse().expect("address"), set),
-                ("2001:db8::7".parse().expect("address"), set),
+                "198.51.100.7".parse::<IpAddr>().expect("address"),
+                "2001:db8::7".parse().expect("address"),
             ]
         );
         assert!(vetted.refused.is_empty());

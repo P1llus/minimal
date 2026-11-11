@@ -18,6 +18,10 @@ const BOX4_OTHER: &str = "10.99.0.3";
 const GATEWAY4: &str = "10.99.0.1";
 const PEER4: &str = "10.99.0.9";
 const BOX6: &str = "fd00:99::2";
+const BOX_LL6: &str = "fe80::99:2";
+/// A link-local address on the box's interface that is not the one the
+/// engine was told.
+const OTHER_LL6: &str = "fe80::99:3";
 const PEER6: &str = "fd00:99::9";
 
 fn refused() -> String {
@@ -58,6 +62,7 @@ fn policy(icmp4: u16, icmp6: u16) -> BoxPolicy {
         rules: vec![
             allow(Protocols::TCP, PortRange::one(18080), PEER4),
             allow(Protocols::TCP, PortRange::one(18080), PEER6),
+            allow(Protocols::UDP, PortRange::one(18090), PEER4),
             allow(Protocols::ICMP, PortRange::one(icmp4), PEER4),
             allow(Protocols::ICMP, PortRange::one(icmp6), PEER6),
         ],
@@ -77,6 +82,7 @@ fn a_box_in_its_own_network_namespace() {
     deployment.addrs = BoxAddrs {
         v4: Some(BOX4.parse().expect("address")),
         v6: Some(BOX6.parse().expect("address")),
+        link_local6: Some(BOX_LL6.parse().expect("address")),
     };
     deployment.network = Some(VirtualNetwork {
         subnet: "10.99.0.0/24".parse().expect("prefix"),
@@ -171,6 +177,24 @@ fn a_box_in_its_own_network_namespace() {
             "nodad",
         ],
     );
+    // The box's link-local address is the one its deployment names, as
+    // when the daemon sets the interface up.
+    in_ns(box_ns, &["ip", "link", "set", "va", "addrgenmode", "none"]);
+    for addr in [BOX_LL6, OTHER_LL6] {
+        in_ns(
+            box_ns,
+            &[
+                "ip",
+                "-6",
+                "addr",
+                "add",
+                &format!("{addr}/64"),
+                "dev",
+                "va",
+                "nodad",
+            ],
+        );
+    }
     for (ns, dev) in [
         (peer_ns, "vb"),
         (peer_ns, "lo"),
@@ -219,6 +243,31 @@ fn a_box_in_its_own_network_namespace() {
     );
     assert_eq!(probe(&["tcp", PEER6, "18081", "500"]), refused());
 
+    // ---- UDP: a socket's replies come back, and nothing else comes in
+    let _peer_echo = Cgroups::hold_peer_probe(peer_ns, &["serve-udp", PEER4, "18090"]);
+    assert_eq!(
+        probe(&["udp", PEER4, "18090", "1000"]),
+        format!("ok from={PEER4}:18090"),
+        "the reply of a peer the box wrote to passes the ingress default"
+    );
+    let _box_echo = cg.hold_probe_in("own", box_ns, &["serve-udp", "::", "18091"]);
+    let knock = |port: &str| Cgroups::peer_probe(peer_ns, &["udp", BOX4, port, "500"]);
+    assert_eq!(
+        knock("18091"),
+        "err timeout",
+        "a datagram nobody asked for is dropped"
+    );
+    let udp_port = PortOf {
+        protocols: Protocols::UDP,
+        port: 18091,
+    };
+    h.handles.publish(&mut live, udp_port).expect("publish");
+    // The peer sends from the gateway address, which no egress rule lets
+    // the box write to. The answer passes because the datagram came in.
+    assert_eq!(knock("18091"), format!("ok from={BOX4}:18091"));
+    h.handles.unpublish(&mut live, udp_port).expect("unpublish");
+    assert_eq!(knock("18091"), "err timeout");
+
     // ---- ICMP and ICMPv6 by message type
     assert_eq!(probe(&["ping", PEER4]), "ok type=0");
     assert_eq!(probe(&["ping", PEER6]), "ok type=129");
@@ -250,6 +299,35 @@ fn a_box_in_its_own_network_namespace() {
         seen.iter().any(|e| e.hook == Hook::Egress
             && e.reason == Reason::SourceAddress
             && e.src == ip(BOX4_OTHER)),
+        "{seen:?}"
+    );
+
+    // A box can give itself any link-local address. Only the one the
+    // engine knows as the box's is a source.
+    let from = |source: &str| probe(&["tcp-from", &format!("{source}%va"), PEER6, "18080", "700"]);
+    assert_eq!(from(BOX_LL6), "ok connected");
+    assert_eq!(from(OTHER_LL6), "err timeout");
+    let seen = Harness::drain(&mut events);
+    assert!(
+        seen.iter().any(|e| e.hook == Hook::Egress
+            && e.reason == Reason::SourceAddress
+            && e.src == ip(OTHER_LL6)),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().all(|e| e.src != ip(BOX_LL6)),
+        "the box's own link-local address is refused: {seen:?}"
+    );
+    // Duplicate address detection sends from the unspecified address, and
+    // the source check lets that through.
+    in_ns(
+        box_ns,
+        &["ip", "-6", "addr", "add", "fd00:99::7/64", "dev", "va"],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let seen = Harness::drain(&mut events);
+    assert!(
+        seen.iter().all(|e| e.reason != Reason::SourceAddress),
         "{seen:?}"
     );
 

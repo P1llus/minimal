@@ -61,9 +61,6 @@ pub fn located() -> sandbox::cgroup::Located {
     }
 }
 
-/// How long a box left by an earlier daemon gets to die at start.
-const SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// Takes the daemon's cgroup root and starts its spawner, in that order:
 /// the daemon moves into the root's `supervisor` cgroup, and the spawner
 /// starts there.
@@ -77,17 +74,10 @@ pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf, guest: b
     let root = match located {
         Located::Guest(dir) | Located::DelegatedUnit(dir) | Located::Handed(dir) => {
             match Root::open(&dir) {
+                // Taking the root ends the boxes of a daemon that ran in
+                // this cgroup before and did not stop them. Their records
+                // are stopped at start too.
                 Ok(root) => {
-                    // Boxes of a daemon that ran in this cgroup before and did
-                    // not stop them. Their records are stopped at start too.
-                    match root.sweep(SWEEP_LIMIT) {
-                        Ok(swept) if swept.is_empty() => {}
-                        Ok(swept) => tracing::warn!(
-                            boxes = ?swept,
-                            "removed box cgroups an earlier daemon left behind"
-                        ),
-                        Err(error) => tracing::warn!(%error, "sweeping leftover box cgroups"),
-                    }
                     tracing::info!(
                         root = %root.dir().display(),
                         controllers = ?root.controllers(),
@@ -122,7 +112,7 @@ pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf, guest: b
     } else {
         crate::net::spec::Node::native()
     };
-    crate::net::engine::Engine::boot(root.as_ref(), node);
+    let root = crate::net::engine::Engine::boot(root, node);
     let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Detached, root.clone());
     set_root(root);
 

@@ -120,12 +120,9 @@ fn options() -> ServeOptions {
 /// is the journal under systemd. True when the request was served.
 fn serve_one(conn: BorrowedFd<'_>) -> bool {
     match serve(conn, &options()) {
-        Ok(Served::Engine {
-            uid, path, reused, ..
-        }) => {
-            let how = if reused { "found" } else { "loaded" };
+        Ok(Served::Engine { uid, path, .. }) => {
             eprintln!(
-                "minimald policy loader: {how} the policy engine at /{} for uid {uid}",
+                "minimald policy loader: loaded the policy engine at /{} for uid {uid}",
                 path.display()
             );
             true

@@ -7,7 +7,7 @@
  *  - TCP: only a bare SYN is checked. Any other segment belongs to a
  *    connection whose SYN this side or the other side admitted.
  *  - UDP: a packet to or from a peer that the rules of the other direction
- *    admitted on this socket is a reply.
+ *    admitted on this socket is a reply. The socket remembers its peers.
  *  - ICMP: an echo reply is a reply. A ping socket receives nothing else.
  */
 
@@ -150,13 +150,18 @@ static __always_inline int drop(struct __sk_buff *skb, __u64 box, __u8 hook, con
 	return 0;
 }
 
-static __always_inline struct sk_state *skb_state(struct __sk_buff *skb, int create)
+/* The packet's socket if it can have storage, else NULL. */
+static __always_inline struct bpf_sock *skb_sock(struct __sk_buff *skb)
 {
 	struct bpf_sock *sk = skb->sk;
 
-	if (!sk)
-		return NULL;
-	sk = bpf_sk_fullsock(sk);
+	return sk ? bpf_sk_fullsock(sk) : NULL;
+}
+
+static __always_inline struct sk_state *skb_state(struct __sk_buff *skb, int create)
+{
+	struct bpf_sock *sk = skb_sock(skb);
+
 	if (!sk)
 		return NULL;
 	return bpf_sk_storage_get(&sk_state, sk, 0, create ? BPF_SK_STORAGE_GET_F_CREATE : 0);
@@ -167,25 +172,45 @@ static __always_inline int addr_eq(const __u32 *a, const __u32 *b)
 	return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
 }
 
-/* Sources a box with BP_F_CHECK_SRC may use besides its own address: loopback,
- * and for IPv6 the unspecified and link-local addresses the kernel's
- * neighbour discovery sends from. */
+#define ICMPV6_MLD_REPORT   131
+#define ICMPV6_MLD_DONE     132
+#define ICMPV6_ROUTER_SOL   133
+#define ICMPV6_NEIGHBOUR_SOL 135
+#define ICMPV6_MLD2_REPORT  143
+
+/*
+ * Sources a box with BP_F_CHECK_SRC may use: its own addresses and loopback.
+ * A box can bind any link-local address (IPV6_FREEBIND needs no privilege),
+ * so of those only its own passes. The unspecified IPv6 address passes for
+ * what the kernel sends before the interface has an address: duplicate
+ * address detection and the multicast reports that go with it.
+ */
 static __always_inline int src_ok(const struct bp_box_cfg *cfg, const struct pkt *p)
 {
 	__u32 own[4];
 
 	if (p->family == 4)
-		return p->saddr[0] == cfg->addr4 ||
+		return (cfg->addr4 && p->saddr[0] == cfg->addr4) ||
 		       (p->saddr[0] & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
+	if (!(p->saddr[0] | p->saddr[1] | p->saddr[2])) {
+		if (p->saddr[3] == bpf_htonl(1))
+			return 1;
+		if (!p->saddr[3])
+			return p->pbit == BP_P_ICMP && !p->later_frag &&
+			       (p->icmp_type == ICMPV6_MLD_REPORT ||
+				p->icmp_type == ICMPV6_MLD_DONE ||
+				p->icmp_type == ICMPV6_ROUTER_SOL ||
+				p->icmp_type == ICMPV6_NEIGHBOUR_SOL ||
+				p->icmp_type == ICMPV6_MLD2_REPORT);
+	}
 	/* Word compares: older clang turns a memcmp builtin into a call, which
-	 * BPF does not have. */
+	 * BPF does not have. An all-zero config address matches nothing here:
+	 * the unspecified source was dealt with above. */
 	__builtin_memcpy(own, cfg->addr6, 16);
 	if (addr_eq(p->saddr, own))
 		return 1;
-	if ((p->saddr[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000))
-		return 1;
-	return p->saddr[0] == 0 && p->saddr[1] == 0 && p->saddr[2] == 0 &&
-	       (p->saddr[3] == 0 || p->saddr[3] == bpf_htonl(1));
+	__builtin_memcpy(own, cfg->ll6, 16);
+	return addr_eq(p->saddr, own);
 }
 
 static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struct pkt *p)
@@ -206,7 +231,8 @@ static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struc
  * (bp_sock_release), so a later socket with the same address and port does
  * not inherit it.
  */
-static __always_inline void record_flow(__u64 box, const struct pkt *p, struct sk_state *st)
+static __always_inline void record_flow(__u64 box, const struct bp_box_cfg *cfg,
+					const struct pkt *p, struct sk_state *st)
 {
 	struct bp_endpoint_key ek = {};
 	struct bp_flow_key fk = {};
@@ -215,6 +241,7 @@ static __always_inline void record_flow(__u64 box, const struct pkt *p, struct s
 	__u32 i;
 
 	ek.box_id = box;
+	ek.generation = cfg->generation;
 	for (i = 0; i < BP_ENDPOINTS_MAX; i++) {
 		ek.idx = i;
 		ep = bpf_map_lookup_elem(&endpoints, &ek);
@@ -290,7 +317,7 @@ int bp_egress(struct __sk_buff *skb)
 	    (p.later_frag || st->ok_port == f.port)) {
 		/* The entry may have been evicted since the first packet. */
 		if (st->flags & ST_FLOW)
-			record_flow(box, &p, st);
+			record_flow(box, cfg, &p, st);
 		goto pass;
 	}
 	if (p.later_frag)
@@ -304,13 +331,10 @@ int bp_egress(struct __sk_buff *skb)
 		v.action = BP_DENY;
 	}
 	if (v.action == BP_DENY) {
-		if (p.pbit == BP_P_UDP) {
-			struct udp_peer up;
-
-			peer_key(&up, bpf_get_socket_cookie(skb), p.daddr, p.dport);
-			if (peer_admitted(&up, BP_DIR_INGRESS, cfg->generation))
-				goto pass;
-		}
+		if (p.pbit == BP_P_UDP &&
+		    peer_admitted(skb_sock(skb), p.daddr, p.dport, p.family, BP_DIR_INGRESS,
+				  cfg->generation))
+			goto pass;
 		return drop(skb, box, BP_H_EGRESS, &p, &v, 0);
 	}
 
@@ -321,14 +345,11 @@ int bp_egress(struct __sk_buff *skb)
 		__builtin_memcpy(st->ok_addr, p.daddr, 16);
 		st->ok_port = f.port;
 		st->ok_generation = cfg->generation;
-		record_flow(box, &p, st);
+		record_flow(box, cfg, &p, st);
 	}
-	if (p.pbit == BP_P_UDP) {
-		struct udp_peer up;
-
-		peer_key(&up, bpf_get_socket_cookie(skb), p.daddr, p.dport);
-		peer_admit(&up, BP_DIR_EGRESS, cfg->generation);
-	}
+	if (p.pbit == BP_P_UDP)
+		peer_admit(skb_sock(skb), p.daddr, p.dport, p.family, BP_DIR_EGRESS,
+			   cfg->generation);
 
 pass:
 	s = stats_of(box);
@@ -346,7 +367,6 @@ int bp_ingress(struct __sk_buff *skb)
 	struct bp_box_cfg *cfg = bpf_map_lookup_elem(&box_cfg, &box);
 	struct verdict v = {};
 	struct bp_stats *s;
-	struct udp_peer up;
 	struct pkt p = {};
 	struct flow f = {};
 
@@ -362,11 +382,9 @@ int bp_ingress(struct __sk_buff *skb)
 	if (p.pbit == BP_P_ICMP &&
 	    p.icmp_type == (p.family == 4 ? ICMP_ECHOREPLY : ICMPV6_ECHO_REPLY))
 		goto pass;
-	if (p.pbit == BP_P_UDP) {
-		peer_key(&up, bpf_get_socket_cookie(skb), p.saddr, p.sport);
-		if (peer_admitted(&up, BP_DIR_EGRESS, cfg->generation))
-			goto pass;
-	}
+	if (p.pbit == BP_P_UDP &&
+	    peer_admitted(skb_sock(skb), p.saddr, p.sport, p.family, BP_DIR_EGRESS, cfg->generation))
+		goto pass;
 
 	f.box = box;
 	f.dir = BP_DIR_INGRESS;
@@ -379,7 +397,8 @@ int bp_ingress(struct __sk_buff *skb)
 		return drop(skb, box, BP_H_INGRESS, &p, &v, 0);
 	/* So the reply gets out, whatever the egress rules say. */
 	if (p.pbit == BP_P_UDP)
-		peer_admit(&up, BP_DIR_INGRESS, cfg->generation);
+		peer_admit(skb_sock(skb), p.saddr, p.sport, p.family, BP_DIR_INGRESS,
+			   cfg->generation);
 
 pass:
 	s = stats_of(box);

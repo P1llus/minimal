@@ -54,6 +54,9 @@ impl Mode {
 pub struct BoxAddrs {
     pub v4: Option<Ipv4Addr>,
     pub v6: Option<Ipv6Addr>,
+    /// The link-local address of the box's interface. The kernel sends
+    /// neighbour discovery from it, so the source check must know it.
+    pub link_local6: Option<Ipv6Addr>,
 }
 
 /// The virtual network a box, or the node of a `host_ip` box, sits on.
@@ -125,7 +128,11 @@ impl Deployment {
         Self {
             node,
             mode,
-            addrs: BoxAddrs { v4: None, v6: None },
+            addrs: BoxAddrs {
+                v4: None,
+                v6: None,
+                link_local6: None,
+            },
             network: None,
             transport_ipv6: false,
             host_exposures: Vec::new(),
@@ -148,9 +155,9 @@ impl Deployment {
 pub struct BasePolicy {
     /// Decided before anything the box declares.
     pub before: Vec<Rule>,
-    /// Decided after the box's rules and before the default. A box rule or
-    /// a pinned name can admit what these refuse.
-    pub after: Vec<Rule>,
+    /// Ranges that are denied after the box's rules, and that a wide allow
+    /// of the box does not open: see [`Rule::reaches_into`]. Egress only.
+    pub protected: Vec<Prefix>,
     pub defaults: Defaults,
     pub endpoints: Vec<(EndpointIndex, Endpoint)>,
     /// Packets must leave from the box's own addresses.
@@ -166,7 +173,7 @@ impl BasePolicy {
         let allow = Verdict::Allow;
         Self {
             before: Vec::new(),
-            after: Vec::new(),
+            protected: Vec::new(),
             defaults: Defaults {
                 egress: allow,
                 ingress: allow,
@@ -174,13 +181,19 @@ impl BasePolicy {
             },
             endpoints: Vec::new(),
             source_check: false,
-            addrs: BoxAddrs { v4: None, v6: None },
+            addrs: BoxAddrs {
+                v4: None,
+                v6: None,
+                link_local6: None,
+            },
         }
     }
 }
 
 const LOOPBACK4: Prefix = prefix4(Ipv4Addr::new(127, 0, 0, 0), 8);
 const LOOPBACK6: Prefix = Prefix::host(IpAddr::V6(Ipv6Addr::LOCALHOST));
+/// Holds the address cloud hosts serve instance metadata on.
+const LINK_LOCAL4: Prefix = prefix4(Ipv4Addr::new(169, 254, 0, 0), 16);
 const LINK_LOCAL6: Prefix = prefix6(0xfe80, 10);
 const MULTICAST_LINK6: Prefix = prefix6(0xff02, 16);
 
@@ -194,11 +207,11 @@ const ROUTED6: [Prefix; 5] = [
     Prefix::host(IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0))).truncated(96),
 ];
 
-const fn prefix4(addr: Ipv4Addr, len: u8) -> Prefix {
+pub(crate) const fn prefix4(addr: Ipv4Addr, len: u8) -> Prefix {
     Prefix::host(IpAddr::V4(addr)).truncated(len)
 }
 
-const fn prefix6(first: u16, len: u8) -> Prefix {
+pub(crate) const fn prefix6(first: u16, len: u8) -> Prefix {
     Prefix::host(IpAddr::V6(Ipv6Addr::new(first, 0, 0, 0, 0, 0, 0, 0))).truncated(len)
 }
 
@@ -461,11 +474,29 @@ const fn defaults(mode: Mode) -> Defaults {
     }
 }
 
+/// The protected ranges of a box on a virtual network: the network itself,
+/// where the other boxes and the node are, and the link-local ranges, which
+/// lead to whatever shares a link with the node. A box that shares a native
+/// node's network is on the host's network by the user's choice and has
+/// none.
+fn protected(d: &Deployment) -> Vec<Prefix> {
+    let on_virtual_network = match d.mode {
+        Mode::None => false,
+        Mode::OwnIp => true,
+        Mode::HostIp => d.node == NodeKind::Guest || d.network.is_some(),
+    };
+    if !on_virtual_network {
+        return Vec::new();
+    }
+    let mut out = vec![LINK_LOCAL4, LINK_LOCAL6];
+    out.extend(d.network.map(|net| net.subnet));
+    out
+}
+
 /// Builds the base policy of one box.
 #[must_use]
 pub fn base_policy(d: &Deployment) -> BasePolicy {
     let mut before = Vec::new();
-    let mut after = Vec::new();
 
     own_endpoints(&d.services, &mut before);
     other_endpoints(&d.endpoint_ranges, &mut before);
@@ -487,12 +518,6 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
     }
     if let Some(net) = &d.network {
         infrastructure(net, &d.host_exposures, &mut before);
-        // Other boxes. A rule of the box or a pinned peer name admits one.
-        after.push(egress(
-            Target::Net(net.subnet),
-            Action::Deny,
-            Origin::VirtualNetwork,
-        ));
     }
     published(&d.published, &mut before);
 
@@ -507,7 +532,7 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
 
     BasePolicy {
         before,
-        after,
+        protected: protected(d),
         defaults: defaults(d.mode),
         endpoints,
         source_check: d.mode == Mode::OwnIp,
@@ -535,16 +560,16 @@ impl fmt::Display for BasePolicy {
             }
             writeln!(f)?;
         }
-        for (title, rules) in [
-            ("before the box's rules", &self.before),
-            ("after the box's rules", &self.after),
-        ] {
-            if rules.is_empty() {
-                continue;
-            }
-            writeln!(f, "{title}:")?;
-            for rule in rules {
+        if !self.before.is_empty() {
+            writeln!(f, "before the box's rules:")?;
+            for rule in &self.before {
                 writeln!(f, "  {rule}  ({})", rule.origin)?;
+            }
+        }
+        if !self.protected.is_empty() {
+            writeln!(f, "protected ranges, after the box's rules:")?;
+            for range in &self.protected {
+                writeln!(f, "  {range}")?;
             }
         }
         Ok(())
@@ -585,7 +610,7 @@ mod tests {
         let mut d = Deployment::new(NodeKind::Native, Mode::HostIp);
         d.transport_ipv6 = true;
         let base = base_policy(&d);
-        assert!(base.before.is_empty() && base.after.is_empty());
+        assert!(base.before.is_empty() && base.protected.is_empty());
         assert_eq!(base.defaults.egress, Verdict::Allow);
         assert!(!base.source_check);
 
@@ -609,8 +634,14 @@ mod tests {
         assert!(first(Origin::HostExposure) < first(Origin::Infrastructure));
         assert!(first(Origin::OwnAddresses) < first(Origin::NoIpv6Transport));
         assert!(origins.contains(&Origin::Published));
-        assert_eq!(base.after.len(), 1);
-        assert_eq!(base.after.first().unwrap().origin, Origin::VirtualNetwork);
+        assert_eq!(
+            base.protected,
+            [
+                LINK_LOCAL4,
+                LINK_LOCAL6,
+                "192.168.127.0/24".parse().unwrap()
+            ]
+        );
         assert_eq!(base.defaults.egress, Verdict::Deny);
         assert!(base.source_check);
         // An endpoint without an IPv6 address gets no IPv6 redirect.
@@ -749,7 +780,30 @@ mod tests {
         let text = base_policy(&own_ip()).to_string();
         assert!(text.contains("defaults: egress deny, ingress deny, bind allow"));
         assert!(text.contains("(DNS to the box resolver)"));
-        assert!(text.contains("after the box's rules:"));
-        assert!(text.contains("192.168.127.0/24  (virtual network)"));
+        assert!(text.contains("protected ranges, after the box's rules:"));
+        assert!(text.contains("  192.168.127.0/24\n"));
+    }
+
+    #[test]
+    fn who_has_protected_ranges() {
+        let ranges = |node, mode| protected(&Deployment::new(node, mode));
+        // On the host's network by the user's choice.
+        assert!(ranges(NodeKind::Native, Mode::HostIp).is_empty());
+        assert!(ranges(NodeKind::Native, Mode::None).is_empty());
+        assert!(ranges(NodeKind::Guest, Mode::None).is_empty());
+        // The metadata address of a cloud host is link-local.
+        let metadata: IpAddr = "169.254.169.254".parse().unwrap();
+        for (node, mode) in [
+            (NodeKind::Guest, Mode::HostIp),
+            (NodeKind::Guest, Mode::OwnIp),
+            (NodeKind::Native, Mode::OwnIp),
+        ] {
+            let list = ranges(node, mode);
+            assert!(
+                list.iter().any(|r| r.contains(metadata)),
+                "{node:?} {mode:?}"
+            );
+            assert!(list.contains(&LINK_LOCAL6), "{node:?} {mode:?}");
+        }
     }
 }

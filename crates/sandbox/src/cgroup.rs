@@ -327,17 +327,68 @@ pub struct Root {
     controllers: Controllers,
 }
 
+/// How long a box an earlier daemon left behind gets to die when a daemon
+/// takes the root.
+const LEFTOVER_LIMIT: Duration = Duration::from_secs(10);
+
+/// Makes `boxes` below `root` a new, empty cgroup. One that is there from
+/// an earlier daemon goes first, with every box cgroup in it, and takes
+/// along whatever that daemon had attached to it: the network policy
+/// programs of a daemon that is gone judge by maps nobody holds. Returns
+/// the names of the box cgroups it removed.
+fn fresh_boxes(root: &Path) -> io::Result<Vec<String>> {
+    let boxes = root.join(BOXES);
+    let mut removed = Vec::new();
+    match fs::File::open(&boxes) {
+        Ok(old) => {
+            let old: OwnedFd = old.into();
+            for entry in fs::read_dir(&boxes)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let left = open_dir_in(old.as_fd(), &name)
+                    .map_err(|e| named(e, "opening the leftover", &entry.path()))?;
+                kill(left.as_fd()).map_err(|e| named(e, "emptying the leftover", &entry.path()))?;
+                if !emptied_blocking(left.as_fd(), LEFTOVER_LIMIT)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{} still holds processes of an earlier daemon",
+                            entry.path().display()
+                        ),
+                    ));
+                }
+                remove(old.as_fd(), &name, cgroup_id(&left)?)
+                    .map_err(|e| named(e, "removing the leftover", &entry.path()))?;
+                removed.push(name);
+            }
+            fs::remove_dir(&boxes).map_err(|e| named(e, "removing the earlier", &boxes))?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(named(e, "opening", &boxes)),
+    }
+    fs::create_dir(&boxes).map_err(|e| named(e, "creating", &boxes))?;
+    Ok(removed)
+}
+
 impl Root {
-    /// Takes `dir` as the root: creates `supervisor` and `boxes`, moves this
-    /// process into `supervisor` unless it is there already, and enables the
-    /// `cpu`, `memory` and `pids` controllers for box cgroups where the root
-    /// has them.
+    /// Takes `dir` as the root, as a daemon does once when it starts:
+    /// creates `supervisor`, `helpers` and a new `boxes`, moves this process
+    /// into `supervisor` unless it is there already, and enables the `cpu`,
+    /// `memory` and `pids` controllers for box cgroups where the root has
+    /// them.
+    ///
+    /// What an earlier daemon left is ended first: its helper programs are
+    /// killed, and its `boxes` cgroup is removed with every box in it. The
+    /// new `boxes` is another cgroup, with nothing attached to it.
     ///
     /// # Errors
     ///
-    /// When `dir` is not a cgroup this process may manage, or its mount
-    /// lacks `nsdelegate`. Nothing is left half-made that a later call
-    /// cannot finish.
+    /// When `dir` is not a cgroup this process may manage, its mount lacks
+    /// `nsdelegate`, or a box of an earlier daemon does not die. Nothing is
+    /// left half-made that a later call cannot finish.
     pub fn open(dir: &Path) -> io::Result<Self> {
         mount_delegates(dir)?;
         let name = dir
@@ -362,7 +413,7 @@ impl Root {
         let supervisor = dir.join(SUPERVISOR);
         let boxes = dir.join(BOXES);
         let helpers = dir.join(HELPERS);
-        for child in [&supervisor, &boxes, &helpers] {
+        for child in [&supervisor, &helpers] {
             match fs::create_dir(child) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -374,6 +425,18 @@ impl Root {
             let procs = supervisor.join("cgroup.procs");
             fs::write(&procs, std::process::id().to_string())
                 .map_err(|e| named(e, "moving the daemon into", &supervisor))?;
+        }
+        let helpers_fd: OwnedFd = fs::File::open(&helpers)
+            .map_err(|e| named(e, "opening", &helpers))?
+            .into();
+        // Helpers an earlier daemon left running serve nobody now.
+        kill(helpers_fd.as_fd()).map_err(|e| named(e, "ending the helpers in", &helpers))?;
+        let left = fresh_boxes(dir)?;
+        if !left.is_empty() {
+            tracing::warn!(
+                boxes = ?left,
+                "removed box cgroups an earlier daemon left behind"
+            );
         }
         // A controller reaches a box cgroup only when every level above it
         // passes it down. The root must hold no process for this, which is
@@ -400,9 +463,6 @@ impl Root {
         let has = |controller: &str| enabled.split_whitespace().any(|have| have == controller);
         let boxes_fd: OwnedFd = fs::File::open(&boxes)
             .map_err(|e| named(e, "opening", &boxes))?
-            .into();
-        let helpers_fd: OwnedFd = fs::File::open(&helpers)
-            .map_err(|e| named(e, "opening", &helpers))?
             .into();
         let helpers = Helpers::over(helpers_fd).map_err(|e| named(e, "opening", &helpers))?;
         Ok(Self {
@@ -444,40 +504,6 @@ impl Root {
 
     fn boxes(&self) -> PathBuf {
         self.dir.join(BOXES)
-    }
-
-    /// Ends and removes every box cgroup an earlier daemon left behind, and
-    /// returns their names. Each gets up to `limit` to empty after the kill.
-    ///
-    /// # Errors
-    ///
-    /// When `boxes` cannot be listed. A cgroup that cannot be removed is
-    /// logged and left.
-    pub fn sweep(&self, limit: Duration) -> io::Result<Vec<String>> {
-        // Helpers an earlier daemon left running serve nobody now.
-        self.helpers.kill()?;
-        let mut swept = Vec::new();
-        for entry in fs::read_dir(self.boxes())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let removed = open_dir_in(self.boxes.as_fd(), &name).and_then(|dir| {
-                kill(dir.as_fd())?;
-                emptied_blocking(dir.as_fd(), limit)?;
-                remove(self.boxes.as_fd(), &name, cgroup_id(&dir)?)
-            });
-            match removed {
-                Ok(()) => swept.push(name),
-                Err(error) => tracing::warn!(
-                    cgroup = %entry.path().display(),
-                    %error,
-                    "could not remove a box cgroup an earlier daemon left behind"
-                ),
-            }
-        }
-        Ok(swept)
     }
 
     /// Kills every process in every box cgroup, and removes nothing. For a
@@ -1164,10 +1190,18 @@ mod tests {
                 pids: has("pids"),
             }
         );
-        // Opening it again, now from `supervisor`, changes nothing.
+        // Taking it again, as the next daemon in this cgroup would, keeps
+        // the layout and makes `boxes` anew: another cgroup under the name.
+        let id = |dir: &Path| {
+            let fd: OwnedFd = fs::File::open(dir).unwrap().into();
+            cgroup_id(&fd).unwrap()
+        };
+        let before = id(&root.dir().join(BOXES));
         let again = Root::open(root.dir()).unwrap();
         assert_eq!(again.controllers(), root.controllers());
         assert_eq!(own_cgroup().unwrap(), root.supervisor_name());
+        assert_ne!(id(&root.dir().join(BOXES)), before);
+        again.create_box("fresh").unwrap();
     }
 
     #[test]
@@ -1348,9 +1382,9 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_box_cgroup_is_killed_and_a_sweep_removes_leftovers() {
+    fn a_dropped_box_cgroup_is_killed_and_the_next_daemon_removes_leftovers() {
         let Some(root) = delegated_root(
-            "cgroup::tests::a_dropped_box_cgroup_is_killed_and_a_sweep_removes_leftovers",
+            "cgroup::tests::a_dropped_box_cgroup_is_killed_and_the_next_daemon_removes_leftovers",
         ) else {
             return;
         };
@@ -1361,7 +1395,7 @@ mod tests {
         assert!(!path.exists());
 
         // Dropped with a process in it: the process is killed, and the
-        // cgroup may stay until a sweep.
+        // cgroup may stay until the next daemon takes the root.
         let busy = root.create_box("busy").unwrap();
         let mut child = sleeper_in(&busy);
         let path = busy.path().to_path_buf();
@@ -1372,12 +1406,11 @@ mod tests {
         // A leftover with a live process, as a crashed daemon leaves one.
         let leftover = root.create_box("leftover").unwrap();
         let mut orphan = sleeper_in(&leftover);
+        let leftover_path = leftover.path().to_path_buf();
         std::mem::forget(leftover);
-        let mut swept = root.sweep(Duration::from_secs(10)).unwrap();
-        swept.sort();
-        assert!(swept.contains(&"leftover".to_owned()), "{swept:?}");
+        let root = Root::open(root.dir()).unwrap();
         assert_eq!(orphan.wait().unwrap().signal(), Some(libc::SIGKILL));
-        assert!(!path.exists());
+        assert!(!path.exists() && !leftover_path.exists());
         let left = fs::read_dir(root.dir().join(BOXES))
             .unwrap()
             .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
@@ -1421,7 +1454,7 @@ mod tests {
         command.arg("300");
         root.helpers().place(&mut command);
         let mut left = command.spawn().unwrap();
-        root.sweep(Duration::from_secs(5)).unwrap();
+        let root = Root::open(root.dir()).unwrap();
         left.wait().unwrap();
         assert!(root.helpers().procs().unwrap().is_empty());
     }

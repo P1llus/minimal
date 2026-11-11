@@ -695,28 +695,29 @@ fn a_loader_of_another_version_is_not_used() {
         while let Ok(conn) = accept(listener.as_raw_fd()) {
             let mut request = [0u8; 256];
             let _read = recv(conn, &mut request, MsgFlags::empty());
-            let reply = format!("ok abi=2 object={} cgroup=1 reused=0", "0".repeat(64));
+            let reply = format!(
+                "err object mismatch: loader={} daemon=unread",
+                "0".repeat(64)
+            );
             let _sent = send(conn, reply.as_bytes(), MsgFlags::empty());
         }
     });
+    let port = target(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let daemon = Daemon::start(dir.path(), &path, None);
     let log = daemon.log();
     assert!(log.contains("from another version"), "{log}");
-    // A loader that answered may have attached its programs, which this
-    // daemon cannot write maps for. Below them no box has a network, so
-    // none starts: not a restricted one, and not one that allows
-    // everything.
-    for (name, flags) in [
-        (
-            "sub",
-            &["--network", "host_ip", "--allow-subnets", "127.0.0.1/32"][..],
-        ),
-        ("open", &["--network", "host_ip"][..]),
-    ] {
-        let activation = daemon.activate(name, flags);
-        let exec = daemon.connect(name, "127.0.0.1", 9);
-        let said = format!("{activation}{exec}");
-        assert_ne!(exec.trim(), "ok", "{said}");
-        assert!(said.contains("min finalize-install"), "{said}");
-    }
+    // The loader refuses another build before it loads anything, so the
+    // daemon runs as one with no loader does: a box that allows everything
+    // has its network, and one that needs enforcement is refused.
+    daemon.activate("open", &["--network", "host_ip"]);
+    assert_eq!(daemon.connect("open", "127.0.0.1", port).trim(), "ok");
+
+    let activation = daemon.activate(
+        "sub",
+        &["--network", "host_ip", "--allow-subnets", "127.0.0.1/32"],
+    );
+    let exec = daemon.connect("sub", "127.0.0.1", port);
+    let said = format!("{activation}{exec}");
+    assert_ne!(exec.trim(), "ok", "{said}");
+    assert!(said.contains("min finalize-install"), "{said}");
 }

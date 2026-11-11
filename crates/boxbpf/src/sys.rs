@@ -13,6 +13,7 @@ use std::{
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
 const BPF_PROG_ATTACH: libc::c_long = 8;
+const BPF_PROG_DETACH: libc::c_long = 9;
 const BPF_PROG_QUERY: libc::c_long = 16;
 pub(crate) const BPF_F_ALLOW_MULTI: u32 = 2;
 
@@ -63,6 +64,31 @@ pub(crate) fn prog_attach(
         libc::syscall(
             libc::SYS_bpf,
             BPF_PROG_ATTACH,
+            &raw mut attr,
+            size_of::<AttachAttr>(),
+        )
+    };
+    cvt(ret).map(drop)
+}
+
+/// `BPF_PROG_DETACH` of one program of a multi attachment, which the
+/// kernel finds by the program.
+pub(crate) fn prog_detach(
+    prog: BorrowedFd<'_>,
+    cgroup: BorrowedFd<'_>,
+    attach_type: u32,
+) -> io::Result<()> {
+    let mut attr = AttachAttr {
+        target_fd: fd_u32(cgroup)?,
+        attach_bpf_fd: fd_u32(prog)?,
+        attach_type,
+        ..AttachAttr::default()
+    };
+    // SAFETY: attr is a valid prefix of bpf_attr of the size passed.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_DETACH,
             &raw mut attr,
             size_of::<AttachAttr>(),
         )
@@ -176,6 +202,101 @@ pub(crate) fn open_cgroup_by_id(cgroup_mount: BorrowedFd<'_>, id: u64) -> io::Re
     cvt(libc::c_long::from(fd))?;
     // SAFETY: open_by_handle_at just returned this descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens the directory `name` in `dir`. A cgroup is always reached this
+/// way from a descriptor that is already trusted, never by a path a peer
+/// could have a say in.
+pub(crate) fn open_dir_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
+    let c = CString::new(name)?;
+    // SAFETY: c is a valid C string and dir an open descriptor.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    cvt(libc::c_long::from(fd))?;
+    // SAFETY: openat just returned this descriptor and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+pub(crate) fn make_dir_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
+    let c = CString::new(name)?;
+    // SAFETY: c is a valid C string and dir an open descriptor.
+    let ret = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
+    cvt(libc::c_long::from(ret)).map(drop)
+}
+
+pub(crate) fn remove_dir_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
+    let c = CString::new(name)?;
+    // SAFETY: c is a valid C string and dir an open descriptor.
+    let ret = unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+    cvt(libc::c_long::from(ret)).map(drop)
+}
+
+/// Gives the file `name` in `dir`, or `dir` itself for an empty name, to a
+/// user.
+pub(crate) fn chown_at(dir: BorrowedFd<'_>, name: &str, uid: u32, gid: u32) -> io::Result<()> {
+    let c = CString::new(name)?;
+    // SAFETY: c is a valid C string and dir an open descriptor. With an
+    // empty name AT_EMPTY_PATH makes the call act on dir itself.
+    let ret = unsafe {
+        libc::fchownat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            uid,
+            gid,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    cvt(libc::c_long::from(ret)).map(drop)
+}
+
+/// Writes `text` to the file `name` in `dir`, in one write.
+pub(crate) fn write_at(dir: BorrowedFd<'_>, name: &str, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let c = CString::new(name)?;
+    // SAFETY: c is a valid C string and dir an open descriptor.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    cvt(libc::c_long::from(fd))?;
+    // SAFETY: openat just returned this descriptor and nothing else owns it.
+    let mut file = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    file.write_all(text.as_bytes())
+}
+
+pub(crate) fn read_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<String> {
+    use std::io::Read as _;
+
+    let c = CString::new(name)?;
+    // SAFETY: c is a valid C string and dir an open descriptor.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    cvt(libc::c_long::from(fd))?;
+    // SAFETY: openat just returned this descriptor and nothing else owns it.
+    let mut file = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Owner, device and inode of an open file.
+pub(crate) fn stat(fd: BorrowedFd<'_>) -> io::Result<(u32, u64, u64)> {
+    let st = nix::sys::stat::fstat(fd)?;
+    Ok((st.st_uid, st.st_dev, st.st_ino))
 }
 
 pub(crate) fn fd_path(fd: BorrowedFd<'_>) -> io::Result<PathBuf> {

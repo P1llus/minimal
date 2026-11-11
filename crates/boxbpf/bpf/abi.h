@@ -14,7 +14,7 @@
 #ifndef BOXBPF_ABI_H
 #define BOXBPF_ABI_H
 
-#define BP_ABI_VERSION 2
+#define BP_ABI_VERSION 3
 
 /* Directions. They index bp_box_cfg.default_action and are part of rule keys. */
 #define BP_DIR_EGRESS  0 /* address = destination, port = destination port */
@@ -36,24 +36,33 @@
 #define BP_F_LOG_FLOWS (1u << 1) /* event for each allowed connect and send */
 #define BP_F_HAS_SETS  (1u << 2) /* the box has name-set rules: look up pins */
 
-/* Keyed by box id: the cgroup id of the box cgroup. */
+/*
+ * Keyed by box id: the cgroup id of the box cgroup.
+ *
+ * `generation` is part of the key of every rule, set and endpoint entry of
+ * the box. Userspace writes a new policy under a new generation beside the
+ * old one, and the write of this struct switches from one to the other. A
+ * program reads the struct once and so sees one policy, never a mix. The
+ * generation also ends the verdicts sockets have cached.
+ */
 struct bp_box_cfg {
 	__u32 flags;
-	__u32 generation; /* any change ends the verdicts sockets have cached */
+	__u32 generation;
 	__u8  default_action[BP_DIR_COUNT];
 	__u8  _pad;
 	__u16 refuse_errno; /* for a refused system call; 0 means EPERM */
 	__u16 _pad2;
-	__u32 addr4;
+	__u32 addr4;     /* the box's addresses; all zero: none of that kind */
 	__u8  addr6[16];
+	__u8  ll6[16];   /* its link-local address */
 };
 
-#define BP_RULES_MAX 8
+#define BP_RULES_MAX 32
 #define BP_NO_RULE   0xffff
 
 struct bp_rule {
 	__u16 prio;       /* position in the box's list; the lowest match wins */
-	__u8  proto_mask; /* 0 ends the list */
+	__u8  proto_mask;
 	__u8  action;
 	__u16 port_lo;    /* TCP and UDP: port. ICMP: message type. */
 	__u16 port_hi;
@@ -67,19 +76,22 @@ struct bp_rule {
  * prefixes into each entry.
  */
 struct bp_rules {
+	__u16 count; /* rules in use, from r[0] */
+	__u16 _pad;
 	struct bp_rule r[BP_RULES_MAX];
 };
 
 /*
- * LPM keys. Box id and direction take the first 96 bits, so prefixlen is
- * 96 + the address prefix length. Byte arrays keep the structs free of
- * padding, which an LPM key must not have.
+ * LPM keys. Box id, generation and direction take the first 128 bits, so
+ * prefixlen is 128 + the address prefix length. Byte arrays keep the
+ * structs free of padding, which an LPM key must not have.
  */
-#define BP_RULE_KEY_BASE 96
+#define BP_RULE_KEY_BASE 128
 
 struct bp_rule4_key {
 	__u32 prefixlen;
-	__u8  box_id[8]; /* native-endian u64 */
+	__u8  box_id[8];     /* native-endian u64 */
+	__u8  generation[4]; /* native-endian u32 */
 	__u8  dir;
 	__u8  _zero[3];
 	__u8  addr[4];
@@ -88,6 +100,7 @@ struct bp_rule4_key {
 struct bp_rule6_key {
 	__u32 prefixlen;
 	__u8  box_id[8];
+	__u8  generation[4];
 	__u8  dir;
 	__u8  _zero[3];
 	__u8  addr[16];
@@ -101,23 +114,27 @@ struct bp_pin_key {
 	__u8  _pad[7];
 };
 
+/* A set id is a hash of the name pattern, the same under every generation.
+ * A pin of a set the box's current generation has no entry for admits
+ * nothing. */
 struct bp_pin_val {
 	__u64 expiry_ns; /* boot-time clock; ignored once it has passed */
-	__u32 set_id;
-	__u32 _pad;
+	__u64 set_id;
 };
 
 struct bp_set_key {
 	__u64 box_id;
-	__u32 set_id;
+	__u64 set_id;
+	__u32 generation;
 	__u8  dir;
 	__u8  _pad[3];
 };
 
 struct bp_endpoint_key {
 	__u64 box_id;
+	__u32 generation;
 	__u8  idx;
-	__u8  _pad[7];
+	__u8  _pad[3];
 };
 
 /* Endpoint indexes of a box are below this. */
@@ -139,8 +156,9 @@ struct bp_stats {
 	__u64 rx_bytes;
 	__u64 tx_drop;
 	__u64 rx_drop;
-	__u64 refused; /* refusals at a system call */
-	__u64 ev_lost; /* events lost to a full ring buffer */
+	__u64 refused;    /* refusals at a system call */
+	__u64 ev_lost;    /* events lost to a full ring buffer */
+	__u64 ev_limited; /* events not written because the box had used up its rate */
 };
 
 /* The box's end of a flow to one of its endpoints, as the endpoint sees its
@@ -199,6 +217,8 @@ struct bp_ev_hdr {
 #define BP_R_MALFORMED   7
 #define BP_R_NOT_STEERED 8 /* packet to a redirect destination no system-call hook rewrote */
 #define BP_R_NO_ENDPOINT 9 /* redirect without an endpoint address of the flow's family */
+#define BP_R_NO_MEMORY   10 /* no memory to remember which box a new socket belongs to */
+#define BP_R_EPHEMERAL_PORT 11 /* never in an event: the evaluator's reason for a bind to port 0 */
 
 struct bp_ev_net {
 	struct bp_ev_hdr hdr;

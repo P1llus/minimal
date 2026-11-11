@@ -37,6 +37,9 @@ const IN_UNIT: &str = "BOXBPF_TEST_IN_UNIT";
 pub const ROLE: &str = "BOXBPF_TEST_ROLE";
 pub const SOCKET: &str = "BOXBPF_TEST_SOCKET";
 pub const LO_ADDRS: &str = "BOXBPF_TEST_LO_ADDRS";
+/// Prefix entries per family the loader sizes the rule maps for, when a
+/// test wants to fill them.
+pub const RULE_ENTRIES: &str = "BOXBPF_TEST_RULE_ENTRIES";
 
 /// The errno boxes in these tests get for a refused call: one the kernel
 /// itself would not return for a loopback connect, so a refusal by the
@@ -213,6 +216,16 @@ pub struct Cgroups {
     root: PathBuf,
 }
 
+/// One test's delegated root and loader, with no engine asked for yet.
+pub struct Bare {
+    pub root: PathBuf,
+    pub boxes: OwnedFd,
+    pub socket: PathBuf,
+    net: (u8, u8),
+    tmp: tempfile::TempDir,
+    loader: LoaderProcess,
+}
+
 /// One test's delegated root, engine and addresses.
 pub struct Harness {
     pub root: PathBuf,
@@ -236,6 +249,16 @@ impl Harness {
     /// loopback for the duration of the test. `suffixes` are the low 16
     /// bits; see [`Self::v6`].
     pub fn start_with(test: &str, v6_suffixes: &[u16]) -> Option<Self> {
+        Self::start_as(test, v6_suffixes, None)
+    }
+
+    /// Like [`Self::start`], with rule maps that hold `rule_entries`
+    /// prefixes per family, few enough for a test to fill.
+    pub fn start_sized(test: &str, rule_entries: u32) -> Option<Self> {
+        Self::start_as(test, &[], Some(rule_entries))
+    }
+
+    fn start_as(test: &str, v6_suffixes: &[u16], rule_entries: Option<u32>) -> Option<Self> {
         if std::env::var_os(GATE).is_none() {
             eprintln!("skipping {test}: {GATE} is not set (it needs sudo -n, systemd and clang)");
             return None;
@@ -243,10 +266,34 @@ impl Harness {
         if rerun_delegated(test) {
             return None;
         }
-        Some(Self::set_up(v6_suffixes))
+        let bare = Self::ground(v6_suffixes, rule_entries);
+        let handles = boxbpf::loader::request(&bare.socket, bare.boxes.as_fd())
+            .expect("get handles from the loader");
+        Some(Self {
+            root: bare.root,
+            boxes: bare.boxes,
+            handles,
+            socket: bare.socket,
+            net: bare.net,
+            _tmp: bare.tmp,
+            _loader: bare.loader,
+        })
     }
 
-    fn set_up(v6_suffixes: &[u16]) -> Self {
+    /// Sets a test up without asking the loader for an engine: for tests
+    /// of the request itself.
+    pub fn bare(test: &str) -> Option<Bare> {
+        if std::env::var_os(GATE).is_none() {
+            eprintln!("skipping {test}: {GATE} is not set (it needs sudo -n, systemd and clang)");
+            return None;
+        }
+        if rerun_delegated(test) {
+            return None;
+        }
+        Some(Self::ground(&[], None))
+    }
+
+    fn ground(v6_suffixes: &[u16], rule_entries: Option<u32>) -> Bare {
         // In a scope we start in the unit's own cgroup, in a service with
         // DelegateSubgroup already in supervisor/.
         let here = own_cgroup();
@@ -285,6 +332,10 @@ impl Harness {
             .arg(format!("{ROLE}=loader"))
             .arg(format!("{SOCKET}={}", socket.display()))
             .arg(format!("{LO_ADDRS}={}", lo_addrs.join(",")))
+            .arg(format!(
+                "{RULE_ENTRIES}={}",
+                rule_entries.map(|n| n.to_string()).unwrap_or_default()
+            ))
             .arg(exe())
             .args(["--exact", "helper", "--ignored", "--nocapture"])
             .stdin(Stdio::piped())
@@ -293,17 +344,13 @@ impl Harness {
             .expect("start the loader through sudo -n: these tests need passwordless sudo");
         let loader = LoaderProcess(loader);
         wait_for("the loader socket", || socket.exists());
-
-        let handles =
-            boxbpf::loader::request(&socket, boxes.as_fd()).expect("get handles from the loader");
-        Self {
+        Bare {
             root,
             boxes,
-            handles,
             socket,
             net,
-            _tmp: tmp,
-            _loader: loader,
+            tmp,
+            loader,
         }
     }
 
@@ -398,11 +445,15 @@ impl Cgroups {
         BoxId::of(fs::File::open(&dir).expect("open a box cgroup").as_fd()).expect("box id")
     }
 
-    fn in_box(&self, name: &str, mut cmd: Command) -> Command {
+    fn in_box(&self, name: &str, cmd: Command) -> Command {
+        self.in_cgroup(&format!("boxes/{name}"), cmd)
+    }
+
+    /// Makes `cmd` start in the cgroup `rel` below the test's root.
+    fn in_cgroup(&self, rel: &str, mut cmd: Command) -> Command {
         let procs = CString::new(
             self.root
-                .join("boxes")
-                .join(name)
+                .join(rel)
                 .join("cgroup.procs")
                 .to_string_lossy()
                 .as_bytes(),
@@ -497,6 +548,20 @@ impl Cgroups {
     /// line: `ok ...` or `err <errno>`.
     pub fn probe(&self, box_name: &str, args: &[&str]) -> String {
         Self::run(self.in_box(box_name, Self::probe_command(args, None)))
+    }
+
+    /// Runs a probe in the cgroup `rel` below the test's root, which need
+    /// not be a box.
+    pub fn probe_at(&self, rel: &str, args: &[&str]) -> String {
+        Self::run(self.in_cgroup(rel, Self::probe_command(args, None)))
+    }
+
+    /// Like [`Self::probe`], with `channel` as the probe's standard input:
+    /// a unix socket it passes sockets over.
+    pub fn probe_over(&self, box_name: &str, args: &[&str], channel: OwnedFd) -> String {
+        let mut cmd = self.in_box(box_name, Self::probe_command(args, None));
+        cmd.stdin(Stdio::from(channel));
+        Self::run(cmd)
     }
 
     /// The same for a box whose sockets live in the netns of `pid`.

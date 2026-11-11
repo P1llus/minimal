@@ -20,7 +20,7 @@ use std::{
 use boxbpf::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
 use boxes::{BoxPolicy, NetworkMode, SessionId};
 use netpol::{
-    Compiled, Protocol, SetId, Verdict,
+    Compiled, Protocol, Verdict,
     base::{PortOf, Services},
     compile::Spec,
 };
@@ -88,9 +88,6 @@ impl std::fmt::Display for Absent {
 /// Why a box cannot run here with its network policy applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unenforceable {
-    /// The engine's programs may be attached to the daemon's boxes, and
-    /// the daemon cannot write their maps: no box would have a network.
-    EngineUnusable(Absent),
     /// A setting nothing applies yet to a box that shares the node's
     /// address.
     Setting(&'static str),
@@ -103,17 +100,6 @@ impl std::fmt::Display for Unenforceable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the box did not start: ")?;
         match self {
-            Self::EngineUnusable(why) => {
-                write!(
-                    f,
-                    "the network policy engine is attached to this daemon's boxes and the \
-                     daemon cannot use it ({why}), so no box would have a network."
-                )?;
-                match why.fix() {
-                    "" => f.write_str(" Restart the daemon."),
-                    fix => write!(f, " {fix} Then restart the daemon."),
-                }
-            }
             Self::Setting(setting) => write!(
                 f,
                 "its network policy sets `{setting}`, which this version of Minimal cannot \
@@ -317,15 +303,34 @@ struct Attached {
     serving: OnceLock<Serving>,
 }
 
+impl Attached {
+    /// Takes the handles as this daemon's engine.
+    fn new(mut handles: Handles, node: Node) -> Result<Self, Absent> {
+        let failed = |error: boxbpf::Error| Absent::Failed(error.to_string());
+        let flows = handles.flows().map_err(failed)?;
+        let source = handles
+            .take_events()
+            .ok_or_else(|| Absent::Failed("the engine has no event buffer".to_owned()))?;
+        let (events, receiver) = mpsc::channel(EVENT_QUEUE);
+        Ok(Self {
+            handles: Mutex::new(handles),
+            flows,
+            node: RwLock::new(node),
+            boxes: RwLock::default(),
+            by_session: RwLock::default(),
+            allocator: Allocator::new(),
+            events,
+            pending: Mutex::new(Some((source, receiver))),
+            serving: OnceLock::new(),
+        })
+    }
+}
+
 enum State {
     Attached(Box<Attached>),
     /// No programs are attached: boxes run unjudged, so only those that
     /// need no enforcement run.
     Absent(Absent),
-    /// Programs may be attached, and the daemon has no maps to give a box
-    /// an entry in. A box without an entry has no network at all, so no
-    /// box runs.
-    Unusable(Absent),
 }
 
 /// The engine, or the reason there is none.
@@ -350,41 +355,93 @@ pub(crate) fn loader_socket() -> PathBuf {
         .map_or_else(|| PathBuf::from(paths::POLICY_LOADER_SOCKET), PathBuf::from)
 }
 
-/// Asks the loader for the engine. An error comes with whether the
-/// loader may have attached the programs before it: true for everything
-/// but a loader that was not reached or that refused the request.
+/// Why the engine was not taken, and whether its programs may be attached
+/// to the `boxes` cgroup all the same.
+struct NotTaken {
+    why: Absent,
+    /// False when nothing was loaded: no loader was reached, or it refused
+    /// the request. In every other case the programs come off again unless
+    /// the side that attached them died first, which this side cannot see.
+    may_be_attached: bool,
+}
+
+impl NotTaken {
+    const fn clean(why: Absent) -> Self {
+        Self {
+            why,
+            may_be_attached: false,
+        }
+    }
+
+    const fn unclear(why: Absent) -> Self {
+        Self {
+            why,
+            may_be_attached: true,
+        }
+    }
+}
+
+/// What went wrong between the request to the loader and its last word.
+enum Failure {
+    Loader(boxbpf::Error),
+    /// The loader attached the engine, and this daemon could not take it.
+    Setup(Absent),
+}
+
+impl From<boxbpf::Error> for Failure {
+    fn from(error: boxbpf::Error) -> Self {
+        Self::Loader(error)
+    }
+}
+
+/// Asks the loader for the engine and takes it as this daemon's. The
+/// loader learns that the engine is in use only after that, so a daemon
+/// that cannot take it leaves the loader to detach the programs.
 fn from_loader(
     boxes: std::os::fd::BorrowedFd<'_>,
     socket: &Path,
-) -> Result<Handles, (Absent, bool)> {
+    node: Node,
+) -> Result<Attached, NotTaken> {
     use boxbpf::Error;
 
-    let no_loader = || Absent::NoLoader {
-        socket: socket.to_owned(),
+    let no_loader = || {
+        NotTaken::clean(Absent::NoLoader {
+            socket: socket.to_owned(),
+        })
     };
     if !socket.exists() {
-        return Err((no_loader(), false));
+        return Err(no_loader());
     }
-    boxbpf::loader::request(socket, boxes).map_err(|error| match error {
-        Error::AbiMismatch { .. } | Error::ObjectMismatch { .. } => (Absent::LoaderOutOfDate, true),
-        Error::Refused(reason) => (Absent::LoaderRefused(reason), false),
-        Error::Sys { source, .. }
+    let taken = boxbpf::loader::request_then(socket, boxes, |handles| {
+        Attached::new(handles, node).map_err(Failure::Setup)
+    });
+    taken.map_err(|failure| match failure {
+        // The loader compares the two builds before it loads.
+        Failure::Loader(Error::AbiMismatch { .. } | Error::ObjectMismatch { .. }) => {
+            NotTaken::clean(Absent::LoaderOutOfDate)
+        }
+        Failure::Loader(Error::Refused(reason)) => NotTaken::clean(Absent::LoaderRefused(reason)),
+        // Nothing listens at the socket: the connection was never made.
+        Failure::Loader(Error::Sys { source, .. })
             if matches!(
                 source.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            (no_loader(), false)
+            no_loader()
         }
-        other => (Absent::Failed(other.to_string()), true),
+        Failure::Loader(other) => NotTaken::unclear(Absent::Failed(other.to_string())),
+        Failure::Setup(why) => NotTaken::unclear(why),
     })
 }
 
 impl Engine {
     /// Gets the engine for the box cgroups below `root` and makes it the
-    /// one [`Engine::current`] returns. Says once what it got.
-    pub(crate) fn boot(root: Option<&Root>, node: Node) {
-        let engine = Self::acquire(root, node, &loader_socket());
+    /// one [`Engine::current`] returns. Says once what it got. Returns the
+    /// root to run boxes in, which is another one than it was given when
+    /// the `boxes` cgroup had to be replaced.
+    pub(crate) fn boot(root: Option<Root>, node: Node) -> Option<Root> {
+        let (engine, root) = Self::acquire(root, node, &loader_socket());
         match &engine.state {
             State::Attached(_) => tracing::info!(
                 loaded_by = if nix::unistd::geteuid().is_root() {
@@ -399,69 +456,67 @@ impl Engine {
                  enforcement are refused. {}",
                 why.fix()
             ),
-            State::Unusable(why) => tracing::error!(
-                "the network policy engine is attached and cannot be used: {why}. No box \
-                 can start until the daemon is restarted. {}",
-                why.fix()
-            ),
         }
         if ENGINE.set(engine).is_err() {
             tracing::warn!("a network policy engine was set before the daemon's own");
         }
+        root
     }
 
-    fn acquire(root: Option<&Root>, node: Node, socket: &Path) -> Self {
+    fn acquire(root: Option<Root>, node: Node, socket: &Path) -> (Self, Option<Root>) {
+        use std::os::fd::AsFd as _;
+
         let Some(root) = root else {
-            return Self::absent(Absent::NoCgroupRoot);
+            return (Self::absent(Absent::NoCgroupRoot), None);
         };
         let boxes = match std::fs::File::open(root.dir().join(sandbox::cgroup::BOXES)) {
             Ok(dir) => std::os::fd::OwnedFd::from(dir),
             Err(error) => {
-                return Self::absent(Absent::Failed(format!("opening the boxes cgroup: {error}")));
+                let why = Absent::Failed(format!("opening the boxes cgroup: {error}"));
+                return (Self::absent(why), Some(root));
             }
         };
-        // Each error says whether programs may be attached by now.
-        let handles = if nix::unistd::geteuid().is_root() {
-            use std::os::fd::AsFd as _;
+        let taken = if nix::unistd::geteuid().is_root() {
+            // A start that fails leaves nothing attached. One that works
+            // leaves the programs attached whatever comes after it.
             boxbpf::Engine::start(boxes.as_fd(), &boxbpf::MapSizes::default())
-                .map_err(|error| (Absent::Failed(error.to_string()), true))
+                .map_err(|error| NotTaken::clean(Absent::Failed(error.to_string())))
+                .and_then(|handles| Attached::new(handles, node).map_err(NotTaken::unclear))
         } else {
-            use std::os::fd::AsFd as _;
-            from_loader(boxes.as_fd(), socket)
+            from_loader(boxes.as_fd(), socket, node)
         };
-        match handles {
-            // From here on the programs are attached. A daemon that cannot
-            // finish taking the maps must not start boxes below them.
-            Ok(handles) => Self::attached(handles, node).unwrap_or_else(|why| Self {
-                state: State::Unusable(why),
-            }),
-            Err((why, true)) => Self {
-                state: State::Unusable(why),
-            },
-            Err((why, false)) => Self::absent(why),
+        drop(boxes);
+        match taken {
+            Ok(attached) => (
+                Self {
+                    state: State::Attached(Box::new(attached)),
+                },
+                Some(root),
+            ),
+            Err(NotTaken {
+                why,
+                may_be_attached: false,
+            }) => (Self::absent(why), Some(root)),
+            Err(NotTaken { why, .. }) => {
+                // Below programs whose maps nobody writes a box has no
+                // network at all. A new `boxes` cgroup has no programs.
+                let dir = root.dir().to_owned();
+                drop(root);
+                match Root::open(&dir) {
+                    Ok(root) => (Self::absent(why), Some(root)),
+                    Err(error) => {
+                        tracing::error!(
+                            root = %dir.display(),
+                            %error,
+                            "the boxes cgroup could not be replaced after the network policy \
+                             engine failed to start; boxes run without a cgroup, and a box \
+                             that needs one is refused"
+                        );
+                        (Self::absent(why), None)
+                    }
+                }
+            }
         }
-    }
-
-    fn attached(mut handles: Handles, node: Node) -> Result<Self, Absent> {
-        let failed = |error: boxbpf::Error| Absent::Failed(error.to_string());
-        let flows = handles.flows().map_err(failed)?;
-        let source = handles
-            .take_events()
-            .ok_or_else(|| Absent::Failed("the engine has no event buffer".to_owned()))?;
-        let (events, receiver) = mpsc::channel(EVENT_QUEUE);
-        Ok(Self {
-            state: State::Attached(Box::new(Attached {
-                handles: Mutex::new(handles),
-                flows,
-                node: RwLock::new(node),
-                boxes: RwLock::default(),
-                by_session: RwLock::default(),
-                allocator: Allocator::new(),
-                events,
-                pending: Mutex::new(Some((source, receiver))),
-                serving: OnceLock::new(),
-            })),
-        })
     }
 
     const fn absent(why: Absent) -> Self {
@@ -479,7 +534,7 @@ impl Engine {
     const fn attached_state(&self) -> Option<&Attached> {
         match &self.state {
             State::Attached(attached) => Some(attached),
-            State::Absent(_) | State::Unusable(_) => None,
+            State::Absent(_) => None,
         }
     }
 
@@ -610,9 +665,6 @@ impl Engine {
         policy: &BoxPolicy,
         deny_all_opt_out: bool,
     ) -> Result<(), Unenforceable> {
-        if let State::Unusable(why) = &self.state {
-            return Err(Unenforceable::EngineUnusable(why.clone()));
-        }
         if let Some(setting) = Self::unapplied_setting(mode, policy) {
             return Err(Unenforceable::Setting(setting));
         }
@@ -629,7 +681,6 @@ impl Engine {
                     .map(drop)
                     .map_err(Unenforceable::Compile)
             }
-            State::Unusable(why) => Err(Unenforceable::EngineUnusable(why.clone())),
             State::Absent(why) => {
                 // Without the programs a box runs unjudged. That is what a
                 // box with no network or with nothing to enforce asks for,
@@ -1002,6 +1053,7 @@ impl Engine {
                 rx_dropped = c.rx_drop,
                 refused = c.refused,
                 events_lost = c.ev_lost,
+                events_limited = c.ev_limited,
                 "removed the box's network policy"
             );
         }
@@ -1036,13 +1088,13 @@ impl Engine {
             .cloned()
     }
 
-    /// Admits `addr` for the box as an address of a name in `set`, for the
-    /// pin lifetime.
+    /// Admits `addr` for the box as an address of `name`, for the pin
+    /// lifetime.
     pub(crate) fn pin(
         &self,
         of: &Installed,
         addr: IpAddr,
-        set: SetId,
+        name: &str,
     ) -> Result<(), boxbpf::Error> {
         let Some(attached) = self.attached_state() else {
             return Ok(());
@@ -1051,7 +1103,7 @@ impl Engine {
             .handles
             .lock()
             .expect("engine lock")
-            .pin(of.id, addr, set, netpol::pins::PIN_TTL)
+            .pin(of.id, addr, name, netpol::pins::PIN_TTL)
     }
 
     /// Judges a flow of the box as the kernel programs would. `name` is
@@ -1155,31 +1207,107 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_engine_that_is_attached_and_unusable_refuses_every_box() {
-        let engine = Engine {
-            state: State::Unusable(Absent::LoaderOutOfDate),
+    /// A loader that answers one request with `reply` and no descriptors.
+    fn fake_loader(socket: &Path, reply: String) -> std::thread::JoinHandle<()> {
+        use nix::sys::socket::{
+            AddressFamily, Backlog, MsgFlags, SockFlag, SockType, UnixAddr, accept, bind, listen,
+            recv, send, socket as new_socket,
         };
-        // Below attached programs a box without an entry has no network at
-        // all, loopback included. So a box that needs no enforcement, and
-        // one with no network of its own, must not start either.
-        let open = BoxPolicy::new(None, None);
-        for mode in [NetworkMode::HostNet, NetworkMode::NoNet, NetworkMode::OwnIp] {
-            let refusal = engine
-                .can_enforce(mode, &open, false)
-                .expect_err("no box runs below programs the daemon cannot use");
-            assert_eq!(
-                refusal,
-                Unenforceable::EngineUnusable(Absent::LoaderOutOfDate),
-                "{mode:?}"
-            );
-            let text = refusal.to_string();
-            assert!(text.contains("no box would have a network"), "{text}");
-            assert!(text.contains("min finalize-install"), "{text}");
-            assert!(text.contains("restart the daemon"), "{text}");
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        let listener = new_socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("socket");
+        bind(
+            listener.as_raw_fd(),
+            &UnixAddr::new(socket).expect("address"),
+        )
+        .expect("bind");
+        listen(&listener, Backlog::new(1).expect("backlog")).expect("listen");
+        std::thread::spawn(move || {
+            let conn = accept(listener.as_raw_fd()).expect("accept");
+            // SAFETY: `accept` returned a descriptor nothing else owns.
+            let conn = unsafe { OwnedFd::from_raw_fd(conn) };
+            let mut request = [0u8; 256];
+            recv(conn.as_raw_fd(), &mut request, MsgFlags::empty()).expect("the request");
+            send(conn.as_raw_fd(), reply.as_bytes(), MsgFlags::empty()).expect("the reply");
+        })
+    }
+
+    #[test]
+    fn an_engine_that_was_not_taken_leaves_no_program_over_the_boxes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let test =
+            "net::engine::tests::an_engine_that_was_not_taken_leaves_no_program_over_the_boxes";
+        let Some(root) = sandbox::cgroup::testing::delegated_root(test) else {
+            return;
+        };
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: root loads the engine itself and asks no loader");
+            return;
         }
-        let unknown = Unenforceable::EngineUnusable(Absent::Failed("map lookup".to_owned()));
-        assert!(unknown.to_string().ends_with("Restart the daemon."));
+        let dir = tempfile::tempdir().expect("a directory for the sockets");
+        let boxes_of = |root: &Root| {
+            std::fs::metadata(root.dir().join(sandbox::cgroup::BOXES))
+                .expect("the boxes cgroup")
+                .ino()
+        };
+        let open = BoxPolicy::new(None, None);
+
+        // The loader says it attached and sends no maps. Whether its
+        // programs are off again is its word alone, so the boxes get a
+        // cgroup nothing was ever attached to.
+        let before = boxes_of(&root);
+        let socket = dir.path().join("attached.sock");
+        let loader = fake_loader(&socket, format!("ok abi={} cgroup=7", netpol::abi::VERSION));
+        let (engine, root) = Engine::acquire(Some(root), Node::native(), &socket);
+        loader.join().expect("the loader");
+        assert!(
+            matches!(engine.state, State::Absent(Absent::Failed(_))),
+            "the engine was taken"
+        );
+        let root = root.expect("the root stays usable");
+        assert_ne!(boxes_of(&root), before, "the boxes cgroup was kept");
+        assert_eq!(
+            engine.can_enforce(NetworkMode::HostNet, &open, false),
+            Ok(())
+        );
+        let id = "0191e0c8-0000-7000-8000-00000000000a";
+        root.create_box(id)
+            .expect("a box cgroup in the new boxes cgroup")
+            .destroy_blocking(Duration::from_secs(5))
+            .expect("removing it");
+
+        // A loader of another build refuses before it loads anything, so
+        // the cgroup stays as it is.
+        let before = boxes_of(&root);
+        let socket = dir.path().join("refusing.sock");
+        let loader = fake_loader(&socket, "err object mismatch loader=abc".to_owned());
+        let (engine, root) = Engine::acquire(Some(root), Node::native(), &socket);
+        loader.join().expect("the loader");
+        assert!(matches!(
+            engine.state,
+            State::Absent(Absent::LoaderOutOfDate)
+        ));
+        let root = root.expect("the root");
+        assert_eq!(boxes_of(&root), before);
+        assert_eq!(
+            engine.can_enforce(NetworkMode::HostNet, &open, false),
+            Ok(())
+        );
+        let restricted = egress(|e| e.allow_subnets = list(&["10.0.0.0/8"]));
+        let refusal = engine
+            .can_enforce(NetworkMode::HostNet, &restricted, false)
+            .expect_err("needs the engine");
+        assert!(
+            refusal.to_string().contains("min finalize-install"),
+            "{refusal}"
+        );
     }
 
     #[test]

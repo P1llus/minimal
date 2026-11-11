@@ -49,7 +49,8 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
             bind(net(h.v4_net()), Action::Deny),
             bind(net(h.v6_net()), Action::Deny).protocols(Protocols::UDP),
         ],
-        after: Vec::new(),
+        // Group 6 and one IPv6 group are closed to the wide allows below.
+        protected: vec![prefix(h.v4_group(6)), prefix(h.v6_group(3))],
         defaults: Defaults {
             egress: Verdict::Allow,
             ingress: Verdict::Allow,
@@ -78,6 +79,11 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         deny: vec![prefix(h.v4(1, 9).to_string()), prefix(h.v6_group(2))],
         allow: vec![
             prefix(h.v4_group(1)),
+            // Groups 6 and 7: wider than the protected group 6.
+            prefix(format!("{}/26", h.v4(6, 0))),
+            // Eight addresses inside it.
+            prefix(format!("{}/29", h.v4(6, 8))),
+            // Every IPv6 address of the test, the protected group included.
             prefix(h.v6_net()),
             prefix("::1/128".to_owned()),
         ],
@@ -90,13 +96,27 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
     };
     let compiled = compile(&base, &policy, options).expect("compile");
     let id = h.new_box("p");
-    h.handles.apply(id, &compiled).expect("apply");
-    // One address the default would refuse is pinned for an allowed name.
-    let set = compiled
-        .set_for_name("pinned.test")
-        .expect("set of the name");
+    let compiled = std::sync::Arc::new(compiled);
     h.handles
-        .pin(id, IpAddr::V4(h.v4(5, 2)), set, Duration::from_secs(60))
+        .apply(id, std::sync::Arc::clone(&compiled))
+        .expect("apply");
+    // One address the default would refuse is pinned for an allowed name.
+    h.handles
+        .pin(
+            id,
+            IpAddr::V4(h.v4(5, 2)),
+            "pinned.test",
+            Duration::from_secs(60),
+        )
+        .expect("pin");
+    // And one address of the protected group: a listed name opens it.
+    h.handles
+        .pin(
+            id,
+            IpAddr::V4(h.v4(6, 2)),
+            "pinned.test",
+            Duration::from_secs(60),
+        )
         .expect("pin");
 
     let v4 = |g, n| IpAddr::V4(h.v4(g, n));
@@ -110,10 +130,21 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         mapped(1, 1),
         mapped(1, 9),
         mapped(5, 2),
+        // Protected: reached by the wide allow only, pinned, inside the
+        // narrow allow. Then the wide allow outside the protected group.
+        v4(6, 1),
+        v4(6, 2),
+        v4(6, 9),
+        mapped(6, 1),
+        v4(7, 1),
+        IpAddr::V6(h.v6(0x0301)),
         IpAddr::V6(h.v6(0x0101)),
         IpAddr::V6(h.v6(0x0201)),
         "::1".parse().expect("address"),
         "fd77::1".parse().expect("address"),
+        // The kernel dials loopback for these two.
+        "0.0.0.0".parse().expect("address"),
+        "::".parse().expect("address"),
     ];
     let mut flows = Vec::new();
     for remote in remotes {
@@ -136,7 +167,7 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         "::1".parse().expect("address"),
     ] {
         for protocol in [Protocol::Tcp, Protocol::Udp] {
-            for port in [18200, 18210, 18211] {
+            for port in [18200, 18210, 18211, 0] {
                 flows.push(Flow {
                     direction: Direction::Bind,
                     protocol,
@@ -167,6 +198,15 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
             .starts_with("ok port="),
         "an ephemeral port is not judged"
     );
+
+    // The protected group, stated outright: the wide allow does not open
+    // it, the narrow one and the pin do.
+    let reach = |ip: IpAddr| h.probe("p", &["udp", &ip.to_string(), "9"]);
+    assert!(kernel_denies(&reach(v4(6, 1))), "{}", reach(v4(6, 1)));
+    assert!(kernel_denies(&reach(IpAddr::V6(h.v6(0x0301)))));
+    for open in [v4(6, 2), v4(6, 9), v4(7, 1)] {
+        assert_eq!(reach(open), "ok", "{open}");
+    }
 
     let mut disagreements = Vec::new();
     let (mut denied, mut allowed) = (0, 0);
@@ -202,5 +242,74 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
     println!(
         "parity: {} flows, {denied} denied, {allowed} allowed",
         flows.len()
+    );
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_rule_that_names_no_protocol_does_not_end_the_list() {
+    let Some(mut h) =
+        Harness::start("cases::parity::a_rule_that_names_no_protocol_does_not_end_the_list")
+    else {
+        return;
+    };
+    // The compiler refuses such a rule. The programs must still not read
+    // it as the end of a list, so the entry is written by hand: a rule
+    // that matches nothing, then a deny.
+    let base = BasePolicy {
+        before: Vec::new(),
+        protected: Vec::new(),
+        defaults: Defaults {
+            egress: Verdict::Allow,
+            ingress: Verdict::Allow,
+            bind: Verdict::Allow,
+        },
+        endpoints: Vec::new(),
+        source_check: false,
+        addrs: BoxAddrs::default(),
+    };
+    let policy = BoxPolicy {
+        rules: vec![BoxRule {
+            action: BoxAction::Allow,
+            protocols: Protocols::TCP,
+            ports: PortRange::ALL,
+            to: Target::Net(h.v4_group(1).parse().expect("prefix")),
+        }],
+        deny: vec![h.v4_group(1).parse().expect("prefix")],
+        ..BoxPolicy::default()
+    };
+    let options = Options {
+        refuse_errno: u16::try_from(REFUSED).expect("errno"),
+        log_flows: false,
+    };
+    let mut compiled = compile(&base, &policy, options).expect("compile");
+    // Pruning dropped nothing: the allow is TCP only, the deny is all.
+    let entry = compiled.nets.first_mut().expect("one entry");
+    assert_eq!(entry.rules.len(), 2);
+    entry.rules.first_mut().expect("the allow").protocols = Protocols::NONE;
+    compiled.rules.first_mut().expect("the allow").protocols = Protocols::NONE;
+
+    let id = h.new_box("e");
+    let compiled = std::sync::Arc::new(compiled);
+    h.handles
+        .apply(id, std::sync::Arc::clone(&compiled))
+        .expect("apply");
+    let to = IpAddr::V4(h.v4(1, 1));
+    let result = h.probe("e", &["udp", &to.to_string(), "9"]);
+    assert!(
+        kernel_denies(&result),
+        "the deny behind the empty rule decides: {result}"
+    );
+    let flow = Flow {
+        direction: Direction::Egress,
+        protocol: Protocol::Udp,
+        remote: to,
+        port: 9,
+        local: None,
+    };
+    let decision = compiled.evaluate(&flow, None);
+    assert_eq!(
+        (decision.verdict, decision.rule),
+        (FlowVerdict::Deny, Some(1))
     );
 }

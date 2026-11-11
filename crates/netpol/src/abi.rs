@@ -21,17 +21,17 @@ use crate::{
     model::{Action, Direction, Protocols, SetId, Verdict},
 };
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Endpoint indexes of a box are below this.
 pub const ENDPOINTS_MAX: u8 = 4;
 
 /// Rules per prefix or name set after covering rules are copied in.
-pub const RULES_MAX: usize = 8;
+pub const RULES_MAX: usize = 32;
 /// `prio` of "no rule": what an event carries when a default decided.
 pub const NO_RULE: u16 = 0xffff;
-/// Bits of an LPM key before the address: box id and direction.
-pub const RULE_KEY_BASE: u32 = 96;
+/// Bits of an LPM key before the address: box id, generation, direction.
+pub const RULE_KEY_BASE: u32 = 128;
 
 pub const FLAG_CHECK_SRC: u32 = 1 << 0;
 pub const FLAG_LOG_FLOWS: u32 = 1 << 1;
@@ -56,22 +56,26 @@ pub unsafe trait Plain: Copy + 'static {}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BoxCfg {
     pub flags: u32,
-    /// Any change of it ends the verdicts sockets have cached.
+    /// Part of the key of every rule, set and endpoint entry of the box:
+    /// writing a config with another generation switches the whole policy
+    /// at once. It also ends the verdicts sockets have cached.
     pub generation: u32,
     /// Indexed by [`Direction::code`].
     pub default_action: [u8; 3],
     pub _pad: u8,
     pub refuse_errno: u16,
     pub _pad2: u16,
+    /// All zero: the box has no address of that kind.
     pub addr4: [u8; 4],
     pub addr6: [u8; 16],
+    /// The box's link-local address.
+    pub ll6: [u8; 16],
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Rule {
     pub prio: u16,
-    /// 0 ends the list.
     pub proto_mask: u8,
     pub action: u8,
     pub port_lo: u16,
@@ -81,9 +85,22 @@ pub struct Rule {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rules {
+    /// Rules in use, from the front of `r`.
+    pub count: u16,
+    pub _pad: u16,
     pub r: [Rule; RULES_MAX],
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            _pad: 0,
+            r: [Rule::default(); RULES_MAX],
+        }
+    }
 }
 
 #[repr(C)]
@@ -91,6 +108,7 @@ pub struct Rules {
 pub struct Rule4Key {
     pub prefixlen: u32,
     pub box_id: [u8; 8],
+    pub generation: [u8; 4],
     pub dir: u8,
     pub _zero: [u8; 3],
     pub addr: [u8; 4],
@@ -101,6 +119,7 @@ pub struct Rule4Key {
 pub struct Rule6Key {
     pub prefixlen: u32,
     pub box_id: [u8; 8],
+    pub generation: [u8; 4],
     pub dir: u8,
     pub _zero: [u8; 3],
     pub addr: [u8; 16],
@@ -120,15 +139,15 @@ pub struct PinKey {
 pub struct PinVal {
     /// Boot-time clock. The programs ignore the entry once this has passed.
     pub expiry_ns: u64,
-    pub set_id: u32,
-    pub _pad: u32,
+    pub set_id: u64,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct SetKey {
     pub box_id: u64,
-    pub set_id: u32,
+    pub set_id: u64,
+    pub generation: u32,
     pub dir: u8,
     pub _pad: [u8; 3],
 }
@@ -137,8 +156,9 @@ pub struct SetKey {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct EndpointKey {
     pub box_id: u64,
+    pub generation: u32,
     pub idx: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
 }
 
 #[repr(C)]
@@ -166,6 +186,9 @@ pub struct Stats {
     pub refused: u64,
     /// Events lost because the ring buffer was full.
     pub ev_lost: u64,
+    /// Events the programs did not write because the box had used up its
+    /// rate. The refusals themselves are in `refused` and the drop counts.
+    pub ev_limited: u64,
 }
 
 impl Stats {
@@ -179,6 +202,7 @@ impl Stats {
         self.rx_drop = self.rx_drop.wrapping_add(other.rx_drop);
         self.refused = self.refused.wrapping_add(other.refused);
         self.ev_lost = self.ev_lost.wrapping_add(other.ev_lost);
+        self.ev_limited = self.ev_limited.wrapping_add(other.ev_limited);
     }
 }
 
@@ -330,10 +354,17 @@ pub enum Reason {
     NotSteered,
     /// A redirect to an endpoint without an address of the flow's family.
     NoEndpoint,
+    /// The kernel had no memory to remember which box a new socket
+    /// belongs to.
+    NoMemory,
+    /// A bind to port 0. The kernel picks the port, as it does for a
+    /// socket that never binds, and no rule is asked. The programs report
+    /// no event for it: this is the evaluator's reason.
+    EphemeralPort,
 }
 
 impl Reason {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::NoConfig,
         Self::Rule,
         Self::SetRule,
@@ -343,6 +374,8 @@ impl Reason {
         Self::Malformed,
         Self::NotSteered,
         Self::NoEndpoint,
+        Self::NoMemory,
+        Self::EphemeralPort,
     ];
 
     #[must_use]
@@ -357,6 +390,8 @@ impl Reason {
             Self::Malformed => 7,
             Self::NotSteered => 8,
             Self::NoEndpoint => 9,
+            Self::NoMemory => 10,
+            Self::EphemeralPort => 11,
         }
     }
 
@@ -376,6 +411,8 @@ impl Reason {
             Self::Malformed => "BP_R_MALFORMED",
             Self::NotSteered => "BP_R_NOT_STEERED",
             Self::NoEndpoint => "BP_R_NO_ENDPOINT",
+            Self::NoMemory => "BP_R_NO_MEMORY",
+            Self::EphemeralPort => "BP_R_EPHEMERAL_PORT",
         }
     }
 }
@@ -454,17 +491,19 @@ fn constants(out: &mut String) {
 }
 
 layouts! {
-    BoxCfg = "bp_box_cfg", 36 { flags, generation, default_action, refuse_errno, addr4, addr6 }
+    BoxCfg = "bp_box_cfg", 52 { flags, generation, default_action, refuse_errno, addr4, addr6, ll6 }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
-    Rules = "bp_rules", 96 { r }
-    Rule4Key = "bp_rule4_key", 20 { prefixlen, box_id, dir, addr }
-    Rule6Key = "bp_rule6_key", 32 { prefixlen, box_id, dir, addr }
+    Rules = "bp_rules", 388 { count, r }
+    Rule4Key = "bp_rule4_key", 24 { prefixlen, box_id, generation, dir, addr }
+    Rule6Key = "bp_rule6_key", 36 { prefixlen, box_id, generation, dir, addr }
     PinKey = "bp_pin_key", 32 { box_id, addr, family }
     PinVal = "bp_pin_val", 16 { expiry_ns, set_id }
-    SetKey = "bp_set_key", 16 { box_id, set_id, dir }
-    EndpointKey = "bp_endpoint_key", 16 { box_id, idx }
+    SetKey = "bp_set_key", 24 { box_id, set_id, generation, dir }
+    EndpointKey = "bp_endpoint_key", 16 { box_id, generation, idx }
     Endpoint = "bp_endpoint", 24 { addr6, addr4, port4, port6 }
-    Stats = "bp_stats", 64 { tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost }
+    Stats = "bp_stats", 72 {
+        tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost, ev_limited
+    }
     FlowKey = "bp_flow_key", 20 { saddr, sport, proto, family }
     FlowVal = "bp_flow_val", 32 { box_id, orig_addr, orig_port, orig_family, endpoint }
     EvHdr = "bp_ev_hdr", 24 { kind, size, cpu, ts_ns, box_id }
@@ -476,11 +515,12 @@ layouts! {
 impl Rule4Key {
     /// The key without its prefix length: what the LPM compares.
     #[must_use]
-    pub fn data(&self) -> [u8; 16] {
-        let mut out = [0u8; 16];
+    pub fn data(&self) -> [u8; 20] {
+        let mut out = [0u8; 20];
         let bytes = self
             .box_id
             .into_iter()
+            .chain(self.generation)
             .chain([self.dir])
             .chain(self._zero)
             .chain(self.addr);
@@ -494,11 +534,12 @@ impl Rule4Key {
 impl Rule6Key {
     /// The key without its prefix length: what the LPM compares.
     #[must_use]
-    pub fn data(&self) -> [u8; 28] {
-        let mut out = [0u8; 28];
+    pub fn data(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
         let bytes = self
             .box_id
             .into_iter()
+            .chain(self.generation)
             .chain([self.dir])
             .chain(self._zero)
             .chain(self.addr);
@@ -550,8 +591,12 @@ const fn verdict_code(verdict: Verdict) -> u8 {
     }
 }
 
+/// The compiler never hands over more than [`RULES_MAX`] slots.
 fn rules_value(slots: &[Slot]) -> Rules {
-    let mut out = Rules::default();
+    let mut out = Rules {
+        count: u16::try_from(slots.len().min(RULES_MAX)).unwrap_or(0),
+        ..Rules::default()
+    };
     for (dst, slot) in out.r.iter_mut().zip(slots) {
         let (action, endpoint) = action_code(slot.action);
         *dst = Rule {
@@ -567,7 +612,7 @@ fn rules_value(slots: &[Slot]) -> Rules {
     out
 }
 
-/// Every map entry of one box.
+/// Every map entry of one generation of a box's policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BoxEntries {
     pub cfg: BoxCfg,
@@ -575,6 +620,37 @@ pub struct BoxEntries {
     pub rules6: Vec<(Rule6Key, Rules)>,
     pub sets: Vec<(SetKey, Rules)>,
     pub endpoints: Vec<(EndpointKey, Endpoint)>,
+}
+
+/// The keys of [`BoxEntries`]: enough to delete a generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoxKeys {
+    pub rules4: Vec<Rule4Key>,
+    pub rules6: Vec<Rule6Key>,
+    pub sets: Vec<SetKey>,
+    pub endpoints: Vec<EndpointKey>,
+}
+
+impl BoxKeys {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rules4.is_empty()
+            && self.rules6.is_empty()
+            && self.sets.is_empty()
+            && self.endpoints.is_empty()
+    }
+}
+
+impl BoxEntries {
+    #[must_use]
+    pub fn keys(&self) -> BoxKeys {
+        BoxKeys {
+            rules4: self.rules4.iter().map(|(k, _)| *k).collect(),
+            rules6: self.rules6.iter().map(|(k, _)| *k).collect(),
+            sets: self.sets.iter().map(|(k, _)| *k).collect(),
+            endpoints: self.endpoints.iter().map(|(k, _)| *k).collect(),
+        }
+    }
 }
 
 /// The config entry of a compiled box at a generation.
@@ -604,13 +680,24 @@ pub fn box_cfg(compiled: &Compiled, generation: u32) -> BoxCfg {
         _pad2: 0,
         addr4: c.addrs.v4.map_or([0; 4], |a| a.octets()),
         addr6: c.addrs.v6.map_or([0; 16], |a| a.octets()),
+        ll6: c.addrs.link_local6.map_or([0; 16], |a| a.octets()),
     }
 }
 
+/// How many rule entries a compiled policy takes in the maps: one per
+/// prefix and one per name set, each per direction it has rules for.
+#[must_use]
+pub const fn rule_entries(compiled: &Compiled) -> usize {
+    compiled.nets.len() + compiled.sets.len()
+}
+
 /// Lays a compiled box out as map entries for the box with this cgroup id.
+/// Every rule, set and endpoint key carries `generation`, so the entries
+/// of two generations of one box lie side by side.
 #[must_use]
 pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries {
     let id = box_id.to_ne_bytes();
+    let generation_bytes = generation.to_ne_bytes();
     let mut out = BoxEntries {
         cfg: box_cfg(compiled, generation),
         ..BoxEntries::default()
@@ -624,6 +711,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
                 Rule4Key {
                     prefixlen,
                     box_id: id,
+                    generation: generation_bytes,
                     dir,
                     _zero: [0; 3],
                     addr: a.octets(),
@@ -634,6 +722,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
                 Rule6Key {
                     prefixlen,
                     box_id: id,
+                    generation: generation_bytes,
                     dir,
                     _zero: [0; 3],
                     addr: a.octets(),
@@ -646,6 +735,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
         let key = SetKey {
             box_id,
             set_id: set.id.0,
+            generation,
             dir: set.direction.code(),
             _pad: [0; 3],
         };
@@ -661,8 +751,9 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
         out.endpoints.push((
             EndpointKey {
                 box_id,
+                generation,
                 idx: index.0,
-                _pad: [0; 7],
+                _pad: [0; 3],
             },
             value,
         ));
@@ -687,7 +778,6 @@ pub const fn pin_val(set: SetId, expiry_ns: u64) -> PinVal {
     PinVal {
         expiry_ns,
         set_id: set.0,
-        _pad: 0,
     }
 }
 
@@ -716,10 +806,10 @@ mod tests {
     #[test]
     fn asserts_cover_every_struct_and_constant() {
         let c = c_static_asserts();
-        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 36,"));
+        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 52,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
-        assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 16"));
-        assert!(c.contains("BP_ABI_VERSION == 2"));
+        assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
+        assert!(c.contains("BP_ABI_VERSION == 3"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
         assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 15);
@@ -776,15 +866,30 @@ mod tests {
         assert_eq!(k4.prefixlen, RULE_KEY_BASE + 8);
         assert_eq!(k4.box_id, 0x0102_0304_0506_0708u64.to_ne_bytes());
         assert_eq!((k4.dir, k4.addr), (0, [10, 0, 0, 0]));
-        assert_eq!(&k4.data()[8..], &[0, 0, 0, 0, 10, 0, 0, 0]);
-        assert_eq!(e.rules6.first().unwrap().0.data()[12], 0xfd);
+        assert_eq!(&k4.data()[8..12], &3u32.to_ne_bytes());
+        assert_eq!(&k4.data()[12..], &[0, 0, 0, 0, 10, 0, 0, 0]);
+        assert_eq!(e.rules6.first().unwrap().0.data()[16], 0xfd);
         assert_eq!(
             (v4.r[0].proto_mask, v4.r[0].action, v4.r[0].port_hi),
             (7, ACTION_ALLOW, u16::MAX)
         );
-        assert_eq!(v4.r[1].proto_mask, 0);
+        assert_eq!((v4.count, v4.r[1].proto_mask), (1, 0));
         assert_eq!(e.rules6.len(), 1);
         assert_eq!(e.sets.len(), 1);
-        assert_eq!(e.sets.first().unwrap().0.set_id, 1);
+        let set = e.sets.first().unwrap().0;
+        assert_eq!(
+            (set.set_id, set.generation),
+            (compiled.set_for_name("example.com").unwrap().0, 3)
+        );
+        assert_eq!(rule_entries(&compiled), 3);
+        // Another generation of the same policy shares no rule key with it.
+        let next = entries(&compiled, 0x0102_0304_0506_0708, 4);
+        assert!(
+            next.keys()
+                .rules4
+                .iter()
+                .all(|k| !e.keys().rules4.contains(k))
+        );
+        assert!(next.keys().sets.iter().all(|k| !e.keys().sets.contains(k)));
     }
 }

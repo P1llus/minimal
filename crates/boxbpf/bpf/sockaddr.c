@@ -2,9 +2,9 @@
 /*
  * Syscall-time hooks: sock_create, connect, sendmsg, recvmsg, getpeername, bind.
  *
- * These run in the calling task, so the box is the task's own. They give the
- * application an errno at once, and they are the only place a destination
- * can be rewritten. The packet hooks in skb.c stay authoritative.
+ * They give the application an errno at once, and they are the only place a
+ * destination can be rewritten. The packet hooks in skb.c stay authoritative.
+ * The caller may be any task that holds the socket: the box is the socket's.
  *
  * `sf` is the socket's family, a compile-time constant in every caller: the
  * verifier rejects a read of user_ip6 in an IPv4 hook and the other way round.
@@ -72,12 +72,32 @@ static __always_inline void sa_set(struct bpf_sock_addr *ctx, __u8 sf, __u8 fami
 	}
 }
 
+/*
+ * The kernel sends a flow to 0.0.0.0 or :: to this host: an IPv4 socket
+ * bound to an address dials that address, anything else dials loopback.
+ * The flow is judged as the address it will reach. Judged as written it
+ * would pass a deny of loopback here and time out at the packet hook, and
+ * miss a redirect.
+ */
+static __always_inline void to_this_host(const struct bpf_sock_addr *ctx, __u8 sf, struct flow *f)
+{
+	if (f->family == 4 && !f->addr[0]) {
+		__u32 bound = sf == 4 ? ctx->sk->src_ip4 : 0;
+
+		f->addr[0] = bound ? bound : bpf_htonl(0x7f000001);
+	} else if (f->family == 6 && !(f->addr[0] | f->addr[1] | f->addr[2] | f->addr[3])) {
+		f->addr[3] = bpf_htonl(1);
+	}
+}
+
 static __always_inline void sa_flow(const struct bpf_sock_addr *ctx, __u8 sf, __u8 dir,
 				    struct flow *f)
 {
 	f->dir = dir;
 	f->pbit = proto_bit(ctx->protocol);
 	f->family = sa_get(ctx, sf, f->addr);
+	if (dir == BP_DIR_EGRESS)
+		to_this_host(ctx, sf, f);
 	/* A ping socket can only send echo requests, and the type is not in
 	 * the sockaddr. */
 	if (f->pbit == BP_P_ICMP)
@@ -114,8 +134,8 @@ static __always_inline void sa_event(struct bpf_sock_addr *ctx, __u8 hook, const
  * program that turns an IPv6 destination into a v4-mapped one (ENOTSUPP in
  * udpv6_sendmsg), and an AF_INET socket cannot reach an IPv6 endpoint at all.
  */
-static __always_inline int steer(struct bpf_sock_addr *ctx, __u8 sf, const struct flow *f,
-				 const struct verdict *v)
+static __always_inline int steer(struct bpf_sock_addr *ctx, __u8 sf, const struct bp_box_cfg *cfg,
+				 const struct flow *f, const struct verdict *v)
 {
 	struct bp_endpoint_key ek = {};
 	struct bp_endpoint *ep;
@@ -124,6 +144,7 @@ static __always_inline int steer(struct bpf_sock_addr *ctx, __u8 sf, const struc
 	__u16 port;
 
 	ek.box_id = f->box;
+	ek.generation = cfg->generation;
 	ek.idx = v->endpoint;
 	ep = bpf_map_lookup_elem(&endpoints, &ek);
 	if (!ep)
@@ -160,7 +181,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 	struct verdict v = {};
 	struct flow f = {};
 
-	f.box = task_box();
+	f.box = sock_box(ctx->sk);
 	sa_flow(ctx, sf, BP_DIR_EGRESS, &f);
 	cfg = bpf_map_lookup_elem(&box_cfg, &f.box);
 	if (!cfg) {
@@ -174,13 +195,11 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 
 	if (v.action == BP_DENY && f.pbit == BP_P_UDP) {
 		/* A reply to a peer the ingress hook let in. */
-		struct udp_peer up;
-
-		peer_key(&up, bpf_get_socket_cookie(ctx), f.addr, f.port);
-		if (peer_admitted(&up, BP_DIR_INGRESS, cfg->generation))
+		if (peer_admitted(ctx->sk, f.addr, f.port, f.family, BP_DIR_INGRESS,
+				  cfg->generation))
 			return 1;
 	}
-	if (v.action == BP_REDIRECT && steer(ctx, sf, &f, &v)) {
+	if (v.action == BP_REDIRECT && steer(ctx, sf, cfg, &f, &v)) {
 		v.action = BP_DENY;
 		v.reason = BP_R_NO_ENDPOINT;
 	}
@@ -263,7 +282,7 @@ static __always_inline int bind_any(struct bpf_sock_addr *ctx, __u8 hook, __u8 s
 	struct verdict v = {};
 	struct flow f = {};
 
-	f.box = task_box();
+	f.box = sock_box(ctx->sk);
 	sa_flow(ctx, sf, BP_DIR_BIND, &f);
 	f.port = bpf_ntohs(ctx->user_port);
 	cfg = bpf_map_lookup_elem(&box_cfg, &f.box);
@@ -308,10 +327,22 @@ int bp_sock_create(struct bpf_sock *sk)
 	struct bp_box_cfg *cfg = bpf_map_lookup_elem(&box_cfg, &box);
 	struct ev_args a = {};
 	__u8 pbit = proto_bit(sk->protocol);
+	__u16 err = cfg ? cfg->refuse_errno : EPERM;
+	__u8 reason = cfg ? BP_R_SOCK_TYPE : BP_R_NO_CFG;
 
 	if (cfg && ((sk->type == SOCK_STREAM && pbit == BP_P_TCP) ||
-		    (sk->type == SOCK_DGRAM && (pbit == BP_P_UDP || pbit == BP_P_ICMP))))
-		return 1;
+		    (sk->type == SOCK_DGRAM && (pbit == BP_P_UDP || pbit == BP_P_ICMP)))) {
+		__u64 *owner = bpf_sk_storage_get(&sk_box, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+
+		if (owner) {
+			*owner = box;
+			return 1;
+		}
+		/* A socket nobody can name the box of would be refused at
+		 * every later call. */
+		err = ENOMEM;
+		reason = BP_R_NO_MEMORY;
+	}
 
 	a.box = box;
 	a.pid = bpf_get_current_pid_tgid() >> 32;
@@ -321,9 +352,9 @@ int bp_sock_create(struct bpf_sock *sk)
 	a.hook = BP_H_SOCK_CREATE;
 	a.family = sk->family == AF_INET6 ? 6 : 4;
 	a.verdict = BP_DENY;
-	a.reason = cfg ? BP_R_SOCK_TYPE : BP_R_NO_CFG;
+	a.reason = reason;
 	emit_net(&a);
-	return refuse(box, cfg ? cfg->refuse_errno : EPERM);
+	return refuse(box, err);
 }
 
 /* The socket's entry in the flows map must not outlive it: the next socket

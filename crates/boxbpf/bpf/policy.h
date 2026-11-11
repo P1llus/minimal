@@ -40,9 +40,12 @@ struct {
 	__type(value, struct bp_pin_val);
 } pins SEC(".maps");
 
+/* Written from userspace only, so nothing is gained by allocating every
+ * entry up front. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct bp_set_key);
 	__type(value, struct bp_rules);
 } set_rules SEC(".maps");
@@ -108,30 +111,62 @@ struct {
 } sk_state SEC(".maps");
 
 /*
- * UDP has no SYN, so the hooks remember which peers a socket was allowed to
- * talk to and in which direction the rules allowed it. A packet the rules
- * would deny still passes when the other direction admitted that peer: it is
- * a reply. A rule change (cfg->generation) forgets all of it.
+ * UDP has no SYN, so each socket remembers the peers it was allowed to talk
+ * to and in which direction the rules allowed it. A packet the rules would
+ * deny still passes when the other direction admitted that peer on this
+ * socket: it is a reply. A rule change (cfg->generation) forgets all of it.
+ *
+ * The state is the socket's own, so no box can push another box's peers
+ * out. A socket remembers its last UDP_PEERS peers. One that talks to more
+ * at the same time loses the reply exemption for the oldest, and their
+ * replies are judged by the rules alone.
  */
+#define UDP_PEERS 16 /* a power of two */
+
 struct udp_peer {
-	__u64 cookie;
 	__u32 addr[4];
 	__u16 port;
-	__u16 _pad[3];
+	__u8  family;
+	__u8  dirs; /* 1 << BP_DIR_EGRESS, 1 << BP_DIR_INGRESS; 0: free */
 };
 
-struct udp_seen {
+struct udp_state {
 	__u32 generation;
-	__u8  dirs; /* 1 << BP_DIR_EGRESS, 1 << BP_DIR_INGRESS */
-	__u8  _pad[3];
+	__u32 next; /* the slot the next new peer takes */
+	struct udp_peer peer[UDP_PEERS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct udp_state);
+} udp_state SEC(".maps");
+
+/*
+ * Events of one box are limited by a token bucket, so a box that provokes
+ * refusals as fast as it can fills neither the ring buffer nor the reader's
+ * time, and the events of other boxes get through. What the bucket turns
+ * away is counted in bp_stats.ev_limited.
+ *
+ * Two CPUs may update a bucket at once and lose one of the updates. The
+ * limit is then off by an event, which does not matter.
+ */
+#define EV_BURST     256
+#define EV_REFILL_NS 15625000ULL /* 64 events a second */
+
+struct ev_bucket {
+	__u64 last_ns; /* when the last token was earned */
+	__u32 tokens;
+	__u32 _pad;
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 65536);
-	__type(key, struct udp_peer);
-	__type(value, struct udp_seen);
-} udp_peers SEC(".maps");
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct ev_bucket);
+} ev_buckets SEC(".maps");
 
 static __always_inline __u8 proto_bit(__u32 l4)
 {
@@ -186,13 +221,46 @@ struct ev_args {
 	__u32 daddr[4];
 };
 
+/* Takes a token of the box's bucket. 0 when there is none. */
+static __always_inline int ev_admit(__u64 box, __u64 now)
+{
+	struct ev_bucket fresh = { .last_ns = now, .tokens = EV_BURST - 1 };
+	struct ev_bucket *b = bpf_map_lookup_elem(&ev_buckets, &box);
+	__u64 earned = 0;
+	__u32 tokens;
+
+	if (!b) {
+		bpf_map_update_elem(&ev_buckets, &box, &fresh, BPF_ANY);
+		return 1;
+	}
+	tokens = b->tokens;
+	if (now > b->last_ns)
+		earned = (now - b->last_ns) / EV_REFILL_NS;
+	if (earned) {
+		tokens = earned >= EV_BURST || tokens + earned >= EV_BURST ? EV_BURST : tokens + earned;
+		b->last_ns += earned * EV_REFILL_NS;
+	}
+	if (!tokens)
+		return 0;
+	b->tokens = tokens - 1;
+	return 1;
+}
+
 static __always_inline void emit_net(const struct ev_args *a)
 {
-	struct bp_ev_net *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	__u64 now = bpf_ktime_get_boot_ns();
+	struct bp_stats *s;
+	struct bp_ev_net *e;
 
+	if (!ev_admit(a->box, now)) {
+		s = stats_of(a->box);
+		if (s)
+			s->ev_limited++;
+		return;
+	}
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e) {
-		struct bp_stats *s = stats_of(a->box);
-
+		s = stats_of(a->box);
 		if (s)
 			s->ev_lost++;
 		return;
@@ -200,7 +268,7 @@ static __always_inline void emit_net(const struct ev_args *a)
 	e->hdr.kind = BP_EV_NET;
 	e->hdr.size = sizeof(*e);
 	e->hdr.cpu = bpf_get_smp_processor_id();
-	e->hdr.ts_ns = bpf_ktime_get_boot_ns();
+	e->hdr.ts_ns = now;
 	e->hdr.box_id = a->box;
 	e->hook = a->hook;
 	e->verdict = a->verdict;
@@ -223,10 +291,12 @@ static __always_inline void emit_net(const struct ev_args *a)
 static __always_inline void scan(const struct bp_rules *rs, const struct flow *f, __u8 reason,
 				 struct verdict *v)
 {
-	for (int i = 0; i < BP_RULES_MAX; i++) {
+	__u32 count = rs->count;
+
+	for (__u32 i = 0; i < BP_RULES_MAX; i++) {
 		const struct bp_rule *r = &rs->r[i];
 
-		if (!r->proto_mask || r->prio >= v->rule)
+		if (i >= count || r->prio >= v->rule)
 			return;
 		if ((r->proto_mask & f->pbit) && f->port >= r->port_lo && f->port <= r->port_hi) {
 			v->rule = r->prio;
@@ -247,6 +317,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 				   struct verdict *v)
 {
 	const struct bp_rules *rs;
+	__u32 generation = cfg->generation;
 
 	v->rule = BP_NO_RULE;
 	v->endpoint = 0;
@@ -256,6 +327,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 
 		k.prefixlen = BP_RULE_KEY_BASE + 32;
 		__builtin_memcpy(k.box_id, &f->box, 8);
+		__builtin_memcpy(k.generation, &generation, 4);
 		k.dir = f->dir;
 		__builtin_memcpy(k.addr, f->addr, 4);
 		rs = bpf_map_lookup_elem(&rules4, &k);
@@ -264,6 +336,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 
 		k.prefixlen = BP_RULE_KEY_BASE + 128;
 		__builtin_memcpy(k.box_id, &f->box, 8);
+		__builtin_memcpy(k.generation, &generation, 4);
 		k.dir = f->dir;
 		__builtin_memcpy(k.addr, f->addr, 16);
 		rs = bpf_map_lookup_elem(&rules6, &k);
@@ -284,6 +357,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 
 			sk.box_id = f->box;
 			sk.set_id = pin->set_id;
+			sk.generation = generation;
 			sk.dir = f->dir;
 			rs = bpf_map_lookup_elem(&set_rules, &sk);
 			if (rs)
@@ -298,32 +372,65 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 	}
 }
 
-static __always_inline void peer_key(struct udp_peer *k, __u64 cookie, const __u32 *addr, __u16 port)
+static __always_inline int peer_is(const struct udp_peer *e, const __u32 *addr, __u16 port,
+				   __u8 family)
 {
-	__builtin_memset(k, 0, sizeof(*k));
-	k->cookie = cookie;
-	__builtin_memcpy(k->addr, addr, 16);
-	k->port = port;
+	return e->dirs && e->port == port && e->family == family && e->addr[0] == addr[0] &&
+	       e->addr[1] == addr[1] && e->addr[2] == addr[2] && e->addr[3] == addr[3];
 }
 
-/* Did the rules of direction `dir` admit this peer since the last rule change? */
-static __always_inline int peer_admitted(const struct udp_peer *k, __u8 dir, __u32 generation)
+/* Did the rules of direction `dir` admit this peer on this socket since the
+ * last rule change? `sk` is a full socket or NULL. */
+static __always_inline int peer_admitted(void *sk, const __u32 *addr, __u16 port, __u8 family,
+					 __u8 dir, __u32 generation)
 {
-	struct udp_seen *seen = bpf_map_lookup_elem(&udp_peers, k);
+	struct udp_state *us;
 
-	return seen && seen->generation == generation && (seen->dirs & (1 << dir));
-}
+	if (!sk)
+		return 0;
+	us = bpf_sk_storage_get(&udp_state, sk, 0, 0);
+	if (!us || us->generation != generation)
+		return 0;
+	for (__u32 i = 0; i < UDP_PEERS; i++) {
+		const struct udp_peer *e = &us->peer[i];
 
-static __always_inline void peer_admit(const struct udp_peer *k, __u8 dir, __u32 generation)
-{
-	struct udp_seen *seen = bpf_map_lookup_elem(&udp_peers, k);
-	struct udp_seen fresh = { .generation = generation, .dirs = 1 << dir };
-
-	if (seen && seen->generation == generation) {
-		seen->dirs |= 1 << dir;
-		return;
+		if ((e->dirs & (1 << dir)) && peer_is(e, addr, port, family))
+			return 1;
 	}
-	bpf_map_update_elem(&udp_peers, k, &fresh, BPF_ANY);
+	return 0;
+}
+
+static __always_inline void peer_admit(void *sk, const __u32 *addr, __u16 port, __u8 family,
+				       __u8 dir, __u32 generation)
+{
+	struct udp_state *us;
+	struct udp_peer *e;
+	__u32 slot;
+
+	if (!sk)
+		return;
+	us = bpf_sk_storage_get(&udp_state, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!us)
+		return;
+	if (us->generation != generation) {
+		__builtin_memset(us->peer, 0, sizeof(us->peer));
+		us->next = 0;
+		us->generation = generation;
+	}
+	for (__u32 i = 0; i < UDP_PEERS; i++) {
+		e = &us->peer[i];
+		if (peer_is(e, addr, port, family)) {
+			e->dirs |= 1 << dir;
+			return;
+		}
+	}
+	slot = us->next & (UDP_PEERS - 1);
+	e = &us->peer[slot];
+	__builtin_memcpy(e->addr, addr, 16);
+	e->port = port;
+	e->family = family;
+	e->dirs = 1 << dir;
+	us->next = slot + 1;
 }
 
 #endif /* BOXBPF_POLICY_H */
