@@ -170,6 +170,13 @@ impl HostExposures {
         }
     }
 
+    /// How often the table can change: the wait between two stats of its
+    /// file. `None` for a table no file backs, which never changes.
+    #[must_use]
+    pub(crate) fn changes_every(&self) -> Option<Duration> {
+        self.inner.file.as_ref().map(|_| self.inner.recheck)
+    }
+
     /// The table of the `config.toml` at `path`, re-read when the file
     /// changes, with at least `recheck` between two stats of it.
     #[must_use]

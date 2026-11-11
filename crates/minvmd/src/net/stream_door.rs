@@ -38,6 +38,10 @@ pub(crate) const STREAM_DOOR_SOCK_ENV: &str = "MINVMD_GUEST_STREAM_SOCK";
 /// How long a connection may take to send its header.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The shortest wait between two looks at the exposure table for an open
+/// stream.
+const SHORTEST_EXPOSURE_CHECK: Duration = Duration::from_millis(10);
+
 /// How long the connect on the host side may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -259,10 +263,53 @@ impl Door {
         tracing::debug!(box_id = %BoxIdText(&id), purpose = ?open.purpose, "opened a stream");
         let ended = match target {
             Target::Proxy(proxy) => splice(guest, proxy).await,
-            Target::Host(host) => splice(guest, host).await,
+            Target::Host(host) => {
+                let StreamPurpose::HostPort { port } = open.purpose else {
+                    return;
+                };
+                let service = std::os::fd::AsFd::as_fd(&host).try_clone_to_owned();
+                tokio::select! {
+                    ended = splice(guest, host) => ended,
+                    // The user took the exposure away: the stream ends
+                    // now, not when one of its ends is done with it.
+                    () = self.no_longer_exposed(port) => {
+                        if let Ok(service) = service {
+                            reset_on_close(&service);
+                        }
+                        tracing::info!(
+                            box_id = %BoxIdText(&id),
+                            port,
+                            "ended a stream to a host port that is no longer exposed"
+                        );
+                        Ok(())
+                    }
+                }
+            }
         };
         if let Err(error) = ended {
             tracing::debug!(box_id = %BoxIdText(&id), %error, "a stream ended with an error");
+        }
+    }
+
+    fn exposed(&self, port: u16) -> bool {
+        self.config
+            .exposures
+            .current(&(self.config.own_listeners)())
+            .iter()
+            .any(|exposure| exposure.port == port)
+    }
+
+    /// Resolves when no exposure opens `port` any more. Never for a table
+    /// that cannot change.
+    async fn no_longer_exposed(&self, port: u16) {
+        let Some(every) = self.config.exposures.changes_every() else {
+            return std::future::pending().await;
+        };
+        loop {
+            tokio::time::sleep(every.max(SHORTEST_EXPOSURE_CHECK)).await;
+            if !self.exposed(port) {
+                return;
+            }
         }
     }
 
@@ -311,13 +358,7 @@ impl Door {
                 Ok((Target::Proxy(stream), Some(slot)))
             }
             StreamPurpose::HostPort { port } => {
-                let open_now = self
-                    .config
-                    .exposures
-                    .current(&(self.config.own_listeners)())
-                    .iter()
-                    .any(|exposure| exposure.port == port);
-                if !open_now {
+                if !self.exposed(port) {
                     return Err(StreamRefusal::PortNotExposed);
                 }
                 // Always the host's own loopback. The header names a port
@@ -410,6 +451,29 @@ where
     half_closed.store(true, Ordering::Release);
     let _ = to.shutdown().await;
     result
+}
+
+/// Makes the socket send a reset when its last descriptor closes, so the
+/// service does not read an orderly end.
+fn reset_on_close(socket: &std::os::fd::OwnedFd) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the descriptor is open, and the option value is a `linger`
+    // of the length passed.
+    let set = unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(socket),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::from_ref(&linger).cast(),
+            libc::socklen_t::try_from(std::mem::size_of::<libc::linger>()).unwrap_or(0),
+        )
+    };
+    if set != 0 {
+        tracing::debug!(error = %io::Error::last_os_error(), "a stream's host side closes without a reset");
+    }
 }
 
 /// Connects to `port` on the host's loopback: `127.0.0.1` first, then `::1`
@@ -627,6 +691,70 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// When the user removes an exposure, the open streams to its port end
+    /// and the service reads a reset. A stream to a port that stays exposed
+    /// goes on.
+    #[test]
+    fn removing_an_exposure_ends_its_open_streams_and_no_other() {
+        /// A service that tells how its one connection ended.
+        fn service() -> (u16, std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (ended, end) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"hello").unwrap();
+                let _sent = ended.send(stream.read(&mut [0u8; 16]));
+            });
+            (port, end)
+        }
+        let (gone, gone_end) = service();
+        let (kept, kept_end) = service();
+        let config = tempfile::tempdir().unwrap();
+        let path = config.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("[host-exposures]\na = {{ port = {gone} }}\nb = {{ port = {kept} }}\n"),
+        )
+        .unwrap();
+        let bed = bed(HostExposures::at(path.clone(), Duration::from_millis(10)));
+        let web = bed.boxes.register_client_box(spec("web", false)).unwrap();
+        let hello = |guest: &mut Guest| {
+            let mut read = [0u8; 5];
+            guest.reader.read_exact(&mut read).unwrap();
+            assert_eq!(&read, b"hello");
+        };
+        let (mut to_gone, reply) = Guest::open(&bed.door, &host_port(web.box_id(), gone));
+        assert_eq!(reply, StreamReply::Open);
+        hello(&mut to_gone);
+        let (mut to_kept, reply) = Guest::open(&bed.door, &host_port(web.box_id(), kept));
+        assert_eq!(reply, StreamReply::Open);
+        hello(&mut to_kept);
+
+        std::fs::write(
+            &path,
+            format!("[host-exposures]\nb = {{ port = {kept} }}\n"),
+        )
+        .unwrap();
+        let ended = gone_end.recv_timeout(WAIT).expect("the stream ends");
+        assert_eq!(
+            ended.map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::ConnectionReset),
+            "the service must not read an orderly end"
+        );
+        assert!(
+            to_gone.read_to_end().is_empty(),
+            "the guest's side ends too"
+        );
+        assert!(
+            kept_end.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a stream to a port that is still exposed goes on"
+        );
+        to_kept.reader.get_ref().write_all(b"x").unwrap();
+        drop(to_kept);
+        assert_eq!(kept_end.recv_timeout(WAIT).unwrap().unwrap(), 1);
     }
 
     #[test]
