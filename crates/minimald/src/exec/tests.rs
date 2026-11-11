@@ -351,7 +351,7 @@ async fn a_task_takes_the_network_of_its_session() {
         false,
     );
     let plan = no_net.plan().await.unwrap();
-    assert!(plan.isolates_netns() && plan.tap().is_none());
+    assert!(plan.isolates_netns() && !plan.wired());
 
     let mut record = record_with(boxes::NetworkMode::OwnIp);
     record.name = Some("web".to_string());

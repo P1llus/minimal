@@ -26,23 +26,6 @@ pub type AttachFuture<'a> =
 /// The future returned by [`Network::abandon`].
 pub type AbandonFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-/// Parameters for a tap device the sandbox layer builds *inside* the sandbox's
-/// own user+network namespace (rootless, via hakoniwa's RustSlirp), surfacing
-/// its descriptor as [`hakoniwa::Child::rustslirp_tapfd`] for the provider to
-/// relay to a switch. A provider that builds the tap itself asks for an
-/// isolated namespace and no tap instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TapSpec {
-    /// The PTask's switch address, assigned to the tap in-namespace.
-    pub address: Ipv4Addr,
-    /// The switch subnet netmask (e.g. `255.255.0.0` for a `/16`).
-    pub netmask: Ipv4Addr,
-    /// The switch gateway, installed as the default route.
-    pub gateway: Ipv4Addr,
-    /// The tap MTU; must match the relay's frame buffer.
-    pub mtu: u16,
-}
-
 /// What `/etc/resolv.conf` should say inside the sandbox. The container build
 /// is the one place that acts on it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -60,16 +43,14 @@ pub enum Resolver {
 
 /// What a sandbox needs from its network, decided before the process starts.
 ///
-/// Data, not behaviour: it says *what* the sandbox needs and not how a provider
-/// obtains it, so the sandbox layer never depends on a switch client
-/// (03-spec-networking R1.4). Built through constructors so the one invariant
-/// cannot be broken: a plan carrying tap parameters always isolates the
-/// network namespace — hakoniwa skips the tap setup entirely, leaving no
-/// descriptor, if that namespace was never unshared.
+/// Data, not behaviour: it says what the sandbox needs and not how a
+/// provider obtains it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetPlan {
     isolate_netns: bool,
-    tap: Option<TapSpec>,
+    /// Whether the provider gives the namespace its interface once the
+    /// container exists. The sandbox's program waits until it has.
+    wired: bool,
     resolver: Resolver,
     hosts: Vec<HostEntry>,
 }
@@ -89,7 +70,7 @@ impl std::fmt::Display for NetPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if !self.isolate_netns {
             write!(f, "host_ip")
-        } else if self.tap.is_some() {
+        } else if self.wired {
             write!(f, "own_ip")
         } else {
             write!(f, "isolated")
@@ -98,12 +79,12 @@ impl std::fmt::Display for NetPlan {
 }
 
 impl NetPlan {
-    /// Share the host's (or VM's) network namespace: no isolation, no tap.
+    /// Share the host's (or VM's) network namespace.
     #[must_use]
     pub fn host() -> Self {
         Self {
             isolate_netns: false,
-            tap: None,
+            wired: false,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -115,18 +96,19 @@ impl NetPlan {
     pub fn isolated() -> Self {
         Self {
             isolate_netns: true,
-            tap: None,
+            wired: false,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
     }
 
-    /// A fresh network namespace with a tap built inside it.
+    /// A fresh network namespace that the provider wires once the container
+    /// exists: its `attach` sets the interface up through [`Spawned::link`].
     #[must_use]
-    pub fn isolated_with_tap(tap: TapSpec) -> Self {
+    pub fn isolated_wired() -> Self {
         Self {
             isolate_netns: true,
-            tap: Some(tap),
+            wired: true,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -155,10 +137,11 @@ impl NetPlan {
         self.isolate_netns
     }
 
-    /// The tap to build inside that namespace, if any.
+    /// Whether the provider sets the namespace's interface up after the
+    /// container exists.
     #[must_use]
-    pub fn tap(&self) -> Option<TapSpec> {
-        self.tap
+    pub fn wired(&self) -> bool {
+        self.wired
     }
 
     /// What to write to `/etc/resolv.conf`.
@@ -237,17 +220,16 @@ pub trait Network: Send + Sync + std::fmt::Debug {
 }
 
 /// What a launched sandbox process hands to [`Network::attach`].
-///
-/// Carries the tap descriptor by value: taken from the child once, moved here,
-/// and closed by the provider's guard at teardown (017-010).
 #[derive(Debug, Default)]
 pub struct Spawned {
     netns: Option<std::os::fd::OwnedFd>,
-    tap_fd: Option<std::os::fd::OwnedFd>,
+    /// The way to the container's spawner jobs.
+    #[cfg(target_os = "linux")]
+    job: Option<crate::Entrance>,
 }
 
 impl Spawned {
-    /// A launched process with no network namespace of its own and no tap.
+    /// A launched process with no network namespace of its own.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -260,13 +242,6 @@ impl Spawned {
         self
     }
 
-    /// Adds the tap descriptor the sandbox layer's in-namespace tap produced.
-    #[must_use]
-    pub fn with_tap_fd(mut self, tap_fd: std::os::fd::OwnedFd) -> Self {
-        self.tap_fd = Some(tap_fd);
-        self
-    }
-
     /// The sandbox's network namespace, when it has one of its own. A
     /// descriptor, not a pid: the spawner reaps the sandbox's processes, so
     /// a pid the provider held could come to name another process.
@@ -276,24 +251,50 @@ impl Spawned {
         self.netns.as_ref().map(|fd| fd.as_fd())
     }
 
-    /// Takes the tap descriptor, if the plan asked for one. Yields it once;
-    /// a second call returns `None`.
-    pub fn take_tap_fd(&mut self) -> Option<std::os::fd::OwnedFd> {
-        self.tap_fd.take()
-    }
-
-    /// Reads a just-started container: its network namespace, and the tap it
-    /// was started with if the plan asked for one, taken out of the child so
-    /// no second reader gets it.
+    /// Reads a just-started container: its network namespace and the way
+    /// to its spawner jobs.
     #[cfg(target_os = "linux")]
     #[must_use]
-    pub fn from_child(child: &mut crate::Child) -> Self {
+    pub fn from_child(child: &crate::Child) -> Self {
         Self {
             // A copy that cannot be made leaves the provider without the
             // namespace, and an attach that needs it fails.
             netns: child.netns().and_then(|fd| fd.try_clone_to_owned().ok()),
-            tap_fd: child.take_tap_fd(),
+            job: Some(child.entrance()),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn job(&self) -> std::io::Result<&crate::Entrance> {
+        self.job
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("the sandbox was not started by a spawner"))
+    }
+
+    /// Sets up the one interface of the sandbox's network namespace. See
+    /// [`crate::Entrance::link`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Entrance::link`].
+    #[cfg(target_os = "linux")]
+    pub fn link(&self, spec: crate::LinkSpec) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        self.job()?.link(spec)
+    }
+
+    /// Creates a socket in the sandbox's network namespace that belongs to
+    /// the caller. See [`crate::Entrance::socket_for_daemon`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Entrance::socket_for_daemon`].
+    #[cfg(target_os = "linux")]
+    pub fn socket_for_daemon(
+        &self,
+        v6: bool,
+        datagram: bool,
+    ) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.job()?.socket_for_daemon(v6, datagram)
     }
 }
 

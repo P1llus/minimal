@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::cgroup::{BoxCgroup, Root};
 use client::Connection;
 pub use link::INTERFACE;
-pub(crate) use wire::{ContainerSpec, Mount, Session, Tap};
+pub(crate) use wire::{ContainerSpec, Mount, Session};
 pub use wire::{LinkKind, LinkSpec};
 
 /// The first argument of this binary when it runs as a spawner process.
@@ -468,6 +468,9 @@ pub(crate) struct Launch {
     pub(crate) ping_gid: Option<u32>,
     /// The cgroup of the box the container belongs to.
     pub(crate) cgroup: Option<BoxCgroup>,
+    /// The hold on the start gate of a container whose network is set up
+    /// after it exists. The first command spawned takes it.
+    pub(crate) wiring: Arc<Mutex<Option<crate::StartGate>>>,
 }
 
 enum Target {
@@ -634,6 +637,10 @@ impl Command {
         let mut fds = vec![stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
         fds.extend(cgroup.as_ref().map(BoxCgroup::dir_fd));
         let has_cgroup = cgroup.is_some();
+        let wiring = match &self.target {
+            Target::Container { launch, .. } => launch.wiring.lock().expect("gate lock").take(),
+            Target::Running(_) => None,
+        };
         let started = match &self.target {
             Target::Container { launch, .. } => {
                 let run = wire::Run {
@@ -683,7 +690,7 @@ impl Command {
             stderr: stderr_ours.map(PipeReader::from),
             pid: started.pid,
             netns: started.netns,
-            tap: started.tap,
+            wiring,
             job: started.id,
             outcome: started.outcome,
             connection,
@@ -725,7 +732,8 @@ pub struct Child {
     pub stderr: Option<PipeReader>,
     pid: u32,
     netns: Option<OwnedFd>,
-    tap: Option<OwnedFd>,
+    /// Held until the container's network is set up: its program waits.
+    wiring: Option<crate::StartGate>,
     job: u64,
     outcome: Arc<client::Outcome>,
     connection: Arc<Connection>,
@@ -758,43 +766,28 @@ impl Child {
         self.netns.as_ref().map(|fd| fd.as_fd())
     }
 
-    /// The tap the container was started with. Yields it once.
-    pub fn take_tap_fd(&mut self) -> Option<OwnedFd> {
-        self.tap.take()
+    /// Lets the container's program start, when it waits for the
+    /// container's network to be set up. Whoever set it up calls this.
+    pub fn release_start(&mut self) {
+        self.wiring = None;
     }
 
-    /// Creates a socket in this container's network namespace that belongs
-    /// to the caller: the process that makes it is in the spawner's cgroup,
-    /// so no rule of the box applies to the socket. For what the caller
-    /// serves to the box inside the box's namespace.
+    /// See [`Entrance::socket_for_daemon`].
     ///
     /// # Errors
     ///
-    /// Fails if the container has ended or the socket cannot be created.
+    /// As [`Entrance::socket_for_daemon`].
     pub fn socket_for_daemon(&self, v6: bool, datagram: bool) -> io::Result<OwnedFd> {
-        self.connection.socket(Some(self.job), v6, datagram, None)
+        self.entrance().socket_for_daemon(v6, datagram)
     }
 
-    /// Sets up the one interface of this container's network namespace, and
-    /// brings `lo` up. Returns the device's descriptor for
-    /// [`LinkKind::Tap`].
-    ///
-    /// The container's program should wait at its start gate until this
-    /// returns, or it runs for a moment with no network.
+    /// See [`Entrance::link`].
     ///
     /// # Errors
     ///
-    /// Fails if the container has ended or has no network namespace of its
-    /// own, or if the kernel refuses a step, which the error names.
+    /// As [`Entrance::link`].
     pub fn link(&self, spec: LinkSpec) -> io::Result<Option<OwnedFd>> {
-        if self.netns.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the container has no network namespace of its own",
-            ));
-        }
-        self.connection
-            .link(self.job, spec, self.cgroup.as_ref().map(BoxCgroup::dir_fd))
+        self.entrance().link(spec)
     }
 
     /// Whether the container's first process exists: the program the
@@ -852,6 +845,8 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
+        // The job is killed before its start gate goes with the handle, so
+        // a program that still waits there never runs.
         if self.outcome.get().is_none() {
             self.connection.forget(self.job);
         }
@@ -896,6 +891,31 @@ impl Entrance {
         };
         command.args(args);
         command
+    }
+
+    /// Creates a socket in the container's network namespace that belongs
+    /// to the caller: the process that makes it is in the spawner's cgroup,
+    /// so no rule of the box applies to the socket. For what the caller
+    /// serves to the box inside the box's namespace.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the container has ended or the socket cannot be created.
+    pub fn socket_for_daemon(&self, v6: bool, datagram: bool) -> io::Result<OwnedFd> {
+        self.connection.socket(Some(self.job), v6, datagram, None)
+    }
+
+    /// Sets up the one interface of the container's network namespace, and
+    /// brings `lo` up. Returns the device's descriptor for
+    /// [`LinkKind::Tap`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the container has ended or has no network namespace of its
+    /// own, or if the kernel refuses a step, which the error names.
+    pub fn link(&self, spec: LinkSpec) -> io::Result<Option<OwnedFd>> {
+        self.connection
+            .link(self.job, spec, self.cgroup.as_ref().map(BoxCgroup::dir_fd))
     }
 
     /// Creates a socket in the container's network namespace and cgroup.

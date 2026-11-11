@@ -79,11 +79,7 @@ impl Outcome {
 
 /// The answer to a request that starts something.
 enum Answer {
-    Started {
-        pid: u32,
-        netns: Option<OwnedFd>,
-        tap: Option<OwnedFd>,
-    },
+    Started { pid: u32, netns: Option<OwnedFd> },
     Socket(OwnedFd),
     Linked(Option<OwnedFd>),
     Init(bool),
@@ -142,18 +138,12 @@ impl Shared {
         let mut table = self.table.lock().expect("spawner table lock");
         let mut fds = fds.into_iter();
         let (id, answer) = match event {
-            Event::Started {
-                id,
-                pid,
-                netns,
-                tap,
-            } => {
+            Event::Started { id, pid, netns } => {
                 let netns = if netns { fds.next() } else { None };
-                let tap = if tap { fds.next() } else { None };
                 if let Some(job) = table.jobs.get_mut(&id) {
                     job.pid = Some(pid);
                 }
-                (id, Answer::Started { pid, netns, tap })
+                (id, Answer::Started { pid, netns })
             }
             Event::Socket { id } => match fds.next() {
                 Some(socket) => (id, Answer::Socket(socket)),
@@ -200,7 +190,6 @@ pub(crate) struct Started {
     pub(crate) id: u64,
     pub(crate) pid: u32,
     pub(crate) netns: Option<OwnedFd>,
-    pub(crate) tap: Option<OwnedFd>,
     pub(crate) outcome: Arc<Outcome>,
 }
 
@@ -328,11 +317,10 @@ impl Connection {
             pid: None,
         };
         match self.ask(make, fds, Some(job))? {
-            (id, Answer::Started { pid, netns, tap }) => Ok(Started {
+            (id, Answer::Started { pid, netns }) => Ok(Started {
                 id,
                 pid,
                 netns,
-                tap,
                 outcome,
             }),
             (_, Answer::Failed(error)) => Err(io::Error::other(error)),

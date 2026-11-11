@@ -159,7 +159,7 @@ google-cloud-storage = "1.17"
 
 # The upstream release pinned in vendor/hakoniwa/hakoniwa.lock plus the patches
 # beside it; scripts/vendor-hakoniwa.sh regenerates the tree.
-hakoniwa = { features = ["rustslirp"], path = "vendor/hakoniwa/crate" }
+hakoniwa = { path = "vendor/hakoniwa/crate" }
 # DNS message parsing/encoding only (the box-zone answerer in `minimald`): no
 # resolver, no server, no async runtime features — the message types are all
 # `net::answerer` needs, and `default-features = false` keeps them that way.

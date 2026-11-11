@@ -308,9 +308,7 @@ pub async fn run_task(
             .spawn()
             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?;
         // A failed attach drops the child, which kills it.
-        let guard = planned
-            .attach(sandbox::Spawned::from_child(&mut child))
-            .await?;
+        let guard = planned.attach_to(&mut child).await?;
         let status = child.exited().await;
         guard.teardown().await;
         if !status.success() {

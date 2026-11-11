@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use boxes::{NetworkMode, SessionId};
 use sandbox::{
     AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Resolver,
-    Spawned, TapSpec,
+    Spawned,
 };
 use tokio::sync::Mutex;
 
@@ -379,6 +379,7 @@ impl OwnAddressReporter {
     /// builds the box's tap itself after the spawn
     /// ([`TapMechanism::Privileged`]), so the launch's plan carries no tap to
     /// read the lease from: this is where the lease is read there.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn lease(&self) -> Option<Ipv4Addr> {
         self.registry
             .read()
@@ -421,21 +422,6 @@ impl OwnAddressReporter {
             .expect("hostname registry lock poisoned");
         registry.withdraw_own_name(self.session_id, session_name);
     }
-}
-
-/// The box's switch lease once its launch has attached, for the listen
-/// watcher (NET-016): the tap the plan asked the sandbox to build carries it
-/// where the sandbox builds the tap, and where the daemon builds it itself —
-/// a VM host's privileged tap, whose plan carries no tap at all — the lease
-/// the attach reported is read instead. `None` for a box with neither: no
-/// own address, so nothing a listen could be published for.
-pub(crate) fn attached_lease(
-    plan: &NetPlan,
-    own_address: Option<&OwnAddressReporter>,
-) -> Option<Ipv4Addr> {
-    plan.tap()
-        .map(|tap| tap.address)
-        .or_else(|| own_address.and_then(OwnAddressReporter::lease))
 }
 
 /// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`
@@ -595,93 +581,19 @@ impl Network for HostIpAddressNetwork {
     }
 }
 
-/// Who builds the tap an own-IP PTask needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TapMechanism {
-    /// The sandbox layer builds it *inside* the PTask's own network namespace,
-    /// rootless, and hands the descriptor out.
-    InNamespace,
-    /// The daemon builds it in its own namespace under `CAP_NET_ADMIN` and moves
-    /// it in with `ip`, after the process exists.
-    Privileged,
-}
-
-/// Which mechanism builds this PTask's tap, decided from the control channel
-/// once, before the sandbox starts.
-///
-/// A choice, not a fallback: in the x86_64 KVM guest, asking RustSlirp for a
-/// tap yields no descriptor *and* takes the container supervisor with it, so
-/// there is no namespace left to fall back into (spec 017, open questions).
-/// `Privileged` execs `ip`/`nsenter` with `CAP_NET_ADMIN`, so it is used only
-/// inside a microVM whose network the daemon owns, never on a native host.
-fn tap_mechanism(control: &ControlChannel) -> TapMechanism {
-    match control {
-        // DM1/3/4: minimald is root in a guest whose network it owns outright.
-        ControlChannel::Vsock { .. } => TapMechanism::Privileged,
-        // DM2: unprivileged by design. No catch-all arm: a new transport must
-        // decide this deliberately.
-        ControlChannel::Unix(_) => TapMechanism::InNamespace,
-    }
-}
-
-/// The plan an own-IP PTask needs, given its switch subnet, its lease, and who
-/// is building its tap. Pure, so testable without a running switch.
-fn own_ip_plan(
-    subnet: crate::net::SwitchSubnet,
-    lease_ip: std::net::Ipv4Addr,
-    mechanism: TapMechanism,
-) -> NetPlan {
-    let plan = match mechanism {
-        TapMechanism::InNamespace => NetPlan::isolated_with_tap(TapSpec {
-            address: lease_ip,
-            netmask: subnet.netmask(),
-            gateway: subnet.gateway(),
-            // Must match the relay's frame buffer.
-            mtu: crate::net::DEFAULT_MTU,
-        }),
-        // The daemon puts the tap there itself, after the process exists.
-        TapMechanism::Privileged => NetPlan::isolated(),
-    };
-    // A fresh netns cannot reach the host's stub resolver; the switch answers
-    // DNS at the gateway (R3.1).
-    plan.with_resolver(Resolver::Nameservers(vec![subnet.dns_server()]))
-}
-
-/// Creates a tap in the daemon's own network namespace, moves it into the
-/// PTask's, and configures it there — the [`TapMechanism::Privileged`] path.
-async fn privileged_tap(
-    lease: crate::net::PtaskLease,
-    subnet: crate::net::SwitchSubnet,
-    netns: Option<std::os::fd::BorrowedFd<'_>>,
-) -> std::io::Result<std::os::fd::OwnedFd> {
-    // Checked before anything is made: a tap made with no namespace to move
-    // it to is left in the daemon's own, holding its name.
-    let Some(netns) = netns else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "the box's sandbox has no network namespace of its own to set up",
-        ));
-    };
-    // Unique across every subnet the switch accepts (`/8` to `/29`), within
-    // the 15-char `IFNAMSIZ` limit.
-    let o = lease.ip.octets();
-    let tap = format!("mtap{}_{}_{}", o[1], o[2], o[3]);
-    let tap_fd = crate::net::switch::open_tap(&tap)?;
-    crate::net::switch::move_tap_into_netns(&tap, netns, lease, subnet).await?;
-    Ok(tap_fd)
+/// The plan of a box with an address of its own: a namespace the attach
+/// wires, resolving at the virtual network's resolver.
+fn own_ip_plan(subnet: crate::net::SwitchSubnet) -> NetPlan {
+    NetPlan::isolated_wired().with_resolver(Resolver::Nameservers(vec![subnet.dns_server()]))
 }
 
 /// What [`OwnIpNetwork::plan`] reserved, waiting for an attach or an abandon.
 #[derive(Debug, Clone)]
 struct Reserved {
-    /// The full lease: the privileged mechanism needs the MAC too.
     lease: crate::net::PtaskLease,
     subnet: crate::net::SwitchSubnet,
     /// gvproxy's control channel: a local socket on DM2, host vsock on DM1/3/4.
     control: ControlChannel,
-    /// Decided with the plan, so `attach` cannot reach a different conclusion
-    /// than the plan the sandbox was built from.
-    mechanism: TapMechanism,
 }
 
 /// An own-IP network: leases an address from the per-host gvproxy switch before
@@ -797,51 +709,39 @@ impl OwnIpNetwork {
             (attach.lease, control, subnet)
         };
 
-        let mechanism = tap_mechanism(&control);
         *self.reserved.lock().unwrap() = Some(Reserved {
             lease,
             subnet,
             control,
-            mechanism,
         });
-        Ok(own_ip_plan(subnet, lease.ip, mechanism))
+        Ok(own_ip_plan(subnet))
     }
 
     /// The body of [`Network::attach`]: relays the tap and applies the
     /// ingress from the reservation `plan` made.
-    async fn attach_reserved(
-        &self,
-        mut spawned: Spawned,
-    ) -> Result<Box<dyn NetGuard>, NetworkError> {
+    async fn attach_reserved(&self, spawned: Spawned) -> Result<Box<dyn NetGuard>, NetworkError> {
         let Some(reserved) = self.reserved.lock().unwrap().clone() else {
             return Err(NetworkError::new(std::io::Error::other(
                 "own-IP attach without a plan: nothing was leased",
             )));
         };
 
-        // The mechanism `plan` chose; only the matching branch can succeed.
-        let tap_fd = match reserved.mechanism {
-            TapMechanism::InNamespace => {
-                let Some(fd) = spawned.take_tap_fd() else {
-                    // Report what building one in-namespace needs: which
-                    // capability is missing separates a kernel-config
-                    // problem from a policy one.
-                    let tun = std::path::Path::new("/dev/net/tun").exists();
-                    let userns = sandbox::user_namespaces_restriction()
-                        .map_or_else(|| "available".to_string(), |r| r.to_string());
-                    return Err(NetworkError::new(std::io::Error::other(format!(
-                        "the box's sandbox could not create its network device \
-                         (/dev/net/tun present: {tun}; user namespaces: {userns})"
-                    ))));
-                };
-                fd
-            }
-            TapMechanism::Privileged => {
-                privileged_tap(reserved.lease, reserved.subnet, spawned.netns())
-                    .await
-                    .map_err(NetworkError::new)?
-            }
-        };
+        // The spawner sets the interface up from inside the namespace and
+        // hands the device back. The box's program waits until the launch
+        // lets it start, after this attach.
+        let link = crate::net::attach::Place {
+            address: reserved.lease.ip,
+            subnet: reserved.subnet,
+        }
+        .link_spec(sandbox::LinkKind::Tap);
+        let tap_fd = spawned
+            .link(link)
+            .map_err(NetworkError::new)?
+            .ok_or_else(|| {
+                NetworkError::new(std::io::Error::other(
+                    "the spawner returned no network device for the box",
+                ))
+            })?;
 
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &self.switch,
@@ -926,7 +826,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        assert!(no_net.isolates_netns() && no_net.tap().is_none());
+        assert!(no_net.isolates_netns() && !no_net.wired());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
         let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
@@ -936,99 +836,17 @@ mod tests {
         assert_eq!(switch.lock().await.attached(), 0);
     }
 
-    /// The privileged tap is used where the daemon is privileged by deployment,
-    /// and nowhere else.
+    /// A box with an address of its own gets a namespace the attach wires,
+    /// and resolves at the virtual network's resolver.
     #[test]
-    fn the_control_channel_decides_the_tap_mechanism() {
-        assert_eq!(
-            tap_mechanism(&ControlChannel::Vsock { cid: 2, port: 1024 }),
-            TapMechanism::Privileged
-        );
-        assert_eq!(
-            tap_mechanism(&ControlChannel::Unix("/run/gvproxy.sock".into())),
-            TapMechanism::InNamespace
-        );
-    }
-
-    /// The plan asks the sandbox layer for a tap only when the sandbox layer
-    /// builds it: in the x86_64 KVM guest, asking RustSlirp for one it cannot
-    /// build destroys the container supervisor.
-    #[test]
-    fn the_plan_asks_for_a_tap_only_where_the_sandbox_builds_one() {
+    fn an_own_ip_plan_is_wired_after_the_spawn_and_resolves_at_the_switch() {
         let subnet = crate::net::SwitchSubnet::default();
-        let ip = std::net::Ipv4Addr::new(100, 64, 0, 9);
-
-        let rootless = own_ip_plan(subnet, ip, TapMechanism::InNamespace);
-        let privileged = own_ip_plan(subnet, ip, TapMechanism::Privileged);
-        assert!(rootless.tap().is_some());
-        assert!(
-            privileged.tap().is_none(),
-            "the daemon builds this one itself"
-        );
-        // The mechanism decides who makes the tap, not what the PTask gets.
-        assert!(privileged.isolates_netns() && rootless.isolates_netns());
-        assert_eq!(privileged.resolver(), rootless.resolver());
-    }
-
-    /// T94, NET-016: a VM host's privileged-tap plan carries no tap, so the
-    /// listen watcher's lease comes from the attach's report — without it a
-    /// VM box gets no listen plan, and no listen of its ever publishes.
-    #[test]
-    fn a_privileged_tap_box_reads_its_lease_from_the_attach_report() {
-        let subnet = crate::net::SwitchSubnet::default();
-        let lease = std::net::Ipv4Addr::new(100, 64, 128, 5);
-        let registry = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
-            "dev", false,
-        )));
-        let reporter = OwnAddressReporter::new(registry, SessionId::nil());
-        let privileged = own_ip_plan(subnet, lease, TapMechanism::Privileged);
-
-        assert_eq!(
-            attached_lease(&privileged, Some(&reporter)),
-            None,
-            "nothing is reported before the attach"
-        );
-        reporter.report("vm-box", lease, BTreeMap::new());
-        assert_eq!(
-            attached_lease(&privileged, Some(&reporter)),
-            Some(lease),
-            "the privileged plan has no tap, so the attach's reported lease is the box's"
-        );
-        // A respawn attaches afresh and reports its own lease, and the
-        // watcher it starts reads that one — never the previous spawn's.
-        let respawned = std::net::Ipv4Addr::new(100, 64, 128, 9);
-        reporter.report("vm-box", respawned, BTreeMap::new());
-        assert_eq!(
-            attached_lease(&privileged, Some(&reporter)),
-            Some(respawned),
-            "a respawned box's watcher reads the lease its own attach reported"
-        );
-        let rootless = own_ip_plan(subnet, lease, TapMechanism::InNamespace);
-        assert_eq!(attached_lease(&rootless, None), Some(lease));
-        assert_eq!(attached_lease(&NetPlan::isolated(), None), None);
-    }
-
-    /// 017-009 and 017-006 for own-IP: the PTask gets its own namespace and
-    /// one tap addressed with its lease, routed and resolving at the switch.
-    #[test]
-    fn own_ip_resolver_points_at_the_switch() {
-        let subnet = crate::net::SwitchSubnet::default();
-        let lease = std::net::Ipv4Addr::new(100, 64, 0, 7);
-        let plan = own_ip_plan(subnet, lease, TapMechanism::InNamespace);
-
+        let plan = own_ip_plan(subnet);
+        assert!(plan.isolates_netns() && plan.wired());
         assert_eq!(
             plan.resolver(),
             &Resolver::Nameservers(vec![subnet.dns_server()])
         );
-        // gvproxy answers DNS on the gateway; two accessors that could drift.
-        assert_eq!(subnet.dns_server(), subnet.gateway());
-
-        assert!(plan.isolates_netns());
-        let tap = plan.tap().expect("own-IP gets a tap");
-        assert_eq!(tap.address, lease);
-        assert_eq!(tap.netmask, subnet.netmask());
-        assert_eq!(tap.gateway, subnet.gateway());
-        assert_eq!(tap.mtu, crate::net::DEFAULT_MTU);
     }
 
     /// 017-008. A launch whose attach fails leaves the switch's attachment
@@ -1042,9 +860,7 @@ mod tests {
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
-        // No namespace, so `privileged_tap`'s check refuses before
-        // anything is created (`counting_switch` is
-        // `HostShuttle`, so this is the privileged mechanism).
+        // Nothing was spawned, so there is no namespace to set up.
         assert!(net.attach(Spawned::new()).await.is_err());
 
         // The sandbox layer runs `abandon` on exactly this path.
@@ -1135,11 +951,7 @@ mod tests {
 
         // Own-address (the plan is transport-independent): the same gateway,
         // whose static zone answers the name with the NAT'd host-alias address.
-        let own = own_ip_plan(
-            subnet,
-            std::net::Ipv4Addr::new(100, 64, 0, 9),
-            TapMechanism::InNamespace,
-        );
+        let own = own_ip_plan(subnet);
         assert_eq!(
             own.resolver(),
             &Resolver::Nameservers(vec![subnet.gateway()])

@@ -15,7 +15,7 @@ use config::Config;
 pub mod network;
 pub use network::{
     AbandonFuture, AttachFuture, HOST_MIN_INTERNAL, HostEntry, HostNet, NetGuard, NetPlan, Network,
-    NetworkError, NoNet, PlanFuture, Resolver, Spawned, TapSpec,
+    NetworkError, NoNet, PlanFuture, Resolver, Spawned,
 };
 use std::fs::{self, Permissions};
 #[cfg(target_os = "linux")]
@@ -190,6 +190,12 @@ impl<C: Channel> Sandbox<C> {
         use std::os::fd::FromRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
 
+        // A container that waits for its network has a gate already. The
+        // program starts when this hold and that one are both gone.
+        if let Some(held) = container.launch.wiring.lock().expect("gate lock").as_ref() {
+            return Ok(held.clone());
+        }
+
         static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
             "{START_GATE_NAME}-{}",
@@ -231,9 +237,11 @@ impl<C: Channel> Sandbox<C> {
         }
         container.launch.gate = Some(Path::new("/run").join(&name));
         Ok(StartGate {
-            // SAFETY: `fd` is a fresh descriptor nothing else owns.
-            _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
-            path,
+            _hold: std::sync::Arc::new(GateWriter {
+                // SAFETY: `fd` is a fresh descriptor nothing else owns.
+                _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+                path,
+            }),
         })
     }
 
@@ -472,14 +480,19 @@ pub struct Container {
 /// its own number. See [`Sandbox::hold_start`].
 pub const START_GATE_NAME: &str = "minimal-start-gate";
 
-/// The daemon's half of a box's start gate: the one writer of the FIFO the
-/// box's first process waits on, just before it execs its program. The
-/// program runs once every writer has closed, so dropping this — or calling
-/// [`Self::release`], which says so at the call site — lets it start. A
-/// daemon that loses the gate any other way (its host dropped, the daemon
-/// gone) releases it too: the gate can delay the program, never wedge it.
-#[derive(Debug)]
+/// A hold on a box's start gate: a writer of the FIFO the box's first
+/// process waits on, just before it execs its program. The program runs
+/// once every hold is gone, so dropping the last one, or calling
+/// [`Self::release`] on it, lets it start. A daemon that loses the gate any
+/// other way releases it too: the gate can delay the program, never wedge
+/// it.
+#[derive(Debug, Clone)]
 pub struct StartGate {
+    _hold: std::sync::Arc<GateWriter>,
+}
+
+#[derive(Debug)]
+struct GateWriter {
     _writer: std::os::fd::OwnedFd,
     /// The FIFO, host-side, removed when the gate goes. A box that has not
     /// opened it by then finds no gate and runs at once, which is what a
@@ -488,11 +501,11 @@ pub struct StartGate {
 }
 
 impl StartGate {
-    /// Lets the gated program exec.
+    /// Gives this hold up.
     pub fn release(self) {}
 }
 
-impl Drop for StartGate {
+impl Drop for GateWriter {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
@@ -950,13 +963,6 @@ impl<C: Channel> Sandbox<C> {
         // the provider wires once the process exists. A host that cannot
         // make the namespace fails the launch.
         let isolate = isolation_decision(plan, network_namespaces_available())?;
-        // A plan cannot describe a tap without isolation.
-        let tap = plan.tap().map(|tap| spawner::Tap {
-            address: tap.address,
-            netmask: tap.netmask,
-            gateway: tap.gateway,
-            mtu: tap.mtu,
-        });
         let mut mounts = Vec::new();
         let mut symlinks = Vec::new();
 
@@ -1074,7 +1080,7 @@ impl<C: Channel> Sandbox<C> {
         // box's resolver does not know still answers from `/etc/hosts`.
         write_hosts(&self.rootfs(), plan.hosts(), ipv6_disabled())?;
 
-        Ok(Container {
+        let mut container = Container {
             launch: spawner::Launch {
                 container: spawner::ContainerSpec {
                     rootfs: self.rootfs(),
@@ -1084,17 +1090,24 @@ impl<C: Channel> Sandbox<C> {
                     symlinks,
                     hostname: self.config.hostname.clone(),
                     netns: isolate,
-                    tap,
                     mount_fallback,
                 },
                 gate: None,
                 session: spawner::Session::New,
-                // hakoniwa brings `lo` up only where it builds a tap.
-                lo_up: isolate && plan.tap().is_none(),
+                lo_up: isolate,
                 ping_gid: isolate.then_some(config::BOX_GID),
                 cgroup: self.config.box_cgroup.clone(),
+                wiring: std::sync::Arc::default(),
             },
-        })
+        };
+        if isolate && plan.wired() {
+            // The program must not run before the provider has given the
+            // namespace its interface, which it does once the container
+            // exists.
+            let held = self.hold_start(&mut container)?;
+            *container.launch.wiring.lock().expect("gate lock") = Some(held);
+        }
+        Ok(container)
     }
 
     /// A command that runs `program` in a new instance of `container`, with
@@ -1862,8 +1875,26 @@ impl PlannedLaunch {
     #[cfg(target_os = "linux")]
     pub async fn attach_child(self, child: &mut Child) -> Result<Option<Box<dyn NetGuard>>, Error> {
         let spawned = network::Spawned::from_child(child);
-        self.attach_unless_ended(spawned, || child.try_wait().is_some())
-            .await
+        let guard = self
+            .attach_unless_ended(spawned, || child.try_wait().is_some())
+            .await?;
+        child.release_start();
+        Ok(guard)
+    }
+
+    /// [`attach`](Self::attach) for a container this process started: wires
+    /// its namespace and then lets its program start, when the program
+    /// waits for that.
+    ///
+    /// # Errors
+    ///
+    /// As [`attach`](Self::attach). The program still waits then, and
+    /// dropping `child` ends the container before it runs.
+    #[cfg(target_os = "linux")]
+    pub async fn attach_to(self, child: &mut Child) -> Result<Box<dyn NetGuard>, Error> {
+        let guard = self.attach(network::Spawned::from_child(child)).await?;
+        child.release_start();
+        Ok(guard)
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2079,11 +2110,10 @@ pub async fn hold_network(
             ),
         ));
     }
-    let spawned = network::Spawned::from_child(&mut child);
     // A held process waits at its start gate, so one that has ended failed
     // its own setup. Its exit status says why, and neither the attach's
     // error nor a later read of its namespace carries that.
-    let guard = match planned.attach(spawned).await {
+    let guard = match planned.attach_to(&mut child).await {
         Ok(guard) => {
             // An attach that touches no namespace succeeds over an ended
             // process too.
@@ -2610,25 +2640,6 @@ mod tests {
         assert_eq!(rec.events(), vec!["plan", "abandon"]);
     }
 
-    /// 017-010. The descriptor reaches the provider once: a second take yields
-    /// nothing rather than a second owner of the same fd.
-    #[test]
-    fn the_tap_descriptor_goes_to_the_provider_once() {
-        use std::os::fd::AsRawFd as _;
-        // A pipe end stands in for the tap; any real fd proves ownership moved.
-        let (read_end, _write_end) = std::io::pipe().expect("pipe");
-        let fd = std::os::fd::OwnedFd::from(read_end);
-        let raw = fd.as_raw_fd();
-
-        let mut spawned = network::Spawned::new().with_tap_fd(fd);
-        assert_eq!(spawned.take_tap_fd().expect("first take").as_raw_fd(), raw);
-        assert!(
-            spawned.take_tap_fd().is_none(),
-            "a second take gets nothing"
-        );
-        assert!(network::Spawned::new().take_tap_fd().is_none());
-    }
-
     /// 017-004. Both ways a sandbox process starts — the invocation path
     /// ([`Sandbox::plan_launch`]) and the caller-spawn path `minimald` uses
     /// ([`PlannedLaunch::begin`]) — reach the same provider through one
@@ -2668,32 +2679,23 @@ mod tests {
         assert_eq!(from_invocation.plan(), from_caller.plan());
     }
 
-    fn tap_spec() -> network::TapSpec {
-        network::TapSpec {
-            address: std::net::Ipv4Addr::new(100, 64, 0, 2),
-            netmask: std::net::Ipv4Addr::new(255, 255, 0, 0),
-            gateway: std::net::Ipv4Addr::new(100, 64, 0, 1),
-            mtu: 1500,
-        }
-    }
-
-    /// 017-007. A plan with tap parameters isolates, however it was built:
-    /// `NetPlan` has no constructor that pairs a tap with a shared namespace.
+    /// A plan the provider wires has a namespace to wire.
     #[test]
-    fn a_tap_plan_always_isolates() {
-        assert!(network::NetPlan::isolated_with_tap(tap_spec()).isolates_netns());
+    fn a_wired_plan_always_isolates() {
+        let wired = network::NetPlan::isolated_wired();
+        assert!(wired.isolates_netns() && wired.wired());
         assert!(
-            network::NetPlan::isolated_with_tap(tap_spec())
+            wired
                 .with_resolver(network::Resolver::Host)
                 .isolates_netns()
         );
-        assert!(network::NetPlan::host().tap().is_none());
+        assert!(!network::NetPlan::host().wired());
+        assert!(!network::NetPlan::isolated().wired());
     }
 
-    /// 017-006, for the plans the sandbox layer handles by itself: a shared
-    /// namespace gets no tap and the host's resolver only when asked; an
-    /// isolated one gets no tap and no resolver; a resolver the plan names is
-    /// kept. The mode half is `minimald::net::provider`.
+    /// For the plans the sandbox layer handles by itself: a shared namespace
+    /// gets the host's resolver only when asked, an isolated one gets none,
+    /// and a resolver the plan names is kept.
     #[test]
     fn the_mode_bounds_the_network_access() {
         let plan_for = |plan, dns| {
@@ -2703,7 +2705,7 @@ mod tests {
         };
 
         let host = plan_for(network::NetPlan::host(), true);
-        assert!(!host.isolates_netns() && host.tap().is_none());
+        assert!(!host.isolates_netns() && !host.wired());
         assert_eq!(host.resolver(), &network::Resolver::Host);
         assert_eq!(
             plan_for(network::NetPlan::host(), false).resolver(),
@@ -2711,11 +2713,11 @@ mod tests {
         );
 
         let isolated = plan_for(network::NetPlan::isolated(), false);
-        assert!(isolated.isolates_netns() && isolated.tap().is_none());
+        assert!(isolated.isolates_netns() && !isolated.wired());
         assert_eq!(isolated.resolver(), &network::Resolver::None);
 
         let named = network::Resolver::Nameservers(vec![std::net::Ipv4Addr::new(100, 64, 0, 1)]);
-        let own_ip = network::NetPlan::isolated_with_tap(tap_spec()).with_resolver(named.clone());
+        let own_ip = network::NetPlan::isolated_wired().with_resolver(named.clone());
         assert_eq!(plan_for(own_ip, true).resolver(), &named);
     }
 
@@ -2941,9 +2943,7 @@ ff02::2\tip6-allrouters
             ),
             "expected NetworkIsolationUnavailable, got {err:?}"
         );
-        assert!(
-            isolation_decision(&network::NetPlan::isolated_with_tap(tap_spec()), false,).is_err()
-        );
+        assert!(isolation_decision(&network::NetPlan::isolated_wired(), false).is_err());
         assert!(!isolation_decision(&network::NetPlan::host(), false).unwrap());
     }
 
@@ -3481,6 +3481,76 @@ ff02::2\tip6-allrouters
         let held = launch_box_probe(name, cgroup, probe_args).await;
         held.release_hold();
         held.report().await
+    }
+
+    /// A container whose plan is wired after it exists holds its program
+    /// until whoever wired it lets it start. A second hold on the same
+    /// container, as a session's hooks take, keeps it waiting too. Dropping
+    /// the handle of a container that still waits ends it before its
+    /// program runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wired_container_waits_for_its_network() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!("skipping a_wired_container_waits_for_its_network: {reason}");
+            return;
+        }
+        let name = "wired-gate";
+        let base_dir = box_base_dir(name);
+        let build = tempfile::tempdir_in(&base_dir).expect("a temp dir");
+        let probe = compile_cgroup_probe(build.path());
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &probe);
+        let sandbox_home = tempfile::tempdir_in(&base_dir).expect("a temp dir");
+        let mut sandbox = Config::new(name)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .build(sandbox_home.path().join("sandbox"), ())
+            .await
+            .expect("building the box");
+        let plan = network::NetPlan::isolated_wired();
+        let run = sandbox.base_dir.join("run");
+        let pause = std::time::Duration::from_secs(1);
+        let mut start = |mark: &str, hooks: bool| {
+            let mut container = sandbox.new_container(&plan).expect("the container");
+            let hold = hooks.then(|| sandbox.hold_start(&mut container).expect("a second hold"));
+            let child = sandbox
+                .command(
+                    &container,
+                    "/usr/bin/probe",
+                    [format!("MARK:/run/{mark}")],
+                    std::iter::empty::<(&str, &str)>(),
+                )
+                .expect("the probe's command")
+                .spawn()
+                .expect("spawning the probe");
+            (run.join(mark), child, hold)
+        };
+
+        let (mark, mut child, hold) = start("wired", true);
+        tokio::time::sleep(pause).await;
+        assert!(
+            !mark.exists(),
+            "the program ran before its network was set up"
+        );
+        child.release_start();
+        tokio::time::sleep(pause).await;
+        assert!(!mark.exists(), "the program ran past the second hold");
+        drop(hold);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.exited())
+            .await
+            .expect("the program runs once both holds are gone");
+        assert!(status.success(), "{status:?}");
+        assert!(mark.exists());
+
+        let (mark, child, _) = start("dropped", false);
+        tokio::time::sleep(pause).await;
+        drop(child);
+        tokio::time::sleep(pause).await;
+        assert!(
+            !mark.exists(),
+            "a container that was given up ran its program"
+        );
     }
 
     /// The start gate (#2118): a command whose container holds its start

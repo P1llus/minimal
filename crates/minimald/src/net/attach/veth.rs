@@ -89,10 +89,8 @@ impl Uplink for VethUplink {
                 .map_err(io::Error::other)??;
             let node_end = host.clone();
             let link = Link::new(move || delete(&node_end));
-            // The link job talks to the spawner, which answers when the
-            // kernel has.
             let spec = place.link_spec(sandbox::LinkKind::Existing(INSIDE.to_owned()));
-            tokio::task::block_in_place(|| job.link(spec))?;
+            job.link(spec)?;
             tracing::debug!(interface = %host, address = %place.address, "connected a box to the node's bridge");
             Ok(link)
         })

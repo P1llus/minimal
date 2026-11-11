@@ -34,8 +34,6 @@ pub(crate) struct Container {
     pub(crate) supervisor: OwnedFd,
     /// The container's network namespace, when it has one of its own.
     pub(crate) netns: Option<OwnedFd>,
-    /// The tap hakoniwa built, when the container asked for one.
-    pub(crate) tap: Option<OwnedFd>,
 }
 
 /// A shim this process started to run a program in a running container.
@@ -92,22 +90,6 @@ fn hakoniwa_container(
     }
     if spec.netns {
         container.unshare(hakoniwa::Namespace::Network);
-    }
-    // `network()` does not imply the unshare above, which a spec with a tap
-    // always asks for.
-    if let Some(tap) = spec.tap {
-        container.network(
-            hakoniwa::RustSlirp::default()
-                // Ethernet frames, as the switch speaks them.
-                .mode(hakoniwa::RustSlirpMode::TAP)
-                .address(tap.address)
-                .netmask(tap.netmask)
-                // A next-hop default route: the switch's gateway does not
-                // answer ARP for other addresses.
-                .gateway(hakoniwa::RustSlirpGateway::IfaceWithAddr(tap.gateway))
-                .mtu(tap.mtu)
-                .clone(),
-        );
     }
     for mount in &spec.mounts {
         container.mount(
@@ -185,14 +167,8 @@ pub(crate) fn run(
         let _title = titled.then(|| Title::set(c"minimal-box"));
         command.spawn()
     };
-    let mut child = spawned.map_err(io::Error::other)?;
+    let child = spawned.map_err(io::Error::other)?;
     let supervisor = enter::pidfd_open(child.id()).map_err(io::Error::other)?;
-    // SAFETY: hakoniwa hands out a live tap descriptor it does not close,
-    // and `take` makes this its one owner.
-    let tap = child
-        .rustslirp_tapfd
-        .take()
-        .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
     // The supervisor made its namespaces before the spawn returned, and it
     // is this process's child, so its pid is its own until it is reaped.
     let netns = if run.container.netns {
@@ -204,7 +180,6 @@ pub(crate) fn run(
         child,
         supervisor,
         netns,
-        tap,
     })
 }
 

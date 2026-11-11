@@ -524,8 +524,9 @@ pub(super) async fn task_producer(
                 let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                let spawned = sandbox::Spawned::from_child(&mut child);
+                let spawned = sandbox::Spawned::from_child(&child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
+                child.release_start();
                 let mut process = HakoniwaProcess::new(child, guard);
                 // The fallback notice leads the first invocation's stderr.
                 process.stderr_notice = start_notice.take();

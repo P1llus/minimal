@@ -1279,8 +1279,7 @@ impl BoxLauncher for SandboxLauncher {
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
         let net_guard: Option<Box<dyn sandbox::NetGuard>> = {
-            let spawned = sandbox::Spawned::from_child(process.get_mut());
-            match planned.attach(spawned).await {
+            match planned.attach_to(process.get_mut()).await {
                 // The guard owns the release now; it detaches at session end.
                 Ok(guard) => Some(guard),
                 // The release stays with `planned`, which drops on this return.
@@ -1307,7 +1306,9 @@ impl BoxLauncher for SandboxLauncher {
         // (`complete_own_ip_attach` reports it before it returns `Ok`), and
         // every launch — a respawn included — runs this step afresh, so the
         // lease the plan carries is always this spawn's own.
-        let lease = crate::net::provider::attached_lease(&plan, own_address.as_ref());
+        let lease = own_address
+            .as_ref()
+            .and_then(crate::net::provider::OwnAddressReporter::lease);
         let published = own_address
             .as_ref()
             .and_then(|reporter| reporter.published_address());

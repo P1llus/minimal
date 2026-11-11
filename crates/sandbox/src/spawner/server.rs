@@ -35,6 +35,8 @@ struct Job {
     init: Option<(u32, OwnedFd)>,
     /// Whether the job took the foreground of the spawner's terminal.
     foreground: bool,
+    /// Whether the job is a container with a network namespace of its own.
+    own_netns: bool,
 }
 
 impl Job {
@@ -226,15 +228,12 @@ impl Server {
                 match started {
                     Ok(mut container) => {
                         let netns = container.netns.take();
-                        let tap = container.tap.take();
                         let event = Event::Started {
                             id,
                             pid: container.child.id(),
                             netns: netns.is_some(),
-                            tap: tap.is_some(),
                         };
-                        let fds: Vec<BorrowedFd<'_>> =
-                            netns.iter().chain(&tap).map(|fd| fd.as_fd()).collect();
+                        let fds: Vec<BorrowedFd<'_>> = netns.iter().map(|fd| fd.as_fd()).collect();
                         self.send(&event, &fds);
                         self.jobs.insert(
                             id,
@@ -242,6 +241,7 @@ impl Server {
                                 process: Process::Container(Box::new(container)),
                                 init: None,
                                 foreground,
+                                own_netns: netns.is_some(),
                             },
                         );
                         // The group a foreground job runs in is its first
@@ -265,7 +265,6 @@ impl Server {
                         id,
                         pid: shim.pid,
                         netns: false,
-                        tap: false,
                     };
                     self.send(&event, &[]);
                     self.jobs.insert(
@@ -274,6 +273,7 @@ impl Server {
                             process: Process::Shim(shim),
                             init: None,
                             foreground: false,
+                            own_netns: false,
                         },
                     );
                 }
@@ -305,9 +305,19 @@ impl Server {
                 cgroup,
             } => {
                 let cgroup = if cgroup { fds.into_iter().next() } else { None };
-                let made = self.supervisor_of(netns_of).and_then(|netns_of| {
-                    link::link(netns_of, &link, cgroup.as_ref().map(|fd| fd.as_fd()))
-                });
+                // The job would set the interface up in whatever namespace
+                // the container is in, which must not be its starter's.
+                let own_netns = self.jobs.get(&netns_of).is_some_and(|job| job.own_netns);
+                let made = if own_netns {
+                    self.supervisor_of(netns_of).and_then(|netns_of| {
+                        link::link(netns_of, &link, cgroup.as_ref().map(|fd| fd.as_fd()))
+                    })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the container has no network namespace of its own",
+                    ))
+                };
                 match made {
                     Ok(tap) => {
                         let fds: Vec<BorrowedFd<'_>> = tap.iter().map(|fd| fd.as_fd()).collect();

@@ -24,15 +24,6 @@ pub(crate) struct Mount {
     pub(crate) data: Option<String>,
 }
 
-/// The tap hakoniwa builds inside the container's network namespace.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct Tap {
-    pub(crate) address: std::net::Ipv4Addr,
-    pub(crate) netmask: std::net::Ipv4Addr,
-    pub(crate) gateway: std::net::Ipv4Addr,
-    pub(crate) mtu: u16,
-}
-
 /// Where a container's `eth0` comes from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LinkKind {
@@ -73,7 +64,6 @@ pub(crate) struct ContainerSpec {
     pub(crate) hostname: Option<String>,
     /// Whether the container gets a network namespace of its own.
     pub(crate) netns: bool,
-    pub(crate) tap: Option<Tap>,
     /// Whether mounts fall back to the flags of their source, and `/proc` is
     /// the outer one bound in.
     pub(crate) mount_fallback: bool,
@@ -185,7 +175,6 @@ pub(crate) enum Event {
         id: u64,
         pid: u32,
         netns: bool,
-        tap: bool,
     },
     Failed {
         id: u64,
