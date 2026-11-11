@@ -3207,7 +3207,9 @@ async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
-        .args(extra);
+        .args(extra)
+        // Nothing is installed under this root, whatever this machine has.
+        .env("MINIMAL_INSTALL_ROOT", config_dir.path());
     command
         .output()
         .await

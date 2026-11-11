@@ -1286,25 +1286,40 @@ pub(crate) mod linux {
         identity_line(&stdout).map(str::to_owned)
     }
 
+    /// The variable that names another root for the installed pieces.
+    const INSTALL_ROOT_VAR: &str = "MINIMAL_INSTALL_ROOT";
+
+    /// Where a piece that `min finalize-install` puts at `path` is read:
+    /// under `/`, or under the directory [`INSTALL_ROOT_VAR`] names. With
+    /// another root, a run reads an install of its own and not this
+    /// machine's.
+    fn installed(path: &str) -> std::path::PathBuf {
+        match std::env::var_os(INSTALL_ROOT_VAR) {
+            Some(root) => std::path::Path::new(&root).join(path.trim_start_matches('/')),
+            None => std::path::PathBuf::from(path),
+        }
+    }
+
     /// [`policy_engine_item_over`] this host's reads.
     pub(crate) fn policy_engine_item_on_this_host() -> Item {
         use std::os::unix::fs::MetadataExt as _;
         let daemon = daemon_beside_min();
-        let copy = std::fs::symlink_metadata(POLICY_LOADER_PROGRAM)
+        let loader = installed(POLICY_LOADER_PROGRAM);
+        let copy = std::fs::symlink_metadata(&loader)
             .ok()
             .map(|meta| LoaderCopy {
                 regular_file: meta.file_type().is_file(),
                 uid: meta.uid(),
                 mode: meta.mode() & 0o7777,
             });
-        let socket_unit = std::fs::read_to_string(POLICY_LOADER_UNIT_SOCKET_PATH).ok();
+        let socket_unit = std::fs::read_to_string(installed(POLICY_LOADER_UNIT_SOCKET_PATH)).ok();
         // A path this account may not look at reads as absent: it cannot
         // tell, and the removal lines run with every install anyway.
         let earlier_pieces = EARLIER_INSTALL_FILES
             .iter()
-            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .filter(|path| std::fs::symlink_metadata(installed(path)).is_ok())
             .chain(
-                std::path::Path::new(EARLIER_INSTALL_CGROUP)
+                installed(EARLIER_INSTALL_CGROUP)
                     .is_dir()
                     .then_some(&EARLIER_INSTALL_CGROUP),
             )
@@ -1319,7 +1334,7 @@ pub(crate) mod linux {
             daemon_identity: daemon.as_deref().and_then(loader_identity),
             copy_identity: copy
                 .filter(|copy| copy.regular_file)
-                .and_then(|_| loader_identity(POLICY_LOADER_PROGRAM)),
+                .and_then(|_| loader_identity(loader.to_str()?)),
             socket_active: socket_unit.is_some()
                 && std::process::Command::new("systemctl")
                     .args([
@@ -1335,7 +1350,7 @@ pub(crate) mod linux {
             daemon,
             copy,
             socket_unit,
-            service_unit: std::fs::read_to_string(POLICY_LOADER_UNIT_SERVICE_PATH).ok(),
+            service_unit: std::fs::read_to_string(installed(POLICY_LOADER_UNIT_SERVICE_PATH)).ok(),
             earlier_pieces,
         })
     }
