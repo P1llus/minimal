@@ -42,9 +42,18 @@ pub(crate) mod provider;
 // (NET-136). Relay-internal, so no more public than this.
 pub(crate) mod dns_gate;
 
+#[allow(
+    dead_code,
+    reason = "no caller until the guest's network runs on the engine"
+)]
+pub(crate) mod door;
 // Whether a box's network policy can be enforced on this host.
 pub(crate) mod endpoints;
 pub(crate) mod engine;
+#[allow(dead_code, reason = "no caller until own_ip runs on the engine")]
+pub(crate) mod publish;
+#[allow(dead_code, reason = "no caller until boxes have a host relay endpoint")]
+pub(crate) mod relay;
 pub(crate) mod resolver;
 pub(crate) mod spec;
 

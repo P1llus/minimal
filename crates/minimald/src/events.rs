@@ -41,6 +41,7 @@ pub(crate) enum Source {
     Kernel(netpol::abi::Hook),
     Resolver,
     HostnameProxy,
+    HostRelay,
 }
 
 impl Source {
@@ -49,6 +50,7 @@ impl Source {
             Self::Kernel(_) => "kernel",
             Self::Resolver => "resolver",
             Self::HostnameProxy => "hostname_proxy",
+            Self::HostRelay => "host_relay",
         }
     }
 }

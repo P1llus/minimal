@@ -761,7 +761,7 @@ const ALREADY_RUNNING_BODY: &str = "proxy already running";
 
 /// Whether `error` is the forwarder's answer to an expose of a listener
 /// that is already bound, as [`post_json`] reports a refused request.
-fn is_already_running(error: &io::Error) -> bool {
+pub(crate) fn is_already_running(error: &io::Error) -> bool {
     let said = error.to_string();
     said.contains("returned HTTP 500") && said.contains(ALREADY_RUNNING_BODY)
 }
@@ -982,7 +982,7 @@ pub struct ClosedConnections(pub Option<u64>);
 
 impl ClosedConnections {
     /// The count in an `/unexpose` reply body, `{"closed":<n>}`.
-    fn from_reply(body: &[u8]) -> Self {
+    pub(crate) fn from_reply(body: &[u8]) -> Self {
         #[derive(serde::Deserialize)]
         struct Reply {
             closed: Option<u64>,
@@ -1758,7 +1758,7 @@ pub(crate) async fn post_json_within<T: Serialize>(
 /// [`post_json_within`] that hands back the body of a 2xx reply, for a verb
 /// whose answer carries data: the patched switch's `/unexpose` says how many
 /// accepted connections it closed.
-async fn post_json_reply_within<T: Serialize>(
+pub(crate) async fn post_json_reply_within<T: Serialize>(
     control: &ControlChannel,
     path: &str,
     body: &T,
@@ -1965,7 +1965,7 @@ fn body_after_headers(response: &[u8]) -> &[u8] {
 /// control socket can accept the connection and then stall or never close;
 /// without a bound, teardown's `remove_ingress` would block forever before the
 /// switch `detach`, leaving the PTask attached and its forwards present.
-const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on bytes buffered from a single gvproxy control response. The
 /// forwarder's replies are a status line plus a tiny body, so 64 KiB is far

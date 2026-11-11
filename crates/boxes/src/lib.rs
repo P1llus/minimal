@@ -88,7 +88,7 @@ impl fmt::Display for IpProto {
 // ---------------------------------------------------------------------------
 
 /// A single static ingress port mapping for an `OwnIp` `PTask`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortMapping {
     /// Host-side port that forwards inbound connections into the `PTask`.
     pub external_port: u16,

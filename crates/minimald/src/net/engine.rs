@@ -19,7 +19,11 @@ use std::{
 
 use boxbpf::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
 use boxes::{BoxPolicy, NetworkMode, SessionId};
-use netpol::{Compiled, Protocol, SetId, Verdict, base::Services, compile::Spec};
+use netpol::{
+    Compiled, Protocol, SetId, Verdict,
+    base::{PortOf, Services},
+    compile::Spec,
+};
 use sandbox::cgroup::{BoxCgroup, Root};
 use tokio::sync::mpsc;
 
@@ -144,6 +148,8 @@ pub(crate) enum InstallError {
     Endpoints(std::io::Error),
     #[error("writing the box's network policy failed: {0}")]
     Engine(#[from] boxbpf::Error),
+    #[error("the box's network policy was removed")]
+    Removed,
 }
 
 /// What the engine needs to know about a box.
@@ -851,11 +857,16 @@ impl Engine {
         )
         .map_err(Unenforceable::Spec)?;
         let node = attached.node.read().expect("engine lock").clone();
-        let spec = Self::spec_of(&node, facts.mode, own, of.block);
+        let mut spec = Self::spec_of(&node, facts.mode, own, of.block);
         let mut entry = of.entry.lock().expect("box entry lock");
         if entry.removed {
             return Ok(());
         }
+        // Published ports come and go while the box runs. No fact of the
+        // box names them, so the entry itself is their record.
+        spec.deployment
+            .published
+            .clone_from(&entry.live.spec().deployment.published);
         if *entry.live.spec() != spec {
             attached
                 .handles
@@ -865,6 +876,43 @@ impl Engine {
             *of.compiled.write().expect("compiled policy lock") = Arc::clone(entry.live.compiled());
         }
         entry.facts = facts.clone();
+        Ok(())
+    }
+
+    /// Admits new inbound flows to a port of the box. Without an engine
+    /// nothing judges the box's flows, and there is nothing to write.
+    pub(crate) fn publish(&self, of: &Installed, port: PortOf) -> Result<(), InstallError> {
+        let Some(attached) = self.attached_state() else {
+            return Ok(());
+        };
+        let mut entry = of.entry.lock().expect("box entry lock");
+        if entry.removed {
+            return Err(InstallError::Removed);
+        }
+        attached
+            .handles
+            .lock()
+            .expect("engine lock")
+            .publish(&mut entry.live, port)?;
+        *of.compiled.write().expect("compiled policy lock") = Arc::clone(entry.live.compiled());
+        Ok(())
+    }
+
+    /// Stops admitting new inbound flows to a port of the box.
+    pub(crate) fn unpublish(&self, of: &Installed, port: PortOf) -> Result<(), InstallError> {
+        let Some(attached) = self.attached_state() else {
+            return Ok(());
+        };
+        let mut entry = of.entry.lock().expect("box entry lock");
+        if entry.removed {
+            return Ok(());
+        }
+        attached
+            .handles
+            .lock()
+            .expect("engine lock")
+            .unpublish(&mut entry.live, port)?;
+        *of.compiled.write().expect("compiled policy lock") = Arc::clone(entry.live.compiled());
         Ok(())
     }
 
