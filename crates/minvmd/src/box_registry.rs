@@ -4943,6 +4943,13 @@ impl BoxRegistry {
                 self.give_back_creation_addrs(creation);
                 self.persist();
             }
+            // A dormant box with a credentialed upstream is revoked at the
+            // proxy by its destroy, as a box whose row stands is.
+            if let (Some(creation), Some(path)) = (&ended, self.proxy_control.as_deref())
+                && creation.credentialed_upstream.is_some()
+            {
+                spawn_revocation(path.clone(), creation.id(), BoxEnd::Destroy);
+            }
             let held = ended.map_or_else(|| name.to_string(), |creation| creation.name);
             return Ok((None, held));
         };
@@ -11522,5 +11529,54 @@ mod tests {
         for n in 1..CARVED_RUN {
             register_carved(&registry, &format!("box{n}")).unwrap();
         }
+    }
+
+    /// A box with a credentialed upstream whose row the guest ended is not
+    /// revoked: its creator may resume it. The creator's destroy of the
+    /// dormant box revokes its id at the credential proxy.
+    #[test]
+    fn a_dormant_credentialed_box_is_revoked_at_its_destroy_and_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = stub_control(
+            &path,
+            &[
+                "{\"ok\":true,\"box_ids\":[]}\n",
+                "{\"ok\":true}\n",
+                "{\"ok\":true}\n",
+            ],
+        );
+        let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(path));
+        let agent = registry
+            .register_client_box(ClientBoxSpec {
+                credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+                ..client_spec("agent")
+            })
+            .unwrap();
+
+        // The guest reports the box ended. Nothing is sent for that: the
+        // lines below are all the proxy hears.
+        assert!(registry.withdraw(agent.switch_addr()).is_some());
+        assert_eq!(registry.dormant_creation_rows().len(), 1);
+
+        registry
+            .withdraw_client_box(
+                &agent.name(),
+                agent.switch_addr(),
+                agent.loopback_addr(),
+                Some(agent.box_id()),
+            )
+            .expect("the creator's own box");
+        let hex = super::box_id_hex(agent.box_id());
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                // The registration asked which ids the proxy holds revoked.
+                serde_json::json!({"op": "revoked_box_ids"}),
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ]
+        );
+        assert!(registry.dormant_creation_rows().is_empty());
     }
 }
