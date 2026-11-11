@@ -15,6 +15,18 @@ use super::ExitStatus;
 use super::wire::{self, Event, Request};
 use crate::cgroup::BoxCgroup;
 
+/// Runs a wait that holds the calling thread. A worker of a multi-threaded
+/// tokio runtime tells the runtime first, which moves the worker's other
+/// tasks to another thread: no task waits behind a spawner that is slow.
+fn off_worker<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
 /// How a job ended, for every holder of its handle.
 #[derive(Default)]
 pub(crate) struct Outcome {
@@ -30,13 +42,15 @@ impl Outcome {
 
     /// Blocks until the job has ended.
     pub(crate) fn wait(&self) -> ExitStatus {
-        let mut status = self.status.lock().expect("outcome lock");
-        loop {
-            if let Some(status) = status.as_ref() {
-                return status.clone();
+        off_worker(|| {
+            let mut status = self.status.lock().expect("outcome lock");
+            loop {
+                if let Some(status) = status.as_ref() {
+                    return status.clone();
+                }
+                status = self.set.wait(status).expect("outcome lock");
             }
-            status = self.set.wait(status).expect("outcome lock");
-        }
+        })
     }
 
     /// Resolves once the job has ended.
@@ -127,6 +141,19 @@ struct Table {
 struct Shared {
     next_id: AtomicU64,
     table: Mutex<Table>,
+    /// The spawner process, when the spawner is one, until it is reaped.
+    process: Mutex<Option<std::process::Child>>,
+    /// Set when this side closed the socket: the spawner's end is then
+    /// asked for, not a death.
+    hung_up: std::sync::atomic::AtomicBool,
+}
+
+/// What a requester does when its spawner process dies under it.
+pub(crate) struct Lost {
+    /// Run first, while the dead spawner's jobs still count as running.
+    pub(crate) before: Box<dyn FnOnce() + Send>,
+    /// Run once every job has been told it ended.
+    pub(crate) after: Box<dyn FnOnce() + Send>,
 }
 
 impl Shared {
@@ -194,17 +221,21 @@ pub(crate) struct Started {
 pub(crate) struct Connection {
     writer: Mutex<UnixStream>,
     shared: Arc<Shared>,
-    /// The spawner process, when the spawner is one.
-    process: Mutex<Option<std::process::Child>>,
 }
 
 impl Connection {
-    /// Takes the requesting end of a spawner's socket.
+    /// Takes the requesting end of a spawner's socket. `process` is the
+    /// spawner when it is a process, and `lost` is what to do if it dies
+    /// without being asked to end.
     pub(crate) fn open(
         sock: UnixStream,
         process: Option<std::process::Child>,
+        lost: Option<Lost>,
     ) -> io::Result<Arc<Self>> {
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            process: Mutex::new(process),
+            ..Shared::default()
+        });
         let mut reader = sock.try_clone()?;
         let events = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -213,12 +244,27 @@ impl Connection {
                 while let Ok(Some((event, fds))) = wire::recv::<Event>(&mut reader) {
                     events.deliver(event, fds);
                 }
+                // The socket ended, so the spawner process is gone or going.
+                let process = events.process.lock().expect("spawner process lock").take();
+                if let Some(mut process) = process {
+                    let _ = process.wait();
+                }
+                let lost = lost.filter(|_| !events.hung_up.load(Ordering::SeqCst));
+                let (before, after) = match lost {
+                    Some(lost) => (Some(lost.before), Some(lost.after)),
+                    None => (None, None),
+                };
+                if let Some(before) = before {
+                    before();
+                }
                 events.close();
+                if let Some(after) = after {
+                    after();
+                }
             })?;
         Ok(Arc::new(Self {
             writer: Mutex::new(sock),
             shared,
-            process: Mutex::new(process),
         }))
     }
 
@@ -228,8 +274,10 @@ impl Connection {
     }
 
     fn send(&self, request: &Request, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
-        let mut writer = self.writer.lock().expect("spawner socket lock");
-        wire::send(&mut writer, request, fds).map_err(|_| gone())
+        off_worker(|| {
+            let mut writer = self.writer.lock().expect("spawner socket lock");
+            wire::send(&mut writer, request, fds).map_err(|_| gone())
+        })
     }
 
     /// Sends the request `make` builds for a fresh id, and waits for its
@@ -271,7 +319,7 @@ impl Connection {
             return Err(error);
         }
         // The events thread drops the sender when the spawner goes.
-        let answer = answered.recv().map_err(|_| gone())?;
+        let answer = off_worker(|| answered.recv()).map_err(|_| gone())?;
         if matches!(answer, Answer::Failed(_)) {
             never_started();
         }
@@ -363,6 +411,7 @@ impl Connection {
 impl Connection {
     /// Closes the socket. The spawner kills its jobs when it reads the end.
     pub(crate) fn hang_up(&self) {
+        self.shared.hung_up.store(true, Ordering::SeqCst);
         if let Ok(writer) = self.writer.lock() {
             let _ = writer.shutdown(std::net::Shutdown::Both);
         }
@@ -372,10 +421,15 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.hang_up();
-        if let Ok(mut process) = self.process.lock()
-            && let Some(mut process) = process.take()
-        {
-            let _ = process.wait();
+        // Reaped here unless the events thread got to it first.
+        let process = self
+            .shared
+            .process
+            .lock()
+            .ok()
+            .and_then(|mut process| process.take());
+        if let Some(mut process) = process {
+            let _ = off_worker(|| process.wait());
         }
     }
 }

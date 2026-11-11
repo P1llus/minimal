@@ -705,18 +705,20 @@ async fn an_entered_program_is_in_every_namespace_of_the_box() {
 
 /// Nothing outlives what asked for it. Killing an entered program's shim
 /// ends the program, and so does dropping its handle. When the spawner
-/// dies, every box dies with it and its handle says why, and the next
-/// request starts a new spawner.
+/// dies, every box dies with it and its handle says why. The daemon reaps
+/// the spawner, kills every box cgroup, which ends a process that did not
+/// die with its parent, and starts a new spawner without being asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_dies_with_its_handle_and_a_box_with_its_spawner() {
     let Some(fixture) = Fixture::new(
         "a_job_dies_with_its_handle_and_a_box_with_its_spawner",
-        false,
+        true,
     ) else {
         return;
     };
+    let cgroup = fixture.root().create_box(BOX_ID).expect("the box's cgroup");
     let boxed = fixture
-        .launch("mortal", None, None, &[], &["HOLD:/run/release"])
+        .launch("mortal", Some(&cgroup), None, &[], &["HOLD:/run/release"])
         .await;
     let supervisor = boxed.child.id();
     let program = eventually("the box has its program", || init_of(supervisor).ok());
@@ -755,6 +757,25 @@ async fn a_job_dies_with_its_handle_and_a_box_with_its_spawner() {
     });
     assert!(running(program), "the box itself runs on");
 
+    // A process in the box's cgroup that is no child of the spawner.
+    let mut stray = {
+        use std::os::unix::process::CommandExt as _;
+        let procs = cgroup.path().join("cgroup.procs");
+        let mut sleep = std::process::Command::new("sleep");
+        sleep.arg("600");
+        // SAFETY: the step only opens and writes a file.
+        unsafe {
+            sleep.pre_exec(move || std::fs::write(&procs, "0"));
+        }
+        sleep.spawn().expect("starting the stray")
+    };
+    eventually("the stray is in the box's cgroup", || {
+        cgroup
+            .procs()
+            .is_ok_and(|pids| pids.contains(&stray.id()))
+            .then_some(())
+    });
+
     // SAFETY: `kill` of the spawner process, which this process started.
     assert_eq!(
         unsafe { libc::kill(spawner as libc::pid_t, libc::SIGKILL) },
@@ -769,8 +790,38 @@ async fn a_job_dies_with_its_handle_and_a_box_with_its_spawner() {
     eventually("the box's program is gone", || {
         (!running(program)).then_some(())
     });
+    // The stray is this test's own child, so no parent's death ends it.
+    // Only the kill of the box's cgroup does.
+    let ended = tokio::task::block_in_place(|| stray.wait()).expect("reaping the stray");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&ended),
+        Some(libc::SIGKILL)
+    );
+    // The dead spawner is reaped, and a new one runs before anything asks.
+    eventually("the dead spawner is reaped", || {
+        stat_fields(spawner).is_none().then_some(())
+    });
+    let children_of_daemon = || -> Vec<u32> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|children| {
+                children
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse().ok())
+                    .collect::<Vec<u32>>()
+            })
+            .collect()
+    };
+    let renewed = eventually("a new spawner runs", || {
+        children_of_daemon()
+            .into_iter()
+            .find(|pid| *pid != spawner && comm(*pid) == "minimal-spawner")
+    });
 
     let again = fixture.launch("after", None, None, &[], &["EXIT:7"]).await;
+    assert_eq!(parent_of(again.child.id()), renewed);
     let status = again.child.exited().await;
     assert_eq!(status.exit_code, Some(7), "{status:?}");
 }

@@ -30,6 +30,7 @@ pub struct Command {
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
     pub(crate) wait_timeout: Option<u64>,
+    setup_timeout: Option<std::time::Duration>,
     pub(crate) runtime_mount_oldproc: String,
     pub(crate) runtime_rootdir_abspath: PathBuf,
     #[cfg(feature = "cgroups")]
@@ -53,6 +54,7 @@ impl Command {
             stdout: None,
             stderr: None,
             wait_timeout: None,
+            setup_timeout: None,
             runtime_mount_oldproc: String::new(),
             runtime_rootdir_abspath: PathBuf::new(),
             #[cfg(feature = "cgroups")]
@@ -78,6 +80,7 @@ impl Command {
             stdout: None,
             stderr: None,
             wait_timeout: None,
+            setup_timeout: None,
             runtime_mount_oldproc: String::new(),
             runtime_rootdir_abspath: PathBuf::new(),
             #[cfg(feature = "cgroups")]
@@ -133,6 +136,18 @@ impl Command {
     /// Sets the number of seconds to wait for the child process to terminate.
     pub fn wait_timeout(&mut self, timeout: u64) -> &mut Self {
         self.wait_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how long [`spawn`](Self::spawn) waits for the container to be
+    /// set up: its namespaces, its ID maps, its network and its mounts.
+    ///
+    /// A setup that takes longer, such as a mount whose source is on a
+    /// filesystem that does not answer, ends the container: the supervisor
+    /// is killed, and the returned child's exit status names the timeout.
+    /// Without it the wait has no limit.
+    pub fn setup_timeout(&mut self, timeout: std::time::Duration) -> &mut Self {
+        self.setup_timeout = Some(timeout);
         self
     }
 
@@ -428,7 +443,15 @@ impl Command {
         writer: &mut PipeWriter,
         child: Pid,
     ) -> Result<u8> {
+        let deadline = self
+            .setup_timeout
+            .map(|limit| std::time::Instant::now() + limit);
         loop {
+            // Wait for the child process's request, no longer than the limit.
+            if let Some(deadline) = deadline {
+                Self::mainp_setup_wait(reader, deadline)?;
+            }
+
             // Receive the child process's request.
             let mut request = [0];
             reader
@@ -471,6 +494,33 @@ impl Command {
             writer
                 .write_all(&[0])
                 .map_err(ProcessErrorKind::StdIoError)?;
+        }
+    }
+
+    /// Waits until the child process has sent a request or `deadline` passes.
+    fn mainp_setup_wait(reader: &PipeReader, deadline: std::time::Instant) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut fd = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+            match unsafe { libc::poll(&mut fd, 1, millis) } {
+                0 if left.is_zero() => {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the container was not set up within its setup timeout",
+                    );
+                    return Err(ProcessErrorKind::StdIoError(err).into());
+                }
+                0 => {}
+                -1 if nix::errno::Errno::last() == nix::errno::Errno::EINTR => {}
+                -1 => return Err(ProcessErrorKind::NixError(nix::errno::Errno::last()).into()),
+                _ => return Ok(()),
+            }
         }
     }
 

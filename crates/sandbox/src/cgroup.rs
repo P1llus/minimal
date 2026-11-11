@@ -172,12 +172,79 @@ pub fn locate() -> Located {
     }
 }
 
+/// `systemctl` for the manager that runs this process's scopes: the user
+/// manager, or the system manager for root.
+fn systemctl() -> std::process::Command {
+    let mut systemctl = std::process::Command::new("systemctl");
+    // SAFETY: `geteuid` reads this process's credentials.
+    if unsafe { libc::geteuid() } != 0 {
+        systemctl.arg("--user");
+    }
+    systemctl
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    systemctl
+}
+
+/// A name for a transient scope, so a later start can find the scope an
+/// earlier one ran in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeUnit {
+    /// The unit name, ending in `.scope`.
+    pub name: String,
+    /// What `systemctl status` shows beside the name.
+    pub description: String,
+}
+
+impl ScopeUnit {
+    /// Whether the manager knows a unit of this name.
+    #[must_use]
+    pub fn exists(&self) -> bool {
+        systemctl()
+            .args(["show", "--property=LoadState", "--value", "--"])
+            .arg(&self.name)
+            .output()
+            .is_ok_and(|shown| String::from_utf8_lossy(&shown.stdout).trim() == "loaded")
+    }
+
+    /// Stops the scope: kills every process in it and waits until the
+    /// manager has let go of the unit.
+    ///
+    /// # Errors
+    ///
+    /// When `systemctl` cannot be run or the unit is still there afterwards.
+    pub fn stop(&self) -> io::Result<()> {
+        // The kill first: a plain stop waits out the unit's stop timeout
+        // for a process that ignores the termination signal.
+        for verb in [
+            &["kill", "--signal=SIGKILL", "--"][..],
+            &["stop", "--"],
+            &["reset-failed", "--"],
+        ] {
+            systemctl()
+                .args(verb)
+                .arg(&self.name)
+                .stdout(std::process::Stdio::null())
+                .status()?;
+        }
+        if self.exists() {
+            return Err(io::Error::other(format!(
+                "the unit {} is still there after its stop",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The command that runs `program` with `args` in a new transient scope
 /// with a delegated cgroup: a scope of the user manager, or of the system
 /// manager for root. `systemd-run --scope` execs the program in place, so
-/// the process keeps its pid.
+/// the process keeps its pid. With `unit` the scope gets that name, which
+/// must not be in use.
 #[must_use]
 pub fn delegated_scope_command(
+    unit: Option<&ScopeUnit>,
     program: &Path,
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> std::process::Command {
@@ -186,15 +253,12 @@ pub fn delegated_scope_command(
     if unsafe { libc::geteuid() } != 0 {
         run.arg("--user");
     }
-    run.args([
-        "--scope",
-        "--quiet",
-        "--collect",
-        "--property=Delegate=yes",
-        "--",
-    ])
-    .arg(program)
-    .args(args);
+    run.args(["--scope", "--quiet", "--collect", "--property=Delegate=yes"]);
+    if let Some(unit) = unit {
+        run.arg(format!("--unit={}", unit.name));
+        run.arg(format!("--description={}", unit.description));
+    }
+    run.arg("--").arg(program).args(args);
     run
 }
 
@@ -204,7 +268,7 @@ pub fn delegated_scope_command(
 /// with nothing running.
 #[must_use]
 pub fn delegated_scope_available() -> bool {
-    delegated_scope_command(Path::new("true"), [])
+    delegated_scope_command(None, Path::new("true"), [])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -362,6 +426,21 @@ impl Root {
             }
         }
         Ok(swept)
+    }
+
+    /// Kills every process in every box cgroup, and removes nothing. For a
+    /// daemon whose spawner died: what the spawner had started is to die
+    /// with it, and this ends what did not.
+    pub fn kill_boxes(&self) {
+        let Ok(entries) = fs::read_dir(self.boxes()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(dir) = open_dir_in(self.boxes.as_fd(), &name) {
+                let _ = kill(dir.as_fd());
+            }
+        }
     }
 
     /// Creates the cgroup of box `box_id`, empty and with no room for a
@@ -968,6 +1047,7 @@ pub mod testing {
         }
         let exe = std::env::current_exe().expect("this test binary's path");
         let run = super::delegated_scope_command(
+            None,
             &exe,
             ["--exact", test, "--nocapture", "--test-threads=1"].map(Into::into),
         )

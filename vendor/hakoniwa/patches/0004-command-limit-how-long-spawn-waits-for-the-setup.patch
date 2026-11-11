@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: minimal <noreply@minimal.dev>
+Date: Wed, 11 Nov 2026 17:11:11 +0100
+Subject: [PATCH] feat(command): limit how long spawn waits for the container
+ setup
+
+Add Command::setup_timeout. spawn waits for the supervisor to set up the
+container, and a mount whose source does not answer keeps it there with
+no end. With a timeout the supervisor is killed when the limit passes,
+and the child's exit status names the timeout.
+---
+ hakoniwa/src/command.rs        | 50 ++++++++++++++++++++++++++++++++++
+ hakoniwa/tests/command_test.rs | 19 +++++++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/hakoniwa/src/command.rs b/hakoniwa/src/command.rs
+index 2256594..b87ca5d 100644
+--- a/hakoniwa/src/command.rs
++++ b/hakoniwa/src/command.rs
+@@ -30,6 +30,7 @@ pub struct Command {
+     stdout: Option<Stdio>,
+     stderr: Option<Stdio>,
+     pub(crate) wait_timeout: Option<u64>,
++    setup_timeout: Option<std::time::Duration>,
+     pub(crate) runtime_mount_oldproc: String,
+     pub(crate) runtime_rootdir_abspath: PathBuf,
+     #[cfg(feature = "cgroups")]
+@@ -53,6 +54,7 @@ impl Command {
+             stdout: None,
+             stderr: None,
+             wait_timeout: None,
++            setup_timeout: None,
+             runtime_mount_oldproc: String::new(),
+             runtime_rootdir_abspath: PathBuf::new(),
+             #[cfg(feature = "cgroups")]
+@@ -78,6 +80,7 @@ impl Command {
+             stdout: None,
+             stderr: None,
+             wait_timeout: None,
++            setup_timeout: None,
+             runtime_mount_oldproc: String::new(),
+             runtime_rootdir_abspath: PathBuf::new(),
+             #[cfg(feature = "cgroups")]
+@@ -136,6 +139,18 @@ impl Command {
+         self
+     }
+ 
++    /// Sets how long [`spawn`](Self::spawn) waits for the container to be
++    /// set up: its namespaces, its ID maps, its network and its mounts.
++    ///
++    /// A setup that takes longer, such as a mount whose source is on a
++    /// filesystem that does not answer, ends the container: the supervisor
++    /// is killed, and the returned child's exit status names the timeout.
++    /// Without it the wait has no limit.
++    pub fn setup_timeout(&mut self, timeout: std::time::Duration) -> &mut Self {
++        self.setup_timeout = Some(timeout);
++        self
++    }
++
+     /// Configuration for the child process’s standard input (stdin) handle.
+     ///
+     /// Defaults to [inherit] when used with [spawn] or [status], and defaults
+@@ -428,7 +443,15 @@ impl Command {
+         writer: &mut PipeWriter,
+         child: Pid,
+     ) -> Result<u8> {
++        let deadline = self
++            .setup_timeout
++            .map(|limit| std::time::Instant::now() + limit);
+         loop {
++            // Wait for the child process's request, no longer than the limit.
++            if let Some(deadline) = deadline {
++                Self::mainp_setup_wait(reader, deadline)?;
++            }
++
+             // Receive the child process's request.
+             let mut request = [0];
+             reader
+@@ -474,6 +497,33 @@ impl Command {
+         }
+     }
+ 
++    /// Waits until the child process has sent a request or `deadline` passes.
++    fn mainp_setup_wait(reader: &PipeReader, deadline: std::time::Instant) -> Result<()> {
++        use std::os::fd::AsRawFd;
++        loop {
++            let left = deadline.saturating_duration_since(std::time::Instant::now());
++            let mut fd = libc::pollfd {
++                fd: reader.as_raw_fd(),
++                events: libc::POLLIN,
++                revents: 0,
++            };
++            let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
++            match unsafe { libc::poll(&mut fd, 1, millis) } {
++                0 if left.is_zero() => {
++                    let err = std::io::Error::new(
++                        std::io::ErrorKind::TimedOut,
++                        "the container was not set up within its setup timeout",
++                    );
++                    return Err(ProcessErrorKind::StdIoError(err).into());
++                }
++                0 => {}
++                -1 if nix::errno::Errno::last() == nix::errno::Errno::EINTR => {}
++                -1 => return Err(ProcessErrorKind::NixError(nix::errno::Errno::last()).into()),
++                _ => return Ok(()),
++            }
++        }
++    }
++
+     /// Setup [ug]idmap.
+     fn mainp_setup_ugidmap(&self, child: Pid) -> Result<()> {
+         crate::unshare::mainp_setup_ugidmap(&self.container, child)
+diff --git a/hakoniwa/tests/command_test.rs b/hakoniwa/tests/command_test.rs
+index bc5cb95..05b2713 100644
+--- a/hakoniwa/tests/command_test.rs
++++ b/hakoniwa/tests/command_test.rs
+@@ -109,6 +109,25 @@ mod command_test {
+         assert_eq!(status.rusage.unwrap().real_time.as_secs(), 1);
+     }
+ 
++    #[test]
++    fn test_setup_timeout() {
++        // A setup that no time is left for ends the container.
++        let mut child = command("/bin/true")
++            .setup_timeout(std::time::Duration::ZERO)
++            .spawn()
++            .unwrap();
++        let status = child.wait().unwrap();
++        assert!(!status.success());
++        assert_contains!(status.reason, "setup timeout");
++
++        // One with time to spare runs.
++        let status = command("/bin/true")
++            .setup_timeout(std::time::Duration::from_secs(30))
++            .status()
++            .unwrap();
++        assert!(status.success());
++    }
++
+     #[test]
+     fn test_spawn() {
+         let mut child = command("/bin/true").spawn().unwrap();

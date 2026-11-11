@@ -220,8 +220,8 @@ impl Spawner {
     /// A spawner that is a process: `exe`, the calling binary, whose `main`
     /// calls [`run_internal_mode`]. The process is started by the first
     /// request, or by [`Spawner::start`], in the cgroup the caller is in
-    /// then. It is started again on the next request if it has died, and
-    /// everything it had started has died with it.
+    /// then. If it dies, everything it had started dies with it, every box
+    /// cgroup below `root` is killed, and a new process is started at once.
     ///
     /// `root` is the caller's cgroup root, if it has one. A container that
     /// is started with no box cgroup then gets a cgroup of its own below
@@ -295,17 +295,46 @@ impl Spawner {
         let fresh = match &self.inner.backend {
             Backend::Process { exe, terminal } => {
                 let process = spawner_process(exe, *terminal, &theirs)?;
-                Connection::open(ours, Some(process))?
+                Connection::open(ours, Some(process), Some(self.lost()))?
             }
             Backend::Thread => {
                 std::thread::Builder::new()
                     .name("spawner".into())
                     .spawn(move || server::serve(theirs, None, false))?;
-                Connection::open(ours, None)?
+                Connection::open(ours, None, None)?
             }
         };
         *connection = Some(Arc::clone(&fresh));
         Ok(fresh)
+    }
+
+    /// What happens when the spawner process dies without being asked to.
+    /// Everything it had started dies with it. Every box cgroup is killed
+    /// as well, for a process that outlived its parent, and a new spawner
+    /// is started at once, so the next box does not wait for it.
+    fn lost(&self) -> client::Lost {
+        let root = self.inner.root.clone();
+        let inner = Arc::downgrade(&self.inner);
+        client::Lost {
+            before: Box::new(move || {
+                tracing::error!("the spawner process died; every box it ran is ended");
+                if let Some(root) = &root {
+                    root.kill_boxes();
+                }
+            }),
+            after: Box::new(move || {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                match (Spawner { inner }).start() {
+                    Ok(()) => tracing::info!("started a new spawner process"),
+                    Err(error) => tracing::error!(
+                        %error,
+                        "a new spawner process did not start; the next request tries again"
+                    ),
+                }
+            }),
+        }
     }
 
     /// Creates a socket in `cgroup`, in the requester's network namespace.

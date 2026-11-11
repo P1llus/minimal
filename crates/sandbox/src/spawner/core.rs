@@ -22,6 +22,10 @@ use super::enter::{self, ShimArgs};
 use super::wire::{ContainerSpec, Enter, Run, Session};
 use super::{ENTER_MODE, ExitStatus, title::Title};
 
+/// How long a container's setup may take: its namespaces, its ID maps, its
+/// network and its mounts. Far more than a healthy host needs.
+const SETUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A container this process started.
 pub(crate) struct Container {
     /// hakoniwa's handle on the supervisor.
@@ -171,6 +175,10 @@ pub(crate) fn run(
         .stdin(hakoniwa::Stdio::from(stdin))
         .stdout(hakoniwa::Stdio::from(stdout))
         .stderr(hakoniwa::Stdio::from(stderr));
+    // The spawner serves every box from one thread, and it waits here for
+    // the container's setup. A mount whose source does not answer must not
+    // hold every other box.
+    command.setup_timeout(SETUP_LIMIT);
     let spawned = {
         // The supervisor is a fork of this process and keeps the title.
         let _title = titled.then(|| Title::set(c"minimal-box"));
