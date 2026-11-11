@@ -535,6 +535,7 @@ pub(crate) fn with_box_closure(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
     lo_up: bool,
+    ping_gid: Option<u32>,
     start_gate: Option<PathBuf>,
     session: spawner::Session,
 ) {
@@ -555,6 +556,7 @@ pub(crate) fn with_box_closure(
                 &args,
                 seccomp_program,
                 lo_up,
+                ping_gid,
                 start_gate.as_deref(),
                 session,
             )
@@ -708,6 +710,7 @@ fn exec_box_program(
     args: &[String],
     seccomp_program: &'static seccomp::Program,
     lo_up: bool,
+    ping_gid: Option<u32>,
     start_gate: Option<&Path>,
     session: spawner::Session,
 ) -> ! {
@@ -735,6 +738,17 @@ fn exec_box_program(
     // A box whose `lo` stays down still runs, without loopback.
     if lo_up && let Err(e) = bring_lo_up() {
         report_from_child("bringing up the loopback interface", &e);
+    }
+    // A new network namespace lets no group open ping sockets, and raw
+    // sockets are refused, so without this the box could not ping at all.
+    // Whether a ping may leave is the network policy's to say.
+    if let Some(gid) = ping_gid
+        && let Err(e) = std::fs::write(
+            "/proc/sys/net/ipv4/ping_group_range",
+            format!("{gid} {gid}"),
+        )
+    {
+        report_from_child("allowing ping sockets in the box", &e);
     }
     let start_gate = start_gate.and_then(open_start_gate);
     if let Err(e) = seccomp::install(seccomp_program) {
@@ -1076,6 +1090,7 @@ impl<C: Channel> Sandbox<C> {
                 session: spawner::Session::New,
                 // hakoniwa brings `lo` up only where it builds a tap.
                 lo_up: isolate && plan.tap().is_none(),
+                ping_gid: isolate.then_some(config::BOX_GID),
                 cgroup: self.config.box_cgroup.clone(),
                 cpu_weight: self.config.cpu_weight,
             },

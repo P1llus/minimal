@@ -84,6 +84,10 @@ pub(crate) struct Run {
     pub(crate) session: Session,
     /// Whether the program's pre-exec step brings `lo` up.
     pub(crate) lo_up: bool,
+    /// The group that may open ping sockets in the container's own network
+    /// namespace: the gid its processes run with. `None` for a container
+    /// in its starter's namespace, whose setting is not the container's.
+    pub(crate) ping_gid: Option<u32>,
 }
 
 /// A program to run in a running container.

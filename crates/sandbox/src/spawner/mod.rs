@@ -477,6 +477,7 @@ pub(crate) struct Launch {
     pub(crate) gate: Option<PathBuf>,
     pub(crate) session: Session,
     pub(crate) lo_up: bool,
+    pub(crate) ping_gid: Option<u32>,
     /// The cgroup of the box the container belongs to.
     pub(crate) cgroup: Option<BoxCgroup>,
     /// The CPU weight of a container that gets a cgroup of its own. A
@@ -655,6 +656,7 @@ impl Command {
                     gate: launch.gate.clone(),
                     session: launch.session,
                     lo_up: launch.lo_up,
+                    ping_gid: launch.ping_gid,
                 };
                 connection.start(
                     |id| wire::Request::Run {

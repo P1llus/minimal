@@ -167,6 +167,7 @@ pub(crate) fn run(
         &container,
         &mut command,
         run.lo_up,
+        run.ping_gid,
         run.gate.clone(),
         run.session,
     );
