@@ -581,6 +581,12 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     // A box with no network runs, and has none.
     daemon.activate("alone", &["--network", "none"]);
     assert_ne!(daemon.connect("alone", "127.0.0.1", port).trim(), "ok");
+    // Its namespace lets the box's own group open ping sockets.
+    let ping = daemon.exec("alone", "cat /proc/sys/net/ipv4/ping_group_range");
+    assert_eq!(
+        ping.split_whitespace().collect::<Vec<_>>(),
+        ["1000", "1000"]
+    );
 
     // Stopping a box removes its cgroup and its entry: a box of the same
     // name starts clean afterwards.

@@ -76,7 +76,7 @@ else
     # for platform in manifest" (OrbStack falls back to amd64 on its own).
     DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" cross "$@"
   fi
-  BIN="$ROOT/target/$TARGET/initramfs/minimald"
+  BIN="${CARGO_TARGET_DIR:-$ROOT/target}/$TARGET/initramfs/minimald"
   [ -x "$BIN" ] || { echo "minimald not built at $BIN" >&2; exit 1; }
 fi
 

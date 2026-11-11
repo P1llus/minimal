@@ -14,6 +14,11 @@ pub(crate) const FINISHED: &str =
 /// The last line of a completed run that added no group membership.
 pub(crate) const PICKED_UP: &str = "Running boxes pick this up on their next start.";
 
+/// The last line of a completed run that installed the policy loader: a
+/// daemon asks the loader once, when it starts.
+pub(crate) const NEEDS_DAEMON_RESTART: &str = "A running daemon gets the network policy engine \
+     at its next start. Its boxes end when it stops.";
+
 /// The last line of a completed run that added the operator to the `kvm`
 /// group: a membership is read at login, so no running process has it yet.
 pub(crate) const NEEDS_LOGIN: &str = "KVM group membership starts at your next login: log out \
@@ -218,7 +223,14 @@ impl Plan {
     /// Whether the script installs an item other than the `kvm` group:
     /// one a running box picks up at its next start.
     pub(crate) fn installs_other_items(&self) -> bool {
-        self.missing().any(|item| item.id != KVM_ID)
+        self.missing()
+            .any(|item| item.id != KVM_ID && item.id != POLICY_ENGINE_ID)
+    }
+
+    /// Whether the script installs or renews the policy loader, which a
+    /// running daemon only uses after a restart.
+    pub(crate) fn installs_policy_engine(&self) -> bool {
+        self.missing().any(|item| item.id == POLICY_ENGINE_ID)
     }
 
     /// The one script a run executes and `--show --script` prints: one
@@ -403,7 +415,11 @@ pub async fn cmd_finalize_install(
     run_as_root(&script, SCRIPT_POINTER)?;
     print!(
         "{}",
-        closing_lines(plan.installs_other_items(), plan.adds_kvm_group())
+        closing_lines(
+            plan.installs_other_items(),
+            plan.installs_policy_engine(),
+            plan.adds_kvm_group(),
+        )
     );
     Ok(())
 }
@@ -412,10 +428,18 @@ pub async fn cmd_finalize_install(
 /// installed items other than the `kvm` group, [`NEEDS_LOGIN`] when it
 /// added the operator to that group, both — items line first, the login
 /// line last — when both apply.
-pub(crate) fn closing_lines(installed_other_items: bool, added_kvm_group: bool) -> String {
+pub(crate) fn closing_lines(
+    installed_other_items: bool,
+    installed_policy_engine: bool,
+    added_kvm_group: bool,
+) -> String {
     let mut out = String::new();
     if installed_other_items {
         out.push_str(PICKED_UP);
+        out.push('\n');
+    }
+    if installed_policy_engine {
+        out.push_str(NEEDS_DAEMON_RESTART);
         out.push('\n');
     }
     if added_kvm_group {
@@ -1521,8 +1545,13 @@ mod tests {
     /// pick-up line.
     #[test]
     fn finalize_install_kvm_group_closing_line_names_a_new_login() {
-        let closing =
-            |plan: &Plan| closing_lines(plan.installs_other_items(), plan.adds_kvm_group());
+        let closing = |plan: &Plan| {
+            closing_lines(
+                plan.installs_other_items(),
+                plan.installs_policy_engine(),
+                plan.adds_kvm_group(),
+            )
+        };
         // The kvm group alone: the login line only.
         let kvm_only = Plan {
             items: vec![done("names"), missing(KVM_ID, "kvm")],
@@ -1546,6 +1575,12 @@ mod tests {
         };
         assert!(both.adds_kvm_group() && both.installs_other_items());
         assert_eq!(closing(&both), format!("{PICKED_UP}\n{NEEDS_LOGIN}\n"));
+        // The policy loader serves a daemon when it starts, so a run that
+        // installed it says the daemon has to start again.
+        let engine = Plan {
+            items: vec![missing(POLICY_ENGINE_ID, "engine")],
+        };
+        assert_eq!(closing(&engine), format!("{NEEDS_DAEMON_RESTART}\n"));
     }
 
     /// `--undo` takes `--show` only with `--script`: `--undo --show` alone
@@ -2456,7 +2491,7 @@ mod tests {
             "{script}"
         );
         assert!(script.contains("\n# policy-engine\n"), "{script}");
-        assert!(plan.installs_other_items() && !plan.adds_kvm_group());
+        assert!(plan.installs_policy_engine() && !plan.adds_kvm_group());
     }
 
     /// The KVM item's table: done when the device opens, a group step on
