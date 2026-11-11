@@ -49,10 +49,6 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// Cancellation token to stop the build.
     pub cancel: tokio_util::sync::CancellationToken,
 
-    /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
-    /// cgroups v2 cpu.weights.
-    pub cpu_weight: Option<u64>,
-
     /// The cgroup of the box this build runs for, if any. The build's
     /// sandbox and its source fetches then run in that cgroup. `None` runs
     /// the build in the cgroup of its caller, as the caller's own traffic.
@@ -568,9 +564,6 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
         }
-        if let Some(w) = self.cpu_weight {
-            config = config.with_cpu_weight(w);
-        }
         if let Some(id) = daemon_id {
             config = config.with_daemon_id(id.clone());
         }
@@ -818,7 +811,6 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             cancel: CancellationToken::new(),
-            cpu_weight: None,
             box_cgroup: None,
             box_network: None,
         }
@@ -982,7 +974,6 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             cancel: CancellationToken::new(),
-            cpu_weight: None,
             box_cgroup: None,
             box_network: None,
         };

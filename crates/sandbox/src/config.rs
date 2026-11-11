@@ -232,12 +232,6 @@ pub struct Config {
     /// Globally/initially-set environment variables.
     pub env_vars: HashMap<String, String>,
 
-    /// The `cpu.weight` of the cgroup a sandbox that belongs to no box gets
-    /// for itself: its share of CPU time when the machine is contended. A
-    /// sandbox in a box's cgroup shares the box's CPU time unweighted, and
-    /// so does one whose process has no cgroup root.
-    pub cpu_weight: Option<u64>,
-
     /// Suffix marker to identify the process in the names of temp files/directories. Defaults
     /// to the PID when not set.
     pub daemon_id: Option<String>,
@@ -442,7 +436,6 @@ impl Config {
             wd: WdSetup::Isolated {
                 working_inputs: Vec::with_capacity(6),
             },
-            cpu_weight: None,
             daemon_id: None,
             box_cgroup: None,
         }
@@ -588,12 +581,6 @@ impl Config {
                 v.into(),
             )
         }));
-        self
-    }
-
-    /// Sets the CPU weight to the given value.
-    pub fn with_cpu_weight(mut self, weight: u64) -> Self {
-        self.cpu_weight = Some(weight);
         self
     }
 

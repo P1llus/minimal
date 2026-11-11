@@ -17,7 +17,6 @@
 
 use std::fs;
 use std::io;
-use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -127,38 +126,6 @@ pub struct Controllers {
     pub memory: bool,
     /// `pids`, for `pids.max`.
     pub pids: bool,
-}
-
-/// Why a limit was not set.
-#[derive(Debug, thiserror::Error)]
-pub enum LimitError {
-    /// The box has no cgroup, because the daemon has no cgroup root.
-    #[error("this box has no cgroup to carry a limit: the daemon runs outside a delegated cgroup")]
-    NoCgroup,
-    /// The controller the limit needs is not delegated to the daemon.
-    #[error("the `{0}` cgroup controller is not delegated to the daemon on this host")]
-    ControllerNotDelegated(&'static str),
-    /// Writing the limit failed.
-    #[error("writing the limit failed: {0}")]
-    Io(#[from] io::Error),
-}
-
-/// A `cpu.weight` value: 1 to 10000, where 100 is the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CpuWeight(u64);
-
-impl CpuWeight {
-    /// `weight` as a CPU weight, or `None` outside 1 to 10000.
-    #[must_use]
-    pub fn new(weight: u64) -> Option<Self> {
-        (1..=10_000).contains(&weight).then_some(Self(weight))
-    }
-
-    /// `weight` moved into the valid range.
-    #[must_use]
-    pub fn clamped(weight: u64) -> Self {
-        Self(weight.clamp(1, 10_000))
-    }
 }
 
 /// This process's cgroup, as `/proc/self/cgroup` names it: a path below the
@@ -580,7 +547,6 @@ impl Root {
             fd,
             parent: Arc::clone(&self.boxes),
             id,
-            controllers: self.controllers,
             destroyed: AtomicBool::new(false),
         })))
     }
@@ -852,7 +818,6 @@ struct Inner {
     /// The `boxes` cgroup, which the cgroup is removed from.
     parent: Arc<OwnedFd>,
     id: u64,
-    controllers: Controllers,
     destroyed: AtomicBool,
 }
 
@@ -881,48 +846,6 @@ impl BoxCgroup {
     #[must_use]
     pub fn dir_fd(&self) -> BorrowedFd<'_> {
         self.0.fd.as_fd()
-    }
-
-    fn write(&self, file: &str, value: &str) -> io::Result<()> {
-        write_in(self.0.fd.as_fd(), file, value)
-    }
-
-    /// Sets the box's share of CPU time under contention (`cpu.weight`).
-    ///
-    /// # Errors
-    ///
-    /// [`LimitError::ControllerNotDelegated`] without the `cpu` controller.
-    pub fn set_cpu_weight(&self, weight: CpuWeight) -> Result<(), LimitError> {
-        if !self.0.controllers.cpu {
-            return Err(LimitError::ControllerNotDelegated("cpu"));
-        }
-        Ok(self.write("cpu.weight", &weight.0.to_string())?)
-    }
-
-    /// Sets the most memory the box may use, in bytes (`memory.max`). `None`
-    /// lifts the limit.
-    ///
-    /// # Errors
-    ///
-    /// [`LimitError::ControllerNotDelegated`] without the `memory` controller.
-    pub fn set_memory_max(&self, bytes: Option<NonZeroU64>) -> Result<(), LimitError> {
-        if !self.0.controllers.memory {
-            return Err(LimitError::ControllerNotDelegated("memory"));
-        }
-        Ok(self.write("memory.max", &max_value(bytes))?)
-    }
-
-    /// Sets the most processes the box may hold (`pids.max`). `None` lifts
-    /// the limit.
-    ///
-    /// # Errors
-    ///
-    /// [`LimitError::ControllerNotDelegated`] without the `pids` controller.
-    pub fn set_pids_max(&self, processes: Option<NonZeroU64>) -> Result<(), LimitError> {
-        if !self.0.controllers.pids {
-            return Err(LimitError::ControllerNotDelegated("pids"));
-        }
-        Ok(self.write("pids.max", &max_value(processes))?)
     }
 
     /// The processes in the cgroup, as this process's PID namespace numbers
@@ -1062,10 +985,6 @@ impl BoxCgroup {
         self.0.destroyed.store(true, Ordering::SeqCst);
         Ok(())
     }
-}
-
-fn max_value(limit: Option<NonZeroU64>) -> String {
-    limit.map_or_else(|| "max".to_owned(), |limit| limit.to_string())
 }
 
 impl Drop for Inner {
@@ -1227,16 +1146,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cpu_weight_is_one_to_ten_thousand() {
-        assert!(CpuWeight::new(0).is_none());
-        assert!(CpuWeight::new(1).is_some());
-        assert!(CpuWeight::new(10_000).is_some());
-        assert!(CpuWeight::new(10_001).is_none());
-        assert_eq!(CpuWeight::clamped(0), CpuWeight(1));
-        assert_eq!(CpuWeight::clamped(50_000), CpuWeight(10_000));
-    }
-
-    #[test]
     fn the_root_has_a_supervisor_and_boxes_with_controllers() {
         let Some(root) =
             delegated_root("cgroup::tests::the_root_has_a_supervisor_and_boxes_with_controllers")
@@ -1262,9 +1171,8 @@ mod tests {
     }
 
     #[test]
-    fn a_box_cgroup_is_one_cgroup_with_an_id_and_limits() {
-        let Some(root) =
-            delegated_root("cgroup::tests::a_box_cgroup_is_one_cgroup_with_an_id_and_limits")
+    fn a_box_cgroup_is_one_cgroup_with_an_id() {
+        let Some(root) = delegated_root("cgroup::tests::a_box_cgroup_is_one_cgroup_with_an_id")
         else {
             return;
         };
@@ -1285,27 +1193,6 @@ mod tests {
         let below = fs::create_dir(cgroup.path().join("sub")).unwrap_err();
         assert_eq!(below.raw_os_error(), Some(libc::EAGAIN), "{below}");
 
-        let read = |file: &str| fs::read_to_string(cgroup.path().join(file)).unwrap();
-        let controllers = root.controllers();
-        if controllers.cpu {
-            cgroup.set_cpu_weight(CpuWeight::new(250).unwrap()).unwrap();
-            assert_eq!(read("cpu.weight").trim(), "250");
-        } else {
-            assert!(matches!(
-                cgroup.set_cpu_weight(CpuWeight::clamped(250)),
-                Err(LimitError::ControllerNotDelegated("cpu"))
-            ));
-        }
-        if controllers.memory {
-            cgroup.set_memory_max(NonZeroU64::new(64 << 20)).unwrap();
-            assert_eq!(read("memory.max").trim(), (64u64 << 20).to_string());
-            cgroup.set_memory_max(None).unwrap();
-            assert_eq!(read("memory.max").trim(), "max");
-        }
-        if controllers.pids {
-            cgroup.set_pids_max(NonZeroU64::new(32)).unwrap();
-            assert_eq!(read("pids.max").trim(), "32");
-        }
         assert_eq!(
             root.box_of_cgroup(&format!("{}/boxes/b1", root.name)),
             Some("b1".into())
