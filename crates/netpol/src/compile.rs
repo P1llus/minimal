@@ -680,6 +680,77 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_box_with_every_service_and_its_own_rules_fits() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        use crate::base::{EndpointRange, PortOf, VirtualNetwork};
+
+        let at = |port| Endpoint {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 80, 1), port)),
+            v6: None,
+        };
+        let mut d = Deployment::new(NodeKind::Guest, Mode::HostIp);
+        d.network = Some(VirtualNetwork {
+            subnet: p("100.64.0.0/24"),
+            gateway: "100.64.0.1".parse().unwrap(),
+            host_alias: Some("100.64.0.254".parse().unwrap()),
+        });
+        d.services.resolver = Some(at(20480));
+        d.services.credential_proxy = Some(at(20481));
+        d.services.hostname_proxy = Some(at(20482));
+        d.steered = vec!["api.example.com".parse().unwrap()];
+        d.node_hostname_proxy = vec!["127.0.0.1:7654".parse().unwrap()];
+        d.endpoint_ranges = vec![EndpointRange {
+            prefix: p("127.0.80.1/32"),
+            ports: PortRange::new(20480, 24575).unwrap(),
+        }];
+        d.host_exposures = (0..7)
+            .map(|i| PortOf {
+                protocols: Protocols::TCP,
+                port: 5000 + i,
+            })
+            .collect();
+        let to_any = |port| BoxRule {
+            action: BoxAction::Allow,
+            protocols: Protocols::TCP,
+            ports: PortRange::one(port),
+            to: Target::Any,
+        };
+        let policy = BoxPolicy {
+            // The second lies in the endpoint ports and can never be the
+            // first match on the endpoint address.
+            rules: vec![to_any(443), to_any(22000), to_any(8443)],
+            protocols: Some(Protocols::TCP_UDP),
+            ..BoxPolicy::default()
+        };
+        let c = compile(&base_policy(&d), &policy, Options::default()).unwrap();
+        let longest = c.nets.iter().map(|e| e.rules.len()).max().unwrap();
+        assert!(longest <= 12, "{longest} rules in one entry\n{c}");
+        // On the endpoint address: its own three endpoints, the deny of
+        // the other ports of the range, DNS, and the box's rules that can
+        // still decide there.
+        let endpoint = entry(&c, Direction::Egress, "127.0.80.1/32");
+        let origins: Vec<Origin> = endpoint
+            .rules
+            .iter()
+            .map(|s| c.rules[usize::from(s.prio)].origin)
+            .collect();
+        assert_eq!(
+            origins,
+            [
+                Origin::OwnEndpoints,
+                Origin::OwnEndpoints,
+                Origin::OwnEndpoints,
+                Origin::OtherEndpoints,
+                Origin::Resolver,
+                Origin::BoxRule(0),
+                Origin::BoxRule(2),
+                Origin::BoxProtocols,
+            ]
+        );
+    }
+
+    #[test]
     fn a_rule_without_a_protocol_is_refused() {
         let policy = BoxPolicy {
             rules: vec![BoxRule {
