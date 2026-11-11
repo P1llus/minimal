@@ -285,6 +285,8 @@ impl Daemon {
             .arg(&cache)
             .args(["run", "--instance-num", "0"])
             .env("MINIMALD_POLICY_LOADER_SOCKET", loader_socket)
+            // The user's own host exposures are not the test's.
+            .env("XDG_CONFIG_HOME", dir.join("config"))
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("log file"))
             .stderr(log);
@@ -343,6 +345,28 @@ impl Daemon {
             name,
             &format!("exec 3<>/dev/tcp/{host}/{port} && echo ok; true"),
         )
+    }
+
+    /// Opens a TCP connection from the box and returns the line the other
+    /// side greets with, or nothing.
+    fn greeting(&self, name: &str, host: &str, port: u16) -> String {
+        self.exec(
+            name,
+            &format!(
+                "exec 3<>/dev/tcp/{host}/{port} && read -t 5 line <&3 && echo \"$line\"; true"
+            ),
+        )
+    }
+
+    /// Writes the user's host exposures table with this one port in it.
+    fn expose_host_port(&self, port: u16) {
+        let dir = self.state.with_file_name("config").join("minimal");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[host-exposures]\ntarget = {{ port = {port} }}\n"),
+        )
+        .expect("config file");
     }
 
     /// Starts a command in the box that runs until its client is ended.
@@ -578,13 +602,20 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     let rebind = daemon.connect("names", "rebind.test", port);
     assert_ne!(rebind.trim(), "ok", "{rebind}");
     assert!(daemon.connect("names", "127.0.0.2", port).contains(REFUSED));
-    // Listing the host's name does not open the host's loopback. The
-    // box's hosts file gives the name an address, the resolver gives it
-    // none, and no lookup admits anything for it.
-    daemon.exec("names", "getent hosts host.min.internal");
+    // The host's name is the alias, in the hosts file and from the
+    // resolver. Listing it does not open the host's loopback. The alias
+    // leads to the host relay, which dials a port only once the user has
+    // exposed it.
+    let named = daemon.exec("names", "getent hosts host.min.internal");
+    assert!(named.contains("100.64.255.254"), "{named}");
     assert!(daemon.connect("names", "127.0.0.1", port).contains(REFUSED));
-    let by_name = daemon.connect("names", "host.min.internal", port);
-    assert!(by_name.contains(REFUSED), "{by_name}");
+    let closed = daemon.greeting("names", "host.min.internal", port);
+    assert!(!closed.contains("hello"), "{closed}");
+    daemon.expose_host_port(port);
+    let exposed = daemon.greeting("names", "host.min.internal", port);
+    assert_eq!(exposed.trim(), "hello");
+    let other = daemon.greeting("names", "host.min.internal", port.wrapping_add(1));
+    assert!(!other.contains("hello"), "{other}");
 
     // Refusals are box events, each with its source.
     wait_for("the refusal events", Duration::from_secs(10), || {

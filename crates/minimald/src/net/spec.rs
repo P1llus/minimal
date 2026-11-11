@@ -31,10 +31,9 @@ pub(crate) struct Node {
     /// The virtual network the node itself sits on, which a box that
     /// shares the node's address sits on with it: a VM guest's.
     pub(crate) network: Option<VirtualNetwork>,
-    /// The address that stands for the host's loopback there.
-    pub(crate) host_alias: Option<IpAddr>,
-    /// The virtual network of boxes with an address of their own. A native
-    /// node learns it when its switch is made.
+    /// The virtual network of boxes with an address of their own, which
+    /// also holds the address that stands for the host's loopback. A
+    /// native node learns it when its switch is made.
     pub(crate) switch: Option<switch::SwitchSubnet>,
     /// Where the node's hostname proxy listens for programs outside boxes.
     pub(crate) hostname_proxy: Vec<SocketAddr>,
@@ -54,7 +53,6 @@ impl Node {
         Self {
             kind: NodeKind::Native,
             network: None,
-            host_alias: None,
             switch: None,
             hostname_proxy: Vec::new(),
         }
@@ -65,10 +63,15 @@ impl Node {
         Self {
             kind: NodeKind::Guest,
             network: virtual_network(subnet),
-            host_alias: Some(IpAddr::V4(subnet.host_alias())),
             switch: Some(subnet),
             hostname_proxy: Vec::new(),
         }
+    }
+
+    /// The address that stands for the host's loopback, the same for every
+    /// box of the node.
+    pub(crate) fn host_alias(&self) -> Option<IpAddr> {
+        self.switch.map(|subnet| IpAddr::V4(subnet.host_alias()))
     }
 }
 
@@ -178,17 +181,15 @@ pub(crate) fn deployment(
         NetworkMode::OwnIp => {
             // The box sits on the virtual network alone, in a namespace of
             // its own, and the daemon's endpoints for it are in there too.
-            if let Some(subnet) = node.switch {
-                d.network = virtual_network(subnet);
-                d.host_alias = Some(IpAddr::V4(subnet.host_alias()));
-            }
+            d.network = node.switch.and_then(virtual_network);
+            d.host_alias = node.host_alias();
             d.services = services;
             d.endpoint_ranges = ranges;
             d.node_hostname_proxy.clone_from(&node.hostname_proxy);
         }
         _ => {
             d.network = node.network;
-            d.host_alias = node.host_alias;
+            d.host_alias = node.host_alias();
             // A native box uses the host's own routes. The virtual network
             // a guest sits on carries IPv4 only.
             d.transport_ipv6 = node.kind == NodeKind::Native;
@@ -392,6 +393,12 @@ mod tests {
             own.host_alias,
             Some(IpAddr::V4(switch::DEFAULT_SUBNET.host_alias()))
         );
+        // The alias is the same address for a box that shares the node's.
+        assert_eq!(
+            d(&switched, NetworkMode::HostNet).host_alias,
+            own.host_alias
+        );
+        assert_eq!(d(&native, NetworkMode::HostNet).host_alias, None);
         let compiled = Spec {
             deployment: own,
             policy: box_policy(Some(&EgressPolicy::deny_all()), NetworkMode::OwnIp, false)

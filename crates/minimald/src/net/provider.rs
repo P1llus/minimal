@@ -462,6 +462,7 @@ pub(crate) fn network_for(
     match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
             switch: Arc::clone(switch),
+            host_alias: engine_box.and_then(|judged| judged.of.host_alias()),
         }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
@@ -554,6 +555,9 @@ pub(crate) fn task_network_for(
 #[derive(Debug)]
 struct HostIpAddressNetwork {
     switch: Arc<Mutex<SwitchClient>>,
+    /// The address the engine redirects to the box's host relay. A box no
+    /// engine judges has none.
+    host_alias: Option<Ipv4Addr>,
 }
 
 impl Network for HostIpAddressNetwork {
@@ -572,10 +576,16 @@ impl Network for HostIpAddressNetwork {
                 )
             };
             if !vm_host {
-                // The namespace the box shares is the host's own, so
-                // `host.min.internal` answers from `/etc/hosts` at the
-                // host's loopback.
-                return sandbox::HostNet.plan().await;
+                // The box may ask the host's own resolver, which has no
+                // `min.internal.` zone, so `/etc/hosts` names the host: at
+                // the alias the engine leads to the host relay, or at the
+                // loopback the box shares when no engine judges it.
+                return Ok(NetPlan::host()
+                    .with_resolver(Resolver::Host)
+                    .with_hosts_entry(
+                        sandbox::HOST_MIN_INTERNAL,
+                        self.host_alias.unwrap_or(Ipv4Addr::LOCALHOST),
+                    ));
             }
             // In a guest, 127.0.0.1 is the guest's loopback and the host's
             // resolver is unreachable. The node's DNS layer answers at the

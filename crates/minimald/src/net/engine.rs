@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock},
     time::{Duration, Instant},
@@ -161,6 +161,8 @@ pub(crate) struct Installed {
     /// Whether the box's processes have a network namespace of their own,
     /// where its endpoints are bound when it has one.
     own_namespace: bool,
+    /// The address the box is told for the host's name.
+    host_alias: Option<Ipv4Addr>,
     wants: Wants,
     /// The box's entry and what it was written for. Every writer takes
     /// this lock first and the engine's handles second.
@@ -202,6 +204,11 @@ impl Installed {
     /// on the virtual network.
     pub(crate) const fn has_own_namespace(&self) -> bool {
         self.own_namespace
+    }
+
+    /// The address that stands for the host's loopback for this box.
+    pub(crate) const fn host_alias(&self) -> Option<Ipv4Addr> {
+        self.host_alias
     }
 
     /// A snapshot of the box's compiled policy.
@@ -795,7 +802,7 @@ impl Engine {
         Wants {
             resolver: spec::needs_resolver(node, mode, own),
             hostname_proxy: mode != NetworkMode::NoNet,
-            host_relay: mode == NetworkMode::OwnIp,
+            host_relay: mode != NetworkMode::NoNet,
         }
     }
 
@@ -868,6 +875,10 @@ impl Engine {
         };
         let id = BoxId(cgroup.id());
         let spec = Self::spec_of(&node, facts.mode, own, block);
+        let host_alias = match spec.deployment.host_alias {
+            Some(IpAddr::V4(alias)) => Some(alias),
+            _ => None,
+        };
         let live = attached
             .handles
             .lock()
@@ -891,6 +902,7 @@ impl Engine {
             id,
             block,
             own_namespace,
+            host_alias,
             wants,
             compiled: RwLock::new(Arc::clone(live.compiled())),
             entry: Mutex::new(Entry {

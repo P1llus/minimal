@@ -222,10 +222,13 @@ pub(crate) struct ZoneAdmission {
 /// daemon gave that box. So an address in it is no rebinding: a box that
 /// lists a peer's name means that peer, and gets its address although the
 /// address lies in a range the box's subnet rules do not open. The host's
-/// name is not such a row and has no address here.
+/// name is no such row: its address is the alias, which the base policy
+/// judges and no pin opens.
 pub(crate) fn admit_zone(answer: ZoneAnswer, name: &str, view: &View<'_>) -> ZoneAdmission {
     let pin = match (answer, view.compiled.set_for_name(name)) {
-        (ZoneAnswer::Address(address), Some(_)) => Some(IpAddr::V4(address)),
+        (ZoneAnswer::Address(address), Some(_)) if name != zone_answer::HOST_ROW_NAME => {
+            Some(IpAddr::V4(address))
+        }
         _ => None,
     };
     ZoneAdmission { answer, pin }
@@ -448,12 +451,12 @@ impl Zone {
     /// What the zone holds for `name`, as a box may be told. `on_switch`
     /// says that the asker has an address on the virtual network: it
     /// reaches a peer at the peer's address there, and a peer that has
-    /// none is out of its reach.
-    fn lookup(&self, name: &str, on_switch: bool) -> ZoneAnswer {
-        // The host's name exists and has no address a box may be told:
-        // the host's loopback is not a box's to reach by a name.
+    /// none is out of its reach. `host_alias` is the address that stands
+    /// for the host's loopback for the asker.
+    fn lookup(&self, name: &str, on_switch: bool, host_alias: Option<Ipv4Addr>) -> ZoneAnswer {
+        // The host's name is the alias, never the host's loopback itself.
         if name == zone_answer::HOST_ROW_NAME {
-            return ZoneAnswer::NoData;
+            return host_alias.map_or(ZoneAnswer::NoData, ZoneAnswer::Address);
         }
         match self.names.zone_entry(name, &[]) {
             ZoneEntry::Held { .. } if on_switch => self
@@ -536,7 +539,9 @@ impl Resolver {
                 Some(reply)
             }
             Decided::Zone { name, query } => {
-                let answer = self.zone.lookup(&name, of.has_own_namespace());
+                let answer = self
+                    .zone
+                    .lookup(&name, of.has_own_namespace(), of.host_alias());
                 let admitted = admit_zone(answer, &name, &view);
                 if let Some(address) = admitted.pin {
                     self.pin(of, address, &name);
@@ -962,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_s_name_has_no_address_for_a_box() {
+    fn the_host_s_name_is_the_alias_and_opens_nothing() {
         struct Empty;
         impl answerer::Zone for Empty {
             fn zone_entry(&self, _host: &str, _node: &[Ipv4Addr]) -> ZoneEntry {
@@ -973,16 +978,32 @@ mod tests {
             }
         }
         let zone = Zone::new(Arc::new(Empty));
+        let alias = Ipv4Addr::new(100, 64, 255, 254);
         for on_switch in [false, true] {
             assert_eq!(
-                zone.lookup("host.min.internal", on_switch),
+                zone.lookup("host.min.internal", on_switch, Some(alias)),
+                ZoneAnswer::Address(alias)
+            );
+            assert_eq!(
+                zone.lookup("host.min.internal", on_switch, None),
                 ZoneAnswer::NoData
             );
             assert_eq!(
-                zone.lookup("nobody.min.internal", on_switch),
+                zone.lookup("nobody.min.internal", on_switch, Some(alias)),
                 ZoneAnswer::NoSuchName
             );
         }
+        // A box that lists the host's name gets no pin for the alias.
+        let listed = by_name(&["host.min.internal"]);
+        let admitted = admit_zone(
+            ZoneAnswer::Address(alias),
+            "host.min.internal",
+            &view(&listed),
+        );
+        assert_eq!(
+            (admitted.answer, admitted.pin),
+            (ZoneAnswer::Address(alias), None)
+        );
     }
 
     #[test]
@@ -1006,18 +1027,21 @@ mod tests {
         }
         let zone = Zone::new(Arc::new(Two));
         assert_eq!(
-            zone.lookup("web.min.internal", true),
+            zone.lookup("web.min.internal", true, None),
             ZoneAnswer::Address(Ipv4Addr::new(100, 64, 1, 9))
         );
         assert_eq!(
-            zone.lookup("web.min.internal", false),
+            zone.lookup("web.min.internal", false, None),
             ZoneAnswer::Address(Ipv4Addr::new(127, 0, 64, 9))
         );
         // A peer with no address on the network exists and cannot be
         // reached from there.
-        assert_eq!(zone.lookup("shared.min.internal", true), ZoneAnswer::NoData);
         assert_eq!(
-            zone.lookup("gone.min.internal", true),
+            zone.lookup("shared.min.internal", true, None),
+            ZoneAnswer::NoData
+        );
+        assert_eq!(
+            zone.lookup("gone.min.internal", true, None),
             ZoneAnswer::NoSuchName
         );
     }
