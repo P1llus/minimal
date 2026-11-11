@@ -6722,7 +6722,7 @@ mod tests {
         // A box process listens on 8080 and 3000, and holds the established
         // socket too.
         fake_process(root, 20, "/minimald.slice/boxes/web", &[101, 102, 106]);
-        // The daemon's own listener, in its own leaf.
+        // The daemon's own listener, in its own cgroup.
         fake_process(root, own_pid, "/minimald.slice/supervisor", &[105]);
         // A box process inherited the daemon's 6666 listener: still the
         // daemon's own.

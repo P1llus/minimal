@@ -1915,11 +1915,6 @@ async fn stale_binding_generation_input_is_discarded() {
         .expect("mainloop should return the reaped exit status");
 }
 
-// ---------------------------------------------------------------------
-// NET-079: the daemon in a classifier leaf of its own, and every box's
-// leaf placed in a cohort it is a sibling of.
-// ---------------------------------------------------------------------
-
 // ---------------------------------------------------------------------------
 // The runtime port-publish ask (NET-045) and the decision log (NET-046)
 // ---------------------------------------------------------------------------
@@ -5997,8 +5992,8 @@ async fn no_switch_box_reports_expose_decision_by_id() {
 }
 
 /// BEP-085: a `host_ip` box with `proxy_env` or `both` steering gets the four
-/// proxy variables on a VM host, where the host-side gate admits its cohort
-/// to the proxy's listener. On a native host it shares the host's network,
+/// proxy variables on a VM host, where the host-side gate admits it to the
+/// proxy's listener. On a native host it shares the host's network,
 /// no gate admits it, and it gets none.
 #[test]
 fn host_ip_box_on_vm_host_gets_the_proxy_variables() {

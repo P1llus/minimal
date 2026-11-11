@@ -27,12 +27,6 @@
 //! * `a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace` — a
 //!   member that outlives the leader's SIGTERM is SIGKILLed when the shim's
 //!   grace period runs out.
-//! * `a_blocked_cohort_rejects_a_pre_flip_udp_443_socket` — against the
-//!   installer's loaded classifier table, a `host_ip` member's UDP 443
-//!   socket opened before its cohort turns blocked is refused with
-//!   ECONNREFUSED after the flip, and sends again after the block lifts
-//!   (BEP-018). It prints NOT RUN with its gate on a host with no `nft` or
-//!   outside the root network namespace.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
 //! `crates/sandbox/tests/caps_root_integration.rs`
@@ -615,7 +609,7 @@ async fn network_none_blocks_all_outside_sockets() {
 /// NET-039. A none box stays attachable.  The test launches a long-lived none
 /// box the way the session host launches a real one — `set_session_leader()`
 /// before the command is built, a pty slave on the box's stdin — injects a
-/// second process into its namespaces with the production nsenter shim, and
+/// second process into its namespaces with the production enter shim, and
 /// verifies that the injected process can still create `AF_UNIX` and `AF_INET`
 /// sockets — the local families the minenv socket and `min` helper rely on —
 /// while `AF_VSOCK` stays refused.
@@ -2118,8 +2112,3 @@ fn spawn_netns_holder() -> (u32, std::process::Child) {
     let netns_pid: u32 = line.trim().parse().expect("parse netns holder pid");
     (netns_pid, child)
 }
-
-// ---------------------------------------------------------------------------
-// BEP-018, live: a blocked cohort rejects a UDP 443 socket opened before the
-// flip (issue #2606).
-// ---------------------------------------------------------------------------

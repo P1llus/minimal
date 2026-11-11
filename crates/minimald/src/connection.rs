@@ -861,8 +861,8 @@ const IN_BOX_DIAL_LINGER_SECS: u32 = 5;
 /// with otherwise.
 ///
 /// The box's namespaces are reached the one sanctioned way — a command run
-/// in-session, which is the nsenter injection joining every namespace the
-/// box unshared, netns included — and the dial itself is a `socat` relaying
+/// in-session, which enters every namespace the box unshared, netns
+/// included — and the dial itself is a `socat` relaying
 /// the box port onto its stdio. `socat` is a baseline package, so every box
 /// has it.
 ///

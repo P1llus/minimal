@@ -14280,7 +14280,7 @@ fn box_build_web_source_under_box_verdict_names_the_host_it_could_not_reach() {
 }
 
 /// NET-155: a materialize reports the error of a package build it started
-/// the way the build side operation does. A build in a deny leaf whose
+/// the way the build side operation does. A build for a deny-all box whose
 /// output names a refused destination fails with the refusal, which names
 /// the destination and the box, before the build's own error.
 #[test]
@@ -14321,7 +14321,7 @@ fn box_package_build_refusal_names_destination_and_box_for_materialize() {
     );
 }
 
-/// NET-155: a materialize build in a deny leaf that fails for a reason other
+/// NET-155: a materialize build for a deny-all box that fails for a reason other
 /// than the box's egress rules keeps the build's own error, unchanged.
 #[test]
 fn box_package_build_refusal_names_destination_and_box_for_materialize_only_when_refused() {
@@ -14549,8 +14549,8 @@ async fn box_handle(server: &TestServer, id: SessionId) -> crate::box_actor::Box
         .expect("session should resolve")
 }
 
-/// NET-155: `min check` on a box that was never placed in a leaf still
-/// starts, and its builds run in the daemon's own cgroup, as before.
+/// NET-155: `min check` on a box of a daemon with no cgroup root still
+/// starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_placed() {
     let server = TestServer::new().await;
@@ -14607,8 +14607,7 @@ fn build_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>
     ))
 }
 
-/// NET-155: an own-address box has no classifier leaf. Its package build
-/// runs on the box's own network, under the box's egress rules, and never
+/// NET-155: the package build of an own-address box runs on the box's own network, under the box's egress rules, and never
 /// as the daemon's own traffic. A deny-all box's build that cannot reach its
 /// download is reported as refused by the box's rules. A box allowed the
 /// destination is never reported as refused. Before each build attaches,

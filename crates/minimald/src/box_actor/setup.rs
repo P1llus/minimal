@@ -49,8 +49,8 @@ pub(crate) fn effective_egress_section(
 /// The network the package builds of the box `record` attach to, when the
 /// box does not share the host's network (NET-155). A box with no network gets
 /// [`op::BuildNetwork::none`], so its builds never take the daemon's network
-/// or the daemon's fetch. A host-address box gets `None`, because a box with
-/// no leaf of that kind has no per-box enforcement.
+/// or the daemon's fetch. A host-address box gets `None`: it shares the
+/// host's network, and its builds run in its cgroup.
 pub(crate) fn box_build_network(
     record: &boxes::Record,
     switch: &Arc<Mutex<crate::net::SwitchClient>>,
