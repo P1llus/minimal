@@ -146,6 +146,26 @@ impl From<Child> for Background {
     }
 }
 
+/// The root loader helper. It cleans up after itself when its stdin
+/// closes, so it is asked to stop that way and given time to finish.
+/// Killing sudo would take the helper down in the middle of its cleanup.
+struct LoaderProcess(Child);
+
+impl Drop for LoaderProcess {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end {
+            if !matches!(self.0.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _killed = self.0.kill();
+        let _reaped = self.0.wait();
+    }
+}
+
 /// A probe that stays alive between two steps of a test.
 pub struct Held {
     child: Child,
@@ -202,7 +222,7 @@ pub struct Harness {
     /// Distinguishes the addresses of tests that run at the same time.
     net: (u8, u8),
     _tmp: tempfile::TempDir,
-    _loader: Background,
+    _loader: LoaderProcess,
 }
 
 impl Harness {
@@ -271,7 +291,7 @@ impl Harness {
             .stdout(Stdio::null())
             .spawn()
             .expect("start the loader through sudo -n: these tests need passwordless sudo");
-        let loader = Background(loader);
+        let loader = LoaderProcess(loader);
         wait_for("the loader socket", || socket.exists());
 
         let handles =

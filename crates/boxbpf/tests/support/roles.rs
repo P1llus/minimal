@@ -6,7 +6,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use boxbpf::loader::{ServeOptions, serve};
@@ -79,13 +79,20 @@ fn loader() {
         }
         let _removed = std::fs::remove_file(&cleanup_path);
         // A handed-over root empties when the test process that was moved
-        // into it has exited, which is a moment after it closed our stdin.
-        for _ in 0..100 {
-            remove_cgroups(&handover_dir);
-            if !handover_dir.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        // into it has exited, and that process is waiting for us to exit.
+        // So the removal is left to a detached shell that outlives both.
+        remove_cgroups(&handover_dir);
+        if handover_dir.exists() {
+            let script = format!(
+                "sleep 2; find {} -depth -type d -exec rmdir {{}} \\; 2>/dev/null",
+                handover_dir.display()
+            );
+            let _detached = Command::new("sh")
+                .args(["-c", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
         }
         std::process::exit(0);
     });
