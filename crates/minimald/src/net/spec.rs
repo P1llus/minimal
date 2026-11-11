@@ -12,11 +12,8 @@ use netpol::{
     compile::Options,
 };
 
-/// A refused system call returns `EPERM`, and allowed flows are not logged.
-pub(crate) const OPTIONS: Options = Options {
-    refuse_errno: 0,
-    log_flows: false,
-};
+/// Allowed flows are not logged.
+pub(crate) const OPTIONS: Options = Options { log_flows: false };
 
 /// An entry of a box's egress section that is not what its list holds.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -122,8 +122,6 @@ pub struct BoxConfig {
     pub defaults: Defaults,
     pub source_check: bool,
     pub log_flows: bool,
-    /// The errno a refused system call returns. 0 means `EPERM`.
-    pub refuse_errno: u16,
     pub addrs: BoxAddrs,
 }
 
@@ -146,7 +144,6 @@ pub struct Compiled {
 /// Settings of the compile that are neither deployment nor policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Options {
-    pub refuse_errno: u16,
     /// Report allowed connects and sends as events too.
     pub log_flows: bool,
 }
@@ -453,7 +450,6 @@ pub fn compile(
             },
             source_check: base.source_check,
             log_flows: options.log_flows,
-            refuse_errno: options.refuse_errno,
             addrs: base.addrs,
         },
         rules,
@@ -1010,15 +1006,11 @@ mod tests {
         let spec = Spec {
             deployment: Deployment::new(NodeKind::Guest, Mode::OwnIp),
             policy: BoxPolicy::default(),
-            options: Options {
-                refuse_errno: 111,
-                log_flows: true,
-            },
+            options: Options { log_flows: true },
         };
         let c = spec.compile().unwrap();
         assert_eq!(c.config.defaults.egress, Verdict::Deny);
         assert!(c.config.source_check && c.config.log_flows);
-        assert_eq!(c.config.refuse_errno, 111);
         assert!(c.to_string().contains("(the box itself)"));
     }
 

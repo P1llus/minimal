@@ -33,6 +33,5 @@ static __u64 (*bpf_get_current_ancestor_cgroup_id)(int ancestor_level) = (void *
 static __u64 (*bpf_ktime_get_boot_ns)(void) = (void *)125;
 static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *)131;
 static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)132;
-static int (*bpf_set_retval)(int retval) = (void *)187;
 
 #endif /* BOXBPF_HELPERS_H */

@@ -62,9 +62,7 @@ pub struct BoxCfg {
     pub generation: u32,
     /// Indexed by [`Direction::code`].
     pub default_action: [u8; 3],
-    pub _pad: u8,
-    pub refuse_errno: u16,
-    pub _pad2: u16,
+    pub _pad: [u8; 5],
     /// All zero: the box has no address of that kind.
     pub addr4: [u8; 4],
     pub addr6: [u8; 16],
@@ -491,7 +489,7 @@ fn constants(out: &mut String) {
 }
 
 layouts! {
-    BoxCfg = "bp_box_cfg", 52 { flags, generation, default_action, refuse_errno, addr4, addr6, ll6 }
+    BoxCfg = "bp_box_cfg", 52 { flags, generation, default_action, addr4, addr6, ll6 }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
     Rules = "bp_rules", 388 { count, r }
     Rule4Key = "bp_rule4_key", 24 { prefixlen, box_id, generation, dir, addr }
@@ -675,9 +673,7 @@ pub fn box_cfg(compiled: &Compiled, generation: u32) -> BoxCfg {
             verdict_code(c.defaults.ingress),
             verdict_code(c.defaults.bind),
         ],
-        _pad: 0,
-        refuse_errno: c.refuse_errno,
-        _pad2: 0,
+        _pad: [0; 5],
         addr4: c.addrs.v4.map_or([0; 4], |a| a.octets()),
         addr6: c.addrs.v6.map_or([0; 16], |a| a.octets()),
         ll6: c.addrs.link_local6.map_or([0; 16], |a| a.octets()),

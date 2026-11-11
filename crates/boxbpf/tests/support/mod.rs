@@ -41,10 +41,10 @@ pub const LO_ADDRS: &str = "BOXBPF_TEST_LO_ADDRS";
 /// test wants to fill them.
 pub const RULE_ENTRIES: &str = "BOXBPF_TEST_RULE_ENTRIES";
 
-/// The errno boxes in these tests get for a refused call: one the kernel
-/// itself would not return for a loopback connect, so a refusal by the
-/// engine cannot be mistaken for anything else.
-pub const REFUSED: i32 = libc::EHOSTUNREACH;
+/// The errno of a call the engine refused. The kernel returns it for a
+/// cgroup program that says no, at the system call and for a datagram
+/// dropped on the way out.
+pub const REFUSED: i32 = libc::EPERM;
 
 fn exe() -> PathBuf {
     std::env::current_exe().expect("path of the test binary")
@@ -405,10 +405,7 @@ impl Harness {
         let spec = Spec {
             deployment,
             policy,
-            options: Options {
-                refuse_errno: u16::try_from(REFUSED).expect("errno"),
-                log_flows: false,
-            },
+            options: Options { log_flows: false },
         };
         self.handles
             .install(id, spec)

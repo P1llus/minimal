@@ -42,8 +42,6 @@ enum {
 #define IPPROTO_ICMPV6 58
 #define ETH_P_IP       0x0800
 #define ETH_P_IPV6     0x86DD
-#define EPERM          1
-#define ENOMEM         12
 #define NULL           ((void *)0)
 
 struct bpf_flow_keys;

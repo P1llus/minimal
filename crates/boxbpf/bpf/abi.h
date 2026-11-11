@@ -49,9 +49,7 @@ struct bp_box_cfg {
 	__u32 flags;
 	__u32 generation;
 	__u8  default_action[BP_DIR_COUNT];
-	__u8  _pad;
-	__u16 refuse_errno; /* for a refused system call; 0 means EPERM */
-	__u16 _pad2;
+	__u8  _pad[5];
 	__u32 addr4;     /* the box's addresses; all zero: none of that kind */
 	__u8  addr6[16];
 	__u8  ll6[16];   /* its link-local address */

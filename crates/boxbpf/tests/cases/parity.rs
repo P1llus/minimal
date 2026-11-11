@@ -90,10 +90,7 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         names: vec!["pinned.test".parse().expect("name")],
         default: None,
     };
-    let options = Options {
-        refuse_errno: u16::try_from(REFUSED).expect("errno"),
-        log_flows: false,
-    };
+    let options = Options { log_flows: false };
     let compiled = compile(&base, &policy, options).expect("compile");
     let id = h.new_box("p");
     let compiled = std::sync::Arc::new(compiled);
@@ -278,10 +275,7 @@ fn a_rule_that_names_no_protocol_does_not_end_the_list() {
         deny: vec![h.v4_group(1).parse().expect("prefix")],
         ..BoxPolicy::default()
     };
-    let options = Options {
-        refuse_errno: u16::try_from(REFUSED).expect("errno"),
-        log_flows: false,
-    };
+    let options = Options { log_flows: false };
     let mut compiled = compile(&base, &policy, options).expect("compile");
     // Pruning dropped nothing: the allow is TCP only, the deny is all.
     let entry = compiled.nets.first_mut().expect("one entry");

@@ -13,13 +13,13 @@
 #define ICMP_ECHO        8
 #define ICMPV6_ECHO_REQ  128
 
-static __always_inline int refuse(__u64 box, __u16 err)
+/* Refuses the system call. The kernel returns EPERM for it. */
+static __always_inline int refuse(__u64 box)
 {
 	struct bp_stats *s = stats_of(box);
 
 	if (s)
 		s->refused++;
-	bpf_set_retval(-(int)(err ? err : EPERM));
 	return 0;
 }
 
@@ -188,7 +188,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 		v.reason = BP_R_NO_CFG;
 		v.rule = BP_NO_RULE;
 		sa_event(ctx, hook, &f, &v);
-		return refuse(f.box, EPERM);
+		return refuse(f.box);
 	}
 
 	decide(cfg, &f, &v);
@@ -205,7 +205,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 	}
 	if (v.action == BP_DENY) {
 		sa_event(ctx, hook, &f, &v);
-		return refuse(f.box, cfg->refuse_errno);
+		return refuse(f.box);
 	}
 	if (cfg->flags & BP_F_LOG_FLOWS)
 		sa_event(ctx, hook, &f, &v);
@@ -290,7 +290,7 @@ static __always_inline int bind_any(struct bpf_sock_addr *ctx, __u8 hook, __u8 s
 		v.reason = BP_R_NO_CFG;
 		v.rule = BP_NO_RULE;
 		sa_event(ctx, hook, &f, &v);
-		return refuse(f.box, EPERM);
+		return refuse(f.box);
 	}
 	/* Port 0 asks the kernel for an ephemeral port, which a socket also
 	 * gets without any bind call. */
@@ -301,7 +301,7 @@ static __always_inline int bind_any(struct bpf_sock_addr *ctx, __u8 hook, __u8 s
 		return 1;
 	v.action = BP_DENY;
 	sa_event(ctx, hook, &f, &v);
-	return refuse(f.box, cfg->refuse_errno);
+	return refuse(f.box);
 }
 
 SEC("cgroup/bind4")
@@ -327,7 +327,6 @@ int bp_sock_create(struct bpf_sock *sk)
 	struct bp_box_cfg *cfg = bpf_map_lookup_elem(&box_cfg, &box);
 	struct ev_args a = {};
 	__u8 pbit = proto_bit(sk->protocol);
-	__u16 err = cfg ? cfg->refuse_errno : EPERM;
 	__u8 reason = cfg ? BP_R_SOCK_TYPE : BP_R_NO_CFG;
 
 	if (cfg && ((sk->type == SOCK_STREAM && pbit == BP_P_TCP) ||
@@ -340,7 +339,6 @@ int bp_sock_create(struct bpf_sock *sk)
 		}
 		/* A socket nobody can name the box of would be refused at
 		 * every later call. */
-		err = ENOMEM;
 		reason = BP_R_NO_MEMORY;
 	}
 
@@ -354,7 +352,7 @@ int bp_sock_create(struct bpf_sock *sk)
 	a.verdict = BP_DENY;
 	a.reason = reason;
 	emit_net(&a);
-	return refuse(box, err);
+	return refuse(box);
 }
 
 /* The socket's entry in the flows map must not outlive it: the next socket

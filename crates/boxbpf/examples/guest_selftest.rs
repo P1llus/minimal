@@ -33,7 +33,8 @@ mod guest {
     };
 
     const CGROUP: &str = "/sys/fs/cgroup";
-    const REFUSED: u16 = 113;
+    /// What a refused system call returns: `EPERM`.
+    const REFUSED: i32 = 1;
     const RESOLVER4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 1), 15353);
     const RESOLVER6: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 15353, 0, 0);
 
@@ -191,10 +192,7 @@ mod guest {
                 allow: prefixes(&["127.1.0.0/16"]),
                 ..BoxPolicy::default()
             },
-            options: Options {
-                refuse_errno: REFUSED,
-                log_flows: false,
-            },
+            options: Options { log_flows: false },
         }
     }
 
