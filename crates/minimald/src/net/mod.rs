@@ -42,6 +42,8 @@ pub(crate) mod provider;
 // (NET-136). Relay-internal, so no more public than this.
 pub(crate) mod dns_gate;
 
+#[allow(dead_code, reason = "no caller until own_ip runs on the engine")]
+pub(crate) mod attach;
 #[allow(
     dead_code,
     reason = "no caller until the guest's network runs on the engine"
