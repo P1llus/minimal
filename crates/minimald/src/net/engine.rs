@@ -874,6 +874,7 @@ impl Engine {
                 rx_dropped = c.rx_drop,
                 refused = c.refused,
                 events_lost = c.ev_lost,
+                events_limited = c.ev_limited,
                 "removed the box's network policy"
             );
         }

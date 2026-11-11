@@ -195,6 +195,65 @@ fn the_async_reader_yields_refusals() {
 
 #[test]
 #[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn one_box_cannot_crowd_out_the_events_of_another() {
+    let Some(mut h) =
+        Harness::start("cases::loader::one_box_cannot_crowd_out_the_events_of_another")
+    else {
+        return;
+    };
+    let mut events = h.handles.take_events().expect("event source");
+    let closed = || BoxPolicy {
+        default: Some(netpol::Verdict::Deny),
+        ..BoxPolicy::default()
+    };
+    let loud = h.install("loud", host_ip(), closed());
+    let quiet = h.install("quiet", host_ip(), closed());
+    let target = h.v4(1, 1).to_string();
+
+    // More refusals than the ring buffer holds records, with nobody
+    // reading. Then a hundred of another box.
+    assert_eq!(h.probe("loud", &["flood", &target, "9", "5000"]), "ok 5000");
+    assert_eq!(h.probe("quiet", &["flood", &target, "9", "100"]), "ok 100");
+    let seen = Harness::drain(&mut events);
+    let of = |id: boxbpf::BoxId| seen.iter().filter(|e| e.box_id == id.0).count();
+    assert_eq!(
+        of(quiet.id()),
+        100,
+        "every refusal of the quiet box arrives"
+    );
+    let stats = |h: &Harness, id| h.handles.stats(id).expect("stats").expect("counters");
+    let (loud_stats, quiet_stats) = (stats(&h, loud.id()), stats(&h, quiet.id()));
+    assert_eq!(
+        (
+            quiet_stats.refused,
+            quiet_stats.ev_limited,
+            quiet_stats.ev_lost
+        ),
+        (100, 0, 0)
+    );
+    // The loud box got its burst and a little more. The rest is counted,
+    // and the refusals themselves all are.
+    let reported = of(loud.id());
+    assert!(
+        (200..600).contains(&reported),
+        "{reported} events of the loud box"
+    );
+    assert_eq!(loud_stats.refused, 5000);
+    assert_eq!(loud_stats.ev_lost, 0);
+    assert_eq!(
+        loud_stats.ev_limited,
+        5000 - u64::try_from(reported).expect("count")
+    );
+
+    // The bucket fills again: after a pause the loud box is heard.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(h.probe("loud", &["flood", &target, "9", "10"]), "ok 10");
+    let seen = Harness::drain(&mut events);
+    assert_eq!(seen.iter().filter(|e| e.box_id == loud.id().0).count(), 10);
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
 fn a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader() {
     let Some(h) = Harness::start(
         "cases::loader::a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader",

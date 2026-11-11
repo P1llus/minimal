@@ -186,6 +186,9 @@ pub struct Stats {
     pub refused: u64,
     /// Events lost because the ring buffer was full.
     pub ev_lost: u64,
+    /// Events the programs did not write because the box had used up its
+    /// rate. The refusals themselves are in `refused` and the drop counts.
+    pub ev_limited: u64,
 }
 
 impl Stats {
@@ -199,6 +202,7 @@ impl Stats {
         self.rx_drop = self.rx_drop.wrapping_add(other.rx_drop);
         self.refused = self.refused.wrapping_add(other.refused);
         self.ev_lost = self.ev_lost.wrapping_add(other.ev_lost);
+        self.ev_limited = self.ev_limited.wrapping_add(other.ev_limited);
     }
 }
 
@@ -497,7 +501,9 @@ layouts! {
     SetKey = "bp_set_key", 24 { box_id, set_id, generation, dir }
     EndpointKey = "bp_endpoint_key", 16 { box_id, generation, idx }
     Endpoint = "bp_endpoint", 24 { addr6, addr4, port4, port6 }
-    Stats = "bp_stats", 64 { tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost }
+    Stats = "bp_stats", 72 {
+        tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost, ev_limited
+    }
     FlowKey = "bp_flow_key", 20 { saddr, sport, proto, family }
     FlowVal = "bp_flow_val", 32 { box_id, orig_addr, orig_port, orig_family, endpoint }
     EvHdr = "bp_ev_hdr", 24 { kind, size, cpu, ts_ns, box_id }

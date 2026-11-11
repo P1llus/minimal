@@ -156,8 +156,9 @@ struct bp_stats {
 	__u64 rx_bytes;
 	__u64 tx_drop;
 	__u64 rx_drop;
-	__u64 refused; /* refusals at a system call */
-	__u64 ev_lost; /* events lost to a full ring buffer */
+	__u64 refused;    /* refusals at a system call */
+	__u64 ev_lost;    /* events lost to a full ring buffer */
+	__u64 ev_limited; /* events not written because the box had used up its rate */
 };
 
 /* The box's end of a flow to one of its endpoints, as the endpoint sees its

@@ -195,10 +195,8 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 
 	if (v.action == BP_DENY && f.pbit == BP_P_UDP) {
 		/* A reply to a peer the ingress hook let in. */
-		struct udp_peer up;
-
-		peer_key(&up, bpf_get_socket_cookie(ctx), f.addr, f.port);
-		if (peer_admitted(&up, BP_DIR_INGRESS, cfg->generation))
+		if (peer_admitted(ctx->sk, f.addr, f.port, f.family, BP_DIR_INGRESS,
+				  cfg->generation))
 			return 1;
 	}
 	if (v.action == BP_REDIRECT && steer(ctx, sf, cfg, &f, &v)) {

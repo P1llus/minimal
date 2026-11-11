@@ -7,7 +7,7 @@
  *  - TCP: only a bare SYN is checked. Any other segment belongs to a
  *    connection whose SYN this side or the other side admitted.
  *  - UDP: a packet to or from a peer that the rules of the other direction
- *    admitted on this socket is a reply.
+ *    admitted on this socket is a reply. The socket remembers its peers.
  *  - ICMP: an echo reply is a reply. A ping socket receives nothing else.
  */
 
@@ -150,13 +150,18 @@ static __always_inline int drop(struct __sk_buff *skb, __u64 box, __u8 hook, con
 	return 0;
 }
 
-static __always_inline struct sk_state *skb_state(struct __sk_buff *skb, int create)
+/* The packet's socket if it can have storage, else NULL. */
+static __always_inline struct bpf_sock *skb_sock(struct __sk_buff *skb)
 {
 	struct bpf_sock *sk = skb->sk;
 
-	if (!sk)
-		return NULL;
-	sk = bpf_sk_fullsock(sk);
+	return sk ? bpf_sk_fullsock(sk) : NULL;
+}
+
+static __always_inline struct sk_state *skb_state(struct __sk_buff *skb, int create)
+{
+	struct bpf_sock *sk = skb_sock(skb);
+
 	if (!sk)
 		return NULL;
 	return bpf_sk_storage_get(&sk_state, sk, 0, create ? BPF_SK_STORAGE_GET_F_CREATE : 0);
@@ -326,13 +331,10 @@ int bp_egress(struct __sk_buff *skb)
 		v.action = BP_DENY;
 	}
 	if (v.action == BP_DENY) {
-		if (p.pbit == BP_P_UDP) {
-			struct udp_peer up;
-
-			peer_key(&up, bpf_get_socket_cookie(skb), p.daddr, p.dport);
-			if (peer_admitted(&up, BP_DIR_INGRESS, cfg->generation))
-				goto pass;
-		}
+		if (p.pbit == BP_P_UDP &&
+		    peer_admitted(skb_sock(skb), p.daddr, p.dport, p.family, BP_DIR_INGRESS,
+				  cfg->generation))
+			goto pass;
 		return drop(skb, box, BP_H_EGRESS, &p, &v, 0);
 	}
 
@@ -345,12 +347,9 @@ int bp_egress(struct __sk_buff *skb)
 		st->ok_generation = cfg->generation;
 		record_flow(box, cfg, &p, st);
 	}
-	if (p.pbit == BP_P_UDP) {
-		struct udp_peer up;
-
-		peer_key(&up, bpf_get_socket_cookie(skb), p.daddr, p.dport);
-		peer_admit(&up, BP_DIR_EGRESS, cfg->generation);
-	}
+	if (p.pbit == BP_P_UDP)
+		peer_admit(skb_sock(skb), p.daddr, p.dport, p.family, BP_DIR_EGRESS,
+			   cfg->generation);
 
 pass:
 	s = stats_of(box);
@@ -368,7 +367,6 @@ int bp_ingress(struct __sk_buff *skb)
 	struct bp_box_cfg *cfg = bpf_map_lookup_elem(&box_cfg, &box);
 	struct verdict v = {};
 	struct bp_stats *s;
-	struct udp_peer up;
 	struct pkt p = {};
 	struct flow f = {};
 
@@ -384,11 +382,9 @@ int bp_ingress(struct __sk_buff *skb)
 	if (p.pbit == BP_P_ICMP &&
 	    p.icmp_type == (p.family == 4 ? ICMP_ECHOREPLY : ICMPV6_ECHO_REPLY))
 		goto pass;
-	if (p.pbit == BP_P_UDP) {
-		peer_key(&up, bpf_get_socket_cookie(skb), p.saddr, p.sport);
-		if (peer_admitted(&up, BP_DIR_EGRESS, cfg->generation))
-			goto pass;
-	}
+	if (p.pbit == BP_P_UDP &&
+	    peer_admitted(skb_sock(skb), p.saddr, p.sport, p.family, BP_DIR_EGRESS, cfg->generation))
+		goto pass;
 
 	f.box = box;
 	f.dir = BP_DIR_INGRESS;
@@ -401,7 +397,8 @@ int bp_ingress(struct __sk_buff *skb)
 		return drop(skb, box, BP_H_INGRESS, &p, &v, 0);
 	/* So the reply gets out, whatever the egress rules say. */
 	if (p.pbit == BP_P_UDP)
-		peer_admit(&up, BP_DIR_INGRESS, cfg->generation);
+		peer_admit(skb_sock(skb), p.saddr, p.sport, p.family, BP_DIR_INGRESS,
+			   cfg->generation);
 
 pass:
 	s = stats_of(box);

@@ -134,8 +134,6 @@ pub struct MapSizes {
     pub endpoints: u32,
     /// Redirected flows whose original destination is remembered.
     pub flows: u32,
-    /// UDP peers whose replies are recognised.
-    pub udp_peers: u32,
     /// Bytes of the event ring buffer: a power of two, at least a page.
     pub event_bytes: u32,
 }
@@ -149,7 +147,6 @@ impl Default for MapSizes {
             name_sets: 4096,
             endpoints: 4096,
             flows: 65536,
-            udp_peers: 16384,
             event_bytes: 1 << 18,
         }
     }
@@ -195,7 +192,7 @@ impl Engine {
             .map_max_entries("set_rules", sizes.name_sets)
             .map_max_entries("endpoints", sizes.endpoints)
             .map_max_entries("flows", sizes.flows)
-            .map_max_entries("udp_peers", sizes.udp_peers)
+            .map_max_entries("ev_buckets", sizes.boxes)
             .map_max_entries("events", sizes.event_bytes)
             .load(OBJECT)
             .map_err(|e| Error::Load(Box::new(e)))?;

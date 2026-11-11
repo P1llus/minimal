@@ -62,6 +62,7 @@ fn policy(icmp4: u16, icmp6: u16) -> BoxPolicy {
         rules: vec![
             allow(Protocols::TCP, PortRange::one(18080), PEER4),
             allow(Protocols::TCP, PortRange::one(18080), PEER6),
+            allow(Protocols::UDP, PortRange::one(18090), PEER4),
             allow(Protocols::ICMP, PortRange::one(icmp4), PEER4),
             allow(Protocols::ICMP, PortRange::one(icmp6), PEER6),
         ],
@@ -241,6 +242,31 @@ fn a_box_in_its_own_network_namespace() {
         probe(&["tcp", PEER6, "18080"])
     );
     assert_eq!(probe(&["tcp", PEER6, "18081", "500"]), refused());
+
+    // ---- UDP: a socket's replies come back, and nothing else comes in
+    let _peer_echo = Cgroups::hold_peer_probe(peer_ns, &["serve-udp", PEER4, "18090"]);
+    assert_eq!(
+        probe(&["udp", PEER4, "18090", "1000"]),
+        format!("ok from={PEER4}:18090"),
+        "the reply of a peer the box wrote to passes the ingress default"
+    );
+    let _box_echo = cg.hold_probe_in("own", box_ns, &["serve-udp", "::", "18091"]);
+    let knock = |port: &str| Cgroups::peer_probe(peer_ns, &["udp", BOX4, port, "500"]);
+    assert_eq!(
+        knock("18091"),
+        "err timeout",
+        "a datagram nobody asked for is dropped"
+    );
+    let udp_port = PortOf {
+        protocols: Protocols::UDP,
+        port: 18091,
+    };
+    h.handles.publish(&mut live, udp_port).expect("publish");
+    // The peer sends from the gateway address, which no egress rule lets
+    // the box write to. The answer passes because the datagram came in.
+    assert_eq!(knock("18091"), format!("ok from={BOX4}:18091"));
+    h.handles.unpublish(&mut live, udp_port).expect("unpublish");
+    assert_eq!(knock("18091"), "err timeout");
 
     // ---- ICMP and ICMPv6 by message type
     assert_eq!(probe(&["ping", PEER4]), "ok type=0");

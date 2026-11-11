@@ -291,6 +291,16 @@ fn tcp_from(src: &str, to: SocketAddr, timeout: Duration) -> std::io::Result<Str
     connect_fd(&sock, to, timeout)
 }
 
+/// Sends `count` datagrams as fast as it can and reports how many the
+/// engine refused.
+fn flood(to: SocketAddr, count: &str) -> std::io::Result<String> {
+    let sock = UdpSocket::bind(unspecified(&to))?;
+    let refused = (0..count.parse::<usize>().expect("count"))
+        .filter(|_| sock.send_to(b"x", to).is_err())
+        .count();
+    Ok(refused.to_string())
+}
+
 /// Hands sockets to whoever holds the other end of `channel`.
 pub fn send_sockets(channel: BorrowedFd<'_>, socks: &[OwnedFd]) -> std::io::Result<()> {
     let raw: Vec<_> = socks.iter().map(AsRawFd::as_raw_fd).collect();
@@ -512,6 +522,7 @@ pub fn run() {
         ["hold-udp", ip, port] => return hold_udp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
+        ["flood", ip, port, count] => report(flood(addr(ip, port), count)),
         ["make-sockets", kind, count] => report(make_sockets(kind, count)),
         ["use-socket", kind, ip, port] => report(use_socket(kind, addr(ip, port))),
         ["accept-bind", ip] => report(accept_bind(ip.parse().expect("address"))),
