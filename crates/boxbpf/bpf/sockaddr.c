@@ -331,10 +331,12 @@ int bp_sock_create(struct bpf_sock *sk)
 
 	if (cfg && ((sk->type == SOCK_STREAM && pbit == BP_P_TCP) ||
 		    (sk->type == SOCK_DGRAM && (pbit == BP_P_UDP || pbit == BP_P_ICMP)))) {
-		__u64 *owner = bpf_sk_storage_get(&sk_box, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+		struct sk_owner *owner =
+			bpf_sk_storage_get(&sk_box, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 
 		if (owner) {
-			*owner = box;
+			owner->box = box;
+			owner->netns = bpf_get_netns_cookie(sk);
 			return 1;
 		}
 		/* A socket nobody can name the box of would be refused at
@@ -361,8 +363,15 @@ SEC("cgroup/sock_release")
 int bp_sock_release(struct bpf_sock *sk)
 {
 	struct sk_state *st = bpf_sk_storage_get(&sk_state, sk, 0, 0);
+	struct bp_usage *use;
+	__u64 box;
 
-	if (st && (st->flags & ST_FLOW))
-		bpf_map_delete_elem(&flows, &st->flow_key);
+	if (!st || !(st->flags & ST_FLOW))
+		return 1;
+	bpf_map_delete_elem(&flows, &st->flow_key);
+	box = sock_box(sk);
+	use = bpf_map_lookup_elem(&box_use, &box);
+	if (use && use->flows)
+		__sync_fetch_and_add(&use->flows, -1);
 	return 1;
 }

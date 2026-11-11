@@ -247,6 +247,8 @@ pub(crate) trait BoxProxy: Send + Sync {
 /// own.
 pub(crate) struct Peers {
     flows: Flows,
+    /// The network namespace the endpoint is in: the daemon's own.
+    netns: u64,
 }
 
 impl Peers {
@@ -260,7 +262,7 @@ impl Peers {
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Option<OriginalDestination> {
-        match self.flows.original_destination(peer, protocol) {
+        match self.flows.original_destination(self.netns, peer, protocol) {
             Ok(Some(flow)) if flow.box_id == of.id && flow.endpoint == service.index() => {
                 Some(flow)
             }
@@ -698,8 +700,16 @@ impl Engine {
         let _in_runtime = serving.runtime.enter();
         let mut tasks = Vec::new();
         let peers = || -> Option<Peers> {
-            match attached.flows.try_clone() {
-                Ok(flows) => Some(Peers { flows }),
+            let made = attached.flows.try_clone().and_then(|flows| {
+                let netns =
+                    boxbpf::current_netns_cookie().map_err(|source| boxbpf::Error::Sys {
+                        what: "read the network namespace cookie",
+                        source,
+                    })?;
+                Ok(Peers { flows, netns })
+            });
+            match made {
+                Ok(peers) => Some(peers),
                 Err(error) => {
                     tracing::error!(%error, "an endpoint cannot ask the engine for its peers");
                     None

@@ -14,7 +14,7 @@
 #ifndef BOXBPF_ABI_H
 #define BOXBPF_ABI_H
 
-#define BP_ABI_VERSION 3
+#define BP_ABI_VERSION 4
 
 /* Directions. They index bp_box_cfg.default_action and are part of rule keys. */
 #define BP_DIR_EGRESS  0 /* address = destination, port = destination port */
@@ -159,14 +159,20 @@ struct bp_stats {
 	__u64 ev_limited; /* events not written because the box had used up its rate */
 };
 
-/* The box's end of a flow to one of its endpoints, as the endpoint sees its
- * peer. The value says which box and where the flow was first headed: the
- * endpoint itself, or the destination a redirect rule took it from. */
+/*
+ * The box's end of a flow to one of its endpoints, as the endpoint sees its
+ * peer, in the network namespace both are in: the cookie the kernel gives a
+ * socket there for SO_NETNS_COOKIE. The value says which box and where the
+ * flow was first headed: the endpoint itself, or the destination a redirect
+ * rule took it from.
+ */
 struct bp_flow_key {
+	__u64 netns;
 	__u8  saddr[16];
 	__u16 sport;
 	__u8  proto;  /* one BP_P_* bit */
 	__u8  family;
+	__u8  _pad[4];
 };
 
 struct bp_flow_val {
@@ -176,6 +182,16 @@ struct bp_flow_val {
 	__u8  orig_family;
 	__u8  endpoint;
 	__u32 _pad;
+};
+
+/*
+ * What a box holds of the maps the programs fill, counted so that one box
+ * cannot fill them. Userspace creates the entry with the box. The programs
+ * record nothing for a box without one.
+ */
+struct bp_usage {
+	__u32 flows;   /* sockets with an entry in the flows map */
+	__u32 listens; /* listening sockets with an entry in the listens map */
 };
 
 /*
@@ -217,6 +233,7 @@ struct bp_ev_hdr {
 #define BP_R_NO_ENDPOINT 9 /* redirect without an endpoint address of the flow's family */
 #define BP_R_NO_MEMORY   10 /* no memory to remember which box a new socket belongs to */
 #define BP_R_EPHEMERAL_PORT 11 /* never in an event: the evaluator's reason for a bind to port 0 */
+#define BP_R_FLOW_LIMIT  12 /* the box has as many flows to its endpoints as it may */
 
 struct bp_ev_net {
 	struct bp_ev_hdr hdr;

@@ -37,9 +37,9 @@ const IN_UNIT: &str = "BOXBPF_TEST_IN_UNIT";
 pub const ROLE: &str = "BOXBPF_TEST_ROLE";
 pub const SOCKET: &str = "BOXBPF_TEST_SOCKET";
 pub const LO_ADDRS: &str = "BOXBPF_TEST_LO_ADDRS";
-/// Prefix entries per family the loader sizes the rule maps for, when a
-/// test wants to fill them.
-pub const RULE_ENTRIES: &str = "BOXBPF_TEST_RULE_ENTRIES";
+/// Sizes the loader loads the engine with where a test wants small ones to
+/// fill: `name=value` pairs, comma separated. See the loader role.
+pub const SIZES: &str = "BOXBPF_TEST_SIZES";
 
 /// The errno of a call the engine refused. The kernel returns it for a
 /// cgroup program that says no, at the system call and for a datagram
@@ -171,6 +171,8 @@ impl Drop for LoaderProcess {
 
 /// A probe that stays alive between two steps of a test.
 pub struct Held {
+    /// What the probe said when it was ready, after the word `ready`.
+    pub ready: String,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -252,13 +254,13 @@ impl Harness {
         Self::start_as(test, v6_suffixes, None)
     }
 
-    /// Like [`Self::start`], with rule maps that hold `rule_entries`
-    /// prefixes per family, few enough for a test to fill.
-    pub fn start_sized(test: &str, rule_entries: u32) -> Option<Self> {
-        Self::start_as(test, &[], Some(rule_entries))
+    /// Like [`Self::start`], with an engine of other sizes, small enough
+    /// for a test to fill: `rule_entries` or `flows_per_box`.
+    pub fn start_sized(test: &str, size: &str, value: u32) -> Option<Self> {
+        Self::start_as(test, &[], Some((size, value)))
     }
 
-    fn start_as(test: &str, v6_suffixes: &[u16], rule_entries: Option<u32>) -> Option<Self> {
+    fn start_as(test: &str, v6_suffixes: &[u16], size: Option<(&str, u32)>) -> Option<Self> {
         if std::env::var_os(GATE).is_none() {
             eprintln!("skipping {test}: {GATE} is not set (it needs sudo -n, systemd and clang)");
             return None;
@@ -266,7 +268,7 @@ impl Harness {
         if rerun_delegated(test) {
             return None;
         }
-        let bare = Self::ground(v6_suffixes, rule_entries);
+        let bare = Self::ground(v6_suffixes, size);
         let handles = boxbpf::loader::request(&bare.socket, bare.boxes.as_fd())
             .expect("get handles from the loader");
         Some(Self {
@@ -293,7 +295,7 @@ impl Harness {
         Some(Self::ground(&[], None))
     }
 
-    fn ground(v6_suffixes: &[u16], rule_entries: Option<u32>) -> Bare {
+    fn ground(v6_suffixes: &[u16], size: Option<(&str, u32)>) -> Bare {
         // In a scope we start in the unit's own cgroup, in a service with
         // DelegateSubgroup already in supervisor/.
         let here = own_cgroup();
@@ -333,8 +335,9 @@ impl Harness {
             .arg(format!("{SOCKET}={}", socket.display()))
             .arg(format!("{LO_ADDRS}={}", lo_addrs.join(",")))
             .arg(format!(
-                "{RULE_ENTRIES}={}",
-                rule_entries.map(|n| n.to_string()).unwrap_or_default()
+                "{SIZES}={}",
+                size.map(|(name, value)| format!("{name}={value}"))
+                    .unwrap_or_default()
             ))
             .arg(exe())
             .args(["--exact", "helper", "--ignored", "--nocapture"])
@@ -579,13 +582,15 @@ impl Cgroups {
             .expect("start a held probe");
         let stdin = child.stdin.take().expect("stdin");
         let mut held = Held {
+            ready: String::new(),
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             stdin,
             child,
         };
         loop {
             let line = held.read_line();
-            if line.starts_with("probe: ready") {
+            if let Some(said) = line.strip_prefix("probe: ready") {
+                held.ready = said.trim().to_owned();
                 return held;
             }
             assert!(

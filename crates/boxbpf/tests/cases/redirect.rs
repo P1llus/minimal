@@ -27,6 +27,7 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
     ) else {
         return;
     };
+    let here = boxbpf::current_netns_cookie().expect("namespace cookie");
     let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
     // IPv4 endpoints get an address each in group 6. On IPv6 the host has
     // one loopback address, so endpoints differ by port.
@@ -103,7 +104,7 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
             // address and port next is not taken for the box.
             assert_eq!(
                 h.handles
-                    .original_destination(seen.peer, seen.protocol)
+                    .original_destination(here, seen.peer, seen.protocol)
                     .expect("lookup"),
                 None,
                 "{server} over {over}"
@@ -187,6 +188,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
     else {
         return;
     };
+    let here = boxbpf::current_netns_cookie().expect("namespace cookie");
     let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let proxy = Endpoint {
         v4: Some(SocketAddrV4::new(
@@ -287,7 +289,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
         );
         assert_eq!(
             h.handles
-                .original_destination(direct.peer, Protocol::Tcp)
+                .original_destination(here, direct.peer, Protocol::Tcp)
                 .expect("lookup"),
             None,
             "the entry goes with the socket"

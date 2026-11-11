@@ -64,12 +64,23 @@ struct {
 	__type(value, struct bp_stats);
 } stats SEC(".maps");
 
+/* Bounded per box by flows_per_box, so no box can fill it for the others. */
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
 	__type(key, struct bp_flow_key);
 	__type(value, struct bp_flow_val);
 } flows SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct bp_usage);
+} box_use SEC(".maps");
+
+/* Set at load. */
+const volatile __u32 flows_per_box = 1024;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);

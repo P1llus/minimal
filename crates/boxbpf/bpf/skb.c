@@ -223,6 +223,19 @@ static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struc
 	return ep->port6 && ep->port6 == p->dport && addr_eq(addr, p->daddr);
 }
 
+/* The cookie of the network namespace the packet's socket lives in, as
+ * bp_sock_create wrote it down. 0 for a socket it never saw. */
+static __always_inline __u64 skb_netns(struct __sk_buff *skb)
+{
+	struct bpf_sock *sk = skb_sock(skb);
+	struct sk_owner *owner;
+
+	if (!sk)
+		return 0;
+	owner = bpf_sk_storage_get(&sk_box, sk, 0, 0);
+	return owner ? owner->netns : 0;
+}
+
 /*
  * Tells the box's endpoints who their peer is. A flow of a box to one of its
  * own endpoints gets an entry under the box's end of it, whether a rule
@@ -230,14 +243,23 @@ static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struc
  * serves only peers that have one. The entry goes when the socket does
  * (bp_sock_release), so a later socket with the same address and port does
  * not inherit it.
+ *
+ * The key has the network namespace in it: the same address and port exist
+ * once in every namespace, and an endpoint asks for its own.
+ *
+ * A box has room for flows_per_box sockets with an entry. Returns -1 for a
+ * flow that would be one more: its endpoint could not tell whose it is, so
+ * the caller drops it.
  */
-static __always_inline void record_flow(__u64 box, const struct bp_box_cfg *cfg,
-					const struct pkt *p, struct sk_state *st)
+static __always_inline int record_flow(struct __sk_buff *skb, __u64 box,
+				       const struct bp_box_cfg *cfg, const struct pkt *p,
+				       struct sk_state *st)
 {
 	struct bp_endpoint_key ek = {};
 	struct bp_flow_key fk = {};
 	struct bp_flow_val fv = {};
 	struct bp_endpoint *ep;
+	struct bp_usage *use;
 	__u32 i;
 
 	ek.box_id = box;
@@ -249,8 +271,11 @@ static __always_inline void record_flow(__u64 box, const struct bp_box_cfg *cfg,
 			break;
 	}
 	if (i == BP_ENDPOINTS_MAX)
-		return;
+		return 0;
 
+	fk.netns = skb_netns(skb);
+	if (!fk.netns)
+		return 0;
 	__builtin_memcpy(fk.saddr, p->saddr, 16);
 	fk.sport = p->sport;
 	fk.proto = p->pbit;
@@ -267,16 +292,25 @@ static __always_inline void record_flow(__u64 box, const struct bp_box_cfg *cfg,
 		fv.orig_port = p->dport;
 	}
 
-	/* A socket has one local end at a time. If it moved, the old entry
-	 * would outlive the socket. */
-	if ((st->flags & ST_FLOW) &&
-	    (st->flow_key.sport != fk.sport || st->flow_key.proto != fk.proto ||
-	     st->flow_key.family != fk.family ||
-	     !addr_eq((const __u32 *)st->flow_key.saddr, (const __u32 *)fk.saddr)))
-		bpf_map_delete_elem(&flows, &st->flow_key);
+	if (st->flags & ST_FLOW) {
+		/* A socket has one local end at a time. If it moved, the old
+		 * entry would outlive the socket. */
+		if (st->flow_key.sport != fk.sport || st->flow_key.proto != fk.proto ||
+		    st->flow_key.family != fk.family ||
+		    !addr_eq((const __u32 *)st->flow_key.saddr, (const __u32 *)fk.saddr))
+			bpf_map_delete_elem(&flows, &st->flow_key);
+	} else {
+		/* The count is of sockets that hold an entry. Two CPUs may
+		 * pass the check at once and go one over. */
+		use = bpf_map_lookup_elem(&box_use, &box);
+		if (!use || use->flows >= flows_per_box)
+			return -1;
+		__sync_fetch_and_add(&use->flows, 1);
+		st->flags |= ST_FLOW;
+	}
 	bpf_map_update_elem(&flows, &fk, &fv, BPF_ANY);
 	st->flow_key = fk;
-	st->flags |= ST_FLOW;
+	return 0;
 }
 
 SEC("cgroup_skb/egress")
@@ -317,7 +351,7 @@ int bp_egress(struct __sk_buff *skb)
 	    (p.later_frag || st->ok_port == f.port)) {
 		/* The entry may have been evicted since the first packet. */
 		if (st->flags & ST_FLOW)
-			record_flow(box, cfg, &p, st);
+			record_flow(skb, box, cfg, &p, st);
 		goto pass;
 	}
 	if (p.later_frag)
@@ -340,12 +374,13 @@ int bp_egress(struct __sk_buff *skb)
 
 	st = skb_state(skb, 1);
 	if (st) {
+		if (record_flow(skb, box, cfg, &p, st))
+			return drop(skb, box, BP_H_EGRESS, &p, &v, BP_R_FLOW_LIMIT);
 		st->ok_pbit = p.pbit;
 		st->ok_family = p.family;
 		__builtin_memcpy(st->ok_addr, p.daddr, 16);
 		st->ok_port = f.port;
 		st->ok_generation = cfg->generation;
-		record_flow(box, cfg, &p, st);
 	}
 	if (p.pbit == BP_P_UDP)
 		peer_admit(skb_sock(skb), p.daddr, p.dport, p.family, BP_DIR_EGRESS,

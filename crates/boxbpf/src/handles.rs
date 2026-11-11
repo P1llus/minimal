@@ -28,7 +28,7 @@ use crate::{Error, engine::MAPS, events, sys};
 
 /// Lets a `netpol::abi` struct be a map key or value.
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Raw<T>(T);
 
 // SAFETY: `Plain` promises repr(C) without padding and that every bit
@@ -75,6 +75,11 @@ pub struct Usage {
     pub pins: usize,
     /// Pins refused so far because the box was at its limit.
     pub pins_refused: u64,
+    /// Sockets of the box with a flow to one of its endpoints, as the
+    /// programs count them.
+    pub flows: u32,
+    /// Listening sockets of the box the programs know.
+    pub listens: u32,
 }
 
 /// What this process wrote for one box.
@@ -145,7 +150,7 @@ impl Flows {
         })?;
         let data = MapData::from_fd(fd).map_err(Error::map("flows"))?;
         Ok(Self {
-            map: HashMap::try_from(Map::LruHashMap(data)).map_err(Error::map("flows"))?,
+            map: HashMap::try_from(Map::HashMap(data)).map_err(Error::map("flows"))?,
             fd: kept,
         })
     }
@@ -160,19 +165,25 @@ impl Flows {
     }
 
     /// Which box is behind `peer`, the remote end of a flow that reached
-    /// an endpoint, and where that flow was first headed. The egress hook
-    /// records every flow of a box to one of its own endpoints with the
-    /// first packet, so the entry is there by the time the endpoint sees
-    /// that packet, and removes it with the box's socket. `None` means the
-    /// peer is no box socket: a process outside every box.
+    /// an endpoint in the network namespace `netns`, and where that flow
+    /// was first headed. `netns` is the endpoint's own namespace cookie
+    /// ([`crate::netns_cookie`] of its socket): a peer address means
+    /// nothing without it, since every namespace has the same loopback.
+    ///
+    /// The egress hook records every flow of a box to one of its own
+    /// endpoints with the first packet, so the entry is there by the time
+    /// the endpoint sees that packet, and removes it with the box's
+    /// socket. `None` means the peer is no box socket: a process outside
+    /// every box.
     pub fn original_destination(
         &self,
+        netns: u64,
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Result<Option<OriginalDestination>, Error> {
         // A v4-mapped peer is an IPv4 flow, and recorded as one.
         let peer = SocketAddr::new(netpol::eval::canonical(peer.ip()), peer.port());
-        let key = Raw(abi::flow_key(peer, protocol));
+        let key = Raw(abi::flow_key(netns, peer, protocol));
         let found = absent_ok(self.map.get(&key, 0)).map_err(Error::map("flows"))?;
         Ok(found.map(|Raw(v)| OriginalDestination {
             box_id: BoxId(v.box_id),
@@ -190,6 +201,7 @@ pub struct Handles {
     set_rules: HashMap<MapData, Raw<abi::SetKey>, Raw<abi::Rules>>,
     endpoints: HashMap<MapData, Raw<abi::EndpointKey>, Raw<abi::Endpoint>>,
     stats: PerCpuHashMap<MapData, u64, Raw<abi::Stats>>,
+    box_use: HashMap<MapData, u64, Raw<abi::Usage>>,
     flows: Flows,
     events: Option<RingBuf<MapData>>,
     boxes: StdHashMap<u64, Held>,
@@ -240,6 +252,8 @@ impl Handles {
                 .map_err(Error::map("endpoints"))?,
             stats: PerCpuHashMap::try_from(Map::PerCpuHashMap(next("stats")?))
                 .map_err(Error::map("stats"))?,
+            box_use: HashMap::try_from(Map::HashMap(next("box_use")?))
+                .map_err(Error::map("box_use"))?,
             flows: Flows::from_fd(next_fd(count)?)?,
             events: Some(
                 RingBuf::try_from(Map::RingBuf(next("events")?)).map_err(Error::map("events"))?,
@@ -331,7 +345,12 @@ impl Handles {
         }
     }
 
+    /// The entries a box has from its first policy to its removal: its
+    /// counters, and the count of what the programs record for it.
     fn zero_stats(&mut self, id: BoxId) -> Result<(), Error> {
+        self.box_use
+            .insert(&id.0, &Raw(abi::Usage::default()), 0)
+            .map_err(Error::map("box_use"))?;
         let cpus = aya::util::nr_cpus().map_err(|(_, e)| Error::Sys {
             what: "count CPUs",
             source: e,
@@ -421,6 +440,7 @@ impl Handles {
             if current.is_none() {
                 // Nothing reads the counters of a box that never started.
                 let _absent = self.stats.remove(&id.0);
+                let _absent = self.box_use.remove(&id.0);
             }
             return Err(error);
         }
@@ -459,6 +479,7 @@ impl Handles {
             }
         }
         absent_ok(self.stats.remove(&id.0)).map_err(Error::map("stats"))?;
+        absent_ok(self.box_use.remove(&id.0)).map_err(Error::map("box_use"))?;
         Ok(())
     }
 
@@ -592,10 +613,13 @@ impl Handles {
     /// What the box holds of the shared maps. `None` for an unknown box.
     #[must_use]
     pub fn usage(&self, id: BoxId) -> Option<Usage> {
+        let Raw(counted) = self.box_use.get(&id.0, 0).unwrap_or_default();
         self.boxes.get(&id.0).map(|held| Usage {
             rule_entries: held.keys.rules4.len() + held.keys.rules6.len() + held.keys.sets.len(),
             pins: held.pins.len(),
             pins_refused: held.pins_refused,
+            flows: counted.flows,
+            listens: counted.listens,
         })
     }
 
@@ -615,10 +639,11 @@ impl Handles {
     /// See [`Flows::original_destination`].
     pub fn original_destination(
         &self,
+        netns: u64,
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Result<Option<OriginalDestination>, Error> {
-        self.flows.original_destination(peer, protocol)
+        self.flows.original_destination(netns, peer, protocol)
     }
 
     /// A handle on the flows map for an endpoint task.

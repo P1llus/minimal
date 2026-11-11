@@ -5,7 +5,9 @@
  * A socket belongs to the box it was created in, at every hook and whoever
  * makes the call. The packet hooks read that from the socket's cgroup. The
  * system-call hooks cannot read a socket's cgroup, so bp_sock_create writes
- * the id into the socket's storage and they read it there.
+ * the id into the socket's storage and they read it there. It writes the
+ * socket's network namespace beside it: the packet hooks have no helper for
+ * that on the older kernels, and a socket never changes its namespace.
  *
  * The ancestor helpers take a depth counted from the real cgroup root.
  * Userspace cannot compute that depth when it runs inside a cgroup
@@ -22,13 +24,18 @@
 const volatile __u64 boxes_id = 0; /* cgroup id of the attach point, set at load */
 __u32 box_level = 0;               /* depth of a box cgroup, 0 until found */
 
+struct sk_owner {
+	__u64 box;
+	__u64 netns; /* cookie of the socket's network namespace */
+};
+
 /* The box a socket was created in. A socket that accept() returns gets a
  * copy of its listener's entry. */
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_CLONE);
 	__type(key, int);
-	__type(value, __u64);
+	__type(value, struct sk_owner);
 } sk_box SEC(".maps");
 
 /* For bp_sock_create only: the calling task's box, which is the box of the
@@ -52,9 +59,9 @@ static __always_inline __u64 task_box(void)
  * 0 for a socket bp_sock_create never saw. */
 static __always_inline __u64 sock_box(void *sk)
 {
-	__u64 *box = bpf_sk_storage_get(&sk_box, sk, 0, 0);
+	struct sk_owner *owner = bpf_sk_storage_get(&sk_box, sk, 0, 0);
 
-	return box ? *box : 0;
+	return owner ? owner->box : 0;
 }
 
 /* For the packet hooks: the box of the socket's cgroup. The kernel's own

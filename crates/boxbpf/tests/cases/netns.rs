@@ -19,6 +19,7 @@ const GATEWAY4: &str = "10.99.0.1";
 const PEER4: &str = "10.99.0.9";
 const BOX6: &str = "fd00:99::2";
 const BOX_LL6: &str = "fe80::99:2";
+const ENDPOINT: &str = "127.0.80.1:20480";
 /// A link-local address on the box's interface that is not the one the
 /// engine was told.
 const OTHER_LL6: &str = "fe80::99:3";
@@ -90,6 +91,13 @@ fn a_box_in_its_own_network_namespace() {
         host_alias: None,
     });
     deployment.transport_ipv6 = true;
+    // The box's resolver endpoint is inside its own namespace, at the
+    // address every namespace has.
+    let endpoint: std::net::SocketAddrV4 = ENDPOINT.parse().expect("address");
+    deployment.services.resolver = Some(netpol::Endpoint {
+        v4: Some(endpoint),
+        v6: None,
+    });
     let mut live = h.install("own", deployment, policy(8, 128));
 
     // The peer's namespaces belong to a process outside any box. The box's
@@ -242,6 +250,68 @@ fn a_box_in_its_own_network_namespace() {
         probe(&["tcp", PEER6, "18080"])
     );
     assert_eq!(probe(&["tcp", PEER6, "18081", "500"]), refused());
+
+    // ---- an endpoint in the box's namespace knows its peers by namespace
+    let mut inside = Cgroups::hold_peer_probe(box_ns, &["endpoint-udp", "127.0.80.1", "20480"]);
+    let inside_ns: u64 = inside
+        .ready
+        .strip_prefix("netns=")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no namespace cookie: {}", inside.ready));
+    let here = boxbpf::current_netns_cookie().expect("namespace cookie");
+    assert_ne!(inside_ns, here);
+    let _client = cg.hold_probe_in("own", box_ns, &["hold-udp", "127.0.80.1", "20480", "40123"]);
+    let peer: std::net::SocketAddr = inside
+        .step()
+        .strip_prefix("ok peer=")
+        .and_then(|p| p.parse().ok())
+        .expect("the endpoint got the box's datagram");
+    assert_eq!(peer, "127.0.0.1:40123".parse().expect("address"));
+    let recorded = |h: &Harness, netns| {
+        h.handles
+            .original_destination(netns, peer, Protocol::Udp)
+            .expect("lookup")
+            .map(|flow| (flow.box_id, flow.destination, flow.endpoint))
+    };
+    assert_eq!(
+        recorded(&h, inside_ns),
+        Some((
+            live.id(),
+            ENDPOINT.parse().expect("address"),
+            netpol::base::RESOLVER
+        ))
+    );
+    assert_eq!(
+        recorded(&h, here),
+        None,
+        "the same peer address in another namespace"
+    );
+    // A box on the node's network with the same client address and port.
+    // Each endpoint finds its own box behind `127.0.0.1:40123`.
+    let outside = std::net::UdpSocket::bind((h.v4(6, 1), 0)).expect("bind an endpoint");
+    let std::net::SocketAddr::V4(outside_at) = outside.local_addr().expect("address") else {
+        panic!("an IPv4 socket");
+    };
+    let mut twin = crate::support::host_ip();
+    twin.services.resolver = Some(netpol::Endpoint {
+        v4: Some(outside_at),
+        v6: None,
+    });
+    let twin = h.install("twin", twin, BoxPolicy::default());
+    let _twin_client = h.hold_probe(
+        "twin",
+        &[
+            "hold-udp",
+            &outside_at.ip().to_string(),
+            &outside_at.port().to_string(),
+            "40123",
+        ],
+    );
+    let mut buf = [0u8; 8];
+    let (_, twin_peer) = outside.recv_from(&mut buf).expect("the twin's datagram");
+    assert_eq!(twin_peer, peer);
+    assert_eq!(recorded(&h, here).map(|(id, ..)| id), Some(twin.id()));
+    assert_eq!(recorded(&h, inside_ns).map(|(id, ..)| id), Some(live.id()));
 
     // ---- UDP: a socket's replies come back, and nothing else comes in
     let _peer_echo = Cgroups::hold_peer_probe(peer_ns, &["serve-udp", PEER4, "18090"]);

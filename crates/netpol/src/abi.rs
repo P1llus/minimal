@@ -21,7 +21,7 @@ use crate::{
     model::{Action, Direction, Protocols, SetId, Verdict},
 };
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Endpoint indexes of a box are below this.
 pub const ENDPOINTS_MAX: u8 = 4;
@@ -204,15 +204,30 @@ impl Stats {
     }
 }
 
-/// The box's end of a redirected flow, as the endpoint sees its peer.
+/// The box's end of a flow to one of its endpoints, as the endpoint sees
+/// its peer, in the network namespace both are in.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FlowKey {
+    /// The cookie of the network namespace: what `SO_NETNS_COOKIE` gives
+    /// for a socket there.
+    pub netns: u64,
     pub saddr: [u8; 16],
     pub sport: u16,
     /// One protocol bit.
     pub proto: u8,
     pub family: u8,
+    pub _pad: [u8; 4],
+}
+
+/// What a box holds of the maps the programs fill.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Usage {
+    /// Sockets with an entry in the flows map.
+    pub flows: u32,
+    /// Listening sockets with an entry in the listens map.
+    pub listens: u32,
 }
 
 #[repr(C)]
@@ -359,10 +374,12 @@ pub enum Reason {
     /// socket that never binds, and no rule is asked. The programs report
     /// no event for it: this is the evaluator's reason.
     EphemeralPort,
+    /// The box has as many flows to its endpoints open as it may have.
+    FlowLimit,
 }
 
 impl Reason {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::NoConfig,
         Self::Rule,
         Self::SetRule,
@@ -374,6 +391,7 @@ impl Reason {
         Self::NoEndpoint,
         Self::NoMemory,
         Self::EphemeralPort,
+        Self::FlowLimit,
     ];
 
     #[must_use]
@@ -390,6 +408,7 @@ impl Reason {
             Self::NoEndpoint => 9,
             Self::NoMemory => 10,
             Self::EphemeralPort => 11,
+            Self::FlowLimit => 12,
         }
     }
 
@@ -411,6 +430,7 @@ impl Reason {
             Self::NoEndpoint => "BP_R_NO_ENDPOINT",
             Self::NoMemory => "BP_R_NO_MEMORY",
             Self::EphemeralPort => "BP_R_EPHEMERAL_PORT",
+            Self::FlowLimit => "BP_R_FLOW_LIMIT",
         }
     }
 }
@@ -502,7 +522,8 @@ layouts! {
     Stats = "bp_stats", 72 {
         tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost, ev_limited
     }
-    FlowKey = "bp_flow_key", 20 { saddr, sport, proto, family }
+    FlowKey = "bp_flow_key", 32 { netns, saddr, sport, proto, family }
+    Usage = "bp_usage", 8 { flows, listens }
     FlowVal = "bp_flow_val", 32 { box_id, orig_addr, orig_port, orig_family, endpoint }
     EvHdr = "bp_ev_hdr", 24 { kind, size, cpu, ts_ns, box_id }
     EvNet = "bp_ev_net", 88 {
@@ -777,16 +798,23 @@ pub const fn pin_val(set: SetId, expiry_ns: u64) -> PinVal {
     }
 }
 
-/// The key under which the egress hook recorded a redirected flow, from
-/// the peer address the endpoint's socket reports.
+/// The key under which the egress hook recorded a flow to an endpoint,
+/// from the endpoint's network namespace and the peer address its socket
+/// reports.
 #[must_use]
-pub fn flow_key(peer: std::net::SocketAddr, protocol: crate::model::Protocol) -> FlowKey {
+pub fn flow_key(
+    netns: u64,
+    peer: std::net::SocketAddr,
+    protocol: crate::model::Protocol,
+) -> FlowKey {
     let (saddr, family) = addr16(crate::eval::canonical(peer.ip()));
     FlowKey {
+        netns,
         saddr,
         sport: peer.port(),
         proto: Protocols::from(protocol).bits(),
         family,
+        _pad: [0; 4],
     }
 }
 
@@ -805,10 +833,10 @@ mod tests {
         assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 52,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
-        assert!(c.contains("BP_ABI_VERSION == 3"));
+        assert!(c.contains("BP_ABI_VERSION == 4"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
-        assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 15);
+        assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 16);
     }
 
     #[test]

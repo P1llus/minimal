@@ -5,7 +5,7 @@ use std::{
     ffi::CString,
     fs, io,
     mem::size_of,
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
@@ -371,6 +371,35 @@ pub(crate) fn pidfd_alive(pidfd: BorrowedFd<'_>) -> bool {
     // once.
     let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
     ready == 0
+}
+
+/// The cookie of the network namespace a socket lives in. Linux 5.14.
+pub fn netns_cookie(sock: BorrowedFd<'_>) -> io::Result<u64> {
+    const SO_NETNS_COOKIE: libc::c_int = 71;
+    let mut cookie: u64 = 0;
+    let mut len = libc::socklen_t::try_from(size_of::<u64>()).unwrap_or(8);
+    // SAFETY: cookie and len describe one writable u64.
+    let ret = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_NETNS_COOKIE,
+            (&raw mut cookie).cast(),
+            &raw mut len,
+        )
+    };
+    cvt(libc::c_long::from(ret))?;
+    Ok(cookie)
+}
+
+/// The cookie of the network namespace this thread is in.
+pub fn current_netns_cookie() -> io::Result<u64> {
+    // SAFETY: socket takes no pointers.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    cvt(libc::c_long::from(fd))?;
+    // SAFETY: socket just returned this descriptor and nothing else owns it.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    netns_cookie(sock.as_fd())
 }
 
 /// The boot-time clock in nanoseconds: what the programs stamp events with

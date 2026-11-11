@@ -73,10 +73,14 @@ pub struct Seen {
 }
 
 fn seen(flows: &Flows, peer: SocketAddr, protocol: Protocol) -> Seen {
+    // These endpoints are in the test's own network namespace.
+    let netns = boxbpf::current_netns_cookie().expect("namespace cookie");
     Seen {
         peer,
         protocol,
-        origin: flows.original_destination(peer, protocol).expect("lookup"),
+        origin: flows
+            .original_destination(netns, peer, protocol)
+            .expect("lookup"),
     }
 }
 

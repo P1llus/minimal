@@ -317,7 +317,7 @@ fn an_engine_nobody_confirms_is_taken_off_again() {
         let (conn, reply, maps) =
             probe::loader_message(&g.socket, &attach, Some(g.boxes.as_fd())).expect("exchange");
         assert!(reply.starts_with("ok abi="), "{reply}");
-        assert_eq!(maps.len(), 9);
+        assert_eq!(maps.len(), 10);
         if let Some(word) = answer {
             nix::sys::socket::send(
                 std::os::fd::AsRawFd::as_raw_fd(&conn),

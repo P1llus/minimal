@@ -421,8 +421,27 @@ fn dns(server: SocketAddr, over_tcp: bool) -> std::io::Result<String> {
     ))
 }
 
-fn hold_udp(to: SocketAddr) {
-    let sock = UdpSocket::bind(unspecified(&to)).and_then(|s| s.connect(to).map(|()| s));
+/// A datagram socket at `at` as an endpoint of the daemon has one: it says
+/// which network namespace it is in, then at each step who wrote to it.
+fn endpoint_udp(at: SocketAddr) {
+    let sock = UdpSocket::bind(at).expect("bind");
+    let netns = boxbpf::netns_cookie(sock.as_fd()).expect("namespace cookie");
+    sock.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    say(&format!("ready netns={netns}"));
+    let mut buf = [0u8; 64];
+    while wait_step() {
+        say(&report(
+            sock.recv_from(&mut buf)
+                .map(|(_, peer)| format!("peer={peer}")),
+        ));
+    }
+}
+
+fn hold_udp(to: SocketAddr, local_port: u16) {
+    let mut local = unspecified(&to);
+    local.set_port(local_port);
+    let sock = UdpSocket::bind(local).and_then(|s| s.connect(to).map(|()| s));
     let Ok(sock) = sock else {
         say("ready err setup");
         return;
@@ -608,7 +627,11 @@ pub fn run() {
         }
         ["bind", kind, ip, port] => report(bind(kind, addr(ip, port))),
         ["dns", ip, rest @ ..] => report(dns(addr(ip, "53"), rest.first() == Some(&"tcp"))),
-        ["hold-udp", ip, port] => return hold_udp(addr(ip, port)),
+        ["hold-udp", ip, port] => return hold_udp(addr(ip, port), 0),
+        ["hold-udp", ip, port, local] => {
+            return hold_udp(addr(ip, port), local.parse().expect("port"));
+        }
+        ["endpoint-udp", ip, port] => return endpoint_udp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
         ["udp-many", ip, first, count] => report(udp_many(

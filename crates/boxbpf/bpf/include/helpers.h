@@ -29,6 +29,7 @@ static __u64 (*bpf_get_socket_cookie)(void *ctx) = (void *)46;
 static __u64 (*bpf_skb_ancestor_cgroup_id)(struct __sk_buff *skb, int ancestor_level) = (void *)83;
 static struct bpf_sock *(*bpf_sk_fullsock)(struct bpf_sock *sk) = (void *)95;
 static void *(*bpf_sk_storage_get)(void *map, void *sk, void *value, __u64 flags) = (void *)107;
+static __u64 (*bpf_get_netns_cookie)(void *ctx) = (void *)122;
 static __u64 (*bpf_get_current_ancestor_cgroup_id)(int ancestor_level) = (void *)123;
 static __u64 (*bpf_ktime_get_boot_ns)(void) = (void *)125;
 static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *)131;

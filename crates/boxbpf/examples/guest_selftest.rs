@@ -244,6 +244,10 @@ mod guest {
             source,
         })?;
         let _timeout = resolver.set_read_timeout(Some(Duration::from_secs(2)));
+        let netns = boxbpf::netns_cookie(resolver.as_fd()).map_err(|source| Error::Sys {
+            what: "read the namespace cookie",
+            source,
+        })?;
 
         let out = in_box("bare", || tcp((Ipv4Addr::LOCALHOST, port).into()));
         report.check(
@@ -332,7 +336,7 @@ mod guest {
             Ok((n, peer)) => {
                 // The entry goes with the box's socket, which closes once
                 // the reply is in: ask first.
-                let origin = handles.original_destination(peer, Protocol::Udp)?;
+                let origin = handles.original_destination(netns, peer, Protocol::Udp)?;
                 let _sent = resolver.send_to(buf.get(..n).unwrap_or_default(), peer);
                 origin
             }
