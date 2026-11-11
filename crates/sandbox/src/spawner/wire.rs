@@ -33,6 +33,33 @@ pub(crate) struct Tap {
     pub(crate) mtu: u16,
 }
 
+/// Where a container's `eth0` comes from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinkKind {
+    /// A new TAP device, whose descriptor the link job returns.
+    Tap,
+    /// The interface of this name, which is already in the namespace.
+    Existing(String),
+}
+
+/// The one interface of a container with a network namespace of its own,
+/// as the link job sets it up.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkSpec {
+    /// Where the interface comes from.
+    pub kind: LinkKind,
+    /// Its hardware address.
+    pub mac: [u8; 6],
+    /// Its address.
+    pub address: std::net::Ipv4Addr,
+    /// The length of the prefix that is on the link.
+    pub prefix: u8,
+    /// The next hop of the default route. It must be on the link.
+    pub gateway: std::net::Ipv4Addr,
+    /// The largest packet the interface carries.
+    pub mtu: u16,
+}
+
 /// A container, as data: what `Sandbox::new_container` decided.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContainerSpec {
@@ -105,7 +132,11 @@ pub(crate) struct Enter {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Request {
     /// Descriptors: stdin, stdout, stderr, then the box cgroup if `cgroup`.
-    Run { id: u64, run: Run, cgroup: bool },
+    Run {
+        id: u64,
+        run: Run,
+        cgroup: bool,
+    },
     /// Descriptors: stdin, stdout, stderr, then the box cgroup if `cgroup`.
     Enter {
         id: u64,
@@ -123,9 +154,26 @@ pub(crate) enum Request {
         cgroup: bool,
     },
     /// Signals the job's own process, or a container's first process.
-    Signal { id: u64, signal: i32, to_init: bool },
+    Link {
+        id: u64,
+        netns_of: u64,
+        link: LinkSpec,
+        cgroup: bool,
+    },
+    /// Whether the first process of container `of` exists.
+    HasInit {
+        id: u64,
+        of: u64,
+    },
+    Signal {
+        id: u64,
+        signal: i32,
+        to_init: bool,
+    },
     /// The requester dropped the job's handle. The job is killed.
-    Forget { id: u64 },
+    Forget {
+        id: u64,
+    },
 }
 
 /// What a spawner tells the process it serves.
@@ -150,6 +198,14 @@ pub(crate) enum Event {
     /// Descriptors: the socket.
     Socket {
         id: u64,
+    },
+    Linked {
+        id: u64,
+        tap: bool,
+    },
+    Init {
+        id: u64,
+        exists: bool,
     },
 }
 

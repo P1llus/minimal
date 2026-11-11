@@ -56,7 +56,8 @@ use crate::error::ExecutionError;
 pub use error::Error;
 #[cfg(target_os = "linux")]
 pub use spawner::{
-    Child, Command, Entrance, ExitStatus, Output, SignalTarget, Spawner, Stdio, Terminal,
+    Child, Command, Entrance, ExitStatus, LinkKind, LinkSpec, Output, SignalTarget, Spawner, Stdio,
+    Terminal,
 };
 
 mod listener;

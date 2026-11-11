@@ -13,9 +13,9 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use super::core;
 use super::wire::{self, Event, Request};
 use super::{ExitStatus, title};
+use super::{core, link};
 
 /// The descriptor a spawner process finds its peer's socket on.
 pub(crate) const SOCKET_FD: libc::c_int = 3;
@@ -287,21 +287,47 @@ impl Server {
                 cgroup,
             } => {
                 let cgroup = if cgroup { fds.into_iter().next() } else { None };
-                let netns_of = match netns_of {
-                    // A job in the table is not reaped, so its pid is its own.
-                    Some(job) => match self.jobs.get(&job).map(|job| &job.process) {
-                        Some(Process::Container(container)) => Ok(Some(container.child.id())),
-                        _ => Err(io::Error::other("the network's process has exited")),
-                    },
-                    None => Ok(None),
-                };
-                let made = netns_of.and_then(|netns_of| {
-                    core::socket(netns_of, v6, datagram, cgroup.as_ref().map(|fd| fd.as_fd()))
-                });
+                let made = netns_of
+                    .map(|job| self.supervisor_of(job))
+                    .transpose()
+                    .and_then(|netns_of| {
+                        core::socket(netns_of, v6, datagram, cgroup.as_ref().map(|fd| fd.as_fd()))
+                    });
                 match made {
                     Ok(socket) => self.send(&Event::Socket { id }, &[socket.as_fd()]),
                     Err(error) => self.fail(id, &error),
                 }
+            }
+            Request::Link {
+                id,
+                netns_of,
+                link,
+                cgroup,
+            } => {
+                let cgroup = if cgroup { fds.into_iter().next() } else { None };
+                let made = self.supervisor_of(netns_of).and_then(|netns_of| {
+                    link::link(netns_of, &link, cgroup.as_ref().map(|fd| fd.as_fd()))
+                });
+                match made {
+                    Ok(tap) => {
+                        let fds: Vec<BorrowedFd<'_>> = tap.iter().map(|fd| fd.as_fd()).collect();
+                        self.send(
+                            &Event::Linked {
+                                id,
+                                tap: tap.is_some(),
+                            },
+                            &fds,
+                        );
+                    }
+                    Err(error) => self.fail(id, &error),
+                }
+            }
+            Request::HasInit { id, of } => {
+                let exists = self
+                    .jobs
+                    .get_mut(&of)
+                    .is_some_and(|job| job.init().is_some());
+                self.send(&Event::Init { id, exists }, &[]);
             }
             Request::Signal {
                 id,
@@ -323,6 +349,16 @@ impl Server {
                     core::signal(job.pidfd(), libc::SIGKILL);
                 }
             }
+        }
+    }
+
+    /// The pid of the supervisor of container `job`, whose namespaces a
+    /// job's child joins. A job in the table is not reaped, so the pid is
+    /// its own.
+    fn supervisor_of(&self, job: u64) -> io::Result<u32> {
+        match self.jobs.get(&job).map(|job| &job.process) {
+            Some(Process::Container(container)) => Ok(container.child.id()),
+            _ => Err(io::Error::other("the container has ended")),
         }
     }
 

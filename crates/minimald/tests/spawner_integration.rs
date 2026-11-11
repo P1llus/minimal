@@ -686,6 +686,373 @@ async fn an_entered_program_is_in_every_namespace_of_the_box() {
     assert!(boxed.child.exited().await.success());
 }
 
+/// What the kernel says about interface `name` of the network namespace
+/// `socket` is in.
+struct Interface {
+    mac: [u8; 6],
+    address: std::net::Ipv4Addr,
+    netmask: std::net::Ipv4Addr,
+    mtu: i32,
+    up: bool,
+}
+
+impl Interface {
+    fn read(socket: &OwnedFd, name: &str) -> Self {
+        let ask = |request: libc::c_ulong| {
+            // SAFETY: an `ifreq` is plain data, and all zeroes is a valid one.
+            let mut ifreq: libc::ifreq = unsafe { std::mem::zeroed() };
+            for (to, from) in ifreq.ifr_name.iter_mut().zip(name.bytes()) {
+                *to = from as libc::c_char;
+            }
+            // SAFETY: each request here fills the one `ifreq` it is given.
+            let got = unsafe { libc::ioctl(socket.as_raw_fd(), request as _, &raw mut ifreq) };
+            assert_eq!(got, 0, "{name}: {}", std::io::Error::last_os_error());
+            ifreq.ifr_ifru
+        };
+        let v4 = |sockaddr: libc::sockaddr| {
+            let octets: Vec<u8> = sockaddr.sa_data[2..6].iter().map(|b| *b as u8).collect();
+            std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])
+        };
+        // SAFETY: each field read is the one its request fills.
+        unsafe {
+            let hardware = ask(libc::SIOCGIFHWADDR).ifru_hwaddr.sa_data;
+            Self {
+                mac: std::array::from_fn(|i| hardware[i] as u8),
+                address: v4(ask(libc::SIOCGIFADDR).ifru_addr),
+                netmask: v4(ask(libc::SIOCGIFNETMASK).ifru_netmask),
+                mtu: ask(libc::SIOCGIFMTU).ifru_mtu,
+                up: i32::from(ask(libc::SIOCGIFFLAGS).ifru_flags) & libc::IFF_UP != 0,
+            }
+        }
+    }
+}
+
+/// The default route of the network namespace of `pid`: its interface and
+/// its next hop.
+fn default_route(pid: u32) -> Option<(String, std::net::Ipv4Addr)> {
+    let routes = std::fs::read_to_string(format!("/proc/{pid}/net/route")).expect("the routes");
+    routes.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let gateway = u32::from_str_radix(fields[2], 16).ok()?;
+        (fields[1] == "00000000").then(|| {
+            // The file prints an address as the host reads its bytes.
+            (
+                fields[0].to_string(),
+                std::net::Ipv4Addr::from(gateway.to_ne_bytes()),
+            )
+        })
+    })
+}
+
+/// The inode of the network namespace `socket` is in.
+fn netns_of_socket(socket: &OwnedFd) -> u64 {
+    // SAFETY: `SIOCGSKNS` takes no argument and returns a descriptor of the
+    // socket's network namespace.
+    let netns = unsafe { libc::ioctl(socket.as_raw_fd(), 0x894C) };
+    assert!(netns >= 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: a fresh descriptor that nothing else owns.
+    let netns = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(netns) });
+    netns.metadata().unwrap().ino()
+}
+
+/// Reads frames from `tap` until one is an ARP request for `target`, and
+/// returns the hardware address that asks. Panics after five seconds.
+fn arp_request_for(tap: &OwnedFd, target: std::net::Ipv4Addr) -> [u8; 6] {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut frame = [0u8; 2048];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "no ARP request for {target} left the box");
+        let mut poll = libc::pollfd {
+            fd: tap.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes the one `pollfd` it is given.
+        if unsafe { libc::poll(&raw mut poll, 1, left.as_millis() as libc::c_int) } <= 0 {
+            continue;
+        }
+        // SAFETY: `read` fills at most the buffer's length.
+        let got = unsafe { libc::read(tap.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len()) };
+        assert!(got >= 0, "{}", std::io::Error::last_os_error());
+        let frame = &frame[..got as usize];
+        // Ethernet header, then ARP: the operation at 20, the sender's
+        // hardware address at 22 and the target's address at 38.
+        let arp_request =
+            frame.len() >= 42 && frame[12..14] == [0x08, 0x06] && frame[20..22] == [0, 1];
+        if arp_request && frame[38..42] == target.octets() {
+            return frame[22..28].try_into().unwrap();
+        }
+    }
+}
+
+/// Runs `ip` with `args` in the user and network namespaces of `pid`, with
+/// the right to configure the network there.
+fn ip_in_box(pid: u32, args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::os::unix::process::CommandExt as _;
+
+    const CAP_NET_ADMIN: u32 = 12;
+    let user = std::fs::File::open(format!("/proc/{pid}/ns/user"))?;
+    let net = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
+    let mut ip = std::process::Command::new("ip");
+    ip.args(args);
+    // SAFETY: the closure makes direct syscalls only.
+    unsafe {
+        ip.pre_exec(move || {
+            let check = |result: libc::c_long| match result {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            };
+            check(libc::setns(user.as_raw_fd(), libc::CLONE_NEWUSER).into())?;
+            check(libc::setns(net.as_raw_fd(), libc::CLONE_NEWNET).into())?;
+            // An exec as a user that is not root keeps a capability only
+            // when it is ambient, and it can be ambient only when it is
+            // inheritable.
+            let header = [0x2008_0522u32, 0];
+            let mut sets = [0u32; 6];
+            check(libc::syscall(
+                libc::SYS_capget,
+                &raw const header,
+                &raw mut sets,
+            ))?;
+            sets[2] |= 1 << CAP_NET_ADMIN;
+            check(libc::syscall(
+                libc::SYS_capset,
+                &raw const header,
+                &raw const sets,
+            ))?;
+            check(
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_RAISE,
+                    CAP_NET_ADMIN,
+                    0,
+                    0,
+                )
+                .into(),
+            )
+        });
+    }
+    ip.output()
+}
+
+/// The link job gives a box's network namespace its `eth0`: a TAP with the
+/// hardware address, address, MTU and default route that were asked for,
+/// and `lo` up. What the box sends arrives on the descriptor the job
+/// returns. The process that does the work starts in the box's cgroup and
+/// is reaped. The process that makes a socket for the daemon in the box's
+/// namespace does not start in the box's cgroup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_link_job_sets_up_the_interface_of_a_box() {
+    let Some(fixture) = Fixture::new("the_link_job_sets_up_the_interface_of_a_box", true) else {
+        return;
+    };
+    let root = fixture.root();
+    let cgroup = root.create_box(BOX_ID).expect("the box's cgroup");
+    let boxed = fixture
+        .launch(
+            "linked",
+            Some(&cgroup),
+            Some(NetPlan::isolated()),
+            &[],
+            &["HOLD:/run/release"],
+        )
+        .await;
+    let supervisor = boxed.child.id();
+    let spawner = parent_of(supervisor);
+    eventually("the box has its program", || {
+        boxed.child.has_init().unwrap().then_some(())
+    });
+    let spec = sandbox::LinkSpec {
+        kind: sandbox::LinkKind::Tap,
+        mac: [0x02, 0x00, 0x64, 0x40, 0x01, 0x07],
+        address: "100.64.1.7".parse().unwrap(),
+        prefix: 16,
+        gateway: "100.64.0.1".parse().unwrap(),
+        mtu: 1400,
+    };
+
+    // With no room for one more process in the box's cgroup, nothing that
+    // starts there can be created.
+    if root.controllers().pids {
+        let limit = cgroup.path().join("pids.max");
+        std::fs::write(&limit, "2").expect("limiting the box's processes");
+        let refused = boxed.child.link(spec.clone()).expect_err("no room");
+        assert!(refused.to_string().contains("os error 11"), "{refused}");
+        boxed
+            .child
+            .entrance()
+            .socket(false, true)
+            .expect_err("a socket of the box is made in the box's cgroup");
+        boxed
+            .child
+            .socket_for_daemon(false, true)
+            .expect("a socket of the daemon is not made in the box's cgroup");
+        std::fs::write(&limit, "max").expect("lifting the limit");
+    } else {
+        eprintln!("not checked: which cgroup a job's process starts in (no pids controller)");
+    }
+
+    let tap = boxed
+        .child
+        .link(spec.clone())
+        .expect("the link job")
+        .expect("a TAP comes with its descriptor");
+    let ours = boxed
+        .child
+        .socket_for_daemon(false, true)
+        .expect("a socket for the daemon in the box's network namespace");
+    assert_eq!(
+        netns_of_socket(&ours),
+        std::fs::metadata(format!("/proc/{supervisor}/ns/net"))
+            .unwrap()
+            .ino()
+    );
+    let eth0 = Interface::read(&ours, "eth0");
+    assert_eq!(eth0.mac, spec.mac);
+    assert_eq!(eth0.address, spec.address);
+    assert_eq!(eth0.netmask, std::net::Ipv4Addr::new(255, 255, 0, 0));
+    assert_eq!(eth0.mtu, 1400);
+    assert!(eth0.up);
+    assert!(Interface::read(&ours, "lo").up);
+    assert_eq!(
+        default_route(supervisor),
+        Some(("eth0".to_string(), spec.gateway))
+    );
+
+    // A datagram of the box to an address past the gateway makes the
+    // kernel ask who the gateway is, on the device the job returned.
+    let theirs = boxed
+        .child
+        .entrance()
+        .socket(false, true)
+        .expect("a socket of the box");
+    let theirs = std::net::UdpSocket::from(theirs);
+    theirs
+        .send_to(b"out", "203.0.113.9:9")
+        .expect("the box has a route out");
+    assert_eq!(arp_request_for(&tap, spec.gateway), spec.mac);
+
+    // Every process the jobs created is gone and reaped.
+    let children = std::fs::read_to_string(format!("/proc/{spawner}/task/{spawner}/children"))
+        .expect("the spawner's children");
+    assert_eq!(children.trim(), supervisor.to_string());
+    assert_eq!(procs_in(cgroup.path()).len(), 2);
+    assert_eq!(
+        procs_in(&root.dir().join("supervisor")),
+        BTreeSet::from([std::process::id(), spawner])
+    );
+
+    // A container in its starter's network namespace has no interface of
+    // its own to set up.
+    let sibling = root.create_box(SIBLING_ID).expect("the sibling's cgroup");
+    let shared = fixture
+        .launch("shared", Some(&sibling), None, &[], &["HOLD:/run/release"])
+        .await;
+    let refused = shared
+        .child
+        .link(spec)
+        .expect_err("no namespace of its own");
+    assert!(
+        refused.to_string().contains("no network namespace"),
+        "{refused}"
+    );
+
+    for held in [&boxed, &shared] {
+        held.release("release");
+        assert!(held.child.exited().await.success());
+    }
+    assert!(!boxed.child.has_init().unwrap());
+    for cgroup in [cgroup, sibling] {
+        cgroup
+            .destroy(DESTROY_LIMIT)
+            .await
+            .expect("destroying a box's cgroup");
+    }
+}
+
+/// The link job configures an interface that is already in the box's
+/// network namespace, under the name it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_link_job_configures_an_interface_that_is_already_there() {
+    let test = "the_link_job_configures_an_interface_that_is_already_there";
+    let Some(fixture) = Fixture::new(test, false) else {
+        return;
+    };
+    let boxed = fixture
+        .launch(
+            "wired",
+            None,
+            Some(NetPlan::isolated()),
+            &[],
+            &["HOLD:/run/release"],
+        )
+        .await;
+    let supervisor = boxed.child.id();
+    // A guest's daemon moves one end of a veth pair in from outside, which
+    // takes root. Here the pair is made inside, which the owner of the
+    // box's user namespace may do.
+    let made = ip_in_box(
+        supervisor,
+        &[
+            "link", "add", "veth7", "type", "veth", "peer", "name", "veth8",
+        ],
+    );
+    match made {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => panic!(
+            "making a veth pair in the box: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => {
+            eprintln!("skipping {test}: ip does not run: {error}");
+            return;
+        }
+    }
+    let spec = sandbox::LinkSpec {
+        kind: sandbox::LinkKind::Existing("veth7".into()),
+        mac: [0x02, 0x00, 0x0a, 0x58, 0x00, 0x09],
+        address: "10.88.0.9".parse().unwrap(),
+        prefix: 24,
+        gateway: "10.88.0.1".parse().unwrap(),
+        mtu: 1500,
+    };
+    let tap = boxed.child.link(spec.clone()).expect("the link job");
+    assert!(
+        tap.is_none(),
+        "an interface that exists comes with no device"
+    );
+    let ours = boxed
+        .child
+        .socket_for_daemon(false, true)
+        .expect("a socket in the box's network namespace");
+    let veth7 = Interface::read(&ours, "veth7");
+    assert_eq!(veth7.mac, spec.mac);
+    assert_eq!(veth7.address, spec.address);
+    assert_eq!(veth7.netmask, std::net::Ipv4Addr::new(255, 255, 255, 0));
+    assert!(veth7.up);
+    assert_eq!(
+        default_route(supervisor),
+        Some(("veth7".to_string(), spec.gateway))
+    );
+
+    // The error names the step the kernel refused.
+    let missing = sandbox::LinkSpec {
+        kind: sandbox::LinkKind::Existing("veth9".into()),
+        ..spec
+    };
+    let refused = boxed.child.link(missing).expect_err("no such interface");
+    assert!(
+        refused
+            .to_string()
+            .contains("setting the hardware address of veth9"),
+        "{refused}"
+    );
+
+    boxed.release("release");
+    assert!(boxed.child.exited().await.success());
+}
+
 /// Nothing outlives what asked for it. Killing an entered program's shim
 /// ends the program, and so does dropping its handle. When the spawner
 /// dies, every box dies with it and its handle says why. The daemon reaps

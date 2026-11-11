@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use super::ExitStatus;
-use super::wire::{self, Event, Request};
+use super::wire::{self, Event, LinkSpec, Request};
 
 /// Runs a wait that holds the calling thread. A worker of a multi-threaded
 /// tokio runtime tells the runtime first, which moves the worker's other
@@ -85,7 +85,13 @@ enum Answer {
         tap: Option<OwnedFd>,
     },
     Socket(OwnedFd),
+    Linked(Option<OwnedFd>),
+    Init(bool),
     Failed(String),
+}
+
+fn out_of_turn() -> io::Error {
+    io::Error::other("the spawner answered out of turn")
 }
 
 /// A job that has not been seen to end.
@@ -153,6 +159,12 @@ impl Shared {
                 Some(socket) => (id, Answer::Socket(socket)),
                 None => (id, Answer::Failed("the spawner sent no socket".into())),
             },
+            Event::Linked { id, tap } => match (tap, fds.next()) {
+                (true, None) => (id, Answer::Failed("the spawner sent no device".into())),
+                (true, tap) => (id, Answer::Linked(tap)),
+                (false, _) => (id, Answer::Linked(None)),
+            },
+            Event::Init { id, exists } => (id, Answer::Init(exists)),
             Event::Failed { id, error } => (id, Answer::Failed(error)),
             Event::Exited { id, status } => {
                 if let Some(job) = table.jobs.remove(&id) {
@@ -324,7 +336,7 @@ impl Connection {
                 outcome,
             }),
             (_, Answer::Failed(error)) => Err(io::Error::other(error)),
-            (_, Answer::Socket(_)) => Err(io::Error::other("the spawner answered out of turn")),
+            _ => Err(out_of_turn()),
         }
     }
 
@@ -356,9 +368,38 @@ impl Connection {
         match self.ask(make, cgroup.as_slice(), None)? {
             (_, Answer::Socket(socket)) => Ok(socket),
             (_, Answer::Failed(error)) => Err(io::Error::other(error)),
-            (_, Answer::Started { .. }) => {
-                Err(io::Error::other("the spawner answered out of turn"))
-            }
+            _ => Err(out_of_turn()),
+        }
+    }
+
+    /// Has the spawner set up the interface of container `netns_of`, with a
+    /// child that starts in `cgroup`. Returns the device when the spawner
+    /// created one.
+    pub(crate) fn link(
+        &self,
+        netns_of: u64,
+        link: LinkSpec,
+        cgroup: Option<BorrowedFd<'_>>,
+    ) -> io::Result<Option<OwnedFd>> {
+        let make = |id| Request::Link {
+            id,
+            netns_of,
+            link,
+            cgroup: cgroup.is_some(),
+        };
+        match self.ask(make, cgroup.as_slice(), None)? {
+            (_, Answer::Linked(tap)) => Ok(tap),
+            (_, Answer::Failed(error)) => Err(io::Error::other(error)),
+            _ => Err(out_of_turn()),
+        }
+    }
+
+    /// Whether the first process of container `of` exists.
+    pub(crate) fn has_init(&self, of: u64) -> io::Result<bool> {
+        match self.ask(|id| Request::HasInit { id, of }, &[], None)? {
+            (_, Answer::Init(exists)) => Ok(exists),
+            (_, Answer::Failed(error)) => Err(io::Error::other(error)),
+            _ => Err(out_of_turn()),
         }
     }
 

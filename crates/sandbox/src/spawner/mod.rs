@@ -1,7 +1,8 @@
 //! The one way a process of a box is started.
 //!
-//! A spawner does three jobs: it runs a program in a new container, it runs
-//! a program in a running container, and it creates a socket for a box.
+//! A spawner runs a program in a new container, runs a program in a running
+//! container, creates a socket for a box, and sets up the network interface
+//! of a container.
 //! Whatever it creates starts in the box's cgroup, and the spawner is its
 //! parent and reaps it.
 //!
@@ -14,6 +15,7 @@
 mod client;
 mod core;
 pub mod enter;
+mod link;
 mod server;
 mod title;
 mod wire;
@@ -31,7 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cgroup::{BoxCgroup, Root};
 use client::Connection;
+pub use link::INTERFACE;
 pub(crate) use wire::{ContainerSpec, Mount, Session, Tap};
+pub use wire::{LinkKind, LinkSpec};
 
 /// The first argument of this binary when it runs as a spawner process.
 const SPAWNER_MODE: &str = "__spawner";
@@ -757,6 +761,51 @@ impl Child {
     /// The tap the container was started with. Yields it once.
     pub fn take_tap_fd(&mut self) -> Option<OwnedFd> {
         self.tap.take()
+    }
+
+    /// Creates a socket in this container's network namespace that belongs
+    /// to the caller: the process that makes it is in the spawner's cgroup,
+    /// so no rule of the box applies to the socket. For what the caller
+    /// serves to the box inside the box's namespace.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the container has ended or the socket cannot be created.
+    pub fn socket_for_daemon(&self, v6: bool, datagram: bool) -> io::Result<OwnedFd> {
+        self.connection.socket(Some(self.job), v6, datagram, None)
+    }
+
+    /// Sets up the one interface of this container's network namespace, and
+    /// brings `lo` up. Returns the device's descriptor for
+    /// [`LinkKind::Tap`].
+    ///
+    /// The container's program should wait at its start gate until this
+    /// returns, or it runs for a moment with no network.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the container has ended or has no network namespace of its
+    /// own, or if the kernel refuses a step, which the error names.
+    pub fn link(&self, spec: LinkSpec) -> io::Result<Option<OwnedFd>> {
+        if self.netns.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the container has no network namespace of its own",
+            ));
+        }
+        self.connection
+            .link(self.job, spec, self.cgroup.as_ref().map(BoxCgroup::dir_fd))
+    }
+
+    /// Whether the container's first process exists: the program the
+    /// container was started for. It does not exist before the supervisor
+    /// has forked it, and not after it has exited.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the spawner is gone.
+    pub fn has_init(&self) -> io::Result<bool> {
+        self.connection.has_init(self.job)
     }
 
     /// How the job ended, if it has.

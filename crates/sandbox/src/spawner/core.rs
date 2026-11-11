@@ -1,4 +1,4 @@
-//! The three jobs, done by the calling process.
+//! The jobs of a spawner, done by the calling process.
 //!
 //! A spawner process calls these for the daemon. A process with no spawner
 //! of its own calls them directly. Either way the caller is the parent of
@@ -423,7 +423,9 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// The child is a copy made by the raw syscall, so the C library's own
 /// record of the thread is stale in it. It may only make direct syscalls
 /// until it execs or exits.
-unsafe fn clone_into(cgroup: Option<BorrowedFd<'_>>) -> io::Result<(libc::pid_t, Option<OwnedFd>)> {
+pub(super) unsafe fn clone_into(
+    cgroup: Option<BorrowedFd<'_>>,
+) -> io::Result<(libc::pid_t, Option<OwnedFd>)> {
     let mut pidfd: libc::c_int = -1;
     let mut args = CloneArgs {
         flags: CLONE_PIDFD,
@@ -586,9 +588,12 @@ unsafe fn report_and_exit(to: libc::c_int) -> ! {
     }
 }
 
-/// The child's report: one step byte (0 done, 1 joining the namespaces, 2
-/// creating the socket) and an errno.
+/// The report of a job's child: the step it failed at, 0 for none, and the
+/// errno of the failure.
 const REPORT_LEN: usize = 5;
+
+/// The step a socket's child fails at when it cannot join the namespaces.
+const SOCKET_JOIN: u8 = 1;
 
 /// Creates a socket in `cgroup`, and in the user and network namespaces of
 /// the process `netns_of` when one is given, and returns it. A child of this
@@ -599,16 +604,8 @@ pub(crate) fn socket(
     datagram: bool,
     cgroup: Option<BorrowedFd<'_>>,
 ) -> io::Result<OwnedFd> {
-    let namespaces = match netns_of {
-        Some(pid) => {
-            let open = |kind: &str| std::fs::File::open(format!("/proc/{pid}/ns/{kind}"));
-            Some((open("user")?, open("net")?))
-        }
-        None => None,
-    };
-    let join = namespaces
-        .as_ref()
-        .map(|(user, net)| (user.as_raw_fd(), net.as_raw_fd()));
+    let namespaces = netns_of.map(Namespaces::of).transpose()?;
+    let join = namespaces.as_ref().map(Namespaces::raw);
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
     let domain = if v6 { libc::AF_INET6 } else { libc::AF_INET };
     let kind = if datagram {
@@ -624,9 +621,66 @@ pub(crate) fn socket(
         unsafe { socket_child(join, theirs.as_raw_fd(), domain, kind) }
     }
     drop(theirs);
-    let received = receive_socket(&ours);
+    let received = receive_report(&ours);
     let _ = reap(pid as u32, true);
-    received
+    match received? {
+        Some((0, _, Some(socket))) => Ok(socket),
+        Some((SOCKET_JOIN, error, _)) => Err(io::Error::new(
+            error.kind(),
+            format!("joining the box's network namespace: {error}"),
+        )),
+        Some((step, error, _)) if step != 0 => Err(error),
+        _ => Err(io::Error::other(
+            "the process that creates a box's socket exited without its result",
+        )),
+    }
+}
+
+/// The user and network namespaces of a container's supervisor, which a
+/// job's child joins.
+pub(super) struct Namespaces {
+    user: std::fs::File,
+    net: std::fs::File,
+}
+
+impl Namespaces {
+    /// Those of `pid`, which the caller knows to be the supervisor: it is
+    /// the caller's child and not reaped.
+    pub(super) fn of(pid: u32) -> io::Result<Self> {
+        let open = |kind: &str| std::fs::File::open(format!("/proc/{pid}/ns/{kind}"));
+        Ok(Self {
+            user: open("user")?,
+            net: open("net")?,
+        })
+    }
+
+    pub(super) fn raw(&self) -> (libc::c_int, libc::c_int) {
+        (self.user.as_raw_fd(), self.net.as_raw_fd())
+    }
+}
+
+/// Joins a user namespace and then a network namespace. The user namespace
+/// comes first: the caller holds the capability to join the network
+/// namespace only inside it.
+///
+/// # Safety
+///
+/// Direct syscalls only, so a `clone3` child may call it.
+pub(super) unsafe fn join((user, net): (libc::c_int, libc::c_int)) -> bool {
+    // SAFETY: `setns` reads two integers.
+    unsafe {
+        libc::setns(user, libc::CLONE_NEWUSER) == 0 && libc::setns(net, libc::CLONE_NEWNET) == 0
+    }
+}
+
+/// The errno of the calling thread.
+///
+/// # Safety
+///
+/// Reads thread-local memory, which a `clone3` child has a copy of.
+pub(super) unsafe fn errno() -> libc::c_int {
+    // SAFETY: the C library's errno of this thread is always readable.
+    unsafe { *libc::__errno_location() }
 }
 
 /// The child of [`socket`]: joins, creates, reports, exits.
@@ -635,32 +689,41 @@ pub(crate) fn socket(
 ///
 /// Only for the child of a `clone3`. It never returns.
 unsafe fn socket_child(
-    join: Option<(libc::c_int, libc::c_int)>,
+    namespaces: Option<(libc::c_int, libc::c_int)>,
     out: libc::c_int,
     domain: libc::c_int,
     kind: libc::c_int,
 ) -> ! {
     // SAFETY: direct syscalls on the parent's descriptors and stack memory.
     unsafe {
-        let mut report = [0u8; REPORT_LEN];
-        let mut fd = -1;
-        let joined = match join {
-            Some((user, net)) => {
-                libc::setns(user, libc::CLONE_NEWUSER) == 0
-                    && libc::setns(net, libc::CLONE_NEWNET) == 0
-            }
-            None => true,
-        };
-        if joined {
-            fd = libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0);
-            if fd < 0 {
-                report[0] = 2;
-                report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
-            }
-        } else {
-            report[0] = 1;
-            report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
+        if namespaces.is_some_and(|namespaces| !join(namespaces)) {
+            send_report(out, SOCKET_JOIN, errno(), -1);
         }
+        let fd = libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            send_report(out, 2, errno(), -1);
+        }
+        send_report(out, 0, 0, fd)
+    }
+}
+
+/// Sends the report of a job's child, with the descriptor it made when it
+/// made one, and ends the child.
+///
+/// # Safety
+///
+/// Only for the child of a `clone3`. It never returns.
+pub(super) unsafe fn send_report(
+    out: libc::c_int,
+    step: u8,
+    errno: libc::c_int,
+    fd: libc::c_int,
+) -> ! {
+    // SAFETY: direct syscalls on the parent's descriptors and stack memory.
+    unsafe {
+        let mut report = [0u8; REPORT_LEN];
+        report[0] = step;
+        report[1..].copy_from_slice(&errno.to_le_bytes());
         let mut iov = libc::iovec {
             iov_base: report.as_mut_ptr().cast(),
             iov_len: report.len(),
@@ -686,8 +749,11 @@ unsafe fn socket_child(
     }
 }
 
-/// Reads the child's report and the socket it sent with it.
-fn receive_socket(sock: &std::os::unix::net::UnixStream) -> io::Result<OwnedFd> {
+/// Reads the report of a job's child: the step it failed at, the error of
+/// that step, and the descriptor it sent. `None` when it sent no report.
+pub(super) fn receive_report(
+    sock: &std::os::unix::net::UnixStream,
+) -> io::Result<Option<(u8, io::Error, Option<OwnedFd>)>> {
     let mut report = [0u8; REPORT_LEN];
     let mut iov = libc::iovec {
         iov_base: report.as_mut_ptr().cast(),
@@ -711,7 +777,7 @@ fn receive_socket(sock: &std::os::unix::net::UnixStream) -> io::Result<OwnedFd> 
     if got < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut socket = None;
+    let mut sent = None;
     // SAFETY: the kernel filled the control buffer, and it is read inside
     // the length the kernel set.
     unsafe {
@@ -719,27 +785,14 @@ fn receive_socket(sock: &std::os::unix::net::UnixStream) -> io::Result<OwnedFd> 
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                 let fd = libc::CMSG_DATA(cmsg).cast::<libc::c_int>().read_unaligned();
-                socket = Some(OwnedFd::from_raw_fd(fd));
+                sent = Some(OwnedFd::from_raw_fd(fd));
             }
             cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
         }
     }
     if got as usize != REPORT_LEN {
-        return Err(io::Error::other(
-            "the process that creates a box's socket exited without a report",
-        ));
+        return Ok(None);
     }
     let errno = i32::from_le_bytes([report[1], report[2], report[3], report[4]]);
-    let error = io::Error::from_raw_os_error(errno);
-    match (report[0], socket) {
-        (0, Some(fd)) => Ok(fd),
-        (1, _) => Err(io::Error::new(
-            error.kind(),
-            format!("joining the box's network namespace: {error}"),
-        )),
-        (2, _) => Err(error),
-        _ => Err(io::Error::other(
-            "the process that creates a box's socket sent no socket",
-        )),
-    }
+    Ok(Some((report[0], io::Error::from_raw_os_error(errno), sent)))
 }
