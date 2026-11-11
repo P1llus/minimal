@@ -78,16 +78,16 @@ fn ports() -> impl Strategy<Value = PortRange> {
         PortRange::ALL,
         PortRange::one(53),
         PortRange::one(443),
-        PortRange::new(400, 500).unwrap(),
-        PortRange::new(0, 1023).unwrap(),
+        PortRange::new(400, 500).expect("ordered"),
+        PortRange::new(0, 1023).expect("ordered"),
     ])
 }
 
 fn target() -> impl Strategy<Value = Target> {
     prop_oneof![
         1 => Just(Target::Any),
-        5 => prop::sample::select(PREFIXES.to_vec()).prop_map(|p| Target::Net(p.parse().unwrap())),
-        3 => prop::sample::select(PATTERNS.to_vec()).prop_map(|p| Target::Names(p.parse().unwrap())),
+        5 => prop::sample::select(PREFIXES.to_vec()).prop_map(|p| Target::Net(p.parse().expect("prefix"))),
+        3 => prop::sample::select(PATTERNS.to_vec()).prop_map(|p| Target::Names(p.parse().expect("pattern"))),
     ]
 }
 
@@ -130,7 +130,7 @@ fn flow() -> impl Strategy<Value = (Flow, Option<&'static str>)> {
                 Flow {
                     direction,
                     protocol,
-                    remote: remote.parse().unwrap(),
+                    remote: remote.parse().expect("address"),
                     port,
                     local: None,
                 },

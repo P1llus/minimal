@@ -137,6 +137,11 @@ impl PinTable {
         dead
     }
 
+    /// Every address with a pin, live or not.
+    pub fn addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.pins.keys().copied()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.pins.len()

@@ -469,6 +469,42 @@ layouts! {
     }
 }
 
+impl Rule4Key {
+    /// The key without its prefix length: what the LPM compares.
+    #[must_use]
+    pub fn data(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        let bytes = self
+            .box_id
+            .into_iter()
+            .chain([self.dir])
+            .chain(self._zero)
+            .chain(self.addr);
+        for (dst, src) in out.iter_mut().zip(bytes) {
+            *dst = src;
+        }
+        out
+    }
+}
+
+impl Rule6Key {
+    /// The key without its prefix length: what the LPM compares.
+    #[must_use]
+    pub fn data(&self) -> [u8; 28] {
+        let mut out = [0u8; 28];
+        let bytes = self
+            .box_id
+            .into_iter()
+            .chain([self.dir])
+            .chain(self._zero)
+            .chain(self.addr);
+        for (dst, src) in out.iter_mut().zip(bytes) {
+            *dst = src;
+        }
+        out
+    }
+}
+
 /// An address in a 16-byte field and its family code.
 #[must_use]
 pub fn addr16(addr: IpAddr) -> ([u8; 16], u8) {
@@ -736,6 +772,8 @@ mod tests {
         assert_eq!(k4.prefixlen, RULE_KEY_BASE + 8);
         assert_eq!(k4.box_id, 0x0102_0304_0506_0708u64.to_ne_bytes());
         assert_eq!((k4.dir, k4.addr), (0, [10, 0, 0, 0]));
+        assert_eq!(&k4.data()[8..], &[0, 0, 0, 0, 10, 0, 0, 0]);
+        assert_eq!(e.rules6.first().unwrap().0.data()[12], 0xfd);
         assert_eq!(
             (v4.r[0].proto_mask, v4.r[0].action, v4.r[0].port_hi),
             (7, ACTION_ALLOW, u16::MAX)
