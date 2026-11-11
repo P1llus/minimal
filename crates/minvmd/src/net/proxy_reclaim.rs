@@ -383,226 +383,6 @@ mod tests {
         assert!(quiet.is_empty(), "{quiet}");
     }
 
-    /// A stand-in switch: answers every forwarder request with HTTP 200 and
-    /// hands each request's text to the test.
-    fn fake_switch(sock: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
-        fake_switch_answering(sock, 200, "")
-    }
-
-    /// A stand-in switch that answers every forwarder request with `status`
-    /// and `body`, and hands each request's text to the test.
-    fn fake_switch_answering(
-        sock: &std::path::Path,
-        status: u16,
-        body: &'static str,
-    ) -> std::sync::mpsc::Receiver<String> {
-        use std::io::{Read as _, Write as _};
-        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the fake switch");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut request = Vec::new();
-                let mut chunk = [0u8; 1024];
-                // The request is one write: head and body. Read until the
-                // body the head announces is in.
-                loop {
-                    let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(chunk.get(..n).unwrap_or_default());
-                    let text = String::from_utf8_lossy(&request);
-                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                        let length = head
-                            .lines()
-                            .find_map(|line| line.strip_prefix("Content-Length: "))
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if body.len() >= length {
-                            break;
-                        }
-                    }
-                }
-                let answer = format!(
-                    "HTTP/1.1 {status} Answer\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(answer.as_bytes());
-                let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
-            }
-        });
-        rx
-    }
-
-    // NET-150: while another process holds the preferred port the watcher
-    // publishes nothing. Once the port is free it takes the reservation,
-    // asks the switch to publish the preferred port to the guest proxy's
-    // port, and the control socket's served ports list both, preferred first.
-    #[test]
-    fn proxy_reclaims_preferred_port_when_free() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ports_dir = dir.path().join("ports");
-        std::fs::create_dir(&ports_dir).expect("ports dir");
-        let switch_sock = dir.path().join("switch.sock");
-        let requests = fake_switch(&switch_sock);
-
-        // The other process on the preferred port.
-        let holder =
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind holder");
-        let preferred = holder.local_addr().expect("holder addr").port();
-        let substitute = 65264;
-        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
-
-        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-        let _entered = runtime.enter();
-        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let ledger = crate::net::egress_gate::TestMirrorLedger::attach(
-            &registry.table(),
-            switch_sock.clone(),
-        );
-
-        let status = crate::control::ProxyPublishStatus::new();
-        status.set_serving(substitute);
-        let recorded = status.clone();
-        let watcher = spawn_reclaim_watcher(
-            preferred,
-            substitute,
-            Duration::from_millis(50),
-            crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
-            crate::cmd::run::proxy_reclaim_publisher(switch_sock.clone(), node, registry.table()),
-            move |port| recorded.add_preferred(port),
-        );
-
-        // Held: several probes pass and the switch hears nothing.
-        assert!(
-            requests.recv_timeout(Duration::from_millis(400)).is_err(),
-            "the watcher published a port another process holds"
-        );
-        assert!(!watcher.reclaimed());
-        assert_eq!(status.serving_ports(), vec![substitute]);
-
-        // Free the port: the next probe takes it back.
-        drop(holder);
-        let expose = requests
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the watcher asks the switch to publish the preferred port");
-        assert!(
-            expose.starts_with("POST /services/forwarder/expose HTTP/1.1\r\n"),
-            "{expose}"
-        );
-        assert!(
-            expose.ends_with(&format!(
-                r#"{{"local":"127.0.0.1:{preferred}","remote":"{node}:{substitute}","protocol":"tcp"}}"#
-            )),
-            "{expose}"
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !watcher.reclaimed() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(watcher.reclaimed());
-        assert_eq!(status.serving_ports(), vec![preferred, substitute]);
-        // The forward is noted in the egress gate's ledger, so the gate
-        // tracks its connections and admits the replies on them.
-        assert_eq!(
-            ledger.dials(std::net::Ipv4Addr::LOCALHOST, preferred),
-            Some(node)
-        );
-        // The watcher holds the preferred port's reservation: a second
-        // supervisor's check skips it.
-        assert!(crate::cmd::run::proxy_reclaim_check(ports_dir.clone())(preferred).is_none());
-        // One expose, never a second.
-        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
-        drop(watcher);
-    }
-
-    // NET-150: a `proxy already running` answer to an expose the ledger did
-    // not already hold means another forward holds the listener. The watcher
-    // does not count that port as the proxy's, and the ledger keeps no note.
-    #[test]
-    fn proxy_reclaims_preferred_port_when_free_not_on_a_listener_held_elsewhere() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ports_dir = dir.path().join("ports");
-        std::fs::create_dir(&ports_dir).expect("ports dir");
-        let switch_sock = dir.path().join("switch.sock");
-        let requests = fake_switch_answering(&switch_sock, 500, "proxy already running\n");
-
-        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-        let _entered = runtime.enter();
-        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let ledger = crate::net::egress_gate::TestMirrorLedger::attach(
-            &registry.table(),
-            switch_sock.clone(),
-        );
-
-        // A free port: the check takes it on the first probe.
-        let preferred = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind a free port")
-            .local_addr()
-            .expect("free addr")
-            .port();
-        let substitute = 65264;
-        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
-        let status = crate::control::ProxyPublishStatus::new();
-        status.set_serving(substitute);
-        let recorded = status.clone();
-        let watcher = spawn_reclaim_watcher(
-            preferred,
-            substitute,
-            Duration::from_millis(50),
-            crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
-            crate::cmd::run::proxy_reclaim_publisher(switch_sock.clone(), node, registry.table()),
-            move |port| recorded.add_preferred(port),
-        );
-
-        requests
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the watcher asks the switch to publish the preferred port");
-        // Let a few more attempts fail the same way.
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!watcher.reclaimed());
-        assert_eq!(status.serving_ports(), vec![substitute]);
-        assert_eq!(
-            ledger.dials(std::net::Ipv4Addr::LOCALHOST, preferred),
-            None,
-            "a failed expose leaves no note in the ledger"
-        );
-        drop(watcher);
-    }
-
-    /// A proxy whose publish is unconfirmed, or held after the start, has no
-    /// serving ports to report, and the watcher does not take the preferred
-    /// port for it.
-    #[test]
-    fn proxy_reclaims_preferred_port_when_free_only_while_serving() {
-        let status = crate::control::ProxyPublishStatus::new();
-        status.set_serving(65264);
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = std::sync::Arc::clone(&counter);
-        let mut take = take_while_serving(status.clone(), move |_port: u16| {
-            seen.fetch_add(1, Ordering::SeqCst);
-            Some(())
-        });
-
-        status.set_unconfirmed(65264);
-        assert!(status.serving_ports().is_empty());
-        assert!(take(7654).is_none());
-
-        status.confirm(65264);
-        assert_eq!(status.serving_ports(), vec![65264]);
-        assert!(take(7654).is_some());
-
-        status.set_down(
-            65264,
-            minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder: None },
-        );
-        assert!(status.serving_ports().is_empty());
-        assert!(take(7654).is_none());
-        // Only the probe after the confirm reached `take`.
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
     // NET-021: the held-port watcher waits 1 s first, doubles the wait, and
     // never waits past 30 s.
     #[test]
@@ -611,95 +391,6 @@ mod tests {
         let waits: Vec<u64> = (0..8).map(|n| backoff.delay(n).as_secs()).collect();
         assert_eq!(waits, vec![1, 2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(backoff.delay(u32::MAX), Duration::from_secs(30));
-    }
-
-    // NET-021, NET-022: a VM that started with its proxy down on a held
-    // port publishes nothing while the port stays held. Once the holder
-    // exits, the watcher takes the reservation, asks the switch to publish
-    // `127.0.0.1:<port>` to the guest proxy's own port, and clears the
-    // down cause, so the status read reports the port as serving.
-    #[test]
-    fn proxy_publishes_once_the_held_port_frees() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ports_dir = dir.path().join("ports");
-        std::fs::create_dir(&ports_dir).expect("ports dir");
-        let switch_sock = dir.path().join("switch.sock");
-        let requests = fake_switch(&switch_sock);
-
-        let holder =
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind holder");
-        let port = holder.local_addr().expect("holder addr").port();
-        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
-
-        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-        let _entered = runtime.enter();
-        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let ledger = crate::net::egress_gate::TestMirrorLedger::attach(
-            &registry.table(),
-            switch_sock.clone(),
-        );
-
-        let status = crate::control::ProxyPublishStatus::new();
-        status.set_down(
-            port,
-            minimald_rpc::ProxyDownCause::PortHeldAfterStart {
-                holder: Some("pid 4242 (python3)".to_string()),
-            },
-        );
-        let recorded = status.clone();
-        {
-            let watcher = spawn_held_port_watcher(
-                port,
-                HeldPortBackoff {
-                    initial: Duration::from_millis(20),
-                    max: Duration::from_millis(50),
-                },
-                crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
-                crate::cmd::run::proxy_reclaim_publisher(
-                    switch_sock.clone(),
-                    node,
-                    registry.table(),
-                ),
-                move |port| mark_serving(&recorded, port),
-            );
-
-            // Held: several retries pass and the switch hears nothing.
-            assert!(
-                requests.recv_timeout(Duration::from_millis(400)).is_err(),
-                "the watcher published a port another process holds"
-            );
-            assert!(!watcher.reclaimed());
-            assert!(
-                status.down().is_some(),
-                "the cause stays while the port is held"
-            );
-            assert!(status.serving_ports().is_empty());
-
-            // Free the port: the next retry publishes it.
-            drop(holder);
-            let expose = requests
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the watcher asks the switch to publish the freed port");
-            assert!(
-                expose.ends_with(&format!(
-                    r#"{{"local":"127.0.0.1:{port}","remote":"{node}:{port}","protocol":"tcp"}}"#
-                )),
-                "{expose}"
-            );
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while status.down().is_some() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(watcher.reclaimed());
-            assert_eq!(status.down(), None, "the recovery clears the cause");
-            assert_eq!(status.serving_ports(), vec![port]);
-            assert_eq!(
-                ledger.dials(std::net::Ipv4Addr::LOCALHOST, port),
-                Some(node)
-            );
-            assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
-            drop(watcher);
-        }
     }
 
     #[test]
@@ -722,5 +413,145 @@ mod tests {
             ReclaimAttempt::Held
         ));
         assert_eq!(taken, 1);
+    }
+
+    /// A publisher over a stand-in gvproxy, for the watchers' publishes.
+    fn publisher() -> (
+        crate::net::gvproxy_api::testing::FakeSwitch,
+        crate::net::publish::Publisher,
+    ) {
+        let fake = crate::net::gvproxy_api::testing::FakeSwitch::start();
+        let publisher = crate::net::publish::Publisher::start(
+            crate::net::gvproxy_api::SwitchApi::new(fake.sock.clone()),
+            crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET),
+            None,
+        );
+        (fake, publisher)
+    }
+
+    fn until(what: &str, holds: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !holds() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // While another process holds the preferred port the watcher publishes
+    // nothing. Once the port is free it takes the reservation and publishes
+    // the preferred port to the guest proxy's port, and the served ports
+    // list both, preferred first.
+    #[test]
+    fn proxy_reclaims_preferred_port_when_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ports_dir = dir.path().join("ports");
+        std::fs::create_dir(&ports_dir).expect("ports dir");
+        let (fake, publisher) = publisher();
+
+        // The other process on the preferred port.
+        let holder =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind holder");
+        let preferred = holder.local_addr().expect("holder addr").port();
+        let substitute = 65264;
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+
+        let status = crate::control::ProxyPublishStatus::new();
+        status.set_serving(substitute);
+        let recorded = status.clone();
+        let watcher = spawn_reclaim_watcher(
+            preferred,
+            substitute,
+            Duration::from_millis(50),
+            crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
+            crate::cmd::run::proxy_reclaim_publisher(publisher.clone(), node),
+            move |port| recorded.add_preferred(port),
+        );
+
+        // Held: several probes pass and gvproxy hears nothing.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            fake.log().is_empty(),
+            "published a port another process holds"
+        );
+        assert!(!watcher.reclaimed());
+        assert_eq!(status.serving_ports(), vec![substitute]);
+
+        // Free the port: the next probe takes it back.
+        drop(holder);
+        until("the preferred port is reclaimed", || watcher.reclaimed());
+        assert_eq!(
+            fake.dials(&format!("127.0.0.1:{preferred}"), "tcp"),
+            Some(format!("{node}:{substitute}"))
+        );
+        assert_eq!(status.serving_ports(), vec![preferred, substitute]);
+        // The forward is in the publish ledger, so a restarted gvproxy gets
+        // it again.
+        fake.restart();
+        publisher.reapply();
+        assert!(
+            fake.dials(&format!("127.0.0.1:{preferred}"), "tcp")
+                .is_some()
+        );
+        // The watcher holds the preferred port's reservation: a second
+        // supervisor's check skips it.
+        assert!(crate::cmd::run::proxy_reclaim_check(ports_dir.clone())(preferred).is_none());
+        drop(watcher);
+    }
+
+    // The port the proxy was to serve on was held at the start. Once its
+    // holder exits, the watcher takes the reservation, publishes the port
+    // to the guest proxy's own port, and clears the down cause.
+    #[test]
+    fn proxy_publishes_once_the_held_port_frees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ports_dir = dir.path().join("ports");
+        std::fs::create_dir(&ports_dir).expect("ports dir");
+        let (fake, publisher) = publisher();
+
+        let holder =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind holder");
+        let port = holder.local_addr().expect("holder addr").port();
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+
+        let status = crate::control::ProxyPublishStatus::new();
+        status.set_down(
+            port,
+            minimald_rpc::ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        );
+        let recorded = status.clone();
+        let watcher = spawn_held_port_watcher(
+            port,
+            HeldPortBackoff {
+                initial: Duration::from_millis(20),
+                max: Duration::from_millis(50),
+            },
+            crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
+            crate::cmd::run::proxy_reclaim_publisher(publisher, node),
+            move |port| mark_serving(&recorded, port),
+        );
+
+        // Held: several retries pass and gvproxy hears nothing.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            fake.log().is_empty(),
+            "published a port another process holds"
+        );
+        assert!(
+            status.down().is_some(),
+            "the cause stays while the port is held"
+        );
+
+        // Free the port: the next retry publishes it.
+        drop(holder);
+        until("the cause clears", || status.down().is_none());
+        assert!(watcher.reclaimed());
+        assert_eq!(status.serving_ports(), vec![port]);
+        assert_eq!(
+            fake.dials(&format!("127.0.0.1:{port}"), "tcp"),
+            Some(format!("{node}:{port}"))
+        );
+        drop(watcher);
     }
 }

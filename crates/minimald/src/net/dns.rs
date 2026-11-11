@@ -3815,25 +3815,17 @@ mod tests {
     }
 
     /// The daemon's zone spellings are the sessions zone's, byte for byte:
-    /// the box suffix is the apex, the switch's host name and the host-net
-    /// `/etc/hosts` entry are the host row, and the gvproxy config renders
-    /// the zone and the host row's label. A spelling that drifts from the
-    /// zone fails here.
+    /// the box suffix is the apex, and the switch's host name and the
+    /// host-net `/etc/hosts` entry are the host row. A spelling that drifts
+    /// from the zone fails here.
     #[test]
     fn zone_spellings_are_the_sessions_zone() {
-        use boxes::core::zone_answer::{HOST_ROW_LABEL, HOST_ROW_NAME, ZONE_APEX};
+        use boxes::core::zone_answer::{HOST_ROW_NAME, ZONE_APEX};
 
         assert_eq!(HOSTNAME_SUFFIX, "min.internal");
         assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
         assert_eq!(crate::net::switch::HOST_MIN_INTERNAL, "host.min.internal");
         assert_eq!(sandbox::HOST_MIN_INTERNAL, HOST_ROW_NAME);
-        let yaml = ::switch::render_gvproxy_config(::switch::SwitchSubnet::default(), &[]);
-        assert!(
-            yaml.contains(&format!(
-                "    - name: \"{ZONE_APEX}.\"\n      records:\n        - name: \"{HOST_ROW_LABEL}\"\n"
-            )),
-            "the gvproxy zone record spells the zone's host row; config was:\n{yaml}"
-        );
     }
 
     /// NET-072's name boundary: the zone the gate carves out of the

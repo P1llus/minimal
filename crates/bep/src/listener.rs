@@ -1,13 +1,10 @@
 //! The proxy's listener: the acceptor for the switch peer's deliveries
 //! (BEP-026).
 //!
-//! A box reaches the proxy through the switch. The switch's peer
-//! (`switch::bep_host`) accepts the box's TCP connection on the leg's
-//! address, then dials this listener's unix socket, once per flow. The dial
-//! writes the per-boot token ([`TOKEN_LEN`] bytes) and then one fixed
-//! delivery header ([`DELIVERY_HEADER_LEN`] bytes) ahead of any byte of the
-//! box's flow. The header layout is the one `switch::bep_host::DeliveryHeader`
-//! documents, and this module reads it byte for byte:
+//! A box reaches the proxy through the VM host's stream door, which dials
+//! this listener's unix socket once per stream. The dial writes the
+//! per-boot token ([`TOKEN_LEN`] bytes) and then one fixed delivery header
+//! ([`DELIVERY_HEADER_LEN`] bytes) ahead of any byte of the box's flow:
 //!
 //! - byte 0: the wire version, [`DELIVERY_HEADER_VERSION`]
 //! - bytes 1..17: the box id, filled from the box's attachment, or the
@@ -43,13 +40,13 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
-/// The per-boot token's length in bytes: `switch::bep_host::TOKEN_LEN`.
+/// The per-boot token's length in bytes.
 pub const TOKEN_LEN: usize = 32;
 
-/// The delivery header's wire version: `switch::bep_host::DELIVERY_HEADER_VERSION`.
+/// The delivery header's wire version.
 pub const DELIVERY_HEADER_VERSION: u8 = 1;
 
-/// The delivery header's length in bytes: `switch::bep_host::DELIVERY_HEADER_LEN`.
+/// The delivery header's length in bytes.
 pub const DELIVERY_HEADER_LEN: usize = 1 + 16 + 4 + 2 + 4 + 2;
 
 /// How long a connection has to present its token and header. A peer that
@@ -60,8 +57,8 @@ pub const PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// names no box.
 pub type BoxId = [u8; 16];
 
-/// The reserved id a delivery from the `host_ip` cohort address carries:
-/// `switch::bep_host::COHORT_BOX_ID`. The cohort's boxes share the address,
+/// The reserved id a delivery from the `host_ip` cohort address carries.
+/// The cohort's boxes share the address,
 /// so the delivery names none of them (BEP-084). The proxy reads this id as
 /// [`crate::redeem::Attribution::HostIpCohort`], and the sealed value a
 /// request carries names the box the request is checked for.

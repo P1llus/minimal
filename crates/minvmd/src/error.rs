@@ -72,18 +72,6 @@ pub enum VmError {
         what: &'static str,
         reason: &'static str,
     },
-
-    /// A `vm_egress` `allow_subnets` entry is not a syntactically valid CIDR
-    /// prefix (R2.5). Validated at config time — mirroring the per-`PTask`
-    /// egress check in `boxes::Record::validate_policy` — so a misconfigured
-    /// subnet is named where it can be fixed, rather than surfacing opaquely
-    /// when #553's egress-enforcement layer parses it. `cidr` is the offending
-    /// entry.
-    #[error(
-        "invalid VM configuration (vm_egress): allow_subnets entry \
-         {cidr:?} is not a valid CIDR prefix"
-    )]
-    InvalidEgressSubnet { cidr: String },
 }
 
 /// A directory the guest image lookup looked in, and the image files it

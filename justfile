@@ -117,14 +117,12 @@ guest-kernel:
 libkrun:
     scripts/fetch-prebuilt.sh krun {{krun-prefix}} {{arch}}
 
-# The linkage Linux users actually receive, and what `minvmd-build` and
-# `test-vm` link against. Built from the vendored pin rather than fetched.
-# Skips when already built; `just clean` forces a rebuild.
-#
-# Build the STATIC libkrun (libkrun.a) from the vendored pin.
+# Build the static libkrun (libkrun.a) from the vendored pin and patches. This
+# is what `minvmd-build` and `test-vm` link against. The script leaves an
+# archive alone that was built from the same pin and patches.
 [linux]
 libkrun-static:
-    @[ -f {{krun-static}}/libkrun.a ] || scripts/build-libkrun-linux.sh {{krun-static}} {{musl-target}}
+    @scripts/build-libkrun-linux.sh {{krun-static}} {{musl-target}}
 
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:

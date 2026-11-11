@@ -26,6 +26,8 @@ pub(crate) mod rpc_client;
 pub mod sock;
 pub mod state;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod timekeep;
 pub mod vm;
 pub mod volume;

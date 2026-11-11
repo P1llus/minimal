@@ -195,7 +195,7 @@ pub fn format_policy_on_host(
     network: boxes::NetworkMode,
     host_ip_enforcement: Option<boxes::HostIpEnforcement>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
-    fabric: Option<switch::SwitchSubnet>,
+    _fabric: Option<switch::SwitchSubnet>,
     native_host: bool,
 ) -> Result<(), anyhow::Error> {
     // BEP-085: the credentialed-upstream row reads the host kind too, since
@@ -303,36 +303,6 @@ pub fn format_policy_on_host(
             out,
             "  host exposures  not applied: this box shares the host's network"
         )?;
-    }
-    // The node-plane baseline set, beside the box's rules (NET-130): the
-    // helper's built-in enumeration of the categories the in-VM daemon's own
-    // traffic may reach, one row per category under its name. A
-    // switch-fabric surface, so it is the own-address modes that carry it —
-    // and only where a fabric the helper gates is named: the enumeration is
-    // built the way the host-side gate builds it, from the fabric's own
-    // address plan, and no fabric named means no set to show. The posture
-    // the gate decides the daemon's own fetches under is spelled beside the
-    // set, the way the daemon's start-up line spells it: announced — the
-    // shipped posture — the run path's allow-all interim node row still
-    // decides those fetches, so the rows name what the set will bound, not
-    // what bounds them today.
-    if network == boxes::NetworkMode::OwnIp
-        && let Some(fabric) = fabric
-    {
-        let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
-        writeln!(
-            out,
-            "destinations for Minimal's own downloads in this VM (not this box's rules): {}",
-            baseline.phase().as_str()
-        )?;
-        for entry in baseline.entries() {
-            writeln!(
-                out,
-                "  {}  {}",
-                entry.category().as_str(),
-                baseline.display_endpoints(entry).join(", ")
-            )?;
-        }
     }
     // Ingress is an own-address surface: the switch's static forwarder is the
     // only per-session ingress minimald applies, and a host-address box
@@ -653,23 +623,6 @@ impl<'a> PolicyEgressJson<'a> {
     }
 }
 
-/// The node-plane baseline set the helper enumerates (NET-130), as the
-/// document carries it: owned rows, because the enumeration is built inside
-/// the render and the wire has no shape for it. The text rendering prints
-/// the same rows, so the two list the same set.
-#[derive(serde::Serialize)]
-struct PolicyBaselineJson {
-    phase: &'static str,
-    entries: Vec<PolicyBaselineEntryJson>,
-}
-
-/// One category row of the baseline set.
-#[derive(serde::Serialize)]
-struct PolicyBaselineEntryJson {
-    category: &'static str,
-    endpoints: Vec<String>,
-}
-
 /// One `min/v1/session-policy` document: the effective policy's parts, each
 /// named as a parser reads them. The blocks the text rendering prints carry
 /// over as keys, and the ones it suppresses are left out entirely rather
@@ -696,8 +649,6 @@ struct PolicyJson<'a> {
     /// client cannot mistake an absent lane for a null one.
     #[serde(skip_serializing_if = "Option::is_none")]
     credentialed_upstream: Option<PolicyCredentialedUpstreamJson<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_ingress: Option<LiveIngressJson>,
     /// The permitted listening ports the daemon left unpublished because
@@ -802,7 +753,7 @@ pub fn write_policy_json_noting(
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
     host_kind: paths::HostKind,
-    fabric: Option<switch::SwitchSubnet>,
+    _fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     unaudited_listen_ports: &[u16],
@@ -821,33 +772,11 @@ pub fn write_policy_json_noting(
             credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
                 effective, network, host_kind,
             ),
-            node_plane_baseline: None,
             live_ingress: None,
             unaudited_listen_ports: &[],
             shared_port_collisions: &[],
         }
     } else {
-        // The baseline set is a switch-fabric surface, held to the same
-        // gate as the text rendering's block: own-address modes, and a
-        // fabric the helper gates named (NET-130).
-        let node_plane_baseline = if network == boxes::NetworkMode::OwnIp
-            && let Some(fabric) = fabric
-        {
-            let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
-            Some(PolicyBaselineJson {
-                phase: baseline.phase().as_str(),
-                entries: baseline
-                    .entries()
-                    .iter()
-                    .map(|entry| PolicyBaselineEntryJson {
-                        category: entry.category().as_str(),
-                        endpoints: baseline.display_endpoints(entry),
-                    })
-                    .collect(),
-            })
-        } else {
-            None
-        };
         PolicyJson {
             schema: POLICY_JSON_SCHEMA,
             network,
@@ -864,7 +793,6 @@ pub fn write_policy_json_noting(
             credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
                 effective, network, host_kind,
             ),
-            node_plane_baseline,
             // The wire's own rows, `pending` included — an empty list is a
             // claim about the box (it published nothing), which is what the
             // key is for; the modes without a surface leave it out instead.

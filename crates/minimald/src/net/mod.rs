@@ -1525,15 +1525,12 @@ mod tests {
         assert!(cfg.contains("subnet: \"100.64.0.0/16\""));
         assert!(cfg.contains("gatewayIP: \"100.64.0.1\""));
         assert!(cfg.contains(&format!("\"{}\": \"{}\"", lease.ip, lease.mac)));
-        // NET-132: the box egress proxy address is infrastructure and must not be
-        // handled by gvproxy's NAT or virtual-IP machinery.
-        assert!(!cfg.contains("100.64.255.252"));
-        // Host alias is NAT'd to loopback and never allocated.
-        assert!(cfg.contains("\"100.64.255.254\": \"127.0.0.1\""));
-        // NET-003: the static zone entry the bundle's switch-configuration copy
-        // shows — `host` answered in `min.internal.` at the NAT'd alias.
-        assert!(cfg.contains("    - name: \"min.internal.\"\n"));
-        assert!(cfg.contains("        - name: \"host\"\n          ip: \"100.64.255.254\"\n"));
+        // The switch gives the virtual network no way to the host's
+        // loopback and answers no zone: the host alias is reached through
+        // the daemon, and the daemon's resolver answers box names.
+        assert!(!cfg.contains("127.0.0.1"), "{cfg}");
+        assert!(!cfg.contains("100.64.255.254"), "{cfg}");
+        assert!(!cfg.contains("min.internal"), "{cfg}");
     }
 
     #[test]

@@ -12,11 +12,9 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "stack-peer")]
-pub mod bep_host;
-#[cfg(feature = "stack-peer")]
-pub use bep_host::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
 pub mod loopback;
+#[cfg(feature = "pump")]
+pub mod pump;
 pub mod refusal;
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
@@ -40,11 +38,6 @@ pub const TCP_CONNECT_TIMEOUT_SECS: u32 = 30;
 
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
-
-/// Stable, locally-administered MAC for the Box Egress Proxy on the default
-/// [`DEFAULT_SUBNET`]. It matches [`MacAddr::for_switch_ip`] applied to
-/// [`SwitchSubnet::box_egress_proxy_address`] on that subnet.
-pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
 
 /// How long the Box Egress Proxy leg's smoltcp neighbour cache keeps an
 /// entry: smoltcp 0.14's `iface::neighbor::Cache::ENTRY_LIFETIME`, which the
@@ -376,12 +369,6 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.daemon_ip()) - 1)
     }
 
-    /// The locally-administered MAC for [`Self::box_egress_proxy_address`].
-    #[must_use]
-    pub fn bep_mac(self) -> MacAddr {
-        MacAddr::for_switch_ip(self.box_egress_proxy_address())
-    }
-
     /// The daemon address (the address below [`Self::host_alias`],
     /// `broadcast - 2`): the guest root netns' primary tap, which gives
     /// `minimald` itself egress through the host gvproxy (so it can fetch
@@ -649,10 +636,14 @@ impl MacAddr {
 
 /// Renders the gvproxy `-config` YAML for the given subnet and static leases.
 ///
-/// The subnet, gateway, NAT alias, DNS zone, DHCP static leases and TCP
-/// forwarder bounds are all expressed through a `-config` YAML file (see the
-/// 2026-06-21 spike): gvproxy v0.9.0 also takes the subnet and gateway as CLI
-/// flags, but the rest is YAML-only. gvproxy reads this file only at spawn
+/// The subnet, gateway, DHCP static leases and TCP forwarder bounds are all
+/// expressed through a `-config` YAML file: gvproxy v0.9.0 also takes the
+/// subnet and gateway as CLI flags, but the rest is YAML-only.
+///
+/// The config has no NAT entry and no DNS zone. A NAT entry for the host
+/// alias would let anything on the virtual network reach every port of the
+/// host's loopback. The daemon that serves the boxes answers the box-name
+/// zone and the alias name itself. gvproxy reads this file only at spawn
 /// time; an `OwnIp` PTask configures its switch address statically rather than
 /// via DHCP, so `dhcpStaticLeases` is a startup-time seed, not a live source.
 ///
@@ -670,29 +661,6 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!(
         "  tcpConnectTimeout: {TCP_CONNECT_TIMEOUT_SECS}\n"
     ));
-    // NET-004: a switch carved from the default block also maps the
-    // documented literal to the host's loopback, beside its own alias, so the
-    // literal reaches what `host.min.internal` reaches.
-    let literal = subnet.documented_host_literal();
-    s.push_str("  nat:\n");
-    s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
-    if let Some(literal) = literal {
-        s.push_str(&format!("    \"{literal}\": \"127.0.0.1\"\n"));
-    }
-    s.push_str("  gatewayVirtualIPs:\n");
-    s.push_str(&format!("    - \"{}\"\n", subnet.host_alias()));
-    if let Some(literal) = literal {
-        s.push_str(&format!("    - \"{literal}\"\n"));
-    }
-    // NET-003: the switch answers `host.min.internal` itself, with the host
-    // alias — the address its `nat` table maps to the host's loopback. Rendered
-    // from first boot, ahead of any dynamic `min.internal.` registration; the
-    // dynamic `/services/dns/add` merge keeps this record behind new ones.
-    s.push_str("  dns:\n");
-    s.push_str("    - name: \"min.internal.\"\n");
-    s.push_str("      records:\n");
-    s.push_str("        - name: \"host\"\n");
-    s.push_str(&format!("          ip: \"{}\"\n", subnet.host_alias()));
     s.push_str("  dhcpStaticLeases:\n");
     if leases.is_empty() {
         // gvproxy accepts an empty map; keep the key present for clarity.
@@ -718,8 +686,6 @@ mod tests {
             net.box_egress_proxy_address(),
             Ipv4Addr::new(100, 64, 255, 252)
         );
-        assert_eq!(net.bep_mac(), BEP_MAC);
-        assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
     }
@@ -792,66 +758,29 @@ mod tests {
             assert!(yaml.contains(&format!("\"{last}\": \"{}\"", MacAddr::for_switch_ip(last))));
             assert!(!yaml.contains(&net.box_egress_proxy_address().to_string()));
             assert!(!yaml.contains(&net.daemon_ip().to_string()));
-            assert!(yaml.contains(&format!("\"{}\": \"127.0.0.1\"", net.host_alias())));
-            assert!(yaml.contains(&format!("- \"{}\"", net.host_alias())));
+            assert!(!yaml.contains(&net.host_alias().to_string()));
         }
     }
 
-    /// NET-004: a `/24` switch carved from the default `/16` maps the
-    /// documented literal to the host's loopback and carries it as a gateway
-    /// virtual address, beside its own alias. The `/16` a guest daemon uses
-    /// renders as before, and a subnet outside the default block gets nothing.
+    /// The switch translates nothing to the host's loopback and answers no
+    /// name of its own, on the guest's `/16` and on a native daemon's `/24`.
     #[test]
-    fn gvproxy_config_maps_documented_literal_on_a_slash_24() {
-        let literal = Ipv4Addr::new(100, 64, 255, 254);
+    fn gvproxy_config_has_no_path_to_the_host_loopback_and_no_zone() {
         let carved = SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).unwrap();
-        assert_eq!(carved.documented_host_literal(), Some(literal));
-        let yaml = render_gvproxy_config(carved, &[]);
-        assert!(
-            yaml.contains(
-                "  nat:\n    \"100.64.3.254\": \"127.0.0.1\"\n    \"100.64.255.254\": \"127.0.0.1\"\n"
-            ),
-            "{yaml}"
-        );
-        assert!(
-            yaml.contains(
-                "  gatewayVirtualIPs:\n    - \"100.64.3.254\"\n    - \"100.64.255.254\"\n  dns:\n"
-            ),
-            "{yaml}"
-        );
-        // `host.min.internal` keeps the switch's own alias.
-        assert!(yaml.contains("          ip: \"100.64.3.254\"\n"), "{yaml}");
-
-        // The default /16: its own alias is the literal, rendered once each.
-        assert_eq!(DEFAULT_SUBNET.documented_host_literal(), None);
-        let yaml = render_gvproxy_config(DEFAULT_SUBNET, &[]);
-        assert_eq!(yaml.matches("\"100.64.255.254\": \"127.0.0.1\"").count(), 1);
-        assert_eq!(yaml.matches("- \"100.64.255.254\"").count(), 1);
-
-        // The /24 that holds the literal as its own alias renders it once.
-        let top = SwitchSubnet::new(Ipv4Addr::new(100, 64, 255, 0), 24).unwrap();
-        assert_eq!(top.documented_host_literal(), None);
-        let yaml = render_gvproxy_config(top, &[]);
-        assert_eq!(yaml.matches("\"100.64.255.254\": \"127.0.0.1\"").count(), 1);
-
-        // A subnet outside the default block never maps the literal.
-        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
-        assert_eq!(custom.documented_host_literal(), None);
-        assert!(!render_gvproxy_config(custom, &[]).contains("100.64.255.254"));
-    }
-
-    #[test]
-    fn proxy_address_is_neither_virtual_ip_nor_translated() {
-        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
-        let net = SwitchSubnet::default();
-        // The proxy address must not appear in gvproxy's NAT map or in its
-        // gatewayVirtualIPs list — the host-side stack peer owns it directly.
-        assert!(!yaml.contains(&format!("\"{}\"", net.box_egress_proxy_address())));
-        assert!(!yaml.contains("100.64.255.252"));
-        // The daemon address is also infrastructure and should not be listed.
-        assert!(!yaml.contains("100.64.255.253"));
-        // The host alias, by contrast, is both NAT'd and a virtual IP.
-        assert!(yaml.contains("100.64.255.254"));
+        for net in [SwitchSubnet::default(), carved] {
+            let yaml = render_gvproxy_config(net, &[]);
+            for absent in [
+                "nat:",
+                "gatewayVirtualIPs",
+                "dns:",
+                "127.0.0.1",
+                "min.internal",
+            ] {
+                assert!(!yaml.contains(absent), "{absent} in:\n{yaml}");
+            }
+            assert!(!yaml.contains(&net.host_alias().to_string()), "{yaml}");
+            assert!(!yaml.contains(&net.daemon_ip().to_string()), "{yaml}");
+        }
     }
 
     #[test]
@@ -921,22 +850,6 @@ mod tests {
             stack.contains(&"  tcpConnectTimeout: 30"),
             "config:\n{yaml}"
         );
-    }
-
-    #[test]
-    fn gvproxy_config_carries_host_min_internal() {
-        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
-        // The static zone record NET-003 renders from first boot: `host`
-        // answered inside the `min.internal.` zone at the NAT'd host-alias
-        // address, so a box resolving the name gets the host's loopback.
-        let zone = concat!(
-            "  dns:\n",
-            "    - name: \"min.internal.\"\n",
-            "      records:\n",
-            "        - name: \"host\"\n",
-            "          ip: \"100.64.255.254\"\n",
-        );
-        assert!(yaml.contains(zone), "config was:\n{yaml}");
     }
 
     // Resolver tests mutate process-global env (MINIMAL_BIN), so serialise

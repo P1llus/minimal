@@ -237,7 +237,6 @@ mod tests {
     fn timekeep_port_is_distinct_from_the_other_vsock_ports() {
         assert_ne!(VSOCK_TIMEKEEP_PORT, crate::cmd::VSOCK_MARKER_PORT);
         assert_ne!(VSOCK_TIMEKEEP_PORT, crate::sock::VSOCK_BRIDGE_PORT);
-        assert_ne!(VSOCK_TIMEKEEP_PORT, crate::net::VSOCK_GVPROXY_SHUTTLE_PORT);
     }
 
     #[test]

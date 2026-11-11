@@ -1575,6 +1575,284 @@ pub enum AskLateEnd {
     },
 }
 
+/// The vsock port the stream door answers on: the guest daemon opens one
+/// connection per stream it wants carried to the host side.
+pub const VM_HOST_STREAM_PORT: u32 = 7354;
+
+/// What prompted a publish. The VM host decides by its own record of the box
+/// whether the port is declared. The origin says whether a person may be
+/// asked: an explicit expose may raise the ask dialog, a listener the daemon
+/// noticed may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishOrigin {
+    /// A port mapping the box was created with.
+    Declared,
+    /// `min net expose` inside the box.
+    Expose,
+    /// The daemon saw the box start to listen.
+    Listen,
+}
+
+/// Asks the VM host to forward a host port to a box. The request names the
+/// box by its id and the two ports. It names no host address: the VM host
+/// picks the listener from its own record of the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishPortRequest {
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+    /// The port on the host.
+    pub external: u16,
+    /// The port in the box.
+    pub internal: u16,
+    pub proto: IpProto,
+    pub origin: PublishOrigin,
+}
+
+/// Asks the VM host to end a forward the box published at run time. A
+/// declared port's forward ends with the box, not by this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnpublishPortRequest {
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+    pub external: u16,
+    pub proto: IpProto,
+}
+
+/// Tells the VM host that a box's network is gone. The host unbinds the
+/// box's forwards and stops serving streams for it. Its creator can ask for
+/// the box's row back when the box starts again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndBoxRequest {
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+}
+
+/// Asks whether the VM host holds a row for the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoxStandingRequest {
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+}
+
+/// Whether a forward is bound on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardState {
+    /// The host listens and forwards to the box.
+    Bound,
+    /// Another box holds the host listener. The forward is bound when that
+    /// box ends.
+    Waiting,
+}
+
+/// Why the VM host did not publish or unpublish a port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum PublishRefusal {
+    /// The VM host holds no row for the box id.
+    UnknownBox,
+    /// The box shares the node's address. Its listeners open on the host
+    /// through listen notices, not through a publish.
+    HostIpBox,
+    /// The port or protocol is not one a forward can have.
+    InvalidPort,
+    /// The port is not one the box declared, and it does not have the shape
+    /// of a run-time publish (TCP, same port on both sides).
+    NotDeclared,
+    /// The box's dynamic ingress stance is deny.
+    Denied,
+    /// The stance is allow, and the box declared no range.
+    NoRange,
+    /// The port is outside the box's dynamic range.
+    OutOfRange { range: (u16, u16) },
+    /// The stance is ask, and only an explicit expose may ask a person.
+    AskNeedsExpose,
+    /// The ask ended without a yes.
+    Ask {
+        refused: AskRefused,
+        cause: Option<AskCancelCause>,
+    },
+    /// Another box holds the host listener.
+    ListenerHeld,
+    /// Another program on the host holds the port.
+    PortInUse,
+    /// The box holds as many run-time ports as one box may.
+    BoxCap,
+    /// The box published too many ports within a second.
+    RateExceeded,
+    /// The VM host holds as many forwards as it tracks.
+    LedgerFull,
+    /// The VM's virtual network did not answer.
+    SwitchUnavailable,
+    /// Nothing is published at the port for this box.
+    NotPublished,
+    /// The port is a declared one. Its forward ends with the box.
+    DeclaredPort,
+}
+
+impl std::fmt::Display for PublishRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownBox => f.write_str("the VM host holds no row for this box"),
+            Self::HostIpBox => {
+                f.write_str("a host_ip box's listeners open on the host without a publish")
+            }
+            Self::InvalidPort => f.write_str("the port or protocol cannot be published"),
+            Self::NotDeclared => f.write_str("the box did not declare this port"),
+            Self::Denied => f.write_str("the box's dynamic ingress is deny"),
+            Self::NoRange => f.write_str("the box declared no dynamic range"),
+            Self::OutOfRange { range } => write!(
+                f,
+                "the port is outside the box's dynamic range {}-{}",
+                range.0, range.1
+            ),
+            Self::AskNeedsExpose => {
+                f.write_str("the box's dynamic ingress is ask, which needs an explicit expose")
+            }
+            Self::Ask { refused, cause } => match cause {
+                Some(cause) => write!(f, "the ask was not allowed ({refused:?}): {cause}"),
+                None => write!(f, "the ask was not allowed ({refused:?})"),
+            },
+            Self::ListenerHeld => f.write_str("another box holds the port on the host"),
+            Self::PortInUse => f.write_str("address already in use on the host"),
+            Self::BoxCap => f.write_str("the box holds as many run-time ports as it may"),
+            Self::RateExceeded => f.write_str("the box is publishing ports too fast"),
+            Self::LedgerFull => f.write_str("the VM host tracks no more forwards"),
+            Self::SwitchUnavailable => f.write_str("the VM's virtual network did not answer"),
+            Self::NotPublished => f.write_str("nothing is published at the port for this box"),
+            Self::DeclaredPort => f.write_str("a declared port stays published until the box ends"),
+        }
+    }
+}
+
+/// One request line on the guest door (vsock port
+/// [`VM_HOST_BOX_REPORT_PORT`]): what the in-VM daemon may ask of the VM
+/// host. The host door's verbs are [`BoxControlRequest`]'s and are never
+/// served here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum GuestDoorRequest {
+    /// Forward a host port to a box. Under an ask stance the connection
+    /// stays open until the ask ends.
+    PublishPort(PublishPortRequest),
+    /// End a forward published at run time.
+    UnpublishPort(UnpublishPortRequest),
+    /// A box's network is gone.
+    EndBox(EndBoxRequest),
+    /// Does the host hold a row for the box?
+    BoxStanding(BoxStandingRequest),
+}
+
+/// One reply line on the guest door.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reply", rename_all = "snake_case")]
+pub enum GuestDoorReply {
+    /// The forward for a [`PublishPortRequest`]: the host listener the VM
+    /// host chose, and whether it is bound yet.
+    Published {
+        listener: std::net::SocketAddrV4,
+        #[serde(with = "boxes::box_id_hex")]
+        box_id: BoxId,
+        internal: u16,
+        proto: IpProto,
+        state: ForwardState,
+    },
+    /// A publish or unpublish the VM host refused.
+    PublishRefused {
+        refusal: PublishRefusal,
+        #[serde(with = "boxes::box_id_hex")]
+        box_id: BoxId,
+        external: u16,
+        proto: IpProto,
+    },
+    /// The forward an [`UnpublishPortRequest`] ended, and how many
+    /// connections were closed with it.
+    Unpublished {
+        listener: std::net::SocketAddrV4,
+        closed: u32,
+    },
+    /// The answer to an [`EndBoxRequest`]. `ended` is false when the host
+    /// held no row for the box. `still_bound` counts forwards the host is
+    /// still retrying to unbind.
+    BoxEnded {
+        ended: bool,
+        #[serde(with = "boxes::box_id_hex")]
+        box_id: BoxId,
+        forwards_unbound: u32,
+        still_bound: u32,
+    },
+    /// The answer to a [`BoxStandingRequest`].
+    BoxStanding {
+        #[serde(with = "boxes::box_id_hex")]
+        box_id: BoxId,
+        standing: bool,
+    },
+    /// The request could not be served.
+    Error { error: String },
+}
+
+/// The longest stream door header line, newline included.
+pub const STREAM_OPEN_MAX: usize = 512;
+
+/// The first line the guest daemon writes on a stream door connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOpen {
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+    pub purpose: StreamPurpose,
+}
+
+/// Where a stream goes on the host. Neither purpose carries a host address:
+/// the VM host connects to the credential proxy's own socket, or to its
+/// loopback at the named port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StreamPurpose {
+    /// A box's connection for the credential proxy. `destination` is where
+    /// the box meant to connect, and `source_port` the box's own port.
+    CredentialProxy {
+        source_port: u16,
+        destination: std::net::SocketAddrV4,
+    },
+    /// A box's connection to the host alias at `port`.
+    HostPort { port: u16 },
+}
+
+/// The one line the VM host answers a [`StreamOpen`] with. After `open` the
+/// connection carries the stream's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stream", rename_all = "snake_case")]
+pub enum StreamReply {
+    Open,
+    Refused { reason: StreamRefusal },
+}
+
+/// Why the VM host did not open a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamRefusal {
+    /// The header was late, too long, or not a [`StreamOpen`].
+    Malformed,
+    /// The VM host holds no row for the box id.
+    UnknownBox,
+    /// The box was not created with a credentialed upstream.
+    NoCredentialedGrant,
+    /// No credential proxy runs on this host.
+    ProxyDown,
+    /// The host exposures table does not open the port.
+    PortNotExposed,
+    /// Nothing accepted the connection on the host.
+    ConnectFailed,
+    /// The door or the box holds as many streams as it may.
+    Busy,
+}
+
 /// The host-side port the in-VM daemon's box-port reports cross to: the
 /// vsock port the guest dials `VMADDR_CID_HOST` on to report a runtime
 /// admission or withdrawal into the host-held grant, pinned here because

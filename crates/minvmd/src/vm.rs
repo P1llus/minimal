@@ -8,10 +8,6 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use minimald_rpc::{EgressPolicy, NetworkMode};
-
-use crate::error::VmError;
-
 /// Environment variable selecting the data volume's `sync_mode` (spec R1.9).
 /// Accepts `none` / `relaxed` / `full` (case-insensitive), the legacy booleans
 /// `false` → none and `true` → relaxed, or the raw libkrun codes `0` / `1` / `2`.
@@ -40,19 +36,6 @@ pub(crate) const NODE_PROXY_PORT_ENV: &str = "MINVMD_NODE_PROXY_PORT";
 /// handed (NET-025).
 const HOSTNAME_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 
-/// The environment variable the supervisor hands the VMM child this boot's
-/// publish generation in (T93), beside [`NODE_PROXY_PORT_ENV`] and by the
-/// same transport: a token the supervisor draws fresh for every boot it
-/// spawns, so a publish report can be told apart from a killed boot's even
-/// when both boots were handed the same port.
-pub(crate) const PUBLISH_GENERATION_ENV: &str = "MINVMD_PUBLISH_GENERATION";
-
-/// The boot token the publish generation rides to the guest on, beside the
-/// port's token: the guest daemon echoes it in every publish report.
-/// Mirrors minimald's `HANDED_PUBLISH_GENERATION_TOKEN` — keep the two in
-/// step.
-const PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
-
 /// The environment variable the operator sets to opt the VM out of the
 /// deny-all egress default (NET-077). Read twice: by the supervisor, whose
 /// host-side registry compiles an undeclared box's row by it, and by the VMM
@@ -71,21 +54,9 @@ pub(crate) const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = "MINVMD_EGRESS_DENY_ALL_OPT
 const EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL_OPT_OUT";
 
 /// Kernel command line every microVM boots with: the console the guest's
-/// stdout/stderr reaches the host boot log through, and IPv6 disabled (the v1
-/// network posture is IPv4-only — design §4.2 keeps IPv6 ULA dual-stack as a
-/// later additive, which retires the parameter when it lands). `ipv6.disable=1`
-/// is the `ipv6` module's `disable` parameter (`net/ipv6/af_inet6.c`); the
-/// kernel parses it for built-in and loadable alike, and `inet6_init` returns
-/// before registering anything, so the guest's IPv6 stack never comes up: no
-/// interface configures an IPv6 address and the route table never gains an
-/// IPv6 entry, loopback included — nothing inside the escape boundary gets a
-/// v6 family to ride or for an egress verdict to decide. That is the inside
-/// half of the posture only: a guest kernel the attacker holds can be rebuilt
-/// with it, so the rule that survives an escape is the host-side egress gate
-/// dropping every foreign-family frame; this parameter removes the v6 family
-/// from inside the boundary, the gate is what enforces it. `kernel_cmdline`
-/// extends the line; nothing else in it is optional.
-const BASE_KERNEL_CMDLINE: &str = "console=hvc0 ipv6.disable=1";
+/// stdout and stderr reach the host boot log through. `kernel_cmdline`
+/// extends the line.
+const BASE_KERNEL_CMDLINE: &str = "console=hvc0";
 
 /// The kernel's `COMMAND_LINE_SIZE` — the buffer the boot line (including its
 /// NUL terminator) must fit in. 2048 on both arm64 and x86_64, the two
@@ -96,33 +67,13 @@ const COMMAND_LINE_SIZE: usize = 2048;
 /// the guest kernel sees it, so [`BOOT_LINE_BUDGET`] keeps the whole line
 /// inside [`COMMAND_LINE_SIZE`]. minvmd is not the boot line's only writer.
 ///
-/// libkrun v1.19.4 (728df812, `vendor/libkrun/libkrun.lock`) composes the
-/// line as minvmd's string, then `krun_env`, then `tsi_hijack`, then an
-/// epilog, each `insert_str` preceded by one space and checked against
-/// `CMDLINE_MAX_SIZE` by an `unwrap` that panics inside `krun_start_enter`
-/// (`src/vmm/src/builder.rs:584-595` and `:1050-1073`,
-/// `src/kernel/src/cmdline/mod.rs:94-100`: `len + more + space < capacity`).
-/// For the context minvmd builds (no `krun_set_exec`, `_workdir`, `_root`,
-/// `_rlimits` or `_env`; vsock ports and no virtio-net device, so TSI is
-/// implicit; no DHCP) that is:
-///
-/// - `krun_env`, `" {} {} {} {} {}"` of five empty parts
-///   (`src/libkrun/src/lib.rs:2907-2914`): 5 bytes, 6 with its separator;
-/// - `tsi_hijack` (`builder.rs:1053`): 11 bytes;
-/// - the epilog `" -- "` with no args (`lib.rs:2915`, `builder.rs:1073`):
-///   5 bytes;
-///
-/// 22 bytes on aarch64, whose `CMDLINE_MAX_SIZE` is 2048
-/// (`src/arch/src/aarch64/layout.rs:63`). On x86_64 libkrun's capacity is
-/// 64 KiB (`src/arch/src/x86_64/layout.rs:16`), so nothing panics, but it
-/// also inserts one ` virtio_mmio.device=4K@0x........:NN` per device
-/// (`src/vmm/src/device_manager/kvm/mmio.rs:178-181`, up to 36 bytes; this
-/// boot registers balloon, rng, console, root disk, data disk and vsock)
-/// before the epilog, and the guest kernel then truncates at its own
-/// 2048-byte `COMMAND_LINE_SIZE`, which would cut those device tokens:
-/// 22 + 6 × 36 = 238 bytes. 256 covers the boot as written with 18 bytes of
-/// slack; a seventh device (274) would need the reserve raised, not the slack.
-const LIBKRUN_CMDLINE_RESERVE: usize = 256;
+/// On x86_64 libkrun adds one ` virtio_mmio.device=4K@0x........:NN` token
+/// per device, 35 or 36 bytes each, plus 11 fixed bytes. This boot has seven
+/// devices: balloon, rng, console, root disk, data disk, vsock and the
+/// network device. That is 258 bytes, counted from `/proc/cmdline` in a
+/// guest. The vsock device is explicit and has no socket passthrough, so
+/// libkrun adds no `tsi_hijack`. 320 leaves room for one more device.
+const LIBKRUN_CMDLINE_RESERVE: usize = 320;
 
 /// The most bytes minvmd's own part of the boot line may hold:
 /// [`COMMAND_LINE_SIZE`] less the NUL terminator and less
@@ -135,33 +86,27 @@ const BOOT_LINE_BUDGET: usize = COMMAND_LINE_SIZE - 1 - LIBKRUN_CMDLINE_RESERVE;
 /// interact poorly with host `O_DIRECT`).
 pub const DISK_DIRECT_IO_ENV: &str = "MINVMD_DISK_DIRECT_IO";
 
-/// Which of the spec's deployment models (DM1–DM5) a minvmd host runs under.
-///
-/// minvmd manages libkrun VMs, which only exist on DM1/DM3/DM4; DM2 is native
-/// Linux with no VM boundary. The distinction matters for VM-wide egress
-/// (R2.5): a `vm_egress` policy is meaningful only where a VM exists, and is a
-/// configuration error on DM2 (see [`VmConfig::validate_for`]).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeploymentMode {
-    /// macOS + one or more libkrun Linux VMs.
-    Dm1,
-    /// Native Linux, minimald on the host directly (no VM).
-    Dm2,
-    /// Native Linux + one or more Linux VMs.
-    Dm3,
-    /// DM2 + DM3 combined.
-    Dm4,
-    /// Any of the above with a network-accessible, authenticated minimald.
-    Dm5,
-}
-
 /// Configuration parameters for a single microVM.
 ///
 /// Build with [`VmConfig::new`] and apply to a libkrun
 /// [`Context`][crate::krun::Context] with [`VmConfig::apply`]. The network mode
 /// defaults to [`NetworkMode::HostNet`]; override it with
 /// [`VmConfig::with_network_mode`].
+/// The backend of the VM's virtio-net device: one end of a stream socket
+/// pair, inherited from the supervisor, and the MAC the guest sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Uplink {
+    pub fd: std::os::fd::RawFd,
+    pub mac: switch::MacAddr,
+}
+
+/// `NET_FEATURE_GUEST_CSUM | NET_FEATURE_GUEST_TSO4`. With these the guest
+/// driver posts receive buffers large enough for any frame. Without them one
+/// frame longer than 1518 bytes toward the guest stops its receive path for
+/// good.
+#[cfg(minvmd_libkrun)]
+const UPLINK_FEATURES: u32 = (1 << 1) | (1 << 7);
+
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     /// Number of virtual CPUs.
@@ -177,15 +122,8 @@ pub struct VmConfig {
     /// `/init` (minimald as pid-1), instead of booting a block-device root. This
     /// is how minimald is shipped as pid-1 without baking it into the rootfs.
     pub initramfs: PathBuf,
-    /// How this VM attaches to the per-host gvproxy switch (R1.5). Defaults to
-    /// [`NetworkMode::HostNet`]; an `OwnIp` VM is wired to the switch as a
-    /// client via the per-PTask vsock shuttle.
-    pub network_mode: NetworkMode,
-    /// VM-wide egress policy applied to all traffic from this VM, regardless of
-    /// per-PTask mode (R2.5). Only meaningful on a deployment model with a VM
-    /// boundary (DM1/DM3/DM4); rejected on DM2 by [`VmConfig::validate_for`].
-    /// `None` means no VM-wide egress restriction.
-    pub vm_egress: Option<EgressPolicy>,
+    /// The virtio-net device's backend, when the VM gets a network device.
+    pub uplink: Option<Uplink>,
     /// Path to the per-VM writable data volume image, attached as `/dev/vdb`
     /// via `krun_add_disk3` (spec R1.4). `None` means no data volume is attached
     /// (legacy tmpfs-only boot). Provision the image with
@@ -209,16 +147,15 @@ impl VmConfig {
             kernel_path,
             rootfs_path,
             initramfs,
-            network_mode: NetworkMode::default(),
-            vm_egress: None,
+            uplink: None,
             data_volume_path: None,
         }
     }
 
-    /// Set the VM network mode (R1.5), consuming and returning `self`.
+    /// Gives the VM a network device on `uplink`.
     #[must_use]
-    pub fn with_network_mode(mut self, network_mode: NetworkMode) -> Self {
-        self.network_mode = network_mode;
+    pub fn with_uplink(mut self, uplink: Uplink) -> Self {
+        self.uplink = Some(uplink);
         self
     }
 
@@ -231,83 +168,6 @@ impl VmConfig {
         self
     }
 
-    /// Set the VM-wide egress policy (R2.5), consuming and returning `self`.
-    #[must_use]
-    pub fn with_vm_egress(mut self, vm_egress: EgressPolicy) -> Self {
-        self.vm_egress = Some(vm_egress);
-        self
-    }
-
-    /// Validates this config against the active deployment model (R2.5).
-    ///
-    /// `vm_egress` is VM-wide egress, meaningful only where a VM boundary exists
-    /// (DM1/DM3/DM4). On DM2 (native Linux, minimald on the host with no VM) it
-    /// has nothing to apply to and collapses to per-PTask egress (UC3), so a
-    /// `vm_egress` set on DM2 is a configuration error rather than a silent
-    /// no-op. [`DeploymentMode::Dm5`] does not by itself encode an underlying
-    /// model, so it may resolve to DM2 (no VM boundary); `vm_egress` is rejected
-    /// there too — fail closed rather than silently accept a policy that might
-    /// have nothing to enforce it — until the underlying model is resolved.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VmError::Configuration`] when `vm_egress` is set and `mode` is
-    /// [`DeploymentMode::Dm2`] or [`DeploymentMode::Dm5`], or
-    /// [`VmError::InvalidEgressSubnet`] when `vm_egress` is accepted for `mode`
-    /// but carries an `allow_subnets` entry that is not a valid CIDR prefix.
-    pub fn validate_for(&self, mode: DeploymentMode) -> Result<(), VmError> {
-        if let Some(vm_egress) = self.vm_egress.as_ref() {
-            let reason = match mode {
-                DeploymentMode::Dm2 => Some(
-                    "VM-wide egress is not applicable on DM2 (native Linux has no VM \
-                     boundary); use per-PTask egress instead",
-                ),
-                DeploymentMode::Dm5 => Some(
-                    "VM-wide egress cannot be applied on DM5 until its underlying \
-                     deployment model is resolved; DM5 does not by itself guarantee a \
-                     VM boundary to enforce it",
-                ),
-                DeploymentMode::Dm1 | DeploymentMode::Dm3 | DeploymentMode::Dm4 => None,
-            };
-            if let Some(reason) = reason {
-                return Err(VmError::Configuration {
-                    what: "vm_egress",
-                    reason,
-                });
-            }
-            // vm_egress is accepted for this mode (a VM boundary exists); validate
-            // that each allow_subnets entry is a syntactically valid CIDR prefix,
-            // mirroring the per-PTask egress check in
-            // `boxes::Record::validate_policy`, so a misconfigured subnet is
-            // named here rather than failing opaquely when #553's enforcement
-            // layer parses it.
-            if let Some(bad) = vm_egress.first_invalid_subnet() {
-                return Err(VmError::InvalidEgressSubnet {
-                    cidr: bad.to_owned(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether this VM joins the per-host gvproxy switch as an own-IP client.
-    ///
-    /// Only an [`NetworkMode::OwnIp`] VM provisions a tap + relay; `HostNet` and
-    /// `NoNet` never attach to the switch (R1.5).
-    #[must_use]
-    pub fn is_own_ip(&self) -> bool {
-        matches!(self.network_mode, NetworkMode::OwnIp)
-    }
-
-    /// The tap interface name this VM's own-IP PTask is bridged onto, derived
-    /// from `index` so each PTask on a host gets a distinct, deterministic name.
-    ///
-    /// The name fits the kernel's 15-char `IFNAMSIZ` limit for any `u32` index.
-    #[must_use]
-    pub fn tap_name(index: u32) -> String {
-        format!("vmtap{index}")
-    }
-
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
     ///
     /// Configures vcpus, RAM, kernel + initramfs, the ext4 root disk, and the
@@ -315,6 +175,10 @@ impl VmConfig {
     #[cfg(minvmd_libkrun)]
     pub fn apply(&self, ctx: &mut crate::krun::Context) -> Result<(), crate::error::VmError> {
         ctx.set_vm_config(self.num_vcpus, self.ram_mib)?;
+        // Before any vsock port is mapped. Left implicit, libkrun's vsock
+        // device lets guest kernel code open sockets on the host, around the
+        // network device.
+        ctx.vsock_without_socket_passthrough()?;
 
         // Initramfs boot: the kernel unpacks the initramfs into a RAM root and
         // runs its `/init` (no `root=`/`init=` cmdline). minimald-as-/init mounts
@@ -328,7 +192,6 @@ impl VmConfig {
         // `set_kernel` outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
         let node_proxy_port = node_proxy_port_from_env()?;
-        let publish_generation = publish_generation_from_env()?;
         let egress_deny_all_opt_out = egress_deny_all_opt_out_from_env();
         // The host's telemetry decision crosses the same way, under the
         // guest's own `MINIMAL_` names and never with an endpoint, headers
@@ -352,16 +215,15 @@ impl VmConfig {
             kernel_cmdline(
                 rust_log.as_deref(),
                 node_proxy_port,
-                publish_generation,
                 egress_deny_all_opt_out,
             ),
             &guest_env,
         );
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
-        // the one line that says what the guest was told to boot with — a
-        // missing or mistyped parameter (`ipv6.disable=1` among them) is
-        // diagnosable from the host before the guest says anything.
+        // the one line that says what the guest was told to boot with, so a
+        // missing or mistyped parameter shows on the host before the guest
+        // says anything.
         // The telemetry tokens by name only (TEL-040): minvmd's info log is
         // exported and spooled when telemetry is on.
         tracing::info!(
@@ -404,13 +266,6 @@ impl VmConfig {
                 sync_mode,
             )?;
         }
-        // Network attachment (R1.5): the VM joins the per-host gvproxy switch
-        // supervised by `crate::net` according to `network_mode`. The libkrun
-        // device wiring (tap fd handed to gvproxy over the per-PTask vsock
-        // shuttle) is driven by the switch handle, not configured here; record
-        // the selected mode so a stuck boot can be diagnosed.
-        tracing::debug!(network_mode = %self.network_mode.word(), "VM network mode selected");
-
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on
         // the host UDS and bridges each accepted connection to the guest process
         // listening on vsock VSOCK_BRIDGE_PORT.
@@ -430,35 +285,13 @@ impl VmConfig {
         // new ones queue. Acceptable for v0.1 workloads (<10 concurrent).
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
 
-        // gvproxy shuttle bridge, through the host-side egress gate (NET-081).
-        // The guest connects to AF_VSOCK CID 2 (the host) on
-        // VSOCK_GVPROXY_SHUTTLE_PORT; with `listen = false` libkrun dials the
-        // named host socket and splices the two, carrying raw L2 frames between
-        // a guest tap and the host. Since NET-081 the named socket is the
-        // **egress gate's**, not the switch's own: the gate — started by the
-        // switch runtime before the VM boots (see `crate::net`) — decides every
-        // frame against the host-side table of published namespaces
-        // (`crate::box_registry`) by the source address it carries, and relays
-        // only what the shared frame verdict admits on to the gvproxy switch (the
-        // single gVisor stack). Per-box egress rules are thereby applied **outside
-        // the VM**, where nothing inside the escape boundary can change them, and
-        // a frame whose source address no namespace holds is dropped, wherever
-        // it is headed (NET-085; `egress_gate` carries the rules and the egress
-        // default's phase). Registered for every VM, not just own-IP: the guest's root netns (the
-        // daemon) attaches a primary tap here for egress, and own-IP PTasks
-        // attach further taps as additional clients on the same switch. If the
-        // gate (or the switch behind it) did not come up, the guest's connect
-        // simply fails and the relay reports no egress — boot is unaffected.
-        let gate_sock = crate::net::resolve_gate_sock()
-            .map_err(|source| crate::error::VmError::Io { source })?;
-        crate::sock::check_uds_path_len(&gate_sock)
-            .map_err(|source| crate::error::VmError::Io { source })?;
-        ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &gate_sock, false)?;
-        tracing::info!(
-            port = crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            gate_sock = %gate_sock.display(),
-            "registered gvproxy shuttle vsock bridge behind the host-side egress gate",
-        );
+        // The network device. The supervisor holds the other end of this
+        // socket and pumps frames between it and gvproxy, so the device stays
+        // up while gvproxy restarts. Without it the VM has no network at all.
+        if let Some(uplink) = &self.uplink {
+            ctx.add_net_unixstream_fd(uplink.fd, uplink.mac.0, UPLINK_FEATURES)?;
+            tracing::info!(fd = uplink.fd, mac = %uplink.mac, "added the VM's network device");
+        }
         Ok(())
     }
 }
@@ -681,19 +514,16 @@ fn append_tokens(base: &str, tokens: &[String]) -> Result<String, usize> {
 ///
 /// The values are injected rather than read from the process environment here,
 /// so this stays pure and unit-testable; the caller passes
-/// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()`,
-/// `publish_generation_from_env()` and `egress_deny_all_opt_out_from_env()` —
-/// the boot's publish generation (T93), which the guest daemon echoes in its
-/// publish reports, rides beside the port and, like it, is never skipped; the
-/// egress opt-out (NET-077) rides the same way, and is only written when the
-/// operator set it. A `RUST_LOG` value that cannot survive the boot line is
-/// skipped (leaving the base line plus the port, generation and opt-out
-/// tokens byte-identical) with a warning, rather than corrupting the boot: a
+/// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()` and
+/// `egress_deny_all_opt_out_from_env()`. The egress opt-out is only written
+/// when the operator set it. A `RUST_LOG` value that cannot survive the boot
+/// line is skipped (leaving the base line plus the port and opt-out tokens
+/// byte-identical) with a warning, rather than corrupting the boot: a
 /// value outside the boot alphabet is not one token to the kernel or not a
 /// line libkrun accepts ([`boot_token`]), an empty value carries nothing, and
-/// an over-long one would push the line past [`BOOT_LINE_BUDGET`]. The port,
-/// the generation and the opt-out are never skipped — the guest binds the
-/// port as handed — so their tokens count against the budget when the
+/// an over-long one would push the line past [`BOOT_LINE_BUDGET`]. The port
+/// and the opt-out are never skipped — the guest binds the port as handed —
+/// so their tokens count against the budget when the
 /// filter's length is judged. Commas are untouched — `info,russh=debug` is
 /// the normal form.
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
@@ -708,24 +538,16 @@ fn append_tokens(base: &str, tokens: &[String]) -> Result<String, usize> {
 fn kernel_cmdline(
     rust_log: Option<&str>,
     proxy_port: Option<u16>,
-    publish_generation: Option<u64>,
     egress_deny_all_opt_out: bool,
 ) -> Cow<'static, str> {
     // The port rides the boot line first: base, then the port token, then the
-    // publish generation beside it, then the egress opt-out when the operator
-    // set it, then the filter when one is forwarded.
-    let base_with_port = match (proxy_port, publish_generation) {
-        (Some(proxy), Some(generation)) => Cow::Owned(format!(
-            "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy} \
-             {PUBLISH_GENERATION_TOKEN}={generation}"
-        )),
-        (Some(proxy), None) => Cow::Owned(format!(
+    // egress opt-out when the operator set it, then the filter when one is
+    // forwarded.
+    let base_with_port = match proxy_port {
+        Some(proxy) => Cow::Owned(format!(
             "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy}"
         )),
-        (None, Some(generation)) => Cow::Owned(format!(
-            "{BASE_KERNEL_CMDLINE} {PUBLISH_GENERATION_TOKEN}={generation}"
-        )),
-        (None, None) => Cow::Borrowed(BASE_KERNEL_CMDLINE),
+        None => Cow::Borrowed(BASE_KERNEL_CMDLINE),
     };
 
     let base_with_port = if egress_deny_all_opt_out {
@@ -809,32 +631,6 @@ fn node_proxy_port_from_raw(proxy: Option<&str>) -> Result<Option<u16>, crate::e
         Err(_) => Err(crate::error::VmError::Io {
             source: std::io::Error::other(format!(
                 "environment variable {NODE_PROXY_PORT_ENV} carries {raw:?}, which is not a port"
-            )),
-        }),
-    }
-}
-
-/// Reads this boot's publish generation the supervisor handed the VMM child
-/// (see [`PUBLISH_GENERATION_ENV`]). Strict like the port's decode: absent
-/// is a boot outside the supervisor (no token), and a value that is not a
-/// generation fails the boot naming the variable and the value.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn publish_generation_from_env() -> Result<Option<u64>, crate::error::VmError> {
-    publish_generation_from_raw(std::env::var(PUBLISH_GENERATION_ENV).ok().as_deref())
-}
-
-/// Decodes a handed publish generation from its raw env value.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::error::VmError> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    match raw.trim().parse::<u64>() {
-        Ok(generation) => Ok(Some(generation)),
-        Err(_) => Err(crate::error::VmError::Io {
-            source: std::io::Error::other(format!(
-                "environment variable {PUBLISH_GENERATION_ENV} carries {raw:?}, \
-                 which is not a publish generation"
             )),
         }),
     }
@@ -968,7 +764,6 @@ fn widest_base_len() -> usize {
         BASE_KERNEL_CMDLINE.len(),
         [
             HOSTNAME_PROXY_PORT_TOKEN.len() + 1 + "65535".len(),
-            PUBLISH_GENERATION_TOKEN.len() + 1 + "18446744073709551615".len(),
             EGRESS_DENY_ALL_OPT_OUT_TOKEN.len() + "=1".len(),
         ],
     )
@@ -1200,38 +995,27 @@ mod tests {
 
     #[test]
     fn kernel_cmdline_without_a_host_filter_is_the_base_boot_line() {
-        // The base line exactly: console plus IPv6 disabled, no empty token,
-        // no trailing space.
-        assert_eq!(
-            kernel_cmdline(None, None, None, false),
-            "console=hvc0 ipv6.disable=1"
-        );
+        // The base line exactly: no empty token, no trailing space.
+        assert_eq!(kernel_cmdline(None, None, false), "console=hvc0");
     }
 
     #[test]
-    fn guest_ipv6_disabled_no_v6_route() {
-        // Every boot line carries `ipv6.disable=1`, so the guest's IPv6 stack
-        // never comes up: no interface configures an IPv6 address and the
-        // route table never gains an IPv6 entry, loopback's ::1 included —
-        // nothing inside the escape boundary gets a v6 family to ride.
-        let lines = [
-            kernel_cmdline(None, None, None, false),
-            kernel_cmdline(Some("debug"), None, None, false),
-        ];
-        for line in lines {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            assert!(
-                tokens.contains(&"ipv6.disable=1"),
-                "expected an `ipv6.disable=1` boot token, got: {line}"
-            );
+    fn the_boot_line_does_not_turn_ipv6_off() {
+        // The guest's policy engine decides IPv6 per box. A kernel with no
+        // IPv6 at all would leave it nothing to decide.
+        for line in [
+            kernel_cmdline(None, None, false),
+            kernel_cmdline(Some("debug"), None, false),
+        ] {
+            assert!(!line.contains("ipv6"), "{line}");
         }
     }
 
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
         assert_eq!(
-            kernel_cmdline(Some("debug"), None, None, false),
-            "console=hvc0 ipv6.disable=1 RUST_LOG=debug"
+            kernel_cmdline(Some("debug"), None, false),
+            "console=hvc0 RUST_LOG=debug"
         );
     }
 
@@ -1239,42 +1023,36 @@ mod tests {
     fn kernel_cmdline_preserves_comma_separated_directives() {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
-            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, None, false),
-            "console=hvc0 ipv6.disable=1 RUST_LOG=info,russh=debug,minimald=debug"
+            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, false),
+            "console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
 
     #[test]
     fn kernel_cmdline_skips_a_filter_containing_whitespace() {
         // The kernel would split these into separate boot tokens, silently
-        // corrupting the line, so the whole value is dropped — the base line
-        // still boots, IPv6 disabled.
+        // corrupting the line, so the whole value is dropped and the base
+        // line still boots.
         assert_eq!(
-            kernel_cmdline(Some("info, russh=debug"), None, None, false),
-            "console=hvc0 ipv6.disable=1"
+            kernel_cmdline(Some("info, russh=debug"), None, false),
+            "console=hvc0"
         );
         assert_eq!(
-            kernel_cmdline(Some("info\trussh=debug"), None, None, false),
-            "console=hvc0 ipv6.disable=1"
+            kernel_cmdline(Some("info\trussh=debug"), None, false),
+            "console=hvc0"
         );
     }
 
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
-        assert_eq!(
-            kernel_cmdline(Some(""), None, None, false),
-            "console=hvc0 ipv6.disable=1"
-        );
+        assert_eq!(kernel_cmdline(Some(""), None, false), "console=hvc0");
     }
 
     #[test]
     fn kernel_cmdline_skips_an_oversized_filter() {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
-        assert_eq!(
-            kernel_cmdline(Some(&huge), None, None, false),
-            "console=hvc0 ipv6.disable=1"
-        );
+        assert_eq!(kernel_cmdline(Some(&huge), None, false), "console=hvc0");
     }
 
     #[test]
@@ -1285,12 +1063,12 @@ mod tests {
             BOOT_LINE_BUDGET + LIBKRUN_CMDLINE_RESERVE + 1,
             COMMAND_LINE_SIZE
         );
-        // `console=hvc0 ipv6.disable=1 RUST_LOG=` (37 bytes today, computed
-        // from the constants so the base line may change) precedes the
+        // `console=hvc0 RUST_LOG=` (computed from the constants, so the
+        // base line may change) precedes the
         // value, so this value yields a line that fills the budget exactly.
         let prefix = format!("{BASE_KERNEL_CMDLINE} {GUEST_LOG_ENV}=").len();
         let longest = "d".repeat(BOOT_LINE_BUDGET - prefix);
-        let line = kernel_cmdline(Some(&longest), None, None, false);
+        let line = kernel_cmdline(Some(&longest), None, false);
         assert_eq!(line.len(), BOOT_LINE_BUDGET);
         assert!(line.ends_with(&longest));
 
@@ -1299,10 +1077,9 @@ mod tests {
             kernel_cmdline(
                 Some(&"d".repeat(BOOT_LINE_BUDGET - prefix + 1)),
                 None,
-                None,
                 false
             ),
-            "console=hvc0 ipv6.disable=1"
+            "console=hvc0"
         );
     }
 
@@ -1311,18 +1088,17 @@ mod tests {
     /// still crosses fills the budget exactly, and one byte more is skipped
     /// while the port, the generation and the opt-out still boot.
     #[test]
-    fn kernel_cmdline_forwards_the_longest_filter_behind_the_widest_port_and_generation() {
-        let base = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true);
+    fn kernel_cmdline_forwards_the_longest_filter_behind_the_widest_port() {
+        let base = kernel_cmdline(None, Some(u16::MAX), true);
         let prefix = format!("{base} {GUEST_LOG_ENV}=").len();
         let longest = "d".repeat(BOOT_LINE_BUDGET - prefix);
-        let line = kernel_cmdline(Some(&longest), Some(u16::MAX), Some(u64::MAX), true);
+        let line = kernel_cmdline(Some(&longest), Some(u16::MAX), true);
         assert_eq!(line.len(), BOOT_LINE_BUDGET);
         assert!(line.starts_with(&*base) && line.ends_with(&longest));
         assert_eq!(
             kernel_cmdline(
                 Some(&"d".repeat(BOOT_LINE_BUDGET - prefix + 1)),
                 Some(u16::MAX),
-                Some(u64::MAX),
                 true
             ),
             base
@@ -1337,7 +1113,7 @@ mod tests {
     /// outside what the proofs assume.
     #[test]
     fn widest_base_len_covers_every_base_token() {
-        let widest = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true);
+        let widest = kernel_cmdline(None, Some(u16::MAX), true);
         assert!(
             widest.len() <= widest_base_len(),
             "the widest base line is {} bytes, past widest_base_len() = {}: {widest}",
@@ -1354,14 +1130,14 @@ mod tests {
     /// its reserve.
     #[test]
     fn kernel_cmdline_decides_the_filter_lengths_the_lab_probe_crashed_on() {
-        for (port, generation) in [(None, None), (Some(u16::MAX), Some(u64::MAX))] {
-            let base = kernel_cmdline(None, port, generation, false);
+        for port in [None, Some(u16::MAX)] {
+            let base = kernel_cmdline(None, port, false);
             let crosses = "d".repeat(1600);
-            let line = kernel_cmdline(Some(&crosses), port, generation, false);
+            let line = kernel_cmdline(Some(&crosses), port, false);
             assert!(line.ends_with(&crosses), "a 1600-byte filter was skipped");
             assert!(line.len() + LIBKRUN_CMDLINE_RESERVE < COMMAND_LINE_SIZE);
             assert_eq!(
-                kernel_cmdline(Some(&"d".repeat(1760)), port, generation, false),
+                kernel_cmdline(Some(&"d".repeat(1760)), port, false),
                 base,
                 "a 1760-byte filter crossed"
             );
@@ -1644,7 +1420,7 @@ mod tests {
             "info\u{1}",
         ] {
             assert_eq!(
-                kernel_cmdline(Some(bad), None, None, false),
+                kernel_cmdline(Some(bad), None, false),
                 BASE_KERNEL_CMDLINE,
                 "{bad:?}"
             );
@@ -1658,7 +1434,7 @@ mod tests {
     #[test]
     fn the_boot_line_leaves_room_for_the_suffix_libkrun_appends() {
         assert_eq!(
-            kernel_cmdline(Some(&"d".repeat(2000)), None, None, false),
+            kernel_cmdline(Some(&"d".repeat(2000)), None, false),
             BASE_KERNEL_CMDLINE
         );
         let tokens = vec![format!("MINIMAL_OTEL_FILTER={}", "d".repeat(1990))];
@@ -1676,8 +1452,8 @@ mod tests {
         // port never rides: on a VM-backed host the in-VM daemon starts no
         // answerer (NET-138), so a token carrying one would be an admitted
         // port with nothing behind it.
-        let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654";
-        assert_eq!(kernel_cmdline(None, Some(7654), None, false), handed);
+        let handed = "console=hvc0 MINIMALD_HOSTNAME_PROXY_PORT=7654";
+        assert_eq!(kernel_cmdline(None, Some(7654), false), handed);
         assert!(
             !handed.contains("MINIMALD_ZONE_ANSWERER_PORT"),
             "the boot line must not carry a zone-answerer port: {handed}"
@@ -1685,17 +1461,17 @@ mod tests {
 
         // With both a filter and the port, the tokens share the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), None, false),
-            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
+            kernel_cmdline(Some("debug"), Some(7654), false),
+            "console=hvc0 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
         );
 
         // A filter that would push the whole line past the buffer is skipped
         // while the port still boots: the line keeps the handed port and
         // drops the filter, rather than corrupting a token the guest binds.
-        let port_only = kernel_cmdline(None, Some(7654), None, false);
+        let port_only = kernel_cmdline(None, Some(7654), false);
         let oversized = "d".repeat(COMMAND_LINE_SIZE - port_only.len() - GUEST_LOG_ENV.len() - 1);
         assert_eq!(
-            kernel_cmdline(Some(&oversized), Some(7654), None, false),
+            kernel_cmdline(Some(&oversized), Some(7654), false),
             port_only,
             "an oversized filter is skipped; the handed port still boots"
         );
@@ -1718,43 +1494,20 @@ mod tests {
     }
 
     #[test]
-    fn the_publish_generation_rides_the_boot_line_beside_the_port() {
-        // T93: the boot's publish generation travels the same way the port
-        // does, so the guest can echo it in every publish report.
-        assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), Some(42), false),
-            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
-             MINIMALD_PUBLISH_GENERATION=42 RUST_LOG=debug"
-        );
-        assert_eq!(publish_generation_from_raw(None).unwrap(), None);
-        assert_eq!(publish_generation_from_raw(Some("42")).unwrap(), Some(42));
-        let garbage = publish_generation_from_raw(Some("not-a-generation"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            garbage.contains(PUBLISH_GENERATION_ENV) && garbage.contains("not-a-generation"),
-            "an undecodable value names the variable and the value, got: {garbage}"
-        );
-    }
-
-    #[test]
     fn the_egress_opt_out_rides_the_boot_line_only_when_set() {
         // NET-077: the operator's opt-out travels the same way the port does,
         // so the guest daemon runs the egress default its host was started
         // with. Unset, the token is absent — the guest runs the default.
+        assert_eq!(kernel_cmdline(None, None, false), "console=hvc0");
         assert_eq!(
-            kernel_cmdline(None, None, None, false),
-            "console=hvc0 ipv6.disable=1"
-        );
-        assert_eq!(
-            kernel_cmdline(None, None, None, true),
-            "console=hvc0 ipv6.disable=1 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1"
+            kernel_cmdline(None, None, true),
+            "console=hvc0 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1"
         );
         // Beside the port and generation, the token shares the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), Some(42), true),
-            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
-             MINIMALD_PUBLISH_GENERATION=42 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
+            kernel_cmdline(Some("debug"), Some(7654), true),
+            "console=hvc0 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
+             MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
         );
     }
 
@@ -1764,12 +1517,12 @@ mod tests {
             "MINIMAL_TELEMETRY=1".to_string(),
             "MINIMAL_OTEL_FILTER=info,minimald::net=debug".to_string(),
         ];
-        // Relative to the base line, which upstream owns (it gained ipv6.disable=1).
+        // Relative to the base line.
         assert_eq!(
-            with_guest_env(kernel_cmdline(Some("info"), None, None, false), &tokens),
+            with_guest_env(kernel_cmdline(Some("info"), None, false), &tokens),
             format!(
                 "{} MINIMAL_TELEMETRY=1 MINIMAL_OTEL_FILTER=info,minimald::net=debug",
-                kernel_cmdline(Some("info"), None, None, false)
+                kernel_cmdline(Some("info"), None, false)
             )
         );
     }
@@ -1785,7 +1538,7 @@ mod tests {
             "MINIMAL_OTEL_TRACES_EXPORTER=none".to_string(),
             "TRACEPARENT=00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
         ];
-        let base = kernel_cmdline(Some("info"), None, None, false);
+        let base = kernel_cmdline(Some("info"), None, false);
         let line = with_guest_env(base.clone(), &tokens);
         let logged = loggable_boot_line(&line, &tokens);
         assert!(logged.starts_with(base.as_ref()), "{logged}");
@@ -1858,7 +1611,7 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| (*v).to_owned())
         };
-        let base = kernel_cmdline(Some("info"), Some(7654), Some(42), false);
+        let base = kernel_cmdline(Some("info"), Some(7654), false);
 
         let tokens = crate::telemetry::guest_env(get, true, Some(7353), Some(TP));
         let on = with_guest_env(base.clone(), &tokens);
@@ -1910,8 +1663,8 @@ mod tests {
     #[test]
     fn no_guest_env_leaves_the_boot_line_byte_identical() {
         assert_eq!(
-            with_guest_env(kernel_cmdline(None, None, None, false), &[]),
-            kernel_cmdline(None, None, None, false)
+            with_guest_env(kernel_cmdline(None, None, false), &[]),
+            kernel_cmdline(None, None, false)
         );
     }
 
@@ -1922,13 +1675,13 @@ mod tests {
             format!("MINIMAL_OTEL_FILTER=info,{}=debug", "h".repeat(2100)),
         ];
         assert_eq!(
-            with_guest_env(kernel_cmdline(None, None, None, false), &big),
-            kernel_cmdline(None, None, None, false)
+            with_guest_env(kernel_cmdline(None, None, false), &big),
+            kernel_cmdline(None, None, false)
         );
 
         // At the boundary: tokens that fill the budget exactly cross; one
         // byte more drops them all, at the token boundary, never mid-value.
-        let base = kernel_cmdline(None, None, None, false);
+        let base = kernel_cmdline(None, None, false);
         let fill = |len: usize| {
             vec![
                 "MINIMAL_TELEMETRY=1".to_string(),
@@ -1958,228 +1711,6 @@ mod tests {
         assert_eq!(cfg.kernel_path, PathBuf::from("/boot/Image.gz"));
         assert_eq!(cfg.rootfs_path, PathBuf::from("/var/lib/rootfs.img"));
         assert_eq!(cfg.initramfs, PathBuf::from("/var/lib/initramfs.cpio"));
-    }
-
-    #[test]
-    fn network_mode_defaults_to_host_net() {
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        );
-        assert_eq!(cfg.network_mode, NetworkMode::HostNet);
-    }
-
-    #[test]
-    fn with_network_mode_overrides_default() {
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_network_mode(NetworkMode::OwnIp);
-        assert_eq!(cfg.network_mode, NetworkMode::OwnIp);
-        assert!(cfg.is_own_ip());
-    }
-
-    #[test]
-    fn host_net_and_no_net_are_not_own_ip() {
-        let base = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        );
-        assert!(
-            !base
-                .clone()
-                .with_network_mode(NetworkMode::HostNet)
-                .is_own_ip()
-        );
-        assert!(!base.with_network_mode(NetworkMode::NoNet).is_own_ip());
-    }
-
-    #[test]
-    fn tap_name_is_deterministic_and_within_ifnamsiz() {
-        assert_eq!(VmConfig::tap_name(2), "vmtap2");
-        assert_eq!(VmConfig::tap_name(3), "vmtap3");
-        assert_ne!(VmConfig::tap_name(2), VmConfig::tap_name(3));
-        // Kernel IFNAMSIZ is 16 (15 usable chars); the widest u32 must fit.
-        assert!(VmConfig::tap_name(u32::MAX).len() < 16);
-    }
-
-    #[test]
-    fn vm_egress_defaults_to_none_and_round_trips() {
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        );
-        assert!(cfg.vm_egress.is_none());
-        let cfg = cfg.with_vm_egress(EgressPolicy::default());
-        assert!(cfg.vm_egress.is_some());
-    }
-
-    #[test]
-    fn vm_egress_is_rejected_on_dm2() {
-        // R2.5: VM-wide egress is a configuration error on DM2 (no VM boundary).
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_vm_egress(EgressPolicy::default());
-        let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                VmError::Configuration {
-                    what: "vm_egress",
-                    ..
-                }
-            ),
-            "expected a typed configuration error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn vm_egress_is_rejected_on_dm5() {
-        // R2.5 fail-closed: DM5 does not encode a VM boundary, so a VM-wide
-        // egress policy is rejected until the underlying model is resolved.
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_vm_egress(EgressPolicy::default());
-        let err = cfg.validate_for(DeploymentMode::Dm5).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                VmError::Configuration {
-                    what: "vm_egress",
-                    ..
-                }
-            ),
-            "expected a typed configuration error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn vm_egress_is_accepted_on_vm_deployment_models() {
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_vm_egress(EgressPolicy::default());
-        // DM1/DM3/DM4 each have a VM boundary, so vm_egress is valid.
-        assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
-        assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
-        assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
-    }
-
-    #[test]
-    fn vm_egress_with_invalid_cidr_is_rejected_on_vm_deployment_models() {
-        // vm_egress is accepted on DM1/DM3/DM4, but an allow_subnets entry that is
-        // not a valid CIDR prefix is named at config time, mirroring the per-PTask
-        // egress check, rather than failing opaquely under #553's enforcement.
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_vm_egress(EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".into(), "not-a-cidr".into()]),
-            ..EgressPolicy::default()
-        });
-        for mode in [
-            DeploymentMode::Dm1,
-            DeploymentMode::Dm3,
-            DeploymentMode::Dm4,
-        ] {
-            let err = cfg.validate_for(mode).unwrap_err();
-            assert!(
-                matches!(&err, VmError::InvalidEgressSubnet { cidr } if cidr == "not-a-cidr"),
-                "expected an invalid-egress-subnet error, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn vm_egress_with_valid_cidrs_is_accepted_on_vm_deployment_models() {
-        // Both IPv4 and IPv6 CIDR prefixes pass the syntactic check.
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_vm_egress(EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".into(), "fd00::/8".into()]),
-            ..EgressPolicy::default()
-        });
-        assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
-        assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
-        assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
-    }
-
-    #[test]
-    fn vm_egress_with_invalid_cidr_still_rejected_first_by_mode_on_dm2() {
-        // On DM2 the mode rejection fires before the CIDR check, so even an
-        // invalid-CIDR vm_egress surfaces as the Configuration error, not
-        // InvalidEgressSubnet — the mode incompatibility is the dominant fault.
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        )
-        .with_vm_egress(EgressPolicy {
-            allow_subnets: Some(vec!["not-a-cidr".into()]),
-            ..EgressPolicy::default()
-        });
-        let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                VmError::Configuration {
-                    what: "vm_egress",
-                    ..
-                }
-            ),
-            "expected a mode configuration error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn absent_vm_egress_is_valid_on_dm2() {
-        // No vm_egress => nothing to reject, even on DM2.
-        let cfg = VmConfig::new(
-            1,
-            256,
-            PathBuf::from("/k"),
-            PathBuf::from("/r"),
-            PathBuf::from("/i"),
-        );
-        assert!(cfg.validate_for(DeploymentMode::Dm2).is_ok());
     }
 
     #[test]

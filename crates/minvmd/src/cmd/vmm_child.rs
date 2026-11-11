@@ -82,12 +82,14 @@ fn run_vmm() -> Result<()> {
         rootfs,
         initramfs,
     );
-    // An own-IP VM registers the per-PTask gvproxy shuttle vsock
-    // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
-    // The env var keeps the parent's gvproxy-spawn decision and this child's VM
-    // config in lock-step.
-    if crate::cmd::own_ip_requested() {
-        cfg = cfg.with_network_mode(minimald_rpc::NetworkMode::OwnIp);
+    // The supervisor hands the network device's backend socket by
+    // inheritance and names its descriptor here. Without it (`minvmd boot`,
+    // or a host with no gvproxy) the VM gets no network device.
+    if let Some(fd) = crate::net::uplink::inherited_fd()? {
+        cfg = cfg.with_uplink(crate::vm::Uplink {
+            fd,
+            mac: switch::MacAddr::for_switch_ip(switch::DEFAULT_SUBNET.daemon_ip()),
+        });
     }
 
     // Provision + attach the per-VM writable data volume as /dev/vdb (spec R1.4).
@@ -145,6 +147,15 @@ fn run_vmm() -> Result<()> {
     {
         ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
             .context("registering the guest report door's vsock port")?;
+    }
+
+    // The stream door's vsock port: the guest daemon opens one connection
+    // per stream it wants carried to the host side.
+    if let Some(stream_sock) = std::env::var_os(crate::net::stream_door::STREAM_DOOR_SOCK_ENV)
+        .filter(|path| !path.is_empty())
+    {
+        ctx.add_vsock_port(minimald_rpc::VM_HOST_STREAM_PORT, &stream_sock)
+            .context("registering the stream door's vsock port")?;
     }
 
     // The guest telemetry door's vsock port (TEL-034): registered only when
