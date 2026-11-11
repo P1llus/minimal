@@ -3487,16 +3487,16 @@ pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
 /// (NET-070), as [`connecting_box`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectingOwner {
-    /// A process in this box's classifier leaf holds the socket, and no
-    /// holder runs in another box's leaf.
+    /// A process in this box's cgroup holds the socket, and no holder runs
+    /// in another box's cgroup.
     Box(SessionId),
-    /// Every process that holds the socket runs in no box's leaf, as the
+    /// Every process that holds the socket runs in no box's cgroup, as the
     /// developer's browser does.
     NoBox,
     /// The lookup found no owner: the socket is gone from the tables or
     /// held by no process (the client closed it), `/proc` hides a holder or
     /// its cgroup from this process, a holder's pid stopped holding the
-    /// socket while it was read, or holders run in two boxes' leaves.
+    /// socket while it was read, or holders run in two boxes' cgroups.
     Unknown,
     /// The peer's address is one this node does not hold, so no lookup ran.
     /// The peer is a client off the node, such as the host side of a VM's
@@ -4408,7 +4408,7 @@ mod tests {
         let inode = client_socket_inode(peer, local).expect("the client socket is in the table");
         assert!(holds_socket(std::process::id(), inode));
         assert!(socket_holders(inode).is_some_and(|pids| pids.contains(&std::process::id())));
-        // A test process runs in no box's leaf, so it is no box.
+        // A test process runs in no box's cgroup, so it is no box.
         assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
         drop(client);
     }

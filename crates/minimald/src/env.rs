@@ -1906,8 +1906,7 @@ impl BoxChannel {
     }
 
     /// NET-080: the context this install's fetches are recorded under — the
-    /// box the install was made for, the leaf this daemon's own fetches
-    /// leave from (where it stands in one), the host the daemon fetches the
+    /// box the install was made for, the host the daemon fetches the
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
     /// when the graph knows one. A source a package declares is a package
@@ -3721,7 +3720,7 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
     };
     let lines: Vec<&str> = lines.into_iter().collect();
     lines.into_iter().rev().find_map(|line| {
-        // A web source the build declares, fetched in the box's leaf:
+        // A web source the build declares, fetched in the box's cgroup:
         // `could not fetch the source https://example.com/a.tar.gz: ...`
         // Only a connection the download could not open names a
         // destination. A bad hash or a failed extract is no refusal.
@@ -3891,8 +3890,8 @@ fn destination_host(destination: &str) -> &str {
 
 /// The next step that lets a box's builds reach `host`, or `None` when `host`
 /// is no name `--allow-dns-hosts` can admit. The step names `--network
-/// own_ip` because a box on the default network refuses that flag at create
-/// (`classifier::unenforceable_rules`). It also names the `minimal.toml` key
+/// own_ip` because a box on the default network is refused with that flag
+/// ([`crate::net::engine`]). It also names the `minimal.toml` key
 /// that does what the flag does: `min` reads `network.egress` under
 /// `[defaults]` into a new session's rules (NET-060). The file sets no
 /// network mode, so that step still names `--network own_ip`.

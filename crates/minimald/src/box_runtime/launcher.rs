@@ -799,22 +799,18 @@ pub(crate) struct SandboxLauncher {
     pub(crate) spec: LaunchSpec,
 }
 
-/// Reaps a freshly-spawned sandbox process if the launch is abandoned
-/// before the process is handed off to a [`Launched`].
+/// Ends a freshly started box if the launch is abandoned before the box is
+/// handed off to a [`Launched`], and waits until it is gone.
 ///
-/// A [`hakoniwa::Child`] does not terminate when dropped, so anything
-/// that lets one go without killing it orphans the sandbox — a process
-/// still holding the session's rootfs after the session it belonged to
-/// is gone. The `Err` arms between the spawn and the handoff reap
-/// explicitly; this is what catches the third way out, a **cancelled**
-/// launch future. There is a real caller: a teardown transition bounds
-/// its launch with a timeout (`box_actor::HOOK_LAUNCH_TIMEOUT`) and drops
-/// this future when it expires, which without the guard would strand a
-/// sandbox the destroy then tries to delete out from under.
+/// A dropped [`sandbox::Child`] kills its box and does not wait for it. A
+/// launch that fails or is cancelled must leave no process holding the
+/// session's rootfs when it returns: a teardown transition bounds its
+/// launch with a timeout (`box_actor::HOOK_LAUNCH_TIMEOUT`), drops this
+/// future when it expires, and the destroy then deletes the sandbox.
 ///
-/// Reaping is synchronous (`kill` + `wait` are not async), so unlike
-/// [`sandbox::PlannedLaunch`] — which has to give a lease back, and spawns
-/// that release — this needs no runtime to do its work in `Drop`.
+/// The wait blocks, so unlike [`sandbox::PlannedLaunch`], which has to give
+/// a lease back and spawns that release, this needs no runtime to do its
+/// work in `Drop`.
 #[cfg_attr(test, allow(dead_code))]
 pub(super) struct SpawnedProcessGuard {
     /// `None` once the process has been handed off — see

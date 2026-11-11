@@ -209,7 +209,7 @@ impl RemoteStorage {
     /// check.
     ///
     /// `placement` is where the download's connections must open, e.g. the
-    /// classifier leaf of the box a build runs for (NET-155). Each connection
+    /// cgroup of the box a build runs for (NET-155). Each connection
     /// then leaves from a socket created there, so the egress rules of the
     /// placement decide it. `None` opens the connections in the caller's own
     /// cgroup. The cache lookup and the content-hash check are the same

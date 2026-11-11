@@ -860,8 +860,8 @@ mod tests {
 
     /// NET-080: an install's package fetch is recorded as node-plane traffic
     /// at the seam, where the op starts — one info line naming the box the
-    /// fetch was made for, the daemon's own leaf, the cache host it left
-    /// for, and the package with its version. One line per fetch, whatever
+    /// fetch was made for, the cache host it left for, and the package with
+    /// its version. One line per fetch, whatever
     /// the repaints, none for a package outside the install's scope, and
     /// none for a fully cached add, which fetches nothing: its ops extract
     /// and build what the cache already holds.
@@ -939,7 +939,7 @@ mod tests {
     /// from the configured remote cache, named with its version, and the
     /// index from the same cache. One line each, spelled from the op that
     /// started. A web source is the box's own fetch (NET-155), made in the
-    /// box's leaf, so it is not recorded as node-plane traffic.
+    /// box's cgroup, so it is not recorded as node-plane traffic.
     #[test]
     fn each_fetch_kind_is_recorded_with_its_own_host_and_object() {
         let root = OpTracker::new_root();

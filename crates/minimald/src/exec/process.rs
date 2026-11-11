@@ -148,9 +148,7 @@ impl TaskExec {
 /// build ships, while the tests pass the phase by name so each arm's posture
 /// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
-/// the launcher did. It carries no classifier decision either (NET-079):
-/// a task places no leaf in the cohort's subtrees, so no per-box verdict
-/// is its plan's to follow.
+/// the launcher did.
 ///
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
@@ -187,9 +185,7 @@ pub(crate) fn task_network(
         // carrying the box's id and egress, so no daemon-side draw happens
         // once a control socket exists. A native daemon, whose record holds
         // none, draws from its reserve (`crate::net::self_allocation_run`);
-        // an in-VM one refuses the draw (`SwitchClient::attach`). There is
-        // no classifier decision to carry (NET-079): a task places no leaf
-        // in the cohort's subtrees.
+        // an in-VM one refuses the draw (`SwitchClient::attach`).
         record.task_addresses.clone(),
     )
 }

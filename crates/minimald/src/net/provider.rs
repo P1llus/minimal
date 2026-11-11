@@ -462,8 +462,7 @@ pub(crate) fn attached_lease(
 /// is the sandbox layer's plan, decided here against the switch (on a VM host
 /// the resolver must be the node's DNS layer, not the host's) and against the
 /// box's own declaration — a native deny-all box resolves through the box
-/// zone's answerer, and its leaf is selected into the deny subtree, both from
-/// the policy below (NET-079); `OwnIp` needs a
+/// zone's answerer, from the policy below; `OwnIp` needs a
 /// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
 /// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
 ///

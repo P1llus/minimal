@@ -47,7 +47,7 @@ pub(crate) fn effective_egress_section(
 }
 
 /// The network the package builds of the box `record` attach to, when the
-/// box has no classifier leaf (NET-155). A box with no network gets
+/// box does not share the host's network (NET-155). A box with no network gets
 /// [`op::BuildNetwork::none`], so its builds never take the daemon's network
 /// or the daemon's fetch. A host-address box gets `None`, because a box with
 /// no leaf of that kind has no per-box enforcement.
@@ -63,8 +63,7 @@ pub(crate) fn box_build_network(
 }
 
 /// The network the package builds of the box `record` attach to, when the
-/// box has a network namespace of its own and so no classifier leaf: an
-/// own-address box (NET-155). Each build gets the network a task of the box
+/// box has a network namespace of its own: an own-address box (NET-155). Each build gets the network a task of the box
 /// gets ([`crate::exec::task_network`]): a task address of the box's own,
 /// under the box's egress rules. So the box's egress verdict decides every
 /// connection the build makes, and the build is never the daemon's own

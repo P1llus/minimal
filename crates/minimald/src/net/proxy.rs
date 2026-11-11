@@ -486,7 +486,7 @@ impl<T: HostRoute> Router<T> {
     }
 
     /// Replaces the socket-owner lookup. A test hook: a test process runs in
-    /// no box's classifier leaf, so the kernel lookup can never name a box
+    /// no box's cgroup, so the kernel lookup can never name a box
     /// for it.
     #[cfg(test)]
     #[must_use]
@@ -552,10 +552,8 @@ impl<T: HostRoute> Router<T> {
     /// The caller a connection from `peer` to `local` stands for (NET-070).
     /// A peer at a live box's switch lease is that box. Any other peer is
     /// the node's address, and the caller is the host-address box that owns
-    /// the connecting socket, if one does: the box whose classifier leaf or
-    /// PID namespace a holder of the socket runs in. The gate does not read
-    /// whether the host decides the box's egress per box, so a host without
-    /// the classifier refuses the same requests. The socket lookup reads `/proc`,
+    /// the connecting socket, if one does: the box whose cgroup a holder of
+    /// the socket runs in. The socket lookup reads `/proc`,
     /// so it runs off the async workers, and it runs only while some live
     /// caller holds no switch lease. A lookup that cannot name the socket's
     /// holder then is [`CallerLookup::Unattributed`], never no caller: the
@@ -4360,7 +4358,7 @@ mod tests {
     const UNREGISTERED_BOX: &str = "00000000-0000-0000-0000-000000000013";
 
     /// The socket-owner lookup a host-address box's connection meets, with
-    /// the kernel's answer stood in: a test process runs in no box's leaf.
+    /// the kernel's answer stood in: a test process runs in no box's cgroup.
     /// The connection from [`HOST_BOX_ADDR`] is owned by the deny-all box,
     /// the one from [`OPEN_HOST_BOX_ADDR`] by the box with no egress rules,
     /// The one from [`UNATTRIBUTED_ADDR`] has no owner the kernel can name, as
@@ -4922,7 +4920,7 @@ mod tests {
     /// [`crate::net::dns::connecting_boxes`] and reads the kernel's socket
     /// tables and `/proc`. 63 real connections from one address and one from
     /// another share a few walks, and every one is answered inside the wait
-    /// bound. The test process runs in no box's classifier leaf, so the
+    /// bound. The test process runs in no box's cgroup, so the
     /// kernel names no box for any of them. The test after this one names
     /// two boxes with a slow batch lookup.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

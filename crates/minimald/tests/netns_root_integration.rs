@@ -1107,7 +1107,7 @@ impl Drop for LiveBox {
 }
 
 /// NET-083, the injected-process half: a process a client attaches into a
-/// running box — the `nsenter` shim, joined to the box's namespaces — execs
+/// running box — started by the enter shim, joined to the box's namespaces — execs
 /// with the box's credentials, so joining a box is not a way around the
 /// posture every box process already execs with.
 ///

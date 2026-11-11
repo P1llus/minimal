@@ -1227,7 +1227,7 @@ where
 /// discarded; `nohup cmd >/dev/null 2>&1 &` is the way to detach
 /// cleanly (documented in `docs/reference/cli-min.md`). A `nohup`'d job
 /// stays in the exec's process group, which a client lost mid-exec ends
-/// (see `nsenter::GROUP_GRACE`), so a job that must survive the client
+/// (see `sandbox::spawner::enter::GROUP_GRACE`), so a job that must survive the client
 /// going away is started with `setsid`: `setsid nohup cmd >/dev/null 2>&1 &`.
 ///
 /// Polling the I/O sources in a single `select!` lets a slow consumer

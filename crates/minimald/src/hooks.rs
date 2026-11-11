@@ -2,8 +2,8 @@
 //!
 //! A hook is a script a loadout or a project asked to run at one
 //! of a session's transitions. It executes **inside the running
-//! session's sandbox**, by joining the session process's namespaces
-//! (see [`crate::nsenter`]) — not in a freshly-built one. That
+//! session's sandbox**, by entering it through the spawner
+//! (see [`sandbox::spawner`]) — not in a freshly-built one. That
 //! distinction matters: a new sandbox would share the rootfs and the
 //! persistent home/workspace mounts, but get its own `/tmp`, its own
 //! `/dev`, and its own network namespace. On an own-IP session the

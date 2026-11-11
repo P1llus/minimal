@@ -3033,8 +3033,8 @@ async fn expose_proxy_on_host(
 
 /// [`expose_proxy_on_host`]'s publish, over whichever control channel the
 /// forwarder is reached on: the vsock shuttle from inside a microVM, a unix
-/// control socket on a native host — and, in a test, whichever stand-in the
-/// classifier's two arms need. The control channel is the only thing the
+/// control socket on a native host — and, in a test, a stand-in for either.
+/// The control channel is the only thing the
 /// caller picks; the request shape, the bound, the report, and the
 /// taken-versus-transient classification are the same on every channel.
 #[cfg(target_os = "linux")]

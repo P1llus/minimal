@@ -192,9 +192,7 @@ pub fn probe_handed_node_port(proxy_port: Option<u16>) -> std::io::Result<()> {
 /// `main` gates on it too (`is_minimal_microvm` there, for `reboot(2)`):
 /// `argv[0]` is
 /// caller-controlled, so it cannot be trusted alone, and pid-1 alone is also
-/// no proof — a native daemon running as a container's init satisfies it. The
-/// classifier asks it one question only a guest answers "yes" to (design
-/// §7.1): a box this daemon cannot place is a box it refuses.
+/// no proof — a native daemon running as a container's init satisfies it.
 ///
 /// Also true in the daemon [`crate::reaper::split_init`] forks off the
 /// microVM's init, which is no longer pid 1 itself: only pid 1, having
@@ -420,12 +418,10 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         tracing::warn!(error = %e, "raising kernel.pty.max; several boxes at their PTY cap may exhaust the shared pool");
     }
 
-    // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
-    // box unshares onto its own leaf is a delegation boundary — the property
-    // that keeps a box from writing its way out of the leaf its verdict is
-    // decided on. The daemon builds the tree itself once this mount is up (it
-    // enters its leaf at start, which creates it — pid 1 needs no privileged
-    // step); the same path is what the installer provisions natively.
+    // cgroup2, mounted with `nsdelegate` so the cgroup namespace of a box
+    // is a delegation boundary: the box cannot change the limits of its
+    // own cgroup. The daemon owns the whole hierarchy here and builds its
+    // `supervisor` and `boxes` cgroups once this mount is up.
     //
     // Strict, not best-effort: a guest that cannot build this tree is a
     // broken image, not a deployment state — there is no privileged step a
@@ -1846,9 +1842,7 @@ mod tests {
 
     /// Only the microVM's init is the microVM daemon: both halves of
     /// [`is_microvm_daemon`] are needed, because either one alone is spoofable
-    /// or satisfiable by something else. The classifier's guest refusal — a
-    /// host-address box a guest cannot place is refused, not run unenforced —
-    /// must fire for the guest alone.
+    /// or satisfiable by something else.
     #[test]
     fn only_the_microvms_init_is_the_guest_daemon() {
         use std::ffi::OsStr;

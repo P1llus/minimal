@@ -575,14 +575,9 @@ async fn serve_create_session(
                 },
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
-                // than a transport failure. NET-079's refusal rides the same
-                // arm — a host-address declaration whose rules this host's
-                // classifier cannot enforce is refused at create while the
-                // host decides per box, and its typed error names each
-                // unenforced rule and ends with what to do about them, so
-                // the person who typed the declaration is told which parts
-                // could not be honoured — and what to type instead — rather
-                // than reading a transport failure off the activate.
+                // than a transport failure. A host-address declaration
+                // whose rules this host cannot enforce is refused the same
+                // way: its error names the setting and what to type instead.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },

@@ -314,15 +314,22 @@ async fn everything_of_a_box_starts_in_its_cgroup() {
         "minimal-box"
     );
 
+    // The entered program tries to reach the sibling box: by the names the
+    // sibling could have from inside this box, by the sibling's path on
+    // the host, and from a user namespace of its own where it is root.
     let nested = format!("NESTED:{SIBLING_ID}");
-    let mut enter = boxed.child.entrance().command(
-        "/usr/bin/probe",
-        [
-            "MKDIR:/sys/fs/cgroup/sub",
-            nested.as_str(),
-            "HOLD:/run/release-entered",
-        ],
-    );
+    let spellings = [
+        format!("/sys/fs/cgroup/{SIBLING_ID}/cgroup.procs"),
+        format!("/sys/fs/cgroup/../{SIBLING_ID}/cgroup.procs"),
+        sibling.path().join("cgroup.procs").display().to_string(),
+    ];
+    let mut probe_args = vec!["MKDIR:/sys/fs/cgroup/sub".to_string()];
+    probe_args.extend(spellings.iter().map(|path| format!("WRITE:{path}")));
+    probe_args.extend([nested, "HOLD:/run/release-entered".to_string()]);
+    let mut enter = boxed
+        .child
+        .entrance()
+        .command("/usr/bin/probe", &probe_args);
     enter.stdin(Stdio::Null).stdout(Stdio::MakePipe);
     let mut entered = enter.spawn().expect("entering the box");
     let entered_report = Report::read(entered.stdout.take().unwrap());
@@ -389,6 +396,9 @@ async fn everything_of_a_box_starts_in_its_cgroup() {
     let seen = entered_report.finish();
     assert_eq!(seen["self_cgroup"], "0::/", "{seen:?}");
     assert_ne!(seen["mkdir /sys/fs/cgroup/sub"], "errno 0", "{seen:?}");
+    for path in &spellings {
+        assert_ne!(seen[&format!("open {path}")], "errno 0", "{seen:?}");
+    }
     assert_eq!(seen["nested self_cgroup"], "0::/", "{seen:?}");
     assert_ne!(seen["nested mkdir"], "errno 0", "{seen:?}");
     assert_eq!(seen["nested sibling reached"], "0", "{seen:?}");

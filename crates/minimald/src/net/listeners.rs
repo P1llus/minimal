@@ -1601,7 +1601,7 @@ pub enum Leader {
     /// box ending — the host's stop is what ends the watcher, not a fact
     /// to re-resolve.
     Resolved(u32),
-    /// The container PID [`crate::nsenter::session_leader_pid`] resolves the
+    /// The container PID [`sandbox::spawner::enter::init_of`] resolves the
     /// leader from — `hakoniwa`'s supervisor, the daemon-side handle whose
     /// sole child is the program the box runs.
     Pending {
