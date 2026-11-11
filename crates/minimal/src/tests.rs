@@ -9854,7 +9854,7 @@ fn write_exec_event(
         exec_data::ARGV.into(),
         serde_json_lenient::json!(["sleep", "600"]),
     );
-    if kind == boxes::events::BoxEventType::ExecExited {
+    if event.kind == boxes::events::BoxEventType::ExecExited {
         event
             .data
             .insert(exec_data::EXIT_CODE.into(), serde_json_lenient::json!(0));

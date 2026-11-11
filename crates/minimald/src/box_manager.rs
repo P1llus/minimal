@@ -5064,7 +5064,7 @@ pub(crate) fn write_box_event(
     tracing::info!(
         box_id = %event.box_id,
         parent = %event.parent.map_or_else(|| "none".to_string(), |p| p.to_string()),
-        event_type = kind.name(),
+        event_type = event.kind.name(),
         ts = event.ts,
         events_path = %object.events_path().as_str(),
         "wrote a box event"

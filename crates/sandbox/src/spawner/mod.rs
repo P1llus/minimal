@@ -194,7 +194,9 @@ enum Backend {
 struct Inner {
     backend: Backend,
     connection: Mutex<Option<Arc<Connection>>>,
-    /// Where a container with no box cgroup gets a cgroup of its own.
+    /// The requester's cgroup root. With one, every container is started
+    /// in a cgroup the requester names, and a dead spawner's boxes are
+    /// killed through it.
     root: Option<Root>,
 }
 
@@ -223,10 +225,10 @@ impl Spawner {
     /// then. If it dies, everything it had started dies with it, every box
     /// cgroup below `root` is killed, and a new process is started at once.
     ///
-    /// `root` is the caller's cgroup root, if it has one. A container that
-    /// is started with no box cgroup then gets a cgroup of its own below
-    /// the root's `boxes`, removed when the container ends, so no container
-    /// shares the cgroup the caller and the spawner are in.
+    /// `root` is the caller's cgroup root, if it has one. A caller with a
+    /// root names a cgroup for every container, and one that names none is
+    /// refused, so no container shares the cgroup the caller and the
+    /// spawner are in.
     pub fn process(exe: impl Into<PathBuf>, terminal: Terminal, root: Option<Root>) -> Self {
         Self {
             inner: Arc::new(Inner {

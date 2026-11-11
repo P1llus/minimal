@@ -3607,7 +3607,7 @@ mod managed {
         assert_eq!(output, "STDIN-CLOSED\nout\nerr\n");
 
         let events = disk.exec_events(&entry.id);
-        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        let kinds: Vec<_> = events.iter().map(|e| e.kind.clone()).collect();
         assert_eq!(kinds, [BoxEventType::ExecStarted, BoxEventType::ExecExited]);
         assert_eq!(events[1].data["exit_code"], 3);
         assert_eq!(events[1].data["reason"], "exited");
@@ -4254,7 +4254,7 @@ wait"#;
             let entry = disk.start(mode, &argv, None, false);
             assert_eq!(entry.wait().await.code, Some(code));
             let events = disk.exec_events(&entry.id);
-            let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+            let kinds: Vec<_> = events.iter().map(|e| e.kind.clone()).collect();
             assert_eq!(
                 kinds,
                 [BoxEventType::ExecStarted, BoxEventType::ExecExited],

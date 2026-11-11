@@ -2782,7 +2782,7 @@ async fn in_box_root_cannot_append_events() {
     let mut reader = mngr.box_events(id).await.unwrap();
     let events = reader.read_new().unwrap();
     assert_eq!(
-        events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        events.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
         [BoxEventType::Created],
         "no event written inside the box reaches its stream"
     );
@@ -2999,7 +2999,7 @@ async fn restart_sets_orphaned_running_record_stopped_without_signal() {
 
     let mut reader = restarted.box_events(orphaned).await.unwrap();
     let events = reader.read_new().unwrap();
-    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    let kinds: Vec<_> = events.iter().map(|e| e.kind.clone()).collect();
     assert_eq!(kinds, [BoxEventType::Created, BoxEventType::Exited]);
     let exited = &events[1];
     assert_eq!(exited.box_id, orphaned);

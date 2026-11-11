@@ -16,7 +16,7 @@ use crate::{BoxId, Record};
 pub const EVENTS_FILE: &str = "events.jsonl";
 
 /// The type of a lifecycle event (BOX-040).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoxEventType {
     /// The box's record was created.
@@ -40,16 +40,17 @@ pub enum BoxEventType {
     /// The box's network policy refused something: a connection, a
     /// datagram, a bind, a name, or a proxied request.
     NetRefused,
-    /// A type this build does not know, written by a newer one. Readers
-    /// pass it on and do not fail on it.
-    #[serde(other)]
-    Unknown,
+    /// A type this build does not know, written by a newer one, under the
+    /// name it was written with. Readers pass it on as it is and do not
+    /// fail on it.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 impl BoxEventType {
     /// The event type as it is written on the wire and on disk.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Created => "created",
             Self::Started => "started",
@@ -61,7 +62,7 @@ impl BoxEventType {
             Self::Resumed => "resumed",
             Self::Detached => "detached",
             Self::NetRefused => "net_refused",
-            Self::Unknown => "unknown",
+            Self::Unknown(name) => name,
         }
     }
 }
@@ -205,7 +206,14 @@ mod tests {
     fn a_type_from_a_newer_build_reads_as_unknown_and_keeps_its_data() {
         let line = r#"{"box":"01a1cb31-b787-75f2-aa69-d77d6b0522f1","parent":null,"ts":7,"type":"syscall_refused","data":{"nr":41}}"#;
         let event: BoxEvent = serde_json_lenient::from_str(line).unwrap();
-        assert_eq!(event.kind, BoxEventType::Unknown);
+        assert_eq!(
+            event.kind,
+            BoxEventType::Unknown("syscall_refused".to_owned())
+        );
+        // Written again, it keeps the name it came with.
+        assert_eq!(event.kind.name(), "syscall_refused");
+        let again = serde_json_lenient::to_string(&event).unwrap();
+        assert!(again.contains(r#""type":"syscall_refused""#), "{again}");
         assert_eq!(
             event
                 .data

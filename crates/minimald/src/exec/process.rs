@@ -1700,14 +1700,14 @@ impl ExecBox {
                 .insert(exec_data::REASON.into(), exit.reason.name().into());
         }
         #[cfg(test)]
-        if kind == boxes::events::BoxEventType::ExecStarted {
+        if event.kind == boxes::events::BoxEventType::ExecStarted {
             stop_at_start::observe(self.record.id, id);
         }
         let path = self.dir.join(boxes::events::EVENTS_FILE);
         if let Err(error) = boxes::store::append_event_at(&path, &event) {
             tracing::warn!(
                 exec_id = %id,
-                event_type = kind.name(),
+                event_type = event.kind.name(),
                 %error,
                 "exec: could not write the box event"
             );

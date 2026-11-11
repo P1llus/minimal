@@ -15459,7 +15459,7 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
     assert_eq!(std::fs::read_to_string(&kept).unwrap(), "still here");
 
     let events = event_kinds(&server, id).await;
-    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    let kinds: Vec<_> = events.iter().map(|e| e.kind.clone()).collect();
     let exited = kinds
         .iter()
         .position(|k| *k == boxes::events::BoxEventType::Exited)
@@ -17757,7 +17757,10 @@ async fn restart_start_failure_leaves_box_stopped_with_its_stop_recorded() {
         "a failed start makes no other change to the record"
     );
     let events = event_kinds(&server, id).await;
-    let added: Vec<_> = events[before.len()..].iter().map(|e| e.kind).collect();
+    let added: Vec<_> = events[before.len()..]
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
     assert_eq!(added, [BoxEventType::Exited], "{added:?}");
     assert_eq!(events[before.len()].data["reason"], "stopped");
 
@@ -17864,7 +17867,7 @@ async fn restart_records_exited_then_started_only() {
         .await
         .expect("the running box restarts");
     let events = event_kinds(&server, id).await;
-    let added: Vec<_> = events[before..].iter().map(|e| e.kind).collect();
+    let added: Vec<_> = events[before..].iter().map(|e| e.kind.clone()).collect();
     assert_eq!(
         added,
         [BoxEventType::Exited, BoxEventType::Started],
@@ -17880,7 +17883,7 @@ async fn restart_records_exited_then_started_only() {
         .expect("the stopped box restarts");
     let added: Vec<_> = event_kinds(&server, id).await[before..]
         .iter()
-        .map(|e| e.kind)
+        .map(|e| e.kind.clone())
         .collect();
     assert_eq!(added, [BoxEventType::Started], "{added:?}");
 }
@@ -17940,7 +17943,7 @@ async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
         panic!("a failed start leaves the box stopped: {record:?}");
     };
     let events = event_kinds(&server, id).await;
-    let added: Vec<_> = events[before..].iter().map(|e| e.kind).collect();
+    let added: Vec<_> = events[before..].iter().map(|e| e.kind.clone()).collect();
     assert_eq!(added, [BoxEventType::Exited], "{added:?}");
     assert_eq!(events[before].data["reason"], "stopped");
 }

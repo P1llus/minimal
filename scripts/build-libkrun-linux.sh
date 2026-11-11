@@ -181,7 +181,7 @@ fi
     -p libkrun --no-default-features --features blk,net
 )
 
-RAW="$WORK/target/$TARGET/release/libkrun.a"
+RAW="${CARGO_TARGET_DIR:-$WORK/target}/$TARGET/release/libkrun.a"
 test -f "$RAW" || { echo "::error::build produced no $RAW" >&2; exit 1; }
 
 # --- Merge, then localize ------------------------------------------------

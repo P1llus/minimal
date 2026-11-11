@@ -2636,7 +2636,7 @@ mod tests {
         ];
         let written: Vec<BoxEvent> = kinds
             .iter()
-            .map(|kind| BoxEvent::for_record(object.record(), *kind))
+            .map(|kind| BoxEvent::for_record(object.record(), kind.clone()))
             .collect();
         object.append_event(&written[0]).unwrap();
         let first = object.read_events_from(0).unwrap();
@@ -5004,7 +5004,7 @@ mod tests {
                     prop_assert!(added.is_empty());
                 } else {
                     prop_assert_eq!(added.len(), 1);
-                    prop_assert_eq!(added[0].kind, crate::events::BoxEventType::Renamed);
+                    prop_assert_eq!(&added[0].kind, &crate::events::BoxEventType::Renamed);
                     prop_assert_eq!(added[0].box_id, *key.id());
                     prop_assert_eq!(
                         &added[0].data,
