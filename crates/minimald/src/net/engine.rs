@@ -198,6 +198,12 @@ impl Installed {
         self.session
     }
 
+    /// Whether the box's processes have a network namespace of their own,
+    /// on the virtual network.
+    pub(crate) const fn has_own_namespace(&self) -> bool {
+        self.own_namespace
+    }
+
     /// A snapshot of the box's compiled policy.
     pub(crate) fn compiled(&self) -> Arc<Compiled> {
         Arc::clone(&self.compiled.read().expect("compiled policy lock"))

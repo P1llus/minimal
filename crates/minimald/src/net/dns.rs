@@ -2002,6 +2002,15 @@ impl HostnameRegistry {
         self.own_published.get(&session_id).map(|own| own.address)
     }
 
+    /// The lease of the box that holds the name `host`, when the box has
+    /// reported one: where a box on the virtual network reaches it.
+    #[must_use]
+    pub fn lease_of_name(&self, host: &str) -> Option<Ipv4Addr> {
+        let route = self.resolve(host)?;
+        let registration = self.by_session.get(route.session())?;
+        self.own.get(&registration.id).map(|own| own.lease)
+    }
+
     /// The switch lease an own-address box's running PTask last reported
     /// ([`Self::report_own_address`]), by stable session id — the address a
     /// forward published for the box delivers to, the same one its declared

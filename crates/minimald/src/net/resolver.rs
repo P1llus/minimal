@@ -445,13 +445,21 @@ impl Zone {
         Self { names }
     }
 
-    fn lookup(&self, name: &str) -> ZoneAnswer {
+    /// What the zone holds for `name`, as a box may be told. `on_switch`
+    /// says that the asker has an address on the virtual network: it
+    /// reaches a peer at the peer's address there, and a peer that has
+    /// none is out of its reach.
+    fn lookup(&self, name: &str, on_switch: bool) -> ZoneAnswer {
         // The host's name exists and has no address a box may be told:
         // the host's loopback is not a box's to reach by a name.
         if name == zone_answer::HOST_ROW_NAME {
             return ZoneAnswer::NoData;
         }
         match self.names.zone_entry(name, &[]) {
+            ZoneEntry::Held { .. } if on_switch => self
+                .names
+                .lease_of(name)
+                .map_or(ZoneAnswer::NoData, ZoneAnswer::Address),
             ZoneEntry::Held {
                 address: Some(address),
                 ..
@@ -528,7 +536,8 @@ impl Resolver {
                 Some(reply)
             }
             Decided::Zone { name, query } => {
-                let admitted = admit_zone(self.zone.lookup(&name), &name, &view);
+                let answer = self.zone.lookup(&name, of.has_own_namespace());
+                let admitted = admit_zone(answer, &name, &view);
                 if let Some(address) = admitted.pin {
                     self.pin(of, address, &name);
                 }
@@ -959,10 +968,58 @@ mod tests {
             fn zone_entry(&self, _host: &str, _node: &[Ipv4Addr]) -> ZoneEntry {
                 ZoneEntry::Absent
             }
+            fn lease_of(&self, _host: &str) -> Option<Ipv4Addr> {
+                None
+            }
         }
         let zone = Zone::new(Arc::new(Empty));
-        assert_eq!(zone.lookup("host.min.internal"), ZoneAnswer::NoData);
-        assert_eq!(zone.lookup("nobody.min.internal"), ZoneAnswer::NoSuchName);
+        for on_switch in [false, true] {
+            assert_eq!(
+                zone.lookup("host.min.internal", on_switch),
+                ZoneAnswer::NoData
+            );
+            assert_eq!(
+                zone.lookup("nobody.min.internal", on_switch),
+                ZoneAnswer::NoSuchName
+            );
+        }
+    }
+
+    #[test]
+    fn a_box_on_the_virtual_network_is_told_a_peers_address_there() {
+        /// A zone with `web` published at a loopback address and leased on
+        /// the virtual network, and `shared`, which has no lease.
+        struct Two;
+        impl answerer::Zone for Two {
+            fn zone_entry(&self, host: &str, _node: &[Ipv4Addr]) -> ZoneEntry {
+                match host {
+                    "web.min.internal" | "shared.min.internal" => ZoneEntry::Held {
+                        owner: "s".into(),
+                        address: Some(Ipv4Addr::new(127, 0, 64, 9)),
+                    },
+                    _ => ZoneEntry::Absent,
+                }
+            }
+            fn lease_of(&self, host: &str) -> Option<Ipv4Addr> {
+                (host == "web.min.internal").then_some(Ipv4Addr::new(100, 64, 1, 9))
+            }
+        }
+        let zone = Zone::new(Arc::new(Two));
+        assert_eq!(
+            zone.lookup("web.min.internal", true),
+            ZoneAnswer::Address(Ipv4Addr::new(100, 64, 1, 9))
+        );
+        assert_eq!(
+            zone.lookup("web.min.internal", false),
+            ZoneAnswer::Address(Ipv4Addr::new(127, 0, 64, 9))
+        );
+        // A peer with no address on the network exists and cannot be
+        // reached from there.
+        assert_eq!(zone.lookup("shared.min.internal", true), ZoneAnswer::NoData);
+        assert_eq!(
+            zone.lookup("gone.min.internal", true),
+            ZoneAnswer::NoSuchName
+        );
     }
 
     #[test]

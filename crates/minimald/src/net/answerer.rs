@@ -86,11 +86,20 @@ pub trait Zone: Send + Sync + 'static {
     /// (with or without a host-answerable A address) or absent — the
     /// NODATA/NXDOMAIN distinction ([`super::dns::ZoneEntry`]).
     fn zone_entry(&self, host: &str, node: &[Ipv4Addr]) -> ZoneEntry;
+
+    /// The address on the virtual network of the box that holds `host`,
+    /// when that box has one: where a box that is on that network itself
+    /// reaches it.
+    fn lease_of(&self, host: &str) -> Option<Ipv4Addr>;
 }
 
 impl Zone for HostnameRegistry {
     fn zone_entry(&self, host: &str, node: &[Ipv4Addr]) -> ZoneEntry {
         HostnameRegistry::zone_entry(self, host, node)
+    }
+
+    fn lease_of(&self, host: &str) -> Option<Ipv4Addr> {
+        self.lease_of_name(host)
     }
 }
 
@@ -105,6 +114,13 @@ impl Zone for std::sync::RwLock<HostnameRegistry> {
         match self.read() {
             Ok(guard) => guard.zone_entry(host, node),
             Err(poisoned) => poisoned.into_inner().zone_entry(host, node),
+        }
+    }
+
+    fn lease_of(&self, host: &str) -> Option<Ipv4Addr> {
+        match self.read() {
+            Ok(guard) => guard.lease_of(host),
+            Err(poisoned) => poisoned.into_inner().lease_of(host),
         }
     }
 }
