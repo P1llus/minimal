@@ -349,6 +349,35 @@ impl Daemon {
         std::fs::read_to_string(self.state.with_file_name("minimald.log")).unwrap_or_default()
     }
 
+    /// The port the daemon's hostname proxy listens on: its default, or
+    /// another when a second daemon on this host holds that.
+    fn proxy_port(&self) -> u16 {
+        let log = self.log();
+        let line = log
+            .lines()
+            .find(|l| l.contains("hostname proxy is serving"))
+            .expect("the proxy's serving line");
+        // The log colours its fields: drop the escape sequences first.
+        let mut plain = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for skipped in chars.by_ref() {
+                    if skipped.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("port="))
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {plain}"))
+    }
+
     /// The daemon's cgroup root on disk.
     fn cgroup_root(&self) -> PathBuf {
         let text = std::fs::read_to_string(format!("/proc/{}/cgroup", self.child.id()))
@@ -561,11 +590,12 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
 
     // The hostname proxy judges a box's request by the box's policy,
     // also when the box dials the node's shared listener.
+    let proxy = daemon.proxy_port();
     let request = |name: &str, host: &str| {
         daemon.exec(
             name,
             &format!(
-                "exec 3<>/dev/tcp/127.0.0.1/7654 && printf 'GET / HTTP/1.1\\r\\nHost: {host}\\r\\n\
+                "exec 3<>/dev/tcp/127.0.0.1/{proxy} && printf 'GET / HTTP/1.1\\r\\nHost: {host}\\r\\n\
                  Connection: close\\r\\n\\r\\n' >&3 && head -c 64 <&3 | head -1; true"
             ),
         )
