@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     compile::{Compiled, Slot},
     model::{
-        Action, Defaults, Direction, Family, NamePattern, Protocol, Rule, SetId, Target, Verdict,
+        Action, Defaults, Direction, Family, NamePattern, Prefix, Protocol, Rule, SetId, Target,
+        Verdict,
     },
 };
 
@@ -163,7 +164,8 @@ impl Compiled {
 }
 
 /// Judges a flow against the ordered rule list itself, with no compiled
-/// form in between. `name` is the name the remote address is pinned for.
+/// form in between. `protected` are the base policy's protected ranges and
+/// `name` is the name the remote address is pinned for.
 ///
 /// Returns the position and action of the first matching rule, or `None`
 /// and the default. This is the reference [`Compiled::evaluate`] is tested
@@ -171,14 +173,20 @@ impl Compiled {
 #[must_use]
 pub fn evaluate_ordered(
     rules: &[Rule],
+    protected: &[Prefix],
     defaults: &Defaults,
     flow: &Flow,
     name: Option<&str>,
 ) -> (Option<usize>, Action) {
     let remote = canonical(flow.remote);
+    let around: Vec<&Prefix> = protected
+        .iter()
+        .filter(|range| flow.direction == Direction::Egress && range.contains(remote))
+        .collect();
     let hit = rules.iter().enumerate().find(|(_, r)| {
         r.direction == flow.direction
             && r.matches_l4(flow.protocol, flow.port)
+            && around.iter().all(|range| r.reaches_into(range))
             && match &r.target {
                 Target::Any => true,
                 Target::Net(p) => p.contains(remote),
@@ -226,14 +234,14 @@ mod tests {
     use crate::{
         base::{BasePolicy, BoxAddrs, RESOLVER},
         compile::{Options, compile},
-        model::{Endpoint, Origin, PortRange, Prefix, Protocols},
+        model::{Endpoint, Origin, PortRange, Protocols},
         policy::BoxPolicy,
     };
 
     fn base() -> BasePolicy {
         BasePolicy {
             before: Vec::new(),
-            after: Vec::new(),
+            protected: Vec::new(),
             defaults: Defaults {
                 egress: Verdict::Deny,
                 ingress: Verdict::Deny,

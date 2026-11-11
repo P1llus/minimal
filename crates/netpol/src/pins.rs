@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    base::{prefix4, prefix6},
     eval::canonical,
     model::{Prefix, SetId},
 };
@@ -30,18 +31,50 @@ pub const fn is_live(expiry_ns: u64, now_ns: u64) -> bool {
     expiry_ns > now_ns
 }
 
-const fn in4(a: Ipv4Addr, net: [u8; 4], len: u32) -> bool {
-    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-    a.to_bits() & mask == u32::from_be_bytes(net)
-}
+/// IPv4 ranges a public name has no business resolving to: this network,
+/// private, carrier-grade NAT, loopback, link-local, multicast, and the
+/// reserved top that ends in the broadcast address.
+const INTERNAL4: [Prefix; 9] = [
+    prefix4(Ipv4Addr::new(0, 0, 0, 0), 8),
+    prefix4(Ipv4Addr::new(10, 0, 0, 0), 8),
+    prefix4(Ipv4Addr::new(100, 64, 0, 0), 10),
+    prefix4(Ipv4Addr::new(127, 0, 0, 0), 8),
+    prefix4(Ipv4Addr::new(169, 254, 0, 0), 16),
+    prefix4(Ipv4Addr::new(172, 16, 0, 0), 12),
+    prefix4(Ipv4Addr::new(192, 168, 0, 0), 16),
+    prefix4(Ipv4Addr::new(224, 0, 0, 0), 4),
+    prefix4(Ipv4Addr::new(240, 0, 0, 0), 4),
+];
 
-const fn in6(a: Ipv6Addr, first: u16, len: u32) -> bool {
-    let mask = if len == 0 {
-        0
-    } else {
-        u128::MAX << (128 - len)
+/// The same for IPv6: unspecified, loopback, unique local, link-local and
+/// multicast.
+const INTERNAL6: [Prefix; 5] = [
+    Prefix::host(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+    Prefix::host(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    prefix6(0xfc00, 7),
+    prefix6(0xfe80, 10),
+    prefix6(0xff00, 8),
+];
+
+/// The internal ranges `addr` lies in. A NAT64 address is in the range of
+/// the IPv4 address it carries, as an IPv6 prefix.
+fn internal_ranges(addr: IpAddr) -> Vec<Prefix> {
+    let within = |table: &[Prefix], a: IpAddr| -> Vec<Prefix> {
+        table.iter().filter(|r| r.contains(a)).copied().collect()
     };
-    a.to_bits() & mask == (first as u128) << 112
+    match addr {
+        IpAddr::V4(_) => within(&INTERNAL4, addr),
+        IpAddr::V6(a) => {
+            if let [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] = a.segments() {
+                let v4 = Ipv4Addr::from_bits((u32::from(hi) << 16) | u32::from(lo));
+                return within(&INTERNAL4, IpAddr::V4(v4))
+                    .into_iter()
+                    .map(|range| Prefix::host(addr).truncated(96 + range.len()))
+                    .collect();
+            }
+            within(&INTERNAL6, addr)
+        }
+    }
 }
 
 /// True for an address a public name has no business resolving to: private
@@ -50,43 +83,33 @@ const fn in6(a: Ipv6Addr, first: u16, len: u32) -> bool {
 /// judged by the IPv4 address it carries.
 #[must_use]
 pub fn is_internal(addr: IpAddr) -> bool {
-    match canonical(addr) {
-        IpAddr::V4(a) => {
-            a.is_unspecified()
-                || a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_multicast()
-                || a.is_broadcast()
-                || in4(a, [100, 64, 0, 0], 10)
-                || in4(a, [0, 0, 0, 0], 8)
-                || in4(a, [240, 0, 0, 0], 4)
-        }
-        IpAddr::V6(a) => {
-            // NAT64 carries an IPv4 address in its last 32 bits.
-            if let [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] = a.segments() {
-                let v4 = Ipv4Addr::from_bits((u32::from(hi) << 16) | u32::from(lo));
-                return is_internal(IpAddr::V4(v4));
-            }
-            a.is_unspecified()
-                || a.is_loopback()
-                || a.is_multicast()
-                || in6(a, 0xfc00, 7)
-                || in6(a, 0xfe80, 10)
-        }
-    }
+    !internal_ranges(canonical(addr)).is_empty()
 }
 
 /// The rebinding filter: whether the resolver may pin `addr` for a name.
 ///
-/// An internal address or one of the box's infrastructure addresses is
-/// refused unless a prefix the box allows covers it. That keeps a public
-/// name from being pointed at something the box was never meant to reach.
+/// An address in an internal range, or in one of the box's `protected`
+/// ranges, is refused unless the box allows a prefix that holds the address
+/// and itself lies inside every such range the address is in. That is the
+/// test [`crate::Rule::reaches_into`] makes for the box's rules, so a wide
+/// allow such as `0.0.0.0/0` neither opens a protected range nor switches
+/// this filter off. It keeps a public name from being pointed at something
+/// the box was never meant to reach.
 #[must_use]
-pub fn may_pin(addr: IpAddr, allowed: &[Prefix], infrastructure: &[Prefix]) -> bool {
+pub fn may_pin(addr: IpAddr, allowed: &[Prefix], protected: &[Prefix]) -> bool {
     let addr = canonical(addr);
-    let suspicious = is_internal(addr) || infrastructure.iter().any(|p| p.contains(addr));
-    !suspicious || allowed.iter().any(|p| p.contains(addr))
+    let mut around = internal_ranges(addr);
+    around.extend(
+        protected
+            .iter()
+            .map(Prefix::canonical)
+            .filter(|range| range.contains(addr)),
+    );
+    around.is_empty()
+        || allowed
+            .iter()
+            .map(Prefix::canonical)
+            .any(|p| p.contains(addr) && around.iter().all(|range| range.covers(&p)))
 }
 
 /// One pin: the name the address was answered for, the set of that name
@@ -260,19 +283,54 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_lets_allowed_prefixes_through() {
+    fn the_filter_passes_what_the_box_allows_inside_the_range() {
         let allowed = ["10.20.0.0/16".parse().unwrap()];
-        let infra = ["192.0.2.1/32".parse().unwrap()];
-        assert!(may_pin(ip("93.184.216.34"), &allowed, &infra));
-        assert!(!may_pin(ip("10.1.1.1"), &allowed, &infra));
-        assert!(may_pin(ip("10.20.3.4"), &allowed, &infra));
+        let protected = ["192.0.2.1/32".parse().unwrap()];
+        assert!(may_pin(ip("93.184.216.34"), &allowed, &protected));
+        assert!(!may_pin(ip("10.1.1.1"), &allowed, &protected));
+        assert!(may_pin(ip("10.20.3.4"), &allowed, &protected));
+        assert!(may_pin(ip("::ffff:10.20.3.4"), &allowed, &protected));
         // A public address that is the box's gateway.
-        assert!(!may_pin(ip("192.0.2.1"), &allowed, &infra));
-        assert!(may_pin(
+        assert!(!may_pin(ip("192.0.2.1"), &allowed, &protected));
+        assert!(!may_pin(
             ip("192.0.2.1"),
             &["192.0.2.0/24".parse().unwrap()],
-            &infra
+            &protected
         ));
+        assert!(may_pin(
+            ip("192.0.2.1"),
+            &["192.0.2.1/32".parse().unwrap()],
+            &protected
+        ));
+    }
+
+    #[test]
+    fn a_wide_allow_does_not_switch_the_filter_off() {
+        let everything: [Prefix; 2] = ["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()];
+        let subnet = ["100.64.0.0/24".parse().unwrap()];
+        for a in [
+            "10.1.1.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.7",
+            "fe80::1",
+            "fd00::1",
+            "64:ff9b::a00:1",
+        ] {
+            assert!(!may_pin(ip(a), &everything, &subnet), "{a}");
+        }
+        assert!(may_pin(ip("8.8.8.8"), &everything, &subnet));
+        assert!(may_pin(ip("2001:4860::1"), &everything, &subnet));
+        // The carrier-grade NAT range is allowed, the virtual network in
+        // it is still closed. Its own prefix opens it.
+        let tailnet = ["100.64.0.0/10".parse().unwrap()];
+        assert!(may_pin(ip("100.100.1.1"), &tailnet, &subnet));
+        assert!(!may_pin(ip("100.64.0.7"), &tailnet, &subnet));
+        assert!(may_pin(ip("100.64.0.7"), &subnet, &subnet));
+        // A NAT64 address is allowed by a prefix inside the mapped range.
+        let nat64 = ["64:ff9b::a14:0/112".parse().unwrap()];
+        assert!(may_pin(ip("64:ff9b::a14:304"), &nat64, &subnet));
+        assert!(!may_pin(ip("64:ff9b::a15:304"), &nat64, &subnet));
     }
 
     #[test]

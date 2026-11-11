@@ -19,7 +19,8 @@ use netpol::{
 };
 use proptest::prelude::*;
 
-const PREFIXES: [&str; 10] = [
+const PREFIXES: [&str; 11] = [
+    "::ffff:10.1.2.0/121",
     "0.0.0.0/0",
     "10.0.0.0/8",
     "10.1.0.0/16",
@@ -38,7 +39,9 @@ const PATTERNS: [&str; 5] = [
     "x.a.example.com",
     "other.org",
 ];
-const ADDRS: [&str; 12] = [
+const ADDRS: [&str; 14] = [
+    "169.254.169.254",
+    "fe80::1",
     "10.1.2.3",
     "10.1.2.9",
     "10.1.9.9",
@@ -91,9 +94,30 @@ fn target() -> impl Strategy<Value = Target> {
     ]
 }
 
+/// Ranges a base policy might protect, among and around [`PREFIXES`].
+const PROTECTED: [&str; 5] = [
+    "10.1.0.0/16",
+    "10.1.2.0/24",
+    "192.0.2.0/24",
+    "fd00:1::/32",
+    "::ffff:10.9.0.0/112",
+];
+
+fn protected() -> impl Strategy<Value = Vec<Prefix>> {
+    prop::sample::subsequence(PROTECTED.to_vec(), 0..4)
+        .prop_map(|list| list.iter().map(|p| p.parse().expect("prefix")).collect())
+}
+
 fn rule() -> impl Strategy<Value = Rule> {
-    (direction(), protocols(), ports(), target(), 0u8..5).prop_map(
-        |(direction, protocols, ports, target, a)| {
+    (
+        direction(),
+        protocols(),
+        ports(),
+        target(),
+        0u8..5,
+        any::<bool>(),
+    )
+        .prop_map(|(direction, protocols, ports, target, a, from_box)| {
             let action = match a {
                 0 | 1 => Action::Allow,
                 2 | 3 => Action::Deny,
@@ -107,10 +131,14 @@ fn rule() -> impl Strategy<Value = Rule> {
                 ports,
                 target,
                 action,
-                origin: Origin::BoxRule(0),
+                // Only a rule the box wrote stops at a protected range.
+                origin: if from_box {
+                    Origin::BoxRule(0)
+                } else {
+                    Origin::Published
+                },
             }
-        },
-    )
+        })
 }
 
 fn verdict() -> impl Strategy<Value = Verdict> {
@@ -143,7 +171,7 @@ fn flow() -> impl Strategy<Value = (Flow, Option<&'static str>)> {
 fn agree(c: &Compiled, flow: &Flow, name: Option<&str>) -> Result<(), TestCaseError> {
     let pinned = name.and_then(|n| c.set_for_name(n));
     let got = c.evaluate(flow, pinned);
-    let (index, action) = evaluate_ordered(&c.rules, &c.config.defaults, flow, name);
+    let (index, action) = evaluate_ordered(&c.rules, &c.protected, &c.config.defaults, flow, name);
     let want = match action {
         Action::Allow => FlowVerdict::Allow,
         Action::Deny => FlowVerdict::Deny,
@@ -164,10 +192,16 @@ fn agree(c: &Compiled, flow: &Flow, name: Option<&str>) -> Result<(), TestCaseEr
     Ok(())
 }
 
-fn bare(rules: Vec<Rule>, egress: Verdict, ingress: Verdict, bind: Verdict) -> BasePolicy {
+fn bare(
+    rules: Vec<Rule>,
+    protected: Vec<Prefix>,
+    egress: Verdict,
+    ingress: Verdict,
+    bind: Verdict,
+) -> BasePolicy {
     BasePolicy {
         before: rules,
-        after: Vec::new(),
+        protected,
         defaults: Defaults {
             egress,
             ingress,
@@ -191,10 +225,11 @@ proptest! {
     #[test]
     fn compiled_agrees_with_the_ordered_list(
         rules in prop::collection::vec(rule(), 0..10),
+        protected in protected(),
         (egress, ingress, bind) in (verdict(), verdict(), verdict()),
         flows in prop::collection::vec(flow(), 1..40),
     ) {
-        let base = bare(rules, egress, ingress, bind);
+        let base = bare(rules, protected, egress, ingress, bind);
         match compile(&base, &BoxPolicy::default(), Options::default()) {
             Ok(c) => {
                 for (flow, name) in &flows {
@@ -210,8 +245,11 @@ proptest! {
     }
 
     #[test]
-    fn rule_lists_are_sorted_bounded_and_complete(rules in prop::collection::vec(rule(), 0..10)) {
-        let base = bare(rules, Verdict::Deny, Verdict::Deny, Verdict::Deny);
+    fn rule_lists_are_sorted_bounded_and_complete(
+        rules in prop::collection::vec(rule(), 0..10),
+        protected in protected(),
+    ) {
+        let base = bare(rules, protected, Verdict::Deny, Verdict::Deny, Verdict::Deny);
         let Ok(c) = compile(&base, &BoxPolicy::default(), Options::default()) else { return Ok(()) };
         for entry in &c.nets {
             prop_assert!(!entry.rules.is_empty() && entry.rules.len() <= RULES_MAX);
@@ -228,10 +266,24 @@ proptest! {
                 prop_assert!(covers, "{:?} does not cover {}", rule.target, entry.prefix);
             }
         }
-        // Every prefix a rule names has an entry in its direction.
+        // Every prefix a rule names has an entry in its direction, and so
+        // has every protected range.
         for rule in &c.rules {
             if let Target::Net(p) = &rule.target {
                 prop_assert!(c.nets.iter().any(|e| e.direction == rule.direction && e.prefix == *p));
+            }
+        }
+        for range in &c.protected {
+            prop_assert!(c.nets.iter().any(|e| e.direction == Direction::Egress && e.prefix == *range));
+        }
+        // No allow the box wrote for a wider prefix is in an entry inside
+        // a protected range.
+        for entry in c.nets.iter().filter(|e| e.direction == Direction::Egress) {
+            for range in c.protected.iter().filter(|r| r.covers(&entry.prefix)) {
+                for slot in &entry.rules {
+                    let rule = &c.rules[usize::from(slot.prio)];
+                    prop_assert!(rule.reaches_into(range), "{} in {} inside {}", rule, entry.prefix, range);
+                }
             }
         }
         for set in &c.sets {
@@ -288,9 +340,10 @@ proptest! {
         let base = base_policy(&d);
         let Ok(c) = compile(&base, &policy, Options::default()) else { return Ok(()) };
 
-        // The list is base-before, box, base-after, in that order.
+        // The list is base-before, box, then a deny per protected range.
         let box_rules = policy.rules();
-        prop_assert_eq!(c.rules.len(), base.before.len() + box_rules.len() + base.after.len());
+        prop_assert_eq!(c.rules.len(), base.before.len() + box_rules.len() + base.protected.len());
+        prop_assert!(c.rules.iter().rev().take(base.protected.len()).all(|r| r.origin == Origin::Protected));
         prop_assert!(c.rules.iter().take(base.before.len()).all(|r| r.origin.is_base()));
         prop_assert!(c.rules.iter().skip(base.before.len()).take(box_rules.len()).all(|r| !r.origin.is_base()));
         prop_assert_eq!(c.config.defaults.egress, policy.egress_default(base.defaults.egress));

@@ -49,7 +49,8 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
             bind(net(h.v4_net()), Action::Deny),
             bind(net(h.v6_net()), Action::Deny).protocols(Protocols::UDP),
         ],
-        after: Vec::new(),
+        // Group 6 and one IPv6 group are closed to the wide allows below.
+        protected: vec![prefix(h.v4_group(6)), prefix(h.v6_group(3))],
         defaults: Defaults {
             egress: Verdict::Allow,
             ingress: Verdict::Allow,
@@ -78,6 +79,11 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         deny: vec![prefix(h.v4(1, 9).to_string()), prefix(h.v6_group(2))],
         allow: vec![
             prefix(h.v4_group(1)),
+            // Groups 6 and 7: wider than the protected group 6.
+            prefix(format!("{}/26", h.v4(6, 0))),
+            // Eight addresses inside it.
+            prefix(format!("{}/29", h.v4(6, 8))),
+            // Every IPv6 address of the test, the protected group included.
             prefix(h.v6_net()),
             prefix("::1/128".to_owned()),
         ],
@@ -103,6 +109,15 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
             Duration::from_secs(60),
         )
         .expect("pin");
+    // And one address of the protected group: a listed name opens it.
+    h.handles
+        .pin(
+            id,
+            IpAddr::V4(h.v4(6, 2)),
+            "pinned.test",
+            Duration::from_secs(60),
+        )
+        .expect("pin");
 
     let v4 = |g, n| IpAddr::V4(h.v4(g, n));
     let mapped = |g, n| IpAddr::V6(h.v4(g, n).to_ipv6_mapped());
@@ -115,6 +130,14 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         mapped(1, 1),
         mapped(1, 9),
         mapped(5, 2),
+        // Protected: reached by the wide allow only, pinned, inside the
+        // narrow allow. Then the wide allow outside the protected group.
+        v4(6, 1),
+        v4(6, 2),
+        v4(6, 9),
+        mapped(6, 1),
+        v4(7, 1),
+        IpAddr::V6(h.v6(0x0301)),
         IpAddr::V6(h.v6(0x0101)),
         IpAddr::V6(h.v6(0x0201)),
         "::1".parse().expect("address"),
@@ -172,6 +195,15 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
             .starts_with("ok port="),
         "an ephemeral port is not judged"
     );
+
+    // The protected group, stated outright: the wide allow does not open
+    // it, the narrow one and the pin do.
+    let reach = |ip: IpAddr| h.probe("p", &["udp", &ip.to_string(), "9"]);
+    assert!(kernel_denies(&reach(v4(6, 1))), "{}", reach(v4(6, 1)));
+    assert!(kernel_denies(&reach(IpAddr::V6(h.v6(0x0301)))));
+    for open in [v4(6, 2), v4(6, 9), v4(7, 1)] {
+        assert_eq!(reach(open), "ok", "{open}");
+    }
 
     let mut disagreements = Vec::new();
     let (mut denied, mut allowed) = (0, 0);

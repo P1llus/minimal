@@ -133,6 +133,9 @@ pub struct Compiled {
     pub config: BoxConfig,
     /// The whole policy in judging order. A slot's `prio` indexes this.
     pub rules: Vec<Rule>,
+    /// The base policy's protected ranges. Each has a deny in `rules`, and
+    /// [`Rule::reaches_into`] says which rules apply inside one.
+    pub protected: Vec<Prefix>,
     pub nets: Vec<NetEntry>,
     pub sets: Vec<SetEntry>,
     /// Which set the pins of a name go to. See [`Self::set_for_name`].
@@ -303,21 +306,46 @@ fn validate(rules: &[Rule], endpoints: &[(EndpointIndex, Endpoint)]) -> Result<(
     Ok(())
 }
 
+/// A rule as the programs judge it: a prefix of v4-mapped addresses names
+/// IPv4 flows.
+fn canonical(mut rule: Rule) -> Rule {
+    if let Target::Net(prefix) = &mut rule.target {
+        *prefix = prefix.canonical();
+    }
+    rule
+}
+
 /// Compiles a base policy and a box's own policy.
 ///
-/// Judging order: the base policy's `before` rules, the box's rules, the
-/// base policy's `after` rules, then the default.
+/// Judging order: the base policy's `before` rules, the box's rules, a deny
+/// for each protected range, then the default. Inside a protected range
+/// only the rules that [`Rule::reaches_into`] it are judged.
 pub fn compile(
     base: &BasePolicy,
     policy: &BoxPolicy,
     options: Options,
 ) -> Result<Compiled, CompileError> {
+    let mut protected: Vec<Prefix> = Vec::new();
+    for range in base.protected.iter().map(Prefix::canonical) {
+        if !protected.contains(&range) {
+            protected.push(range);
+        }
+    }
+    let closed = protected.iter().map(|range| {
+        Rule::new(
+            Direction::Egress,
+            Target::Net(*range),
+            Action::Deny,
+            crate::model::Origin::Protected,
+        )
+    });
     let rules: Vec<Rule> = base
         .before
         .iter()
         .cloned()
         .chain(policy.rules())
-        .chain(base.after.iter().cloned())
+        .chain(closed)
+        .map(canonical)
         .collect();
     if rules.len() >= usize::from(abi::NO_RULE) {
         return Err(CompileError::TooManyRulesTotal(rules.len()));
@@ -343,22 +371,31 @@ pub fn compile(
     let mut nets = Vec::new();
     for direction in Direction::ALL {
         for family in [Family::V4, Family::V6] {
-            let scoped: Vec<(Slot, Prefix)> = numbered
+            let scoped: Vec<(Slot, Prefix, &Rule)> = numbered
                 .iter()
                 .filter(|(_, r)| r.direction == direction)
                 .filter_map(|(slot, r)| match &r.target {
-                    Target::Any => Some((*slot, Prefix::all(family))),
-                    Target::Net(p) if p.family() == family => Some((*slot, *p)),
+                    Target::Any => Some((*slot, Prefix::all(family), *r)),
+                    Target::Net(p) if p.family() == family => Some((*slot, *p, *r)),
                     Target::Net(_) | Target::Names(_) => None,
                 })
                 .collect();
-            let prefixes: BTreeSet<Prefix> = scoped.iter().map(|(_, p)| *p).collect();
+            let prefixes: BTreeSet<Prefix> = scoped.iter().map(|(_, p, _)| *p).collect();
             for prefix in prefixes {
+                // Every protected range has a rule and so an entry. An
+                // address in one therefore never falls to the entry of a
+                // wider prefix, and the ranges that hold this entry are the
+                // ranges that hold each of its addresses.
+                let around: Vec<&Prefix> = protected
+                    .iter()
+                    .filter(|range| direction == Direction::Egress && range.covers(&prefix))
+                    .collect();
                 let list = prune(
                     scoped
                         .iter()
-                        .filter(|(_, p)| p.covers(&prefix))
-                        .map(|(s, _)| *s),
+                        .filter(|(_, p, _)| p.covers(&prefix))
+                        .filter(|(_, _, r)| around.iter().all(|range| r.reaches_into(range)))
+                        .map(|(s, _, _)| *s),
                 );
                 check_len(direction, &prefix, &list, &rules)?;
                 nets.push(NetEntry {
@@ -420,6 +457,7 @@ pub fn compile(
             addrs: base.addrs,
         },
         rules,
+        protected,
         nets,
         sets,
         names,
@@ -485,6 +523,9 @@ impl fmt::Display for Compiled {
         }
         for (i, rule) in self.rules.iter().enumerate() {
             writeln!(f, "{i:>4}  {rule}  ({})", rule.origin)?;
+        }
+        for range in &self.protected {
+            writeln!(f, "protected: {range}")?;
         }
         Ok(())
     }
@@ -736,6 +777,113 @@ mod tests {
         assert_eq!(after.set_for_name("removed.test"), None);
         assert!(after.sets.iter().all(|s| s.id != removed));
         assert!(after.set_rules(removed, Direction::Egress).is_none());
+    }
+
+    fn guest() -> BasePolicy {
+        let mut d = Deployment::new(NodeKind::Guest, Mode::HostIp);
+        d.network = Some(crate::base::VirtualNetwork {
+            subnet: p("100.64.0.0/24"),
+            gateway: "100.64.0.1".parse().unwrap(),
+            host_alias: None,
+        });
+        base_policy(&d)
+    }
+
+    fn tcp(c: &Compiled, to: &str, pinned: Option<SetId>) -> crate::eval::FlowVerdict {
+        let flow = crate::eval::Flow {
+            direction: Direction::Egress,
+            protocol: crate::model::Protocol::Tcp,
+            remote: to.parse().unwrap(),
+            port: 443,
+            local: None,
+        };
+        c.evaluate(&flow, pinned).verdict
+    }
+
+    #[test]
+    fn a_wide_allow_does_not_open_a_protected_range() {
+        use crate::eval::FlowVerdict::{Allow, Deny};
+
+        // An allow-all box in a guest: the default is allow.
+        let open = compile(&guest(), &BoxPolicy::default(), Options::default()).unwrap();
+        assert_eq!(tcp(&open, "8.8.8.8", None), Allow);
+        for closed in ["100.64.0.7", "169.254.169.254"] {
+            assert_eq!(tcp(&open, closed, None), Deny, "{closed}");
+        }
+
+        // Wide prefixes, as subnets and as an explicit rule to anywhere.
+        let wide = BoxPolicy {
+            rules: vec![BoxRule {
+                action: BoxAction::Allow,
+                protocols: Protocols::TCP,
+                ports: PortRange::ALL,
+                to: Target::Any,
+            }],
+            allow: vec![p("0.0.0.0/0"), p("100.64.0.0/10"), p("::/0")],
+            ..BoxPolicy::default()
+        };
+        let c = compile(&guest(), &wide, Options::default()).unwrap();
+        assert_eq!(tcp(&c, "100.127.0.1", None), Allow);
+        for closed in ["100.64.0.7", "169.254.169.254", "fe80::1"] {
+            assert_eq!(tcp(&c, closed, None), Deny, "{closed}");
+        }
+        let d = c.evaluate(
+            &crate::eval::Flow {
+                direction: Direction::Egress,
+                protocol: crate::model::Protocol::Tcp,
+                remote: "100.64.0.7".parse().unwrap(),
+                port: 443,
+                local: None,
+            },
+            None,
+        );
+        let by = &c.rules[usize::from(d.rule.unwrap())];
+        assert_eq!(
+            (by.origin, &by.target),
+            (Origin::Protected, &Target::Net(p("100.64.0.0/24")))
+        );
+
+        // A prefix inside the range is a decision about the range, and
+        // the range itself is too.
+        let narrow = BoxPolicy {
+            allow: vec![p("0.0.0.0/0"), p("100.64.0.8/29"), p("169.254.0.0/16")],
+            names: vec!["peer.min.internal".parse().unwrap()],
+            ..BoxPolicy::default()
+        };
+        let c = compile(&guest(), &narrow, Options::default()).unwrap();
+        assert_eq!(tcp(&c, "100.64.0.9", None), Allow);
+        assert_eq!(tcp(&c, "100.64.0.7", None), Deny);
+        assert_eq!(tcp(&c, "169.254.169.254", None), Allow);
+        // So is a name: an address pinned for a listed name is admitted.
+        let peer = c.set_for_name("peer.min.internal");
+        assert_eq!(tcp(&c, "100.64.0.7", peer), Allow);
+        // A deny the box wrote applies inside the range like anywhere.
+        let denied = BoxPolicy {
+            deny: vec![p("100.64.0.9/32")],
+            ..narrow
+        };
+        let c = compile(&guest(), &denied, Options::default()).unwrap();
+        assert_eq!(tcp(&c, "100.64.0.9", None), Deny);
+        assert_eq!(tcp(&c, "100.64.0.10", None), Allow);
+    }
+
+    #[test]
+    fn a_v4_mapped_prefix_is_the_ipv4_prefix_it_carries() {
+        let policy = BoxPolicy {
+            allow: vec![p("::ffff:10.1.0.0/112")],
+            ..BoxPolicy::default()
+        };
+        let c = compile(&host_ip(), &policy, Options::default()).unwrap();
+        assert!(
+            c.rules
+                .iter()
+                .any(|r| r.target == Target::Net(p("10.1.0.0/16")))
+        );
+        assert_eq!(entry(&c, Direction::Egress, "10.1.0.0/16").rules.len(), 1);
+        for to in ["10.1.2.3", "::ffff:10.1.2.3"] {
+            assert_eq!(tcp(&c, to, None), crate::eval::FlowVerdict::Allow, "{to}");
+        }
+        assert_eq!(tcp(&c, "10.2.0.1", None), crate::eval::FlowVerdict::Deny);
     }
 
     #[test]

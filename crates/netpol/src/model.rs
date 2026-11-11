@@ -436,6 +436,23 @@ impl Prefix {
     pub fn covers(&self, other: &Self) -> bool {
         self.len <= other.len && self.contains(other.addr)
     }
+
+    /// The prefix as flows are judged: a prefix of v4-mapped IPv6 addresses
+    /// (`::ffff:a.b.c.d/96+n`) is the IPv4 prefix `a.b.c.d/n`, because a
+    /// flow to a v4-mapped address is an IPv4 flow.
+    #[must_use]
+    pub fn canonical(&self) -> Self {
+        let IpAddr::V6(a) = self.addr else {
+            return *self;
+        };
+        match (a.segments(), self.len) {
+            ([0, 0, 0, 0, 0, 0xffff, hi, lo], 96..=128) => Self {
+                addr: IpAddr::V4(Ipv4Addr::from_bits((u32::from(hi) << 16) | u32::from(lo))),
+                len: self.len - 96,
+            },
+            _ => *self,
+        }
+    }
 }
 
 impl FromStr for Prefix {
@@ -684,9 +701,9 @@ pub enum Origin {
     HostExposure,
     /// Gateway and host alias of the virtual network.
     Infrastructure,
-    /// Other addresses of the virtual network: boxes do not reach each
-    /// other unless a rule or a name admits it.
-    VirtualNetwork,
+    /// A protected range: closed unless the box allows a prefix inside
+    /// it or lists a name that resolves into it.
+    Protected,
     /// A published port.
     Published,
     /// `rules` of the box, by position.
@@ -725,7 +742,7 @@ impl fmt::Display for Origin {
             Self::NoIpv6Transport => f.write_str("transport without IPv6"),
             Self::HostExposure => f.write_str("host exposure"),
             Self::Infrastructure => f.write_str("virtual network infrastructure"),
-            Self::VirtualNetwork => f.write_str("virtual network"),
+            Self::Protected => f.write_str("protected range"),
             Self::Published => f.write_str("published port"),
             Self::BoxRule(i) => write!(f, "rules[{i}]"),
             Self::BoxProtocols => f.write_str("allow_protocols"),
@@ -776,6 +793,25 @@ impl Rule {
     #[must_use]
     pub const fn matches_l4(&self, protocol: Protocol, port: u16) -> bool {
         self.protocols.contains(protocol) && self.ports.contains(port)
+    }
+
+    /// Whether the rule applies to addresses of a protected range.
+    ///
+    /// A wide allow does not open a protected range: `0.0.0.0/0` is not a
+    /// decision to reach the other boxes of a virtual network. So an allow
+    /// the box wrote for a prefix applies there only when the prefix lies
+    /// inside the range. Denies, rules by name and the base policy's own
+    /// rules apply everywhere.
+    #[must_use]
+    pub fn reaches_into(&self, range: &Prefix) -> bool {
+        if self.origin.is_base() || self.action == Action::Deny {
+            return true;
+        }
+        match &self.target {
+            Target::Names(_) => true,
+            Target::Any => false,
+            Target::Net(prefix) => range.covers(prefix),
+        }
     }
 }
 
@@ -868,6 +904,16 @@ mod tests {
         assert_eq!("192.0.2.7".parse::<Prefix>().unwrap().len(), 32);
         "10.0.0.0/33".parse::<Prefix>().unwrap_err();
         "nope/8".parse::<Prefix>().unwrap_err();
+        // A v4-mapped prefix is the IPv4 prefix it carries.
+        let mapped: Prefix = "::ffff:10.1.0.0/112".parse().unwrap();
+        assert_eq!(mapped.canonical(), p);
+        assert_eq!(
+            "::ffff:0:0/96".parse::<Prefix>().unwrap().canonical(),
+            Prefix::V4_ALL
+        );
+        assert_eq!(p6.canonical(), p6);
+        let short: Prefix = "::/64".parse().unwrap();
+        assert_eq!(short.canonical(), short);
     }
 
     #[test]
