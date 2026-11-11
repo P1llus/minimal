@@ -103,13 +103,6 @@ fn root_name() -> Option<String> {
     root().map(|root| root.name().to_owned())
 }
 
-/// The box whose cgroup a process is in, from the path its
-/// `/proc/<pid>/cgroup` names after `0::`. `None` for a process in no box
-/// cgroup of this daemon.
-pub(crate) fn box_of_cgroup(cgroup: &str) -> Option<boxes::SessionId> {
-    boxes::SessionId::parse_str(sandbox::cgroup::box_below(&root_name()?, cgroup.trim())?).ok()
-}
-
 /// Whether the cgroup path is a box cgroup of this daemon.
 pub(crate) fn in_a_box(cgroup: &str) -> bool {
     root_name().is_some_and(|root| sandbox::cgroup::box_below(&root, cgroup.trim()).is_some())

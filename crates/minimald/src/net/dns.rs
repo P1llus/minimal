@@ -796,14 +796,12 @@ pub struct InterimPublish {
 /// egress rules its own outbound frames are decided by — the same rules a
 /// request from it is put to, exactly as a direct connection from it would be
 /// ([`super::switch::proxied_request_verdict`]). Named by the
-/// lease-to-session map ([`HostnameRegistry::by_lease`]) for a box on the
-/// switch, and by the box that owns the connecting socket for a host-address
-/// box ([`HostnameRegistry::caller_owning`]). A host-side client is no
-/// caller: it has no declaration to honour.
+/// lease-to-session map ([`HostnameRegistry::by_lease`]). A host-side client
+/// is no caller: it has no declaration to honour.
 #[derive(Debug, Clone)]
 pub struct Caller {
     /// The address the caller's proxied connections come from: the switch
-    /// lease its box holds, or the node's address for a host-address box.
+    /// lease its box holds.
     lease: Ipv4Addr,
     /// The caller's session name, for the refusal log.
     name: String,
@@ -979,11 +977,9 @@ pub struct HostnameRegistry {
     /// the node's own listener at that port keeps answering and the stopped
     /// box is not silently impersonated by it.
     stopped: HashSet<SessionId>,
-    /// Stopped boxes whose host launch has started and has not reached
-    /// [`Self::mark_running`] yet ([`Self::begin_host_launch`]). The launch
-    /// can start the box's processes before the host's loop clears `stopped`,
-    /// so [`Self::has_unleased_callers`] counts a box with this mark as live
-    /// (NET-070).
+    /// Boxes whose host launch has started and has not reached
+    /// [`Self::mark_running`] yet ([`Self::begin_host_launch`]). Nothing
+    /// reads this set.
     launching: HashSet<SessionId>,
     /// Each box's current host launch number ([`Self::begin_host_launch`]).
     /// A host loop that a newer launch replaced holds an older number, so its
@@ -1005,15 +1001,12 @@ pub struct HostnameRegistry {
     /// the box has a lease, so the join is ready the moment it attaches.
     callers: HashMap<SessionId, CallerFacts>,
     /// The sessions registered as `HostNet` boxes
-    /// ([`Self::register_host_net`]): they hold no switch lease by design, so
-    /// a caller fact without a lease is an unreported own-address lease only
-    /// for a session that is not in this set (NET-070).
+    /// ([`Self::register_host_net`]). On a VM node the host answers their
+    /// names, so this registry's zone holds no address for them.
     host_net: HashSet<SessionId>,
     /// The own-address boxes whose attach is running and has not reported
-    /// its switch lease yet ([`Self::begin_lease_attach`]). Only these make
-    /// [`Self::has_unreported_lease_callers`] true: a box created and never
-    /// started, or stopped, has no attach in flight and connects from no
-    /// lease at all (NET-070).
+    /// its switch lease yet ([`Self::begin_lease_attach`]). Nothing reads
+    /// this set.
     attaching: HashSet<SessionId>,
     /// The lease-to-session map that names a caller (NET-070): the switch
     /// address a proxied request's peer resolves to a session with. Reserved
@@ -1468,9 +1461,7 @@ impl HostnameRegistry {
     /// carry (NET-084) and the two surfaces decide by one rule set (NET-071).
     /// `None` when the lease names no session — which is what a host-side
     /// caller (the developer's browser, the daemon's own lanes) is, and what a
-    /// host-address session is too: neither has a box on the switch. A
-    /// host-address box is named by the socket it connects from instead
-    /// ([`Self::caller_owning`]).
+    /// host-address session is too: neither has a box on the switch.
     #[must_use]
     pub fn caller_at(&self, lease: Ipv4Addr) -> Option<Caller> {
         let id = self.by_lease.get(&lease)?;
@@ -1487,69 +1478,6 @@ impl HostnameRegistry {
         })
     }
 
-    /// The caller a connection from the node's address stands for
-    /// (NET-070): the live host-address box `owner`, which owns the
-    /// connecting socket ([`connecting_box`]), with its egress rules compiled
-    /// with `from`, the address the connection came from, as their source.
-    /// A host-address box holds no switch lease, so [`Self::caller_at`]
-    /// cannot name it. `None` when `owner` has no caller facts, or when it is
-    /// an own-address box, whose connections come from its lease. The proxy
-    /// refuses a connection that this returns `None` for: the kernel named a
-    /// box, so the connection is not a host-side client's, and an unknown box
-    /// is denied by default.
-    #[must_use]
-    pub fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<Caller> {
-        if self.own.contains_key(&owner) || self.by_lease.values().any(|id| *id == owner) {
-            return None;
-        }
-        let facts = self.callers.get(&owner)?;
-        Some(Caller {
-            lease: from,
-            name: facts.name.clone(),
-            egress: super::switch::compiled_egress(
-                Some(&facts.policy),
-                facts.subnet,
-                from,
-                facts.hostname_proxy_port,
-            ),
-        })
-    }
-
-    /// Whether any live session with caller facts holds no switch lease: a
-    /// host-address box, or a box whose lease is not reported yet. While
-    /// none does, no connection from the node's address can be a box's, so
-    /// the proxy does not look up who owns the connecting socket. A stopped
-    /// box ([`Self::mark_stopped`]) is not live: it keeps its caller facts
-    /// until destroy, but it runs nothing that can connect, so it does not
-    /// count until [`Self::begin_host_launch`] or [`Self::mark_running`].
-    /// A launching box with no own address and no lease counts whether or
-    /// not it has caller facts: an ended box brought up for its destroy hooks
-    /// can have none, and the proxy refuses its connections as unattributed
-    /// rather than pass them as no box's (NET-070, design §7.1).
-    #[must_use]
-    pub fn has_unleased_callers(&self) -> bool {
-        let unleased =
-            |id: &SessionId| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id);
-        self.callers
-            .keys()
-            .any(|id| !self.stopped.contains(id) && unleased(id))
-            || self.launching.iter().any(unleased)
-    }
-
-    /// Whether any own-address box is attaching and has not reported its
-    /// switch lease yet: it sits between [`Self::begin_lease_attach`] at the
-    /// start of its attach and [`Self::report_own_address`] at the end of it.
-    /// Its connections come from a lease this node does not hold, so
-    /// [`connecting_box`] answers [`ConnectingOwner::OffNode`] for them. While
-    /// this is true, the proxy cannot tell such a peer from a host-side client
-    /// off the node, and it refuses the peer as unattributed (NET-070, design
-    /// §7.1). A box that is registered but not attaching does not count: it
-    /// runs nothing that can connect.
-    #[must_use]
-    pub fn has_unreported_lease_callers(&self) -> bool {
-        self.attaching.iter().any(|id| !self.host_net.contains(id))
-    }
-
     /// Marks `session_id` as an own-address box whose attach has started and
     /// whose switch lease is not reported yet (NET-070). The mark ends at
     /// [`Self::report_own_address`], at [`Self::end_lease_attach`] when the
@@ -1559,11 +1487,8 @@ impl HostnameRegistry {
         self.attaching.insert(session_id);
     }
 
-    /// Marks `session_id` as a box whose host launch has started (NET-070).
-    /// A resumed box can run processes before its host's loop calls
-    /// [`Self::mark_running`], so from this mark the box counts as live for
-    /// [`Self::has_unleased_callers`], stopped or not. The mark ends at
-    /// [`Self::mark_running`], at [`Self::mark_stopped`], at
+    /// Marks `session_id` as a box whose host launch has started. The mark
+    /// ends at [`Self::mark_running`], at [`Self::mark_stopped`], at
     /// [`Self::forget_own_address`] and at [`Self::end_host_launch`] when the
     /// launch fails.
     ///
@@ -2186,8 +2111,8 @@ impl HostnameRegistry {
     /// Marks a box's host as stopped from the loop of the host that `launch`
     /// started ([`Self::begin_host_launch`]), as [`Self::mark_stopped`] does.
     /// A loop that a newer launch replaced can end after that launch, so a
-    /// `launch` older than the box's current launch changes nothing: the box
-    /// stays live for [`Self::has_unleased_callers`] (NET-070, design §7.1).
+    /// `launch` older than the box's current launch changes nothing: the
+    /// running box's name keeps answering.
     pub fn mark_host_stopped(&mut self, session_id: SessionId, launch: u64) {
         if let Some(&current) = self.host_launches.get(&session_id)
             && launch < current
@@ -3483,360 +3408,6 @@ pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
     );
 }
 
-/// What the kernel says owns the client end of a connection to this host
-/// (NET-070), as [`connecting_box`] reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectingOwner {
-    /// A process in this box's cgroup holds the socket, and no holder runs
-    /// in another box's cgroup.
-    Box(SessionId),
-    /// Every process that holds the socket runs in no box's cgroup, as the
-    /// developer's browser does.
-    NoBox,
-    /// The lookup found no owner: the socket is gone from the tables or
-    /// held by no process (the client closed it), `/proc` hides a holder or
-    /// its cgroup from this process, a holder's pid stopped holding the
-    /// socket while it was read, or holders run in two boxes' cgroups.
-    Unknown,
-    /// The peer's address is one this node does not hold, so no lookup ran.
-    /// The peer is a client off the node, such as the host side of a VM's
-    /// forwarded port, or an own-address box whose lease is not reported
-    /// yet. The caller decides which ([`HostnameRegistry::has_unreported_lease_callers`]).
-    OffNode,
-}
-
-/// The box that owns the client end of a TCP connection to this host
-/// (NET-070): `peer` is the client's address and `local` the address it
-/// connected to, as the accepting side sees them. The kernel's socket tables
-/// give the client socket's inode, every process that holds a descriptor for
-/// it, and each one's cgroup. Every process of a box runs in the box's
-/// cgroup, `<root>/boxes/<box id>`, and the cgroup's name is the box's id.
-/// The socket is the box's when any holder runs in its cgroup
-/// ([`owner_of_holders`]). [`ConnectingOwner::NoBox`] when every holder runs
-/// in no box's cgroup, and [`ConnectingOwner::Unknown`] when any step finds
-/// nothing or holders run in two boxes' cgroups, so a caller can refuse a
-/// connection it cannot attribute.
-///
-/// A peer whose address this node does not hold is [`ConnectingOwner::OffNode`]
-/// with no lookup. A host-address box shares the node's network namespace,
-/// so it connects from an address the node holds. A client off the node,
-/// such as the host side of a VM's forwarded port that arrives through the
-/// switch's gateway, is never in this node's socket tables. Without this
-/// rule its lookup finds nothing, and the proxy refuses every host request
-/// while a host-address box is live.
-#[must_use]
-pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwner {
-    if !node_holds_address(*peer.ip()) {
-        return ConnectingOwner::OffNode;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let Some(inode) = client_socket_inode(peer, local) else {
-            return ConnectingOwner::Unknown;
-        };
-        let Some(holders) = socket_holders(inode) else {
-            return ConnectingOwner::Unknown;
-        };
-        // Read each holder's cgroup, then check that the pid still holds
-        // the socket. A pid that exited and was reused between the reads
-        // names another process's cgroup, so it counts as unreadable.
-        owner_of_holders(holders.into_iter().map(|pid| {
-            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-            if !holds_socket(pid, inode) {
-                return None;
-            }
-            Some(holder_box(&cgroup))
-        }))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (peer, local);
-        ConnectingOwner::Unknown
-    }
-}
-
-/// The owners of many connections to this host at once (NET-070): one
-/// answer for each `(peer, local)` pair, in order, as [`connecting_box`]
-/// gives it for that pair alone. It reads each socket table once and walks
-/// `/proc/*/fd` once for every pair, so its cost does not grow with the
-/// number of pairs as a [`connecting_box`] call for each pair does. The
-/// proxy's shared owner walk asks it for every connection that waits.
-///
-/// Each holder found in the walk then has its cgroup read and its `fd`
-/// directory read again, once for each holder and not once for each pair. A
-/// pid that exited and was reused between the two reads names another
-/// process's cgroup, so it counts as unreadable, as in [`connecting_box`].
-#[must_use]
-pub fn connecting_boxes(pairs: &[(SocketAddrV4, SocketAddrV4)]) -> Vec<ConnectingOwner> {
-    #[cfg(target_os = "linux")]
-    {
-        let on_node: Vec<bool> = pairs
-            .iter()
-            .map(|(peer, _)| node_holds_address(*peer.ip()))
-            .collect();
-        if !on_node.contains(&true) {
-            return vec![ConnectingOwner::OffNode; pairs.len()];
-        }
-        let tables: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
-            .iter()
-            .filter_map(|table| std::fs::read_to_string(table).ok())
-            .collect();
-        let inodes: Vec<Option<u64>> = pairs
-            .iter()
-            .zip(&on_node)
-            .map(|((peer, local), on_node)| {
-                if !on_node {
-                    return None;
-                }
-                let (ours, theirs) = (socket_table_keys(*peer), socket_table_keys(*local));
-                tables
-                    .iter()
-                    .find_map(|text| socket_row_inode(text, &ours, &theirs))
-            })
-            .collect();
-        let wanted: BTreeSet<u64> = inodes.iter().flatten().copied().collect();
-        let holders = if wanted.is_empty() {
-            Some(BTreeMap::new())
-        } else {
-            socket_holders_of(&wanted)
-        };
-        on_node
-            .iter()
-            .zip(&inodes)
-            .map(|(on_node, inode)| {
-                if !on_node {
-                    return ConnectingOwner::OffNode;
-                }
-                let (Some(inode), Some(holders)) = (inode, holders.as_ref()) else {
-                    return ConnectingOwner::Unknown;
-                };
-                owner_of_holders(
-                    holders
-                        .values()
-                        .filter(|holder| holder.held.contains(inode))
-                        .map(|holder| {
-                            let cgroup = holder
-                                .cgroup
-                                .as_deref()
-                                .filter(|_| holder.still.contains(inode))?;
-                            Some(holder_box(cgroup))
-                        }),
-                )
-            })
-            .collect()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        pairs
-            .iter()
-            .map(|(peer, local)| connecting_box(*peer, *local))
-            .collect()
-    }
-}
-
-/// One process that holds a descriptor for a wanted socket, as
-/// [`socket_holders_of`] found it.
-#[cfg(target_os = "linux")]
-struct Holder {
-    /// The wanted sockets it held in the walk.
-    held: Vec<u64>,
-    /// The wanted sockets it held on a second read of its `fd` directory,
-    /// after its cgroup read. A socket in `held` and not here counts as
-    /// unreadable for this holder, as [`connecting_box`] checks.
-    still: Vec<u64>,
-    /// Its `/proc/<pid>/cgroup`, or `None` when that read failed.
-    cgroup: Option<String>,
-}
-
-/// The processes that hold a descriptor for any socket in `wanted`, by pid,
-/// from one walk of `/proc/*/fd`. `None` when `/proc` cannot be read.
-#[cfg(target_os = "linux")]
-fn socket_holders_of(wanted: &BTreeSet<u64>) -> Option<BTreeMap<u32, Holder>> {
-    let held_by = |pid: u32| -> Vec<u64> {
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            return Vec::new();
-        };
-        fds.flatten()
-            .filter_map(|fd| {
-                let link = std::fs::read_link(fd.path()).ok()?;
-                let inode = link
-                    .to_str()?
-                    .strip_prefix("socket:[")?
-                    .strip_suffix(']')?
-                    .parse::<u64>()
-                    .ok()?;
-                wanted.contains(&inode).then_some(inode)
-            })
-            .collect()
-    };
-    let holders = std::fs::read_dir("/proc")
-        .ok()?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter_map(|pid| {
-            let held = held_by(pid);
-            if held.is_empty() {
-                return None;
-            }
-            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
-            let still = held_by(pid);
-            Some((
-                pid,
-                Holder {
-                    held,
-                    still,
-                    cgroup,
-                },
-            ))
-        })
-        .collect();
-    Some(holders)
-}
-
-/// Whether `ip` is an address this node holds: a loopback address, or one
-/// a socket can bind to. A bind to port 0 fails with `EADDRNOTAVAIL` for an
-/// address no interface holds. A host that permits non-local binds
-/// (`ip_nonlocal_bind`) answers true for every address, so the caller's
-/// lookup still runs and fails closed.
-fn node_holds_address(ip: Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_unspecified() || std::net::UdpSocket::bind((ip, 0)).is_ok()
-}
-
-/// The kernel's socket-table spelling of an IPv4 socket address: the
-/// address as one little-endian word, then the port, both in upper-case hex
-/// (`0100007F:1F90` for `127.0.0.1:8080`), and the v4-mapped IPv6 spelling
-/// the `tcp6` table prints for the same address.
-fn socket_table_keys(addr: SocketAddrV4) -> [String; 2] {
-    let word = u32::from(*addr.ip()).swap_bytes();
-    let port = addr.port();
-    [
-        format!("{word:08X}:{port:04X}"),
-        format!("0000000000000000FFFF0000{word:08X}:{port:04X}"),
-    ]
-}
-
-/// The inode of the socket whose local end is `peer` and whose remote end is
-/// `local`: the client end of a connection the accepting side sees from
-/// `peer` to `local`.
-#[cfg(target_os = "linux")]
-fn client_socket_inode(peer: SocketAddrV4, local: SocketAddrV4) -> Option<u64> {
-    let ours = socket_table_keys(peer);
-    let theirs = socket_table_keys(local);
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        if let Some(inode) = socket_row_inode(&text, &ours, &theirs) {
-            return Some(inode);
-        }
-    }
-    None
-}
-
-/// The inode of the first row of one socket table whose local address is
-/// one of `ours` and whose remote address is one of `theirs`. Inode `0` is
-/// a socket no process holds (a time-wait row), so it is skipped.
-fn socket_row_inode(table: &str, ours: &[String; 2], theirs: &[String; 2]) -> Option<u64> {
-    table.lines().skip(1).find_map(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let (local, remote, inode) = (fields.get(1)?, fields.get(2)?, fields.get(9)?);
-        if !ours.iter().any(|key| key == local) || !theirs.iter().any(|key| key == remote) {
-            return None;
-        }
-        inode.parse().ok().filter(|inode| *inode != 0)
-    })
-}
-
-/// Every process that holds a descriptor for the socket `inode`, in `/proc`
-/// order. A socket can have several holders: a forked child keeps its
-/// parent's descriptors, and a descriptor can be passed over a Unix socket.
-/// `None` when `/proc` cannot be read.
-#[cfg(target_os = "linux")]
-fn socket_holders(inode: u64) -> Option<Vec<u32>> {
-    let holders = std::fs::read_dir("/proc")
-        .ok()?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter(|pid| holds_socket(*pid, inode))
-        .collect();
-    Some(holders)
-}
-
-/// Whether process `pid` holds a descriptor for the socket `inode` now.
-#[cfg(target_os = "linux")]
-fn holds_socket(pid: u32, inode: u64) -> bool {
-    let target = format!("socket:[{inode}]");
-    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return false;
-    };
-    fds.flatten().any(|fd| {
-        std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == target.as_str())
-    })
-}
-
-/// The box one holder of a socket runs in (NET-070), as [`holder_box`]
-/// reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HolderBox {
-    /// The holder runs in this box's cgroup.
-    Box(SessionId),
-    /// The holder runs in no box's cgroup, as the developer's browser does.
-    Outside,
-}
-
-/// The box a holder runs in, from its `/proc/<pid>/cgroup` (NET-070).
-fn holder_box(cgroup: &str) -> HolderBox {
-    box_in_cgroup(cgroup).map_or(HolderBox::Outside, HolderBox::Box)
-}
-
-/// The owner of a socket from the boxes its holders run in (NET-070). Each
-/// item is one holder's [`HolderBox`], or `None` when a read failed or the
-/// pid no longer held the socket after it. The socket is a box's when any
-/// holder runs in that box's cgroup, whatever other holders run outside
-/// every box: a process outside the boxes must not lift the box's gate by
-/// sharing its socket. [`ConnectingOwner::Unknown`] when there is no holder,
-/// when any holder cannot be read, or when holders run in two different
-/// boxes, so the proxy refuses the connection. [`ConnectingOwner::NoBox`]
-/// only when every holder runs outside every box.
-fn owner_of_holders(holders: impl IntoIterator<Item = Option<HolderBox>>) -> ConnectingOwner {
-    let mut owner = None;
-    let mut any = false;
-    for holder in holders {
-        any = true;
-        let id = match holder {
-            None => return ConnectingOwner::Unknown,
-            Some(HolderBox::Outside) => continue,
-            Some(HolderBox::Box(id)) => id,
-        };
-        match owner {
-            Some(seen) if seen != id => return ConnectingOwner::Unknown,
-            _ => owner = Some(id),
-        }
-    }
-    match owner {
-        Some(id) => {
-            tracing::debug!(
-                component = "dns-proxy",
-                box_id = %id,
-                "named the box that holds a connecting socket"
-            );
-            ConnectingOwner::Box(id)
-        }
-        None if any => ConnectingOwner::NoBox,
-        None => ConnectingOwner::Unknown,
-    }
-}
-
-/// The box whose cgroup a process's `/proc/<pid>/cgroup` names. `None` for a
-/// process in no box cgroup.
-fn box_in_cgroup(cgroup: &str) -> Option<SessionId> {
-    cgroup
-        .lines()
-        // cgroup2's line is `0::<path>`; a v1 line names a controller.
-        .find_map(|line| line.strip_prefix("0::"))
-        .and_then(crate::box_cgroups::box_of_cgroup)
-}
-
 /// The wall clock the record stamps grants with, in Unix seconds — the same
 /// clock a daemon stamps its own start with (the stamp the manager passes
 /// to [`LoopbackLeaseBook::release_dead_boxes`]), so the sweep's
@@ -4277,202 +3848,6 @@ mod tests {
         // An own-address route carries its own port gate.
         let own_ip = Route::loopback("own", Ipv4Addr::LOCALHOST, Some(BTreeSet::new()));
         assert_eq!(own_ip.host_address_listener(wildcard_port), None);
-    }
-
-    /// The cgroup a process reports names its box when it is a box cgroup of
-    /// this daemon, and names no box otherwise.
-    #[test]
-    fn box_in_cgroup_reads_the_box_cgroup() {
-        let id = "00000000-0000-0000-0000-0000000000aa";
-        let want = SessionId::parse_str(id).ok();
-        crate::box_cgroups::with_root_name("/minimal", || {
-            assert_eq!(box_in_cgroup(&format!("0::/minimal/boxes/{id}\n")), want);
-            for cgroup in [
-                "0::/user.slice/user-1000.slice/session-2.scope\n",
-                "0::/minimal/supervisor\n",
-                "0::/minimal/boxes/not-a-box-id\n",
-                "0::/other/boxes/00000000-0000-0000-0000-0000000000aa\n",
-                "4:cpu:/minimal/boxes/00000000-0000-0000-0000-0000000000aa\n",
-            ] {
-                assert_eq!(box_in_cgroup(cgroup), None, "{cgroup}");
-            }
-        });
-        // A daemon with no cgroup root names no box.
-        assert_eq!(box_in_cgroup(&format!("0::/minimal/boxes/{id}\n")), None);
-    }
-
-    /// NET-070: a socket can have several holders. A holder in a box's
-    /// cgroup makes the socket that box's, whatever holder outside every box
-    /// shares it and in whatever order `/proc` lists them. Holders in two
-    /// boxes' cgroups, or a holder that cannot be read, make the owner
-    /// unknown.
-    #[test]
-    fn owner_of_holders_prefers_a_box_holder_and_refuses_two_boxes() {
-        let a = "00000000-0000-0000-0000-0000000000aa";
-        let b = "00000000-0000-0000-0000-0000000000bb";
-        let in_box = |id: &str| {
-            crate::box_cgroups::with_root_name("/minimal", || {
-                Some(holder_box(&format!("0::/minimal/boxes/{id}\n")))
-            })
-        };
-        let outside = || {
-            Some(holder_box(
-                "0::/user.slice/user-1000.slice/session-1.scope\n",
-            ))
-        };
-        assert_eq!(outside(), Some(HolderBox::Outside));
-        let box_a = ConnectingOwner::Box(SessionId::parse_str(a).unwrap());
-
-        assert_eq!(owner_of_holders([outside(), in_box(a)]), box_a);
-        assert_eq!(owner_of_holders([in_box(a), outside()]), box_a);
-        assert_eq!(owner_of_holders([in_box(a), in_box(a)]), box_a);
-        assert_eq!(
-            owner_of_holders([in_box(a), outside(), in_box(b)]),
-            ConnectingOwner::Unknown,
-            "holders in two boxes' cgroups"
-        );
-        assert_eq!(
-            owner_of_holders([outside(), outside()]),
-            ConnectingOwner::NoBox
-        );
-        assert_eq!(
-            owner_of_holders([outside(), None]),
-            ConnectingOwner::Unknown,
-            "a holder whose cgroup read failed or whose pid was reused"
-        );
-        assert_eq!(
-            owner_of_holders(std::iter::empty()),
-            ConnectingOwner::Unknown,
-            "no holder"
-        );
-    }
-
-    /// NET-070: a real connection from this process, which runs in no box's
-    /// cgroup, is no box's, through the one-pair lookup and the batch lookup
-    /// alike.
-    #[test]
-    fn a_connection_from_outside_every_box_is_no_boxs() {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_accepted, peer) = listener.accept().unwrap();
-        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (peer, listener.local_addr().unwrap())
-        else {
-            panic!("an IPv4 connection");
-        };
-        if cfg!(target_os = "linux") {
-            assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
-            assert_eq!(connecting_boxes(&[(peer, local)]), [ConnectingOwner::NoBox]);
-        }
-        drop(client);
-    }
-
-    /// The socket table row of a connection's client end is the one whose
-    /// local address is the peer and whose remote address is the proxy's,
-    /// in the v4 table and in the v4-mapped spelling of the v6 table alike.
-    #[test]
-    fn socket_row_inode_finds_the_client_end() {
-        let peer = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), 40000);
-        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
-        let ours = socket_table_keys(peer);
-        let theirs = socket_table_keys(local);
-        assert_eq!(ours[0], "0400007F:9C40");
-        assert_eq!(theirs[0], "0100007F:1F90");
-        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
-        let v4 = format!(
-            "{header}\n   0: 0100007F:1F90 0400007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 111 1\n   1: 0400007F:9C40 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 222 1\n"
-        );
-        assert_eq!(socket_row_inode(&v4, &ours, &theirs), Some(222));
-        let v6 = format!(
-            "{header}\n   0: 0000000000000000FFFF00000400007F:9C40 0000000000000000FFFF00000100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 333 1\n"
-        );
-        assert_eq!(socket_row_inode(&v6, &ours, &theirs), Some(333));
-        let time_wait = format!(
-            "{header}\n   0: 0400007F:9C40 0100007F:1F90 06 00000000:00000000 00:00000000 00000000     0        0 0 1\n"
-        );
-        assert_eq!(socket_row_inode(&time_wait, &ours, &theirs), None);
-    }
-
-    /// The kernel half of the lookup, against a real connection: the client
-    /// socket's inode is found from the accepting side's view, and the
-    /// process that holds it is this one.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn connecting_socket_holder_is_found() {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_accepted, peer) = listener.accept().unwrap();
-        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (peer, listener.local_addr().unwrap())
-        else {
-            panic!("an IPv4 connection");
-        };
-        let inode = client_socket_inode(peer, local).expect("the client socket is in the table");
-        assert!(holds_socket(std::process::id(), inode));
-        assert!(socket_holders(inode).is_some_and(|pids| pids.contains(&std::process::id())));
-        // A test process runs in no box's cgroup, so it is no box.
-        assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
-        drop(client);
-    }
-
-    /// The batch lookup gives each pair the answer [`connecting_box`] gives
-    /// it alone, in order: live connections from this process are no box's,
-    /// an off-node peer is off the node, and a pair in no socket table has
-    /// no owner (NET-070).
-    #[test]
-    fn connecting_boxes_names_each_pair_as_connecting_box_does() {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let SocketAddr::V4(local) = listener.local_addr().unwrap() else {
-            panic!("an IPv4 listener");
-        };
-        let mut held = Vec::new();
-        let mut pairs = Vec::new();
-        for _ in 0..3 {
-            let client = std::net::TcpStream::connect(local).unwrap();
-            let (accepted, SocketAddr::V4(peer)) = listener.accept().unwrap() else {
-                panic!("an IPv4 connection");
-            };
-            held.push((client, accepted));
-            pairs.push((peer, local));
-        }
-        pairs.insert(
-            1,
-            (SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000), local),
-        );
-        // No socket connects from this port to the listener.
-        pairs.push((SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1), local));
-        let one_by_one: Vec<_> = pairs
-            .iter()
-            .map(|(peer, local)| connecting_box(*peer, *local))
-            .collect();
-        assert_eq!(connecting_boxes(&pairs), one_by_one);
-        if cfg!(target_os = "linux") {
-            assert_eq!(
-                one_by_one,
-                [
-                    ConnectingOwner::NoBox,
-                    ConnectingOwner::OffNode,
-                    ConnectingOwner::NoBox,
-                    ConnectingOwner::NoBox,
-                    ConnectingOwner::Unknown,
-                ]
-            );
-        }
-        assert!(connecting_boxes(&[]).is_empty());
-        drop(held);
-    }
-
-    /// A peer at an address this node does not hold is off the node, with no
-    /// socket lookup: a host-address box connects from the node's own
-    /// addresses, and an off-node client, such as a VM host's forwarded
-    /// request through the switch's gateway, is never in the node's tables
-    /// (NET-070).
-    #[test]
-    fn off_node_peer_is_no_box() {
-        // TEST-NET-1 (RFC 5737): no interface holds it.
-        let peer = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
-        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7654);
-        assert!(!node_holds_address(*peer.ip()));
-        assert!(node_holds_address(Ipv4Addr::new(127, 0, 0, 4)));
-        assert_eq!(connecting_box(peer, local), ConnectingOwner::OffNode);
     }
 
     /// A lease an attach path would report, with an `18080:8080` ingress
@@ -4948,6 +4323,41 @@ mod tests {
                 owner: "shared".to_string(),
                 address: Some(node),
             }
+        );
+    }
+
+    /// The loop of a replaced host can end after the newer launch's host
+    /// runs. Its stop mark carries the older launch number and changes
+    /// nothing, so the running box's name keeps its address.
+    #[test]
+    fn a_replaced_hosts_late_stop_mark_leaves_the_running_box_answering() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let shared = id("1");
+        let port = BTreeSet::from([8080u16]);
+        reg.publish_own_address(shared, "shared", node, port.clone());
+        reg.register_own_ip(shared, "shared", port);
+        let answer = |reg: &HostnameRegistry| match reg.zone_entry("shared.min.internal", &[]) {
+            ZoneEntry::Held { address, .. } => address,
+            ZoneEntry::Absent => panic!("a registered box's name is held"),
+        };
+
+        let first = reg.begin_host_launch(shared);
+        let second = reg.begin_host_launch(shared);
+        assert!(second > first, "each launch gets a newer number");
+        reg.mark_running(shared);
+
+        reg.mark_host_stopped(shared, first);
+        assert_eq!(
+            answer(&reg),
+            Some(node),
+            "the replaced host's stop mark is ignored"
+        );
+        reg.mark_host_stopped(shared, second);
+        assert_eq!(
+            answer(&reg),
+            None,
+            "the current host's stop mark stops the name"
         );
     }
 
