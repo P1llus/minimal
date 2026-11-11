@@ -75,6 +75,7 @@ struct {
 
 /* Per-socket state. Not part of the ABI: userspace never reads it. */
 #define ST_REWRITTEN 1
+#define ST_FLOW      2 /* flow_key names an entry of the flows map */
 
 struct sk_state {
 	/* A destination the connect/sendmsg hook rewrote. recvmsg and
@@ -95,6 +96,8 @@ struct sk_state {
 	__u8  ok_family;
 	__u8  _pad;
 	__u32 ok_generation;
+	/* The entry this socket has in the flows map, removed with the socket. */
+	struct bp_flow_key flow_key;
 };
 
 struct {

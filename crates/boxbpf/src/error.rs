@@ -43,6 +43,10 @@ pub enum Error {
         "the installed policy loader speaks ABI {loader}, this daemon speaks ABI {daemon}: run `min finalize-install` to update the loader"
     )]
     AbiMismatch { loader: u32, daemon: u32 },
+    #[error(
+        "the installed policy loader carries other policy programs than this daemon: run `min finalize-install` to update the loader"
+    )]
+    ObjectMismatch { loader: String, daemon: String },
     #[error("not supported: {0}")]
     NotSupported(&'static str),
 }

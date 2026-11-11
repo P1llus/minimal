@@ -14,7 +14,7 @@
 #ifndef BOXBPF_ABI_H
 #define BOXBPF_ABI_H
 
-#define BP_ABI_VERSION 1
+#define BP_ABI_VERSION 2
 
 /* Directions. They index bp_box_cfg.default_action and are part of rule keys. */
 #define BP_DIR_EGRESS  0 /* address = destination, port = destination port */
@@ -120,6 +120,9 @@ struct bp_endpoint_key {
 	__u8  _pad[7];
 };
 
+/* Endpoint indexes of a box are below this. */
+#define BP_ENDPOINTS_MAX 4
+
 /* Where a redirect sends a flow. It never changes the flow's family. */
 struct bp_endpoint {
 	__u8  addr6[16];
@@ -140,7 +143,9 @@ struct bp_stats {
 	__u64 ev_lost; /* events lost to a full ring buffer */
 };
 
-/* The box's end of a redirected flow, as the endpoint sees its peer. */
+/* The box's end of a flow to one of its endpoints, as the endpoint sees its
+ * peer. The value says which box and where the flow was first headed: the
+ * endpoint itself, or the destination a redirect rule took it from. */
 struct bp_flow_key {
 	__u8  saddr[16];
 	__u16 sport;

@@ -25,10 +25,10 @@ pub mod loader;
 mod sys;
 
 #[cfg(target_os = "linux")]
-pub use engine::{Engine, MapSizes};
+pub use engine::{Engine, MapSizes, object_id};
 #[cfg(target_os = "linux")]
 pub use error::Error;
 #[cfg(target_os = "linux")]
-pub use handles::{BoxId, Handles, LiveBox, OriginalDestination};
+pub use handles::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
 #[cfg(target_os = "linux")]
 pub use sys::{boot_time_ns, cgroup_id};

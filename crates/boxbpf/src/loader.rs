@@ -17,14 +17,14 @@
 //!
 //! Wire format, one line of text per message:
 //! - request: `attach abi=<n>`, with one descriptor
-//! - reply: `ok abi=<n> cgroup=<id> reused=<0|1>`, with one descriptor per
-//!   map in a fixed order
+//! - reply: `ok abi=<n> object=<id> cgroup=<id> reused=<0|1>`, with one
+//!   descriptor per map in a fixed order. `object` names the programs the
+//!   loader carries, and the daemon refuses any but its own.
 //! - request: `root abi=<n>`
 //! - reply: `ok abi=<n> root=<path>`, with the descriptor of the new root
 //! - any refusal: `err <reason>`
 
 use std::{
-    ffi::CStr,
     fs, io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     os::unix::fs::MetadataExt,
@@ -49,9 +49,6 @@ use crate::{Engine, Error, Handles, MapSizes, engine, sys};
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 const REQUEST_TIMEOUT_SECS: i64 = 5;
 const REPLY_TIMEOUT_SECS: i64 = 30;
-/// systemd sets this on the cgroup of a unit it delegates. Only root can
-/// set a `trusted.` attribute, so the owner of the cgroup cannot forge it.
-const DELEGATE_XATTR: &CStr = c"trusted.delegate";
 
 /// What the loader does for a request it accepts.
 #[derive(Debug, Clone, Default)]
@@ -147,6 +144,16 @@ struct Target {
     path: PathBuf,
 }
 
+fn owner(dir: BorrowedFd<'_>) -> Result<u32, Refusal> {
+    let dir = dir
+        .try_clone_to_owned()
+        .map_err(io_step("duplicate the descriptor"))?;
+    let meta = fs::File::from(dir)
+        .metadata()
+        .map_err(io_step("stat a cgroup"))?;
+    Ok(meta.uid())
+}
+
 /// Decides whether the peer may have an engine at `boxes`.
 ///
 /// Everything is read from the descriptor the peer sent: ownership,
@@ -164,36 +171,22 @@ fn authorize(conn: BorrowedFd<'_>, boxes: BorrowedFd<'_>) -> Result<Target, Refu
         return policy("the attach point must be a cgroup named boxes");
     }
 
-    // Walk up to the unit systemd delegated. Every cgroup on the way must
-    // belong to the peer, or it could not have been delegated to it.
-    let mut dir: OwnedFd = boxes
-        .try_clone_to_owned()
-        .map_err(io_step("duplicate the descriptor"))?;
-    let mut delegated = false;
-    for _ in path.components() {
-        let meta = fs::File::from(
-            dir.try_clone()
-                .map_err(io_step("duplicate the descriptor"))?,
-        )
-        .metadata()
-        .map_err(io_step("stat a cgroup"))?;
-        if !meta.is_dir() || meta.uid() != uid {
+    // A cgroup belongs to a user only when root gave it away: a delegated
+    // unit, or a root this loader handed over. So `boxes` and the root
+    // above it must be the peer's. Root itself needs no loader.
+    if uid == 0 {
+        return policy("root loads the programs itself");
+    }
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let root =
+        openat(boxes, "..", flags, Mode::empty()).map_err(nix_step("open the parent cgroup"))?;
+    for dir in [boxes, root.as_fd()] {
+        if owner(dir)? != uid {
             return policy(format!(
-                "the cgroup is not owned by uid {uid} up to its delegated unit"
+                "the attach point and the cgroup above it must belong to uid {uid}: \
+                 the daemon needs a delegated cgroup"
             ));
         }
-        if sys::xattr(dir.as_fd(), DELEGATE_XATTR).as_deref() == Some(b"1") {
-            delegated = true;
-            break;
-        }
-        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-        dir =
-            openat(&dir, "..", flags, Mode::empty()).map_err(nix_step("open the parent cgroup"))?;
-    }
-    if !delegated {
-        return policy(format!(
-            "no delegated unit of uid {uid} above the attach point"
-        ));
     }
 
     // Only the daemon's own cgroup may ask. A process in boxes/ is a box
@@ -244,8 +237,9 @@ fn attach(
         }
     };
     let reply = format!(
-        "ok abi={} cgroup={cgroup} reused={}",
+        "ok abi={} object={} cgroup={cgroup} reused={}",
         abi::VERSION,
+        engine::object_id(),
         u8::from(reused)
     );
     Ok((
@@ -292,6 +286,28 @@ fn delegate(dir: &Path, uid: u32, gid: u32) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// A root is for a daemon nobody delegated a cgroup to. A peer below a
+/// cgroup that belongs to a user already has one: it is a daemon in a
+/// delegated unit, which asks systemd, or it is a process of a box, which
+/// must stay where it is. Every cgroup outside a delegation belongs to root.
+fn refuse_delegated_peer(conn: BorrowedFd<'_>, pid: i32) -> Result<(), Refusal> {
+    let peer = peer_cgroup(conn, pid)?;
+    let mut dir = Path::new(CGROUP_MOUNT).join(&peer);
+    while dir.starts_with(CGROUP_MOUNT) && dir != Path::new(CGROUP_MOUNT) {
+        let meta = fs::metadata(&dir).map_err(io_step("stat the peer's cgroup"))?;
+        if meta.uid() != 0 {
+            return policy(format!(
+                "the peer runs below /{}, a cgroup that is delegated already",
+                dir.strip_prefix(CGROUP_MOUNT).unwrap_or(&dir).display()
+            ));
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn hand_over_root(
     conn: BorrowedFd<'_>,
     options: &ServeOptions,
@@ -304,6 +320,7 @@ fn hand_over_root(
     let cred = socket::getsockopt(&conn, PeerCredentials)
         .map_err(nix_step("read the peer's credentials"))?;
     let pidfd = sys::peer_pidfd(conn).map_err(io_step("get a pidfd of the peer"))?;
+    refuse_delegated_peer(conn, cred.pid())?;
 
     let base_dir = Path::new(CGROUP_MOUNT).join(base);
     fs::create_dir_all(&base_dir).map_err(io_step("create the base cgroup"))?;
@@ -322,9 +339,6 @@ fn hand_over_root(
     delegate(&root, cred.uid(), cred.gid())?;
     delegate(&supervisor, cred.uid(), cred.gid())?;
     let root_fd = sys::open_dir(&root).map_err(io_step("open the new root"))?;
-    // The mark `authorize` looks for. Only root can set it.
-    sys::set_xattr(root_fd.as_fd(), DELEGATE_XATTR, b"1")
-        .map_err(io_step("mark the new root delegated"))?;
 
     // The daemon cannot move itself: that takes write access to a cgroup
     // above both its old place and the new one.
@@ -462,8 +476,18 @@ fn exchange(
 
 /// Asks the loader at `socket` for an engine at `boxes` and returns its
 /// handles. The caller must run in the `supervisor` cgroup next to `boxes`.
+///
+/// A loader that carries other programs than this build is refused: the
+/// daemon would write maps for programs it does not know.
 pub fn request(socket: &Path, boxes: BorrowedFd<'_>) -> Result<Handles, Error> {
-    let (_, fds) = exchange(socket, "attach", &[boxes.as_raw_fd()])?;
+    let (reply, fds) = exchange(socket, "attach", &[boxes.as_raw_fd()])?;
+    let loader = field(&reply, "object").unwrap_or("unknown");
+    if loader != engine::object_id() {
+        return Err(Error::ObjectMismatch {
+            loader: loader.to_owned(),
+            daemon: engine::object_id().to_owned(),
+        });
+    }
     Handles::from_fds(fds)
 }
 
@@ -478,5 +502,76 @@ pub fn request_root(socket: &Path) -> Result<OwnedFd, Error> {
     match (fds.pop(), fds.pop()) {
         (Some(root), None) => Ok(root),
         _ => Err(Error::Protocol(reply)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nix::sys::socket::{Backlog, accept, bind, listen};
+
+    use super::*;
+
+    /// A loader that answers every request with `reply` and no descriptors.
+    fn fake_loader(socket: &Path, reply: String) -> std::thread::JoinHandle<()> {
+        let listener = socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("socket");
+        bind(
+            listener.as_raw_fd(),
+            &UnixAddr::new(socket).expect("address"),
+        )
+        .expect("bind");
+        listen(&listener, Backlog::new(1).expect("backlog")).expect("listen");
+        std::thread::spawn(move || {
+            let conn = accept(listener.as_raw_fd()).expect("accept");
+            let _request = sys::recv_with_fds(conn).expect("request");
+            sys::send_with_fds(conn, reply.as_bytes(), &[]).expect("reply");
+        })
+    }
+
+    #[test]
+    fn a_loader_with_other_programs_is_refused_with_the_fix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("loader.sock");
+        let reply = format!(
+            "ok abi={} object={} cgroup=7 reused=0",
+            abi::VERSION,
+            "0".repeat(64)
+        );
+        let loader = fake_loader(&socket, reply);
+        let boxes: OwnedFd = fs::File::open(dir.path()).expect("open").into();
+        let error = request(&socket, boxes.as_fd())
+            .err()
+            .expect("a loader with other programs");
+        loader.join().expect("loader thread");
+        assert!(
+            matches!(&error, Error::ObjectMismatch { daemon, .. } if daemon == engine::object_id()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("min finalize-install"));
+    }
+
+    #[test]
+    fn a_loader_of_another_abi_is_refused_with_the_fix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("loader.sock");
+        let loader = fake_loader(
+            &socket,
+            format!("err abi mismatch: loader=1 daemon={}", abi::VERSION),
+        );
+        let boxes: OwnedFd = fs::File::open(dir.path()).expect("open").into();
+        let error = request(&socket, boxes.as_fd())
+            .err()
+            .expect("a loader of another ABI");
+        loader.join().expect("loader thread");
+        assert!(
+            matches!(error, Error::AbiMismatch { loader: 1, .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("min finalize-install"));
     }
 }

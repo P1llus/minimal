@@ -187,35 +187,6 @@ pub(crate) fn is_cgroup2(fd: BorrowedFd<'_>) -> io::Result<bool> {
     Ok(stat.filesystem_type() == nix::sys::statfs::CGROUP2_SUPER_MAGIC)
 }
 
-pub(crate) fn xattr(fd: BorrowedFd<'_>, name: &std::ffi::CStr) -> Option<Vec<u8>> {
-    let mut buf = [0u8; 64];
-    // SAFETY: buf is writable for the length passed.
-    let n = unsafe {
-        libc::fgetxattr(
-            fd.as_raw_fd(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    let n = usize::try_from(n).ok()?;
-    buf.get(..n).map(<[u8]>::to_vec)
-}
-
-pub(crate) fn set_xattr(fd: BorrowedFd<'_>, name: &std::ffi::CStr, value: &[u8]) -> io::Result<()> {
-    // SAFETY: name is a C string and value is readable for its length.
-    let ret = unsafe {
-        libc::fsetxattr(
-            fd.as_raw_fd(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    cvt(libc::c_long::from(ret)).map(drop)
-}
-
 /// The peer of a unix socket as a pidfd. Linux 6.5.
 pub(crate) fn peer_pidfd(sock: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     const SO_PEERPIDFD: libc::c_int = 77;

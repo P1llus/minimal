@@ -325,3 +325,15 @@ int bp_sock_create(struct bpf_sock *sk)
 	emit_net(&a);
 	return refuse(box, cfg ? cfg->refuse_errno : EPERM);
 }
+
+/* The socket's entry in the flows map must not outlive it: the next socket
+ * with the same local address and port may belong to anyone. */
+SEC("cgroup/sock_release")
+int bp_sock_release(struct bpf_sock *sk)
+{
+	struct sk_state *st = bpf_sk_storage_get(&sk_state, sk, 0, 0);
+
+	if (st && (st->flags & ST_FLOW))
+		bpf_map_delete_elem(&flows, &st->flow_key);
+	return 1;
+}

@@ -728,6 +728,7 @@ dependencies = [
  "libc",
  "netpol",
  "nix 0.31.3",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

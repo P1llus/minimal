@@ -21,7 +21,10 @@ use crate::{
     model::{Action, Direction, Protocols, SetId, Verdict},
 };
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+/// Endpoint indexes of a box are below this.
+pub const ENDPOINTS_MAX: u8 = 4;
 
 /// Rules per prefix or name set after covering rules are copied in.
 pub const RULES_MAX: usize = 8;
@@ -415,8 +418,9 @@ fn line(out: &mut String, condition: &str) {
 }
 
 fn constants(out: &mut String) {
-    let pairs: [(&str, u64); 14] = [
+    let pairs: [(&str, u64); 15] = [
         ("BP_ABI_VERSION", u64::from(VERSION)),
+        ("BP_ENDPOINTS_MAX", u64::from(ENDPOINTS_MAX)),
         ("BP_RULES_MAX", RULES_MAX as u64),
         ("BP_NO_RULE", u64::from(NO_RULE)),
         ("BP_RULE_KEY_BASE", u64::from(RULE_KEY_BASE)),
@@ -715,7 +719,7 @@ mod tests {
         assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 36,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 16"));
-        assert!(c.contains("BP_ABI_VERSION == 1"));
+        assert!(c.contains("BP_ABI_VERSION == 2"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
         assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 15);

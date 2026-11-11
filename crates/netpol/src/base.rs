@@ -6,7 +6,7 @@
 
 use std::{
     fmt,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use crate::model::{
 pub const RESOLVER: EndpointIndex = EndpointIndex(0);
 pub const CREDENTIAL_PROXY: EndpointIndex = EndpointIndex(1);
 pub const HOSTNAME_PROXY: EndpointIndex = EndpointIndex(2);
+pub const HOST_RELAY: EndpointIndex = EndpointIndex(3);
 
 /// The kernel a box runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +80,7 @@ pub struct Services {
     pub resolver: Option<Endpoint>,
     /// TCP 443 to steered names is redirected here.
     pub credential_proxy: Option<Endpoint>,
-    /// Reached directly: the box is told its address.
+    /// Where the box's requests to the node's hostname proxy end up.
     pub hostname_proxy: Option<Endpoint>,
 }
 
@@ -108,6 +109,13 @@ pub struct Deployment {
     pub endpoint_ranges: Vec<EndpointRange>,
     /// Names whose TCP 443 goes through the credential proxy.
     pub steered: Vec<NamePattern>,
+    /// Where the node's hostname proxy listens for programs outside boxes.
+    /// A box that dials one of these gets its own proxy endpoint instead.
+    pub node_hostname_proxy: Vec<SocketAddr>,
+    /// The transport under the box enforces its policy, not the engine:
+    /// the box's entry lets everything through. True for `own_ip` while its
+    /// frames still pass the daemon's relay.
+    pub transport_enforces: bool,
 }
 
 impl Deployment {
@@ -129,6 +137,8 @@ impl Deployment {
             },
             endpoint_ranges: Vec::new(),
             steered: Vec::new(),
+            node_hostname_proxy: Vec::new(),
+            transport_enforces: false,
         }
     }
 }
@@ -146,6 +156,27 @@ pub struct BasePolicy {
     /// Packets must leave from the box's own addresses.
     pub source_check: bool,
     pub addrs: BoxAddrs,
+}
+
+impl BasePolicy {
+    /// The base policy of a box whose transport enforces its policy:
+    /// nothing is refused here.
+    #[must_use]
+    pub const fn pass_through() -> Self {
+        let allow = Verdict::Allow;
+        Self {
+            before: Vec::new(),
+            after: Vec::new(),
+            defaults: Defaults {
+                egress: allow,
+                ingress: allow,
+                bind: allow,
+            },
+            endpoints: Vec::new(),
+            source_check: false,
+            addrs: BoxAddrs { v4: None, v6: None },
+        }
+    }
 }
 
 const LOOPBACK4: Prefix = prefix4(Ipv4Addr::new(127, 0, 0, 0), 8);
@@ -214,7 +245,9 @@ fn own_endpoints(s: &Services, out: &mut Vec<Rule>) {
     }
 }
 
-/// No box reaches the endpoints the daemon serves to other boxes.
+/// No box reaches the endpoints the daemon serves to other boxes, and no
+/// box binds a port the daemon's endpoints are drawn from. A bind on any
+/// address would do: a wildcard bind takes the port on every address.
 fn other_endpoints(ranges: &[EndpointRange], out: &mut Vec<Rule>) {
     for r in ranges {
         // A port range only means something for TCP and UDP.
@@ -227,6 +260,47 @@ fn other_endpoints(ranges: &[EndpointRange], out: &mut Vec<Rule>) {
             egress(Target::Net(r.prefix), Action::Deny, Origin::OtherEndpoints)
                 .protocols(protocols)
                 .ports(r.ports),
+        );
+        if r.ports != PortRange::ALL {
+            out.push(
+                Rule::new(
+                    Direction::Bind,
+                    Target::Any,
+                    Action::Deny,
+                    Origin::OtherEndpoints,
+                )
+                .protocols(Protocols::TCP_UDP)
+                .ports(r.ports),
+            );
+        }
+    }
+}
+
+/// A box that dials the node's hostname proxy is served by its own
+/// endpoint, so the proxy knows the box and judges the request by its rules.
+fn hostname_proxy(endpoint: Option<Endpoint>, shared: &[SocketAddr], out: &mut Vec<Rule>) {
+    let Some(e) = endpoint else { return };
+    for addr in shared {
+        let family_ok = match addr {
+            SocketAddr::V4(_) => e.v4.is_some(),
+            SocketAddr::V6(_) => e.v6.is_some(),
+        };
+        if !family_ok {
+            continue;
+        }
+        let target = if addr.ip().is_unspecified() {
+            Prefix::all(crate::model::Family::of(&addr.ip()))
+        } else {
+            Prefix::host(addr.ip())
+        };
+        out.push(
+            egress(
+                Target::Net(target),
+                Action::Redirect(HOSTNAME_PROXY),
+                Origin::HostnameProxy,
+            )
+            .protocols(Protocols::TCP)
+            .ports(PortRange::one(addr.port())),
         );
     }
 }
@@ -396,6 +470,11 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
     own_endpoints(&d.services, &mut before);
     other_endpoints(&d.endpoint_ranges, &mut before);
     resolver(d.services.resolver, &mut before);
+    hostname_proxy(
+        d.services.hostname_proxy,
+        &d.node_hostname_proxy,
+        &mut before,
+    );
     steering(d.services.credential_proxy, &d.steered, &mut before);
     if d.mode.own_namespace() {
         own_addresses(&d.addrs, &mut before);
@@ -544,6 +623,67 @@ mod tests {
         assert_eq!(
             redirects.first().unwrap().target,
             Target::Net(Prefix::V4_ALL)
+        );
+    }
+
+    #[test]
+    fn a_box_that_dials_the_node_s_hostname_proxy_gets_its_own_endpoint() {
+        let mut d = Deployment::new(NodeKind::Native, Mode::HostIp);
+        d.services.hostname_proxy = Some(Endpoint {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 80, 1), 20481)),
+            v6: None,
+        });
+        d.node_hostname_proxy = vec![
+            "127.0.0.1:7654".parse().unwrap(),
+            "[::1]:7654".parse().unwrap(),
+        ];
+        let base = base_policy(&d);
+        let redirects: Vec<&Rule> = base
+            .before
+            .iter()
+            .filter(|r| r.origin == Origin::HostnameProxy)
+            .collect();
+        // The endpoint has no IPv6 address, and a redirect keeps the family.
+        assert_eq!(redirects.len(), 1);
+        let rule = redirects.first().unwrap();
+        assert_eq!(rule.action, Action::Redirect(HOSTNAME_PROXY));
+        assert_eq!(
+            rule.target,
+            Target::Net(Prefix::host("127.0.0.1".parse().unwrap()))
+        );
+        assert!(rule.matches_l4(crate::model::Protocol::Tcp, 7654));
+        assert!(!rule.matches_l4(crate::model::Protocol::Udp, 7654));
+
+        // A listener on every address is every address of that family.
+        d.node_hostname_proxy = vec!["0.0.0.0:7654".parse().unwrap()];
+        let base = base_policy(&d);
+        let rule = base
+            .before
+            .iter()
+            .find(|r| r.origin == Origin::HostnameProxy)
+            .unwrap();
+        assert_eq!(rule.target, Target::Net(Prefix::V4_ALL));
+    }
+
+    #[test]
+    fn a_box_cannot_bind_a_port_the_daemon_s_endpoints_are_drawn_from() {
+        let mut d = Deployment::new(NodeKind::Native, Mode::HostIp);
+        let ports = PortRange::new(20480, 24575).unwrap();
+        d.endpoint_ranges = vec![EndpointRange {
+            prefix: Prefix::host("127.0.80.1".parse().unwrap()),
+            ports,
+        }];
+        let base = base_policy(&d);
+        let binds: Vec<&Rule> = base
+            .before
+            .iter()
+            .filter(|r| r.direction == Direction::Bind)
+            .collect();
+        assert_eq!(binds.len(), 1);
+        let rule = binds.first().unwrap();
+        assert_eq!(
+            (rule.action, rule.origin, &rule.target, rule.ports),
+            (Action::Deny, Origin::OtherEndpoints, &Target::Any, ports)
         );
     }
 

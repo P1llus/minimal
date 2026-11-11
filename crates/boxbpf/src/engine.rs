@@ -12,6 +12,13 @@ use crate::{Error, Handles, sys};
 
 static OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/boxbpf.bpf.o"));
 
+/// Names the programs this build carries: the SHA-256 of the object. A
+/// daemon and a loader with the same value load the same programs.
+#[must_use]
+pub const fn object_id() -> &'static str {
+    env!("BOXBPF_OBJECT_ID")
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Sock,
@@ -29,11 +36,16 @@ struct Program {
 /// Every program of the object. One that is missing, fails the verifier or
 /// does not attach fails the whole engine: a partly attached engine would
 /// leave a hook unguarded.
-const PROGRAMS: [Program; 13] = [
+const PROGRAMS: [Program; 14] = [
     Program {
         name: "bp_sock_create",
         kind: Kind::Sock,
         attach_type: 2,
+    },
+    Program {
+        name: "bp_sock_release",
+        kind: Kind::Sock,
+        attach_type: 34,
     },
     Program {
         name: "bp_bind4",
@@ -136,7 +148,7 @@ impl Default for MapSizes {
             pins: 16384,
             name_sets: 4096,
             endpoints: 4096,
-            flows: 8192,
+            flows: 65536,
             udp_peers: 16384,
             event_bytes: 1 << 18,
         }
@@ -248,7 +260,15 @@ impl Engine {
 
     /// Loads and attaches in one step and returns the handles: what a
     /// daemon with root does for itself, as in the VM guest.
+    ///
+    /// The cgroup must not carry the programs yet. A second set would judge
+    /// every flow as well, from maps nobody writes, and refuse it.
     pub fn start(boxes: BorrowedFd<'_>, sizes: &MapSizes) -> Result<Handles, Error> {
+        if find_attached(boxes)?.is_some() {
+            return Err(Error::NotSupported(
+                "the boxes cgroup already has policy programs attached",
+            ));
+        }
         let mut engine = Self::load(boxes, sizes)?;
         engine.attach(boxes)?;
         engine.handles()

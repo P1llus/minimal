@@ -391,11 +391,6 @@ impl Harness {
 }
 
 impl Cgroups {
-    /// The box cgroups below another root than the harness's own.
-    pub fn at(root: PathBuf) -> Self {
-        Self { root }
-    }
-
     /// Creates a box cgroup and returns its id. No policy yet.
     pub fn new_box(&self, name: &str) -> BoxId {
         let dir = self.root.join("boxes").join(name);
@@ -469,6 +464,33 @@ impl Cgroups {
             .find_map(|l| l.strip_prefix("probe: "))
             .unwrap_or("err no-result")
             .to_owned()
+    }
+
+    /// Runs a probe as this user in a cgroup nobody delegated: a transient
+    /// system service. Returns its result line.
+    pub fn outside_probe(args: &[&str]) -> String {
+        let user = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .ok()
+            .flatten()
+            .expect("the current user has a passwd entry")
+            .name;
+        let mut cmd = Command::new("sudo");
+        cmd.args([
+            "-n",
+            "systemd-run",
+            "--wait",
+            "--pipe",
+            "--quiet",
+            "--collect",
+        ])
+        .args(["-p", &format!("User={user}")])
+        .arg(format!("--setenv={GATE}=1"))
+        .arg(format!("--setenv={ROLE}=probe"))
+        .arg(format!("--setenv=BOXBPF_TEST_PROBE={}", args.join(" ")))
+        .arg("--")
+        .arg(exe())
+        .args(["--exact", "helper", "--ignored", "--nocapture"]);
+        Self::run(cmd)
     }
 
     /// Runs a socket action as a process of the box and returns its result

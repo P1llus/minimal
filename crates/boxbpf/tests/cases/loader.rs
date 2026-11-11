@@ -19,7 +19,7 @@ fn open(path: &std::path::Path) -> OwnedFd {
     fs::File::open(path).expect("open a directory").into()
 }
 
-fn refusal(result: Result<boxbpf::Handles, Error>) -> String {
+fn refusal<T>(result: Result<T, Error>) -> String {
     let error = result.err().expect("the loader should have refused");
     assert!(
         matches!(error, Error::Refused(_)),
@@ -139,8 +139,8 @@ fn the_loader_serves_only_the_supervisor_of_a_delegated_boxes_cgroup() {
         && out.status.success()
     {
         let listing = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(listing.matches("bp_").count(), 13, "{listing}");
-        assert_eq!(listing.matches(" multi ").count(), 13, "{listing}");
+        assert_eq!(listing.matches("bp_").count(), 14, "{listing}");
+        assert_eq!(listing.matches(" multi ").count(), 14, "{listing}");
     }
 }
 
@@ -201,64 +201,28 @@ fn a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader() {
     ) else {
         return;
     };
-    let own_cgroup = || {
-        fs::read_to_string("/proc/self/cgroup")
-            .expect("own cgroup")
-            .trim()
+    // This process runs in a delegated unit, as a box process does. It has
+    // a root, or must stay where it is: the loader moves neither.
+    let reason = refusal(loader::request_root(&h.socket).map(drop));
+    assert!(reason.contains("delegated already"), "{reason}");
+
+    // A process of this user in a cgroup nobody delegated: a plain system
+    // service. The loader makes it a root, moves it into supervisor/, and
+    // serves its attach request like any other.
+    let line = Cgroups::outside_probe(&["root-request", &h.socket.to_string_lossy()]);
+    assert!(line.starts_with("ok root="), "{line}");
+    let value = |key: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key}: {line}"))
             .to_owned()
     };
-    let before = own_cgroup();
-
-    // The loader creates the root, marks it delegated and moves us into
-    // its supervisor/. systemd is not involved.
-    let root = loader::request_root(&h.socket).expect("a root from the loader");
-    let root_path =
-        fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd())).expect("path of the root");
-    let rel = root_path
+    let root = value("root");
+    let rel = root
         .strip_prefix("/sys/fs/cgroup")
         .expect("below the cgroup mount");
-    assert_eq!(
-        own_cgroup(),
-        format!("0::/{}/supervisor", rel.display()),
-        "moved from {before}"
-    );
-    let meta = fs::metadata(&root_path).expect("stat the root");
-    assert_eq!(
-        std::os::unix::fs::MetadataExt::uid(&meta),
-        nix::unistd::getuid().as_raw()
-    );
-
-    // From here on it is the ordinary path: our boxes/, our request.
-    fs::create_dir(root_path.join("boxes")).expect("create boxes/ in the new root");
-    let boxes = open(&root_path.join("boxes"));
-    let mut handles = loader::request(&h.socket, boxes.as_fd()).expect("an engine in the new root");
-    let cg = Cgroups::at(root_path.clone());
-    let id = cg.new_box("b");
-    let socket_args = [
-        "sock",
-        &libc::AF_INET.to_string(),
-        &libc::SOCK_STREAM.to_string(),
-        "0",
-    ];
-    assert_eq!(cg.probe("b", &socket_args), "err 1", "no policy yet");
-    let spec = netpol::Spec {
-        deployment: host_ip(),
-        policy: BoxPolicy::default(),
-        options: netpol::compile::Options::default(),
-    };
-    let live = handles.install(id, spec).expect("install");
-    assert_eq!(cg.probe("b", &socket_args), "ok");
-    handles.uninstall(&live).expect("uninstall");
-
-    // A box process of that root is refused like any other.
-    let out = cg.probe(
-        "b",
-        &[
-            "loader-request",
-            &h.socket.to_string_lossy(),
-            &root_path.join("boxes").to_string_lossy(),
-        ],
-    );
-    assert!(out.starts_with("err ") && out.contains("not in"), "{out}");
-    fs::remove_dir(root_path.join("boxes").join("b")).expect("remove the box cgroup");
+    assert_eq!(value("cgroup"), format!("0::{rel}/supervisor"));
+    assert_eq!(value("owner"), nix::unistd::getuid().as_raw().to_string());
+    assert_eq!(value("engine"), "ok");
+    assert_ne!(value("before"), value("cgroup"));
 }

@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use boxbpf::{Flows, OriginalDestination};
 use netpol::Protocol;
 
 /// A TCP listener on every address of the host that greets with `hello`.
@@ -51,18 +52,39 @@ fn dns_answer(query: &[u8], answer: Ipv4Addr) -> Vec<u8> {
     reply
 }
 
+/// A peer of an endpoint, with what the engine recorded for it at the time
+/// the endpoint saw it. The entry goes with the peer's socket, so the
+/// endpoint asks before it answers, as the daemon's endpoints do.
+pub struct Seen {
+    pub peer: SocketAddr,
+    pub protocol: Protocol,
+    pub origin: Option<OriginalDestination>,
+}
+
+fn seen(flows: &Flows, peer: SocketAddr, protocol: Protocol) -> Seen {
+    Seen {
+        peer,
+        protocol,
+        origin: flows.original_destination(peer, protocol).expect("lookup"),
+    }
+}
+
 /// A resolver endpoint: answers every query over UDP and TCP at `at` with
 /// one A record and reports the peer of each query.
-pub fn dns_endpoint(at: SocketAddr, answer: Ipv4Addr) -> Receiver<(SocketAddr, Protocol)> {
+pub fn dns_endpoint(at: SocketAddr, answer: Ipv4Addr, flows: &Flows) -> Receiver<Seen> {
     let (tx, rx) = channel();
+    let (udp_flows, tcp_flows) = (
+        flows.try_clone().expect("flows"),
+        flows.try_clone().expect("flows"),
+    );
     let udp = UdpSocket::bind(at).expect("bind a resolver endpoint (UDP)");
     let tcp = TcpListener::bind(at).expect("bind a resolver endpoint (TCP)");
     let udp_tx = tx.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 512];
         while let Ok((n, peer)) = udp.recv_from(&mut buf) {
+            let _told = udp_tx.send(seen(&udp_flows, peer, Protocol::Udp));
             let _sent = udp.send_to(&dns_answer(buf.get(..n).unwrap_or_default(), answer), peer);
-            let _told = udp_tx.send((peer, Protocol::Udp));
         }
     });
     thread::spawn(move || {
@@ -80,26 +102,27 @@ pub fn dns_endpoint(at: SocketAddr, answer: Ipv4Addr) -> Receiver<(SocketAddr, P
             if stream.read_exact(&mut query).is_err() {
                 continue;
             }
+            let _told = tx.send(seen(&tcp_flows, peer, Protocol::Tcp));
             let reply = dns_answer(&query, answer);
             let _sent = stream
                 .write_all(&u16::try_from(reply.len()).expect("length").to_be_bytes())
                 .and_then(|()| stream.write_all(&reply));
-            let _told = tx.send((peer, Protocol::Tcp));
         }
     });
     rx
 }
 
 /// A proxy endpoint: accepts at `at`, says `proxied`, reports each peer.
-pub fn proxy_endpoint(at: SocketAddr) -> Receiver<SocketAddr> {
+pub fn proxy_endpoint(at: SocketAddr, flows: &Flows) -> Receiver<Seen> {
     let (tx, rx) = channel();
+    let flows = flows.try_clone().expect("flows");
     let listener = TcpListener::bind(at).expect("bind a proxy endpoint");
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let Ok(peer) = stream.peer_addr() else {
                 continue;
             };
-            let _told = tx.send(peer);
+            let _told = tx.send(seen(&flows, peer, Protocol::Tcp));
             let _sent = stream.write_all(b"proxied\n");
         }
     });

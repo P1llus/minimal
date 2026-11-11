@@ -324,6 +324,39 @@ fn loader_request(socket: &str, boxes: &str) -> String {
     }
 }
 
+/// Asks the loader for a root, then for an engine in it, and reports
+/// where this process ended up.
+fn root_request(socket: &str) -> String {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    let own_cgroup = || {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let before = own_cgroup();
+    let root = match boxbpf::loader::request_root(Path::new(socket)) {
+        Ok(root) => root,
+        Err(e) => return format!("err {e}"),
+    };
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))
+        .expect("path of the root");
+    let owner = std::fs::metadata(&path).expect("stat the root").uid();
+    std::fs::create_dir(path.join("boxes")).expect("create boxes/ in the new root");
+    let boxes: OwnedFd = std::fs::File::open(path.join("boxes"))
+        .expect("open boxes")
+        .into();
+    let engine = match boxbpf::loader::request(Path::new(socket), boxes.as_fd()) {
+        Ok(_) => "ok".to_owned(),
+        Err(e) => format!("{e}").replace(' ', "_"),
+    };
+    format!(
+        "ok root={} cgroup={} owner={owner} engine={engine} before={before}",
+        path.display(),
+        own_cgroup()
+    )
+}
+
 pub fn run() {
     let spec = std::env::var("BOXBPF_TEST_PROBE").expect("probe action");
     let args: Vec<&str> = spec.split(' ').collect();
@@ -370,6 +403,7 @@ pub fn run() {
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
         ["loader-request", socket, boxes] => loader_request(socket, boxes),
+        ["root-request", socket] => root_request(socket),
         _ => format!("err unknown-probe {spec}"),
     };
     say(&result);

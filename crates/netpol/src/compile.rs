@@ -45,6 +45,8 @@ pub enum CompileError {
     },
     #[error("endpoint {0} is defined twice")]
     DuplicateEndpoint(u8),
+    #[error("endpoint index {0} is beyond what the engine holds per box")]
+    EndpointIndex(u8),
 }
 
 /// One rule as the programs see it: `prio` is its position in the box's list.
@@ -115,6 +117,15 @@ pub struct Spec {
 
 impl Spec {
     pub fn compile(&self) -> Result<Compiled, CompileError> {
+        if self.deployment.transport_enforces {
+            // The transport judges this box's traffic. The engine lets
+            // everything through, so the box's rules are not compiled.
+            return compile(
+                &BasePolicy::pass_through(),
+                &BoxPolicy::default(),
+                self.options,
+            );
+        }
         compile(&base_policy(&self.deployment), &self.policy, self.options)
     }
 }
@@ -158,6 +169,9 @@ fn validate(rules: &[Rule], endpoints: &[(EndpointIndex, Endpoint)]) -> Result<(
             .any(|(other, _)| other == index)
         {
             return Err(CompileError::DuplicateEndpoint(index.0));
+        }
+        if index.0 >= abi::ENDPOINTS_MAX {
+            return Err(CompileError::EndpointIndex(index.0));
         }
     }
     for (rule, r) in rules.iter().enumerate() {
@@ -575,5 +589,26 @@ mod tests {
         assert!(c.config.source_check && c.config.log_flows);
         assert_eq!(c.config.refuse_errno, 111);
         assert!(c.to_string().contains("(the box itself)"));
+    }
+
+    #[test]
+    fn a_box_whose_transport_enforces_gets_an_entry_that_refuses_nothing() {
+        let mut deployment = Deployment::new(NodeKind::Native, Mode::OwnIp);
+        deployment.addrs.v4 = Some("100.64.7.2".parse().unwrap());
+        deployment.transport_enforces = true;
+        let spec = Spec {
+            deployment,
+            policy: BoxPolicy {
+                deny: vec!["10.0.0.0/8".parse().unwrap()],
+                ..BoxPolicy::default()
+            },
+            options: Options::default(),
+        };
+        let compiled = spec.compile().unwrap();
+        assert!(compiled.rules.is_empty());
+        assert!(!compiled.config.source_check);
+        for direction in Direction::ALL {
+            assert_eq!(compiled.config.defaults.of(direction), Verdict::Allow);
+        }
     }
 }

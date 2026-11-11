@@ -8,6 +8,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     os::fd::{BorrowedFd, OwnedFd},
+    sync::Arc,
     time::Duration,
 };
 
@@ -47,7 +48,7 @@ impl BoxId {
 pub struct LiveBox {
     id: BoxId,
     spec: Spec,
-    compiled: Compiled,
+    compiled: Arc<Compiled>,
 }
 
 impl LiveBox {
@@ -62,20 +63,76 @@ impl LiveBox {
     }
 
     /// The policy as the kernel has it: what the evaluator judges and what
-    /// an event's rule number indexes.
+    /// an event's rule number indexes. Shared, so a reader keeps a
+    /// snapshot while the box is reconfigured.
     #[must_use]
-    pub const fn compiled(&self) -> &Compiled {
+    pub const fn compiled(&self) -> &Arc<Compiled> {
         &self.compiled
     }
 }
 
-/// Where a redirected flow was going before the engine rewrote it.
+/// A flow of a box to one of its endpoints, as the engine recorded it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginalDestination {
     pub box_id: BoxId,
+    /// Where the box sent the flow: the address a redirect rule took it
+    /// from, or the endpoint's own when the box dialled that.
     pub destination: SocketAddr,
-    /// The endpoint the redirect rule named.
+    /// The endpoint the flow arrived at.
     pub endpoint: EndpointIndex,
+}
+
+/// The flows map alone: who is behind the peer of an endpoint. An endpoint
+/// task holds its own copy and asks without the lock the writers share.
+pub struct Flows {
+    map: HashMap<MapData, Raw<abi::FlowKey>, Raw<abi::FlowVal>>,
+    /// A second descriptor of the map, to make further handles from.
+    fd: OwnedFd,
+}
+
+impl Flows {
+    fn from_fd(fd: OwnedFd) -> Result<Self, Error> {
+        let kept = fd.try_clone().map_err(|source| Error::Sys {
+            what: "duplicate the flows map",
+            source,
+        })?;
+        let data = MapData::from_fd(fd).map_err(Error::map("flows"))?;
+        Ok(Self {
+            map: HashMap::try_from(Map::LruHashMap(data)).map_err(Error::map("flows"))?,
+            fd: kept,
+        })
+    }
+
+    /// Another handle on the same map.
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        let fd = self.fd.try_clone().map_err(|source| Error::Sys {
+            what: "duplicate the flows map",
+            source,
+        })?;
+        Self::from_fd(fd)
+    }
+
+    /// Which box is behind `peer`, the remote end of a flow that reached
+    /// an endpoint, and where that flow was first headed. The egress hook
+    /// records every flow of a box to one of its own endpoints with the
+    /// first packet, so the entry is there by the time the endpoint sees
+    /// that packet, and removes it with the box's socket. `None` means the
+    /// peer is no box socket: a process outside every box.
+    pub fn original_destination(
+        &self,
+        peer: SocketAddr,
+        protocol: Protocol,
+    ) -> Result<Option<OriginalDestination>, Error> {
+        // A v4-mapped peer is an IPv4 flow, and recorded as one.
+        let peer = SocketAddr::new(netpol::eval::canonical(peer.ip()), peer.port());
+        let key = Raw(abi::flow_key(peer, protocol));
+        let found = absent_ok(self.map.get(&key, 0)).map_err(Error::map("flows"))?;
+        Ok(found.map(|Raw(v)| OriginalDestination {
+            box_id: BoxId(v.box_id),
+            destination: SocketAddr::new(abi::addr_of(&v.orig_addr, v.orig_family), v.orig_port),
+            endpoint: EndpointIndex(v.endpoint),
+        }))
+    }
 }
 
 pub struct Handles {
@@ -86,7 +143,7 @@ pub struct Handles {
     set_rules: HashMap<MapData, Raw<abi::SetKey>, Raw<abi::Rules>>,
     endpoints: HashMap<MapData, Raw<abi::EndpointKey>, Raw<abi::Endpoint>>,
     stats: PerCpuHashMap<MapData, u64, Raw<abi::Stats>>,
-    flows: HashMap<MapData, Raw<abi::FlowKey>, Raw<abi::FlowVal>>,
+    flows: Flows,
     events: Option<RingBuf<MapData>>,
     /// The pins this process wrote, per box. The kernel map is the truth
     /// for the programs. This copy says what to delete and when.
@@ -109,10 +166,15 @@ impl Handles {
     /// sends them in.
     pub fn from_fds(fds: Vec<OwnedFd>) -> Result<Self, Error> {
         let count = fds.len();
-        let mut fds = fds.into_iter();
-        let mut next = |name: &'static str| -> Result<MapData, Error> {
-            let fd = fds.next().ok_or(Error::HandleCount(count, MAPS.len()))?;
-            MapData::from_fd(fd).map_err(Error::map(name))
+        let fds = fds.into_iter();
+        let fds = std::cell::RefCell::new(fds);
+        let next_fd = |count: usize| -> Result<OwnedFd, Error> {
+            fds.borrow_mut()
+                .next()
+                .ok_or(Error::HandleCount(count, MAPS.len()))
+        };
+        let next = |name: &'static str| -> Result<MapData, Error> {
+            MapData::from_fd(next_fd(count)?).map_err(Error::map(name))
         };
         let this = Self {
             box_cfg: HashMap::try_from(Map::HashMap(next("box_cfg")?))
@@ -128,14 +190,13 @@ impl Handles {
                 .map_err(Error::map("endpoints"))?,
             stats: PerCpuHashMap::try_from(Map::PerCpuHashMap(next("stats")?))
                 .map_err(Error::map("stats"))?,
-            flows: HashMap::try_from(Map::LruHashMap(next("flows")?))
-                .map_err(Error::map("flows"))?,
+            flows: Flows::from_fd(next_fd(count)?)?,
             events: Some(
                 RingBuf::try_from(Map::RingBuf(next("events")?)).map_err(Error::map("events"))?,
             ),
             pinned: StdHashMap::new(),
         };
-        if fds.next().is_some() {
+        if fds.borrow_mut().next().is_some() {
             return Err(Error::HandleCount(count, MAPS.len()));
         }
         Ok(this)
@@ -289,14 +350,14 @@ impl Handles {
 
     /// Compiles a spec and puts it into the maps.
     pub fn install(&mut self, id: BoxId, spec: Spec) -> Result<LiveBox, Error> {
-        let compiled = spec.compile()?;
+        let compiled = Arc::new(spec.compile()?);
         self.apply(id, &compiled)?;
         Ok(LiveBox { id, spec, compiled })
     }
 
     /// Gives a live box a new spec. On a compile error nothing changes.
     pub fn reconfigure(&mut self, live: &mut LiveBox, spec: Spec) -> Result<(), Error> {
-        let compiled = spec.compile()?;
+        let compiled = Arc::new(spec.compile()?);
         self.update(live.id, Some(&live.compiled), &compiled)?;
         live.spec = spec;
         live.compiled = compiled;
@@ -402,20 +463,17 @@ impl Handles {
         Ok(Some(total))
     }
 
-    /// Where the flow that reached an endpoint from `peer` was going. The
-    /// egress hook records it with the first packet of a redirected flow,
-    /// so it is there by the time the endpoint sees that packet.
+    /// See [`Flows::original_destination`].
     pub fn original_destination(
         &self,
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Result<Option<OriginalDestination>, Error> {
-        let key = Raw(abi::flow_key(peer, protocol));
-        let found = absent_ok(self.flows.get(&key, 0)).map_err(Error::map("flows"))?;
-        Ok(found.map(|Raw(v)| OriginalDestination {
-            box_id: BoxId(v.box_id),
-            destination: SocketAddr::new(abi::addr_of(&v.orig_addr, v.orig_family), v.orig_port),
-            endpoint: EndpointIndex(v.endpoint),
-        }))
+        self.flows.original_destination(peer, protocol)
+    }
+
+    /// A handle on the flows map for an endpoint task.
+    pub fn flows(&self) -> Result<Flows, Error> {
+        self.flows.try_clone()
     }
 }

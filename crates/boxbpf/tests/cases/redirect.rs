@@ -51,10 +51,11 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
                 .expect("range"),
         },
     ];
+    let flows = h.handles.flows().expect("flows");
     let serve = |e: Endpoint, answer: Ipv4Addr| {
         (
-            servers::dns_endpoint(SocketAddr::V4(e.v4.expect("v4")), answer),
-            servers::dns_endpoint(SocketAddr::V6(e.v6.expect("v6")), answer),
+            servers::dns_endpoint(SocketAddr::V4(e.v4.expect("v4")), answer, &flows),
+            servers::dns_endpoint(SocketAddr::V6(e.v6.expect("v6")), answer, &flows),
         )
     };
     let (a4, a6) = serve(ep_a, Ipv4Addr::new(198, 51, 100, 1));
@@ -91,17 +92,22 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
             );
             // The endpoint learns the box and the original server from
             // the peer address it saw.
-            let (peer, protocol) = endpoint_rx
+            let seen = endpoint_rx
                 .recv_timeout(wait)
                 .expect("the endpoint saw the query");
-            let origin = h
-                .handles
-                .original_destination(peer, protocol)
-                .expect("lookup")
-                .expect("a recorded flow");
+            let origin = seen.origin.expect("a recorded flow");
             assert_eq!(origin.box_id, box_a.id());
             assert_eq!(origin.destination, shown.parse().expect("address"));
             assert_eq!(origin.endpoint, RESOLVER);
+            // The entry went with the box's socket: whoever gets that
+            // address and port next is not taken for the box.
+            assert_eq!(
+                h.handles
+                    .original_destination(seen.peer, seen.protocol)
+                    .expect("lookup"),
+                None,
+                "{server} over {over}"
+            );
         }
     }
     // A v4-mapped server on an AF_INET6 socket is an IPv4 flow.
@@ -115,13 +121,20 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
         h.probe("b", &["dns", "127.0.0.53"]),
         "ok from=127.0.0.53:53 answer=198.51.100.2"
     );
-    let (peer, protocol) = b4.recv_timeout(wait).expect("endpoint b saw the query");
-    let origin = h
-        .handles
-        .original_destination(peer, protocol)
-        .expect("lookup")
-        .expect("a recorded flow");
-    assert_eq!(origin.box_id, box_b.id());
+    let seen = b4.recv_timeout(wait).expect("endpoint b saw the query");
+    assert_eq!(seen.origin.expect("a recorded flow").box_id, box_b.id());
+
+    // A process outside every box reaches the endpoint too, since nothing
+    // judges its sockets. The engine has no entry for it, which is how an
+    // endpoint knows not to serve it.
+    while a4.try_recv().is_ok() {}
+    let outside = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+    outside
+        .send_to(b"not a box", SocketAddr::V4(ep_a.v4.expect("v4")))
+        .expect("send");
+    let seen = a4.recv_timeout(wait).expect("endpoint a saw the datagram");
+    assert_eq!(seen.peer, outside.local_addr().expect("address"));
+    assert_eq!(seen.origin, None);
 
     // A box reaches its own endpoint directly and not the other box's.
     let sock = |e: Endpoint, v6: bool| -> (String, String) {
@@ -187,8 +200,9 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
             0,
         )),
     };
-    let seen4 = servers::proxy_endpoint(SocketAddr::V4(proxy.v4.expect("v4")));
-    let seen6 = servers::proxy_endpoint(SocketAddr::V6(proxy.v6.expect("v6")));
+    let flows = h.handles.flows().expect("flows");
+    let seen4 = servers::proxy_endpoint(SocketAddr::V4(proxy.v4.expect("v4")), &flows);
+    let seen6 = servers::proxy_endpoint(SocketAddr::V6(proxy.v6.expect("v6")), &flows);
     let banner = servers::banner().to_string();
     let echo = servers::udp_echo(IpAddr::V4(h.v4(5, 8))).to_string();
 
@@ -229,13 +243,10 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
             h.probe("c", &["tcp", &target.to_string(), "443"]),
             format!("ok peer={shown} data=proxied")
         );
-        let peer = seen
+        let origin = seen
             .recv_timeout(wait)
-            .expect("the proxy endpoint accepted");
-        let origin = h
-            .handles
-            .original_destination(peer, Protocol::Tcp)
-            .expect("lookup")
+            .expect("the proxy endpoint accepted")
+            .origin
             .expect("a recorded flow");
         assert_eq!(
             (origin.box_id, origin.destination, origin.endpoint),
@@ -252,6 +263,48 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
             refused()
         );
     }
+    // The box may dial its endpoint itself. That flow is recorded too,
+    // with the endpoint as where it was headed. A process outside every
+    // box connects as well and has no entry.
+    for (endpoint, seen) in [
+        (SocketAddr::V4(proxy.v4.expect("v4")), &seen4),
+        (SocketAddr::V6(proxy.v6.expect("v6")), &seen6),
+    ] {
+        assert_eq!(
+            h.probe(
+                "c",
+                &[
+                    "tcp",
+                    &endpoint.ip().to_string(),
+                    &endpoint.port().to_string()
+                ]
+            ),
+            format!("ok peer={endpoint} data=proxied")
+        );
+        let direct = seen
+            .recv_timeout(wait)
+            .expect("the proxy endpoint accepted");
+        let origin = direct.origin.expect("a recorded flow");
+        assert_eq!(
+            (origin.box_id, origin.destination, origin.endpoint),
+            (id, endpoint, CREDENTIAL_PROXY)
+        );
+        assert_eq!(
+            h.handles
+                .original_destination(direct.peer, Protocol::Tcp)
+                .expect("lookup"),
+            None,
+            "the entry goes with the socket"
+        );
+
+        let outside = std::net::TcpStream::connect(endpoint).expect("connect from outside");
+        let from_outside = seen
+            .recv_timeout(wait)
+            .expect("the proxy endpoint accepted");
+        assert_eq!(from_outside.peer, outside.local_addr().expect("address"));
+        assert_eq!(from_outside.origin, None);
+    }
+
     // A v4-mapped destination is redirected as IPv4.
     let mapped = h.v4(5, 7).to_ipv6_mapped().to_string();
     assert_eq!(

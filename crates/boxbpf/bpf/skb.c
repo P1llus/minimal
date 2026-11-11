@@ -188,6 +188,70 @@ static __always_inline int src_ok(const struct bp_box_cfg *cfg, const struct pkt
 	       (p->saddr[3] == 0 || p->saddr[3] == bpf_htonl(1));
 }
 
+static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struct pkt *p)
+{
+	__u32 addr[4];
+
+	if (p->family == 4)
+		return ep->port4 && ep->port4 == p->dport && ep->addr4 == p->daddr[0];
+	__builtin_memcpy(addr, ep->addr6, 16);
+	return ep->port6 && ep->port6 == p->dport && addr_eq(addr, p->daddr);
+}
+
+/*
+ * Tells the box's endpoints who their peer is. A flow of a box to one of its
+ * own endpoints gets an entry under the box's end of it, whether a rule
+ * redirected it there or the box dialled the endpoint itself. An endpoint
+ * serves only peers that have one. The entry goes when the socket does
+ * (bp_sock_release), so a later socket with the same address and port does
+ * not inherit it.
+ */
+static __always_inline void record_flow(__u64 box, const struct pkt *p, struct sk_state *st)
+{
+	struct bp_endpoint_key ek = {};
+	struct bp_flow_key fk = {};
+	struct bp_flow_val fv = {};
+	struct bp_endpoint *ep;
+	__u32 i;
+
+	ek.box_id = box;
+	for (i = 0; i < BP_ENDPOINTS_MAX; i++) {
+		ek.idx = i;
+		ep = bpf_map_lookup_elem(&endpoints, &ek);
+		if (ep && to_endpoint(ep, p))
+			break;
+	}
+	if (i == BP_ENDPOINTS_MAX)
+		return;
+
+	__builtin_memcpy(fk.saddr, p->saddr, 16);
+	fk.sport = p->sport;
+	fk.proto = p->pbit;
+	fk.family = p->family;
+	fv.box_id = box;
+	fv.endpoint = i;
+	fv.orig_family = p->family;
+	if ((st->flags & ST_REWRITTEN) && st->to_port == bpf_htons(p->dport) &&
+	    st->family == p->family && addr_eq(st->to, p->daddr)) {
+		__builtin_memcpy(fv.orig_addr, st->orig, 16);
+		fv.orig_port = bpf_ntohs(st->orig_port);
+	} else {
+		__builtin_memcpy(fv.orig_addr, p->daddr, 16);
+		fv.orig_port = p->dport;
+	}
+
+	/* A socket has one local end at a time. If it moved, the old entry
+	 * would outlive the socket. */
+	if ((st->flags & ST_FLOW) &&
+	    (st->flow_key.sport != fk.sport || st->flow_key.proto != fk.proto ||
+	     st->flow_key.family != fk.family ||
+	     !addr_eq((const __u32 *)st->flow_key.saddr, (const __u32 *)fk.saddr)))
+		bpf_map_delete_elem(&flows, &st->flow_key);
+	bpf_map_update_elem(&flows, &fk, &fv, BPF_ANY);
+	st->flow_key = fk;
+	st->flags |= ST_FLOW;
+}
+
 SEC("cgroup_skb/egress")
 int bp_egress(struct __sk_buff *skb)
 {
@@ -223,8 +287,12 @@ int bp_egress(struct __sk_buff *skb)
 	st = skb_state(skb, 0);
 	if (st && p.pbit && st->ok_pbit == p.pbit && st->ok_family == p.family &&
 	    addr_eq(st->ok_addr, p.daddr) && st->ok_generation == cfg->generation &&
-	    (p.later_frag || st->ok_port == f.port))
+	    (p.later_frag || st->ok_port == f.port)) {
+		/* The entry may have been evicted since the first packet. */
+		if (st->flags & ST_FLOW)
+			record_flow(box, &p, st);
 		goto pass;
+	}
 	if (p.later_frag)
 		return drop(skb, box, BP_H_EGRESS, &p, &v, BP_R_MALFORMED);
 
@@ -253,24 +321,7 @@ int bp_egress(struct __sk_buff *skb)
 		__builtin_memcpy(st->ok_addr, p.daddr, 16);
 		st->ok_port = f.port;
 		st->ok_generation = cfg->generation;
-		/* Let the endpoint that receives a redirected flow find out
-		 * who sent it and where it was going. */
-		if ((st->flags & ST_REWRITTEN) && st->to_port == bpf_htons(p.dport) &&
-		    st->family == p.family && addr_eq(st->to, p.daddr)) {
-			struct bp_flow_key fk = {};
-			struct bp_flow_val fv = {};
-
-			__builtin_memcpy(fk.saddr, p.saddr, 16);
-			fk.sport = p.sport;
-			fk.proto = p.pbit;
-			fk.family = p.family;
-			fv.box_id = box;
-			__builtin_memcpy(fv.orig_addr, st->orig, 16);
-			fv.orig_port = bpf_ntohs(st->orig_port);
-			fv.orig_family = st->family;
-			fv.endpoint = st->endpoint;
-			bpf_map_update_elem(&flows, &fk, &fv, BPF_ANY);
-		}
+		record_flow(box, &p, st);
 	}
 	if (p.pbit == BP_P_UDP) {
 		struct udp_peer up;

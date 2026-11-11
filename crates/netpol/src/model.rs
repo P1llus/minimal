@@ -656,6 +656,8 @@ pub enum Origin {
     Resolver,
     /// Steered names go to the box's credential proxy endpoint.
     Steering,
+    /// The node's hostname proxy is reached through the box's endpoint.
+    HostnameProxy,
     /// A box with its own network namespace may talk to itself.
     OwnAddresses,
     /// The kernel's IPv6 neighbour discovery for a box with its own netns.
@@ -701,6 +703,7 @@ impl fmt::Display for Origin {
             Self::OtherEndpoints => f.write_str("service endpoints of other boxes"),
             Self::Resolver => f.write_str("DNS to the box resolver"),
             Self::Steering => f.write_str("steered names to the credential proxy"),
+            Self::HostnameProxy => f.write_str("hostname proxy through the box endpoint"),
             Self::OwnAddresses => f.write_str("the box itself"),
             Self::NeighbourDiscovery => f.write_str("IPv6 neighbour discovery"),
             Self::NoIpv6Transport => f.write_str("transport without IPv6"),

@@ -7,6 +7,8 @@
 
 use std::{env, fs, io, path::PathBuf, process::Command};
 
+use sha2::{Digest as _, Sha256};
+
 fn fail(message: &str) -> ! {
     println!("cargo::error={message}");
     std::process::exit(1);
@@ -55,4 +57,16 @@ fn main() {
         )),
         Err(e) => fail(&format!("cannot run {clang}: {e}")),
     }
+
+    // Loader and daemon compare this, so a daemon never runs on programs
+    // other than the ones it was built with.
+    let bytes = match fs::read(&object) {
+        Ok(bytes) => bytes,
+        Err(e) => fail(&format!("cannot read {}: {e}", object.display())),
+    };
+    let id: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    println!("cargo::rustc-env=BOXBPF_OBJECT_ID={id}");
 }
