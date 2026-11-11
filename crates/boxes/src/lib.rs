@@ -292,7 +292,7 @@ pub struct IngressPolicy {
     /// *listens* on is published on the box's address while it falls inside
     /// this range — inclusively at both ends — and withdrawn when the
     /// listener closes. The decision is the shared one in
-    /// [`core::egress::IngressRules`], which the daemon's listener watcher
+    /// [`core::ingress::IngressRules`], which the daemon's listener watcher
     /// applies and the Kani harness exhausts. Stored on the [`Record`] and
     /// returned verbatim by `GetSessionPolicy`.
     pub dynamic_allowed_range: Option<(u16, u16)>,

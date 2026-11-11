@@ -33,7 +33,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_vsock::{VsockAddr, VsockStream};
 
-use boxes::core::egress::{DynamicPortVerdict, IngressRules};
+use boxes::core::ingress::{DynamicPortVerdict, IngressRules};
 use boxes::{IngressPolicy, IpProto, PortMapping};
 
 /// The forwarder-expose request body gvproxy's `POST /services/forwarder/expose`
@@ -2527,7 +2527,7 @@ mod tests {
         // `Publish` or `Deny`, and `Publish` holds exactly where the expose
         // decision allows.
         use boxes::DynamicIngress;
-        use boxes::core::egress::ListenVerdict;
+        use boxes::core::ingress::ListenVerdict;
 
         const LOW: u16 = 3000;
         const HIGH: u16 = 3010;

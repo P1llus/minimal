@@ -132,7 +132,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use boxes::IpProto;
-use boxes::core::egress::ListenVerdict;
+use boxes::core::ingress::ListenVerdict;
 
 use super::policy::{
     ControlChannel, ExposedMapping, expose_mapping, log_withdrawal, unexpose_mapping,
@@ -2722,21 +2722,21 @@ impl WatchState {
             ListenVerdict::Declared => Appearance::Settled,
             ListenVerdict::Deny => {
                 let reason = match self.plan.gate.dynamic_verdict(port) {
-                    boxes::core::egress::DynamicPortVerdict::Deny => {
+                    boxes::core::ingress::DynamicPortVerdict::Deny => {
                         "the box's dynamic ingress stance is deny".to_string()
                     }
-                    boxes::core::egress::DynamicPortVerdict::Ask => {
+                    boxes::core::ingress::DynamicPortVerdict::Ask => {
                         "the box's dynamic ingress stance is ask; a listen cannot answer it"
                             .to_string()
                     }
-                    boxes::core::egress::DynamicPortVerdict::NoRange => {
+                    boxes::core::ingress::DynamicPortVerdict::NoRange => {
                         "the box declared no dynamic allowed range".to_string()
                     }
-                    boxes::core::egress::DynamicPortVerdict::OutOfRange { .. } => {
+                    boxes::core::ingress::DynamicPortVerdict::OutOfRange { .. } => {
                         "the port is outside the box's dynamic allowed range".to_string()
                     }
                     // Not reached: an allowed port is a `Publish` verdict.
-                    boxes::core::egress::DynamicPortVerdict::Allow => {
+                    boxes::core::ingress::DynamicPortVerdict::Allow => {
                         "the stance allows it but the verdict did not".to_string()
                     }
                 };
@@ -2745,7 +2745,7 @@ impl WatchState {
                 // box's declaration could have published is never quiet.
                 if matches!(
                     self.plan.gate.dynamic_verdict(port),
-                    boxes::core::egress::DynamicPortVerdict::OutOfRange { .. }
+                    boxes::core::ingress::DynamicPortVerdict::OutOfRange { .. }
                 ) {
                     tracing::warn!(
                         session = %self.plan.box_name,

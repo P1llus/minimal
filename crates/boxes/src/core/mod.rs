@@ -5,6 +5,7 @@ pub mod egress;
 pub mod enumerate;
 pub mod expansion;
 pub mod hooks;
+pub mod ingress;
 pub mod lifecyclehook;
 pub mod loadout;
 pub mod loopback;

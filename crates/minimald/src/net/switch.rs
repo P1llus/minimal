@@ -70,9 +70,8 @@ use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 #[cfg(test)]
 use boxes::core::bep::Quic443;
 use boxes::core::bep::{SecretGrant, Steering};
-use boxes::core::egress::{
-    self, DropReason, FrameSummary, FrameVerdict, IngressRules, ListenVerdict,
-};
+use boxes::core::egress::{self, DropReason, FrameSummary, FrameVerdict};
+use boxes::core::ingress::{IngressRules, ListenVerdict};
 use boxes::core::zone_answer;
 use switch::refusal;
 
@@ -2950,7 +2949,7 @@ impl BoxGate {
     /// (NET-043), for the watcher's line naming why a listen it saw was left
     /// unpublished: the stance, no range, or out of range.
     #[must_use]
-    pub(crate) fn dynamic_verdict(&self, port: u16) -> boxes::core::egress::DynamicPortVerdict {
+    pub(crate) fn dynamic_verdict(&self, port: u16) -> boxes::core::ingress::DynamicPortVerdict {
         self.ingress.dynamic_verdict(port)
     }
 
@@ -3410,7 +3409,7 @@ pub use switch::refusal::REVOKED_INGRESS_PORT_RULE;
 /// one derivation both ingress surfaces read: the relay's inbound gate
 /// ([`BoxGate::allowed`]/[`BoxGate::udp_allowed`]) and, through the
 /// registry's routes, the hostname proxy's own port gate. Compiled by the
-/// shared rules (`boxes::core::egress::IngressRules`), so the declared
+/// shared rules (`boxes::core::ingress::IngressRules`), so the declared
 /// half and the listen-published half of a box's ingress answer the same
 /// form of the same declaration. An absent ingress policy admits nothing
 /// (the own-IP default-block posture).
