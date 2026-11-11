@@ -6,10 +6,12 @@ use std::{
     io::{BufRead, Read, Write},
     mem::size_of,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     path::Path,
     time::Duration,
 };
+
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
 fn errno(e: &std::io::Error) -> String {
     match e.kind() {
@@ -218,10 +220,7 @@ fn bind(kind: &str, at: SocketAddr) -> std::io::Result<String> {
     Ok(format!("port={port}"))
 }
 
-/// TCP connect from a chosen local address.
-fn tcp_from(src: IpAddr, to: SocketAddr, timeout: Duration) -> std::io::Result<String> {
-    let sock = raw_socket(family_of(&to), libc::SOCK_STREAM, 0)?;
-    let local = SocketAddr::new(src, 0);
+fn bind_fd(sock: &OwnedFd, local: SocketAddr) -> std::io::Result<()> {
     let sa = sockaddr(local);
     // SAFETY: sa is valid for the length passed.
     let bound = unsafe {
@@ -231,9 +230,13 @@ fn tcp_from(src: IpAddr, to: SocketAddr, timeout: Duration) -> std::io::Result<S
             socket2_lite::Addr::len(&local),
         )
     };
-    check_int(bound)?;
+    check_int(bound)
+}
+
+/// Connects a socket the caller holds, whoever created it.
+pub fn connect_fd(sock: &OwnedFd, to: SocketAddr, timeout: Duration) -> std::io::Result<String> {
     // A send timeout bounds a blocking connect.
-    set_timeout(&sock, libc::SO_SNDTIMEO, timeout)?;
+    set_timeout(sock, libc::SO_SNDTIMEO, timeout)?;
     let sa = sockaddr(to);
     // SAFETY: sa is valid for the length passed.
     let connected =
@@ -247,6 +250,100 @@ fn tcp_from(src: IpAddr, to: SocketAddr, timeout: Duration) -> std::io::Result<S
         return Err(e);
     }
     Ok("connected".to_owned())
+}
+
+/// Sends one datagram on a socket the caller holds.
+pub fn sendto_fd(sock: &OwnedFd, to: SocketAddr) -> std::io::Result<String> {
+    let sa = sockaddr(to);
+    // SAFETY: the buffer and sa are valid for the lengths passed.
+    let sent = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            b"x".as_ptr().cast(),
+            1,
+            0,
+            sa.as_ptr(),
+            socket2_lite::Addr::len(&to),
+        )
+    };
+    check(sent).map(|_| "sent".to_owned())
+}
+
+/// TCP connect from a chosen local address.
+fn tcp_from(src: IpAddr, to: SocketAddr, timeout: Duration) -> std::io::Result<String> {
+    let sock = raw_socket(family_of(&to), libc::SOCK_STREAM, 0)?;
+    bind_fd(&sock, SocketAddr::new(src, 0))?;
+    connect_fd(&sock, to, timeout)
+}
+
+/// Hands sockets to whoever holds the other end of `channel`.
+pub fn send_sockets(channel: BorrowedFd<'_>, socks: &[OwnedFd]) -> std::io::Result<()> {
+    let raw: Vec<_> = socks.iter().map(AsRawFd::as_raw_fd).collect();
+    let iov = [std::io::IoSlice::new(b"s")];
+    let rights = [ControlMessage::ScmRights(&raw)];
+    sendmsg::<()>(channel.as_raw_fd(), &iov, &rights, MsgFlags::empty(), None)?;
+    Ok(())
+}
+
+/// The sockets of one [`send_sockets`] call.
+pub fn recv_sockets(channel: BorrowedFd<'_>) -> std::io::Result<Vec<OwnedFd>> {
+    let mut buf = [0u8; 8];
+    let mut space = nix::cmsg_space!([std::os::fd::RawFd; 8]);
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let msg = recvmsg::<()>(
+        channel.as_raw_fd(),
+        &mut iov,
+        Some(&mut space),
+        MsgFlags::MSG_CMSG_CLOEXEC,
+    )?;
+    let mut socks = Vec::new();
+    for cmsg in msg.cmsgs()? {
+        if let ControlMessageOwned::ScmRights(received) = cmsg {
+            for fd in received {
+                // SAFETY: the kernel just installed this descriptor for us
+                // and nothing else owns it.
+                socks.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    Ok(socks)
+}
+
+/// Creates sockets in this process's cgroup and hands them to whoever
+/// holds the other end of standard input.
+fn make_sockets(kind: &str, count: &str) -> std::io::Result<String> {
+    let kind = if kind == "tcp" {
+        libc::SOCK_STREAM
+    } else {
+        libc::SOCK_DGRAM
+    };
+    let socks = (0..count.parse::<usize>().expect("count"))
+        .map(|_| raw_socket(libc::AF_INET, kind, 0))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    send_sockets(std::io::stdin().as_fd(), &socks)?;
+    Ok(String::new())
+}
+
+/// Uses a socket that arrives on standard input: one some other process
+/// created.
+fn use_socket(kind: &str, to: SocketAddr) -> std::io::Result<String> {
+    let mut socks = recv_sockets(std::io::stdin().as_fd())?;
+    let sock = socks.pop().ok_or(std::io::ErrorKind::UnexpectedEof)?;
+    if kind == "tcp" {
+        connect_fd(&sock, to, Duration::from_millis(1500))
+    } else {
+        sendto_fd(&sock, to)
+    }
+}
+
+/// What `bind` says on a socket that `accept` returned. The kernel refuses
+/// it with `EINVAL`, after the bind hook has let it through.
+fn accept_bind(at: IpAddr) -> std::io::Result<String> {
+    let listener = TcpListener::bind(SocketAddr::new(at, 0))?;
+    let _client = TcpStream::connect(listener.local_addr()?)?;
+    let (accepted, _) = listener.accept()?;
+    bind_fd(&OwnedFd::from(accepted), SocketAddr::new(at, 0))?;
+    Ok(String::new())
 }
 
 /// The query of `dns`: one A question for `box.test`.
@@ -402,6 +499,9 @@ pub fn run() {
         ["hold-udp", ip, port] => return hold_udp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
+        ["make-sockets", kind, count] => report(make_sockets(kind, count)),
+        ["use-socket", kind, ip, port] => report(use_socket(kind, addr(ip, port))),
+        ["accept-bind", ip] => report(accept_bind(ip.parse().expect("address"))),
         ["loader-request", socket, boxes] => loader_request(socket, boxes),
         ["root-request", socket] => root_request(socket),
         _ => format!("err unknown-probe {spec}"),

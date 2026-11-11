@@ -342,10 +342,13 @@ pub enum Reason {
     NotSteered,
     /// A redirect to an endpoint without an address of the flow's family.
     NoEndpoint,
+    /// The kernel had no memory to remember which box a new socket
+    /// belongs to.
+    NoMemory,
 }
 
 impl Reason {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::NoConfig,
         Self::Rule,
         Self::SetRule,
@@ -355,6 +358,7 @@ impl Reason {
         Self::Malformed,
         Self::NotSteered,
         Self::NoEndpoint,
+        Self::NoMemory,
     ];
 
     #[must_use]
@@ -369,6 +373,7 @@ impl Reason {
             Self::Malformed => 7,
             Self::NotSteered => 8,
             Self::NoEndpoint => 9,
+            Self::NoMemory => 10,
         }
     }
 
@@ -388,6 +393,7 @@ impl Reason {
             Self::Malformed => "BP_R_MALFORMED",
             Self::NotSteered => "BP_R_NOT_STEERED",
             Self::NoEndpoint => "BP_R_NO_ENDPOINT",
+            Self::NoMemory => "BP_R_NO_MEMORY",
         }
     }
 }

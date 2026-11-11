@@ -2,9 +2,9 @@
 /*
  * Syscall-time hooks: sock_create, connect, sendmsg, recvmsg, getpeername, bind.
  *
- * These run in the calling task, so the box is the task's own. They give the
- * application an errno at once, and they are the only place a destination
- * can be rewritten. The packet hooks in skb.c stay authoritative.
+ * They give the application an errno at once, and they are the only place a
+ * destination can be rewritten. The packet hooks in skb.c stay authoritative.
+ * The caller may be any task that holds the socket: the box is the socket's.
  *
  * `sf` is the socket's family, a compile-time constant in every caller: the
  * verifier rejects a read of user_ip6 in an IPv4 hook and the other way round.
@@ -160,7 +160,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 	struct verdict v = {};
 	struct flow f = {};
 
-	f.box = task_box();
+	f.box = sock_box(ctx->sk);
 	sa_flow(ctx, sf, BP_DIR_EGRESS, &f);
 	cfg = bpf_map_lookup_elem(&box_cfg, &f.box);
 	if (!cfg) {
@@ -263,7 +263,7 @@ static __always_inline int bind_any(struct bpf_sock_addr *ctx, __u8 hook, __u8 s
 	struct verdict v = {};
 	struct flow f = {};
 
-	f.box = task_box();
+	f.box = sock_box(ctx->sk);
 	sa_flow(ctx, sf, BP_DIR_BIND, &f);
 	f.port = bpf_ntohs(ctx->user_port);
 	cfg = bpf_map_lookup_elem(&box_cfg, &f.box);
@@ -308,10 +308,22 @@ int bp_sock_create(struct bpf_sock *sk)
 	struct bp_box_cfg *cfg = bpf_map_lookup_elem(&box_cfg, &box);
 	struct ev_args a = {};
 	__u8 pbit = proto_bit(sk->protocol);
+	__u16 err = cfg ? cfg->refuse_errno : EPERM;
+	__u8 reason = cfg ? BP_R_SOCK_TYPE : BP_R_NO_CFG;
 
 	if (cfg && ((sk->type == SOCK_STREAM && pbit == BP_P_TCP) ||
-		    (sk->type == SOCK_DGRAM && (pbit == BP_P_UDP || pbit == BP_P_ICMP))))
-		return 1;
+		    (sk->type == SOCK_DGRAM && (pbit == BP_P_UDP || pbit == BP_P_ICMP)))) {
+		__u64 *owner = bpf_sk_storage_get(&sk_box, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+
+		if (owner) {
+			*owner = box;
+			return 1;
+		}
+		/* A socket nobody can name the box of would be refused at
+		 * every later call. */
+		err = ENOMEM;
+		reason = BP_R_NO_MEMORY;
+	}
 
 	a.box = box;
 	a.pid = bpf_get_current_pid_tgid() >> 32;
@@ -321,9 +333,9 @@ int bp_sock_create(struct bpf_sock *sk)
 	a.hook = BP_H_SOCK_CREATE;
 	a.family = sk->family == AF_INET6 ? 6 : 4;
 	a.verdict = BP_DENY;
-	a.reason = cfg ? BP_R_SOCK_TYPE : BP_R_NO_CFG;
+	a.reason = reason;
 	emit_net(&a);
-	return refuse(box, cfg ? cfg->refuse_errno : EPERM);
+	return refuse(box, err);
 }
 
 /* The socket's entry in the flows map must not outlive it: the next socket

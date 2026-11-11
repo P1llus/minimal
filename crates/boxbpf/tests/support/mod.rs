@@ -499,6 +499,14 @@ impl Cgroups {
         Self::run(self.in_box(box_name, Self::probe_command(args, None)))
     }
 
+    /// Like [`Self::probe`], with `channel` as the probe's standard input:
+    /// a unix socket it passes sockets over.
+    pub fn probe_over(&self, box_name: &str, args: &[&str], channel: OwnedFd) -> String {
+        let mut cmd = self.in_box(box_name, Self::probe_command(args, None));
+        cmd.stdin(Stdio::from(channel));
+        Self::run(cmd)
+    }
+
     /// The same for a box whose sockets live in the netns of `pid`.
     pub fn probe_in(&self, box_name: &str, netns_of: u32, args: &[&str]) -> String {
         Self::run(self.in_box(box_name, Self::probe_command(args, Some(netns_of))))

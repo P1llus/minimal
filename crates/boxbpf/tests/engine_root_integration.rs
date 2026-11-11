@@ -17,6 +17,7 @@ mod cases {
     pub mod parity;
     pub mod redirect;
     pub mod rules;
+    pub mod sockets;
 }
 
 /// Not a test: the entry point of the helper processes the tests start.

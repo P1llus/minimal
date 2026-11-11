@@ -29,6 +29,7 @@ enum {
 
 #define BPF_ANY                     0
 #define BPF_F_NO_PREALLOC           1
+#define BPF_F_CLONE                 512
 #define BPF_SK_STORAGE_GET_F_CREATE 1
 
 #define AF_INET        2
@@ -42,6 +43,7 @@ enum {
 #define ETH_P_IP       0x0800
 #define ETH_P_IPV6     0x86DD
 #define EPERM          1
+#define ENOMEM         12
 #define NULL           ((void *)0)
 
 struct bpf_flow_keys;

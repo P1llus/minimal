@@ -201,6 +201,7 @@ struct bp_ev_hdr {
 #define BP_R_MALFORMED   7
 #define BP_R_NOT_STEERED 8 /* packet to a redirect destination no system-call hook rewrote */
 #define BP_R_NO_ENDPOINT 9 /* redirect without an endpoint address of the flow's family */
+#define BP_R_NO_MEMORY   10 /* no memory to remember which box a new socket belongs to */
 
 struct bp_ev_net {
 	struct bp_ev_hdr hdr;
