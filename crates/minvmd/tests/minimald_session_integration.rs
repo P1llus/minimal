@@ -188,6 +188,30 @@ impl Guest {
         guest
     }
 
+    /// The guest's console, with the colour codes of its log lines removed.
+    fn boot_log(&self) -> String {
+        let path = self
+            .state
+            .path()
+            .join("minimal/providers/local-minvmd0/boot.log");
+        let raw = std::fs::read(&path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&raw);
+        let mut plain = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for skipped in chars.by_ref() {
+                    if skipped.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    }
+
     /// The detached supervisor's stderr (boot-failure diagnosis), for panics.
     fn run_log(&self) -> String {
         let path = self
@@ -308,6 +332,50 @@ async fn minimald_exec_over_bridge() {
         "expected stdout {sentinel:?} and nothing else, got {stdout:?}"
     );
     assert_eq!(exit, Some(0), "expected exit status 0, got {exit:?}");
+}
+
+/// The guest daemon wires its node to the VM's network device and loads the
+/// policy engine itself, before it serves anything. Without either no box
+/// with a network starts in the VM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1; requires libkrun >=1.19, kernel, rootfs, initramfs"]
+async fn the_guest_node_has_its_network_and_its_engine() {
+    if !e2e_enabled() {
+        return;
+    }
+    let guest = Guest::boot();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (network, engine) = (
+        "the guest node's network is up",
+        "the network policy engine is attached",
+    );
+    loop {
+        let log = guest.boot_log();
+        if log.contains(network) && log.contains(engine) {
+            // The node sits on the VM host's virtual network, behind the
+            // bridge that boxes with their own address hang off.
+            let line = log
+                .lines()
+                .find(|line| line.contains(network))
+                .unwrap_or_default();
+            assert!(
+                line.contains("address=100.64.255.253") && line.contains("gateway=100.64.0.1"),
+                "{line}"
+            );
+            assert!(
+                log.contains("br0: port 1(eth0) entered forwarding state"),
+                "{log}"
+            );
+            assert!(!log.contains("no network policy engine"), "{log}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest never reported its network and its engine:\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// BOX-002: the VM host daemon mints the id of a box before the in-VM
