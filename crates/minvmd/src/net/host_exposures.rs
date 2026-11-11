@@ -35,47 +35,22 @@ use std::time::{Duration, Instant};
 
 use client_config::host_exposures::{HOST_EXPOSURES_TABLE, HostExposuresFile};
 
-/// The IP protocol numbers an exposure can name.
-pub(crate) const PROTOCOL_TCP: u8 = 6;
-pub(crate) const PROTOCOL_UDP: u8 = 17;
-
 /// The longest time a changed table waits before a stream is decided by
 /// it: the handle stats the file at most once in this interval.
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
-/// One host exposure: the IP protocol and the port a table entry opens.
+/// One host exposure: the TCP port a table entry opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostExposure {
-    /// The IP protocol number: [`PROTOCOL_TCP`] or [`PROTOCOL_UDP`].
-    pub(crate) protocol: u8,
     pub(crate) port: u16,
 }
 
 impl HostExposure {
-    /// A TCP exposure at `port`.
+    /// An exposure at `port`.
     #[cfg(test)]
     #[must_use]
     pub const fn tcp(port: u16) -> Self {
-        Self {
-            protocol: PROTOCOL_TCP,
-            port,
-        }
-    }
-
-    /// A UDP exposure at `port`.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn udp(port: u16) -> Self {
-        Self {
-            protocol: PROTOCOL_UDP,
-            port,
-        }
-    }
-
-    /// Whether a connection of this IP protocol to this port matches.
-    #[must_use]
-    pub(crate) fn admits(self, protocol: u8, port: u16) -> bool {
-        self.protocol == protocol && self.port == port
+        Self { port }
     }
 }
 
@@ -93,8 +68,6 @@ pub(crate) struct Entry {
 pub(crate) struct Holder {
     /// The ports the listener holds, inclusive.
     pub(crate) ports: (u16, u16),
-    /// The IP protocol it holds them for, `None` for both.
-    pub(crate) protocol: Option<u8>,
     /// The listener as the daemon log names it.
     pub(crate) name: &'static str,
 }
@@ -103,14 +76,14 @@ impl Holder {
     /// Whether this listener holds the port that `exposure` opens.
     #[must_use]
     pub(crate) fn holds(&self, exposure: HostExposure) -> bool {
-        self.holds_port(exposure.protocol, exposure.port)
+        self.holds_port(exposure.port)
     }
 
-    /// Whether this listener holds `port` for `protocol`.
+    /// Whether this listener holds `port`.
     #[must_use]
-    pub(crate) fn holds_port(&self, protocol: u8, port: u16) -> bool {
+    pub(crate) fn holds_port(&self, port: u16) -> bool {
         let (lo, hi) = self.ports;
-        lo <= port && port <= hi && self.protocol.is_none_or(|held| held == protocol)
+        lo <= port && port <= hi
     }
 }
 
@@ -128,14 +101,12 @@ pub(crate) fn minimal_listeners(hostname_proxy: &[u16]) -> Vec<Holder> {
         .iter()
         .map(|&port| Holder {
             ports: (port, port),
-            protocol: None,
             name: HOSTNAME_PROXY,
         })
         .collect();
     let answerer = crate::net::answerer::DEFAULT_ANSWERER_PORT;
     held.push(Holder {
         ports: (answerer, answerer),
-        protocol: None,
         name: ANSWERER,
     });
     held
@@ -267,12 +238,11 @@ impl HostExposures {
             };
             let key = (entry.name.clone(), entry.exposure, holder.name);
             if !state.reported.contains(&key) {
-                let (proto, port) = (proto_name(entry.exposure), entry.exposure.port);
+                let port = entry.exposure.port;
                 if before.contains(entry) {
                     tracing::warn!(
                         table = HOST_EXPOSURES_TABLE,
                         entry = %entry.name,
-                        proto,
                         port,
                         holder = holder.name,
                         "a Minimal listener now holds the port of a host exposure, so \
@@ -282,7 +252,6 @@ impl HostExposures {
                     tracing::warn!(
                         table = HOST_EXPOSURES_TABLE,
                         entry = %entry.name,
-                        proto,
                         port,
                         holder = holder.name,
                         "refused a host exposure at a port that a Minimal listener holds"
@@ -368,21 +337,13 @@ impl PartialEq for HostExposures {
 
 impl Eq for HostExposures {}
 
-fn proto_name(exposure: HostExposure) -> &'static str {
-    if exposure.protocol == PROTOCOL_UDP {
-        "udp"
-    } else {
-        "tcp"
-    }
-}
-
 fn render(ports: &[HostExposure]) -> String {
     if ports.is_empty() {
         return "(none)".to_string();
     }
     ports
         .iter()
-        .map(|&exposure| format!("{}/{}", proto_name(exposure), exposure.port))
+        .map(|exposure| exposure.port.to_string())
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -408,10 +369,7 @@ fn entries_of(table: &client_config::host_exposures::HostExposures) -> Vec<Entry
         .iter()
         .map(|(name, entry)| Entry {
             name: name.to_string(),
-            exposure: HostExposure {
-                protocol: entry.proto.ip_protocol(),
-                port: entry.port,
-            },
+            exposure: HostExposure { port: entry.port },
         })
         .collect();
     entries.sort_unstable_by(|a, b| (a.exposure, &a.name).cmp(&(b.exposure, &b.name)));
@@ -439,8 +397,8 @@ mod tests {
     }
 
     /// NET-159: the host exposures come from the `[host-exposures]` table of
-    /// the client `config.toml` alone. Each entry names one exposure, its
-    /// port and its protocol, and `proto` defaults to `tcp`. The handle
+    /// the client `config.toml` alone. Each entry names one exposure by its
+    /// port. The handle
     /// reads the file at the client config's path and follows it.
     #[test]
     fn host_exposures_read_from_client_config() {
@@ -461,11 +419,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             exposures_of(&entries),
-            vec![
-                HostExposure::tcp(5173),
-                HostExposure::tcp(5432),
-                HostExposure::udp(5353),
-            ]
+            // An exposure carries TCP only: the reader skips the UDP entry.
+            vec![HostExposure::tcp(5173), HostExposure::tcp(5432)]
         );
         assert_eq!(entries[0].name, "vite", "each entry keeps its name");
         assert!(parse_table("[other]\nx = 1\n").unwrap().is_empty());

@@ -29,7 +29,7 @@ use tracing::Instrument as _;
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::BoxRegistry;
 use crate::control::BepListening;
-use crate::net::host_exposures::{Holder, HostExposures, PROTOCOL_TCP};
+use crate::net::host_exposures::{Holder, HostExposures};
 
 /// Names the door's socket to the VMM child, which maps the guest's vsock
 /// port to it.
@@ -316,7 +316,7 @@ impl Door {
                     .exposures
                     .current(&(self.config.own_listeners)())
                     .iter()
-                    .any(|exposure| exposure.admits(PROTOCOL_TCP, port));
+                    .any(|exposure| exposure.port == port);
                 if !open_now {
                     return Err(StreamRefusal::PortNotExposed);
                 }
@@ -711,19 +711,6 @@ mod tests {
         // After a refusal the door sends nothing more.
         drop(guest.reader.get_ref().shutdown(std::net::Shutdown::Write));
         assert!(guest.read_to_end().is_empty());
-
-        // A UDP entry does not open the TCP port.
-        let udp_only = bed_udp(hidden);
-        let web = udp_only
-            .boxes
-            .register_client_box(spec("web", false))
-            .unwrap();
-        let (_guest, reply) = Guest::open(&udp_only.door, &host_port(web.box_id(), hidden));
-        assert_eq!(reply, refused(StreamRefusal::PortNotExposed));
-    }
-
-    fn bed_udp(port: u16) -> Bed {
-        bed(HostExposures::fixed(vec![HostExposure::udp(port)]))
     }
 
     #[test]

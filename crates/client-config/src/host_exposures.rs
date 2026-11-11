@@ -15,8 +15,9 @@
 //! This is the one reader of the table. The native session daemon and the
 //! VM host daemon both read it here, so a bad entry is handled one way: an
 //! entry that is not a table with a port from 1 to 65535 and an optional
-//! `proto` of `tcp` or `udp` is skipped, the other entries stand, and the
-//! daemon log names the skipped entry. A file that does not parse, or a
+//! `proto` of `tcp` is skipped, the other entries stand, and the daemon log
+//! names the skipped entry. An exposure carries TCP only, so a `proto` of
+//! `udp` is skipped the same way. A file that does not parse, or a
 //! `host-exposures` key that is not a table, opens no exposure.
 //!
 //! [`HostExposuresFile`] holds the table of one `config.toml` and reads it
@@ -32,37 +33,19 @@ use serde::Deserialize;
 /// The key of the table in `config.toml`.
 pub const HOST_EXPOSURES_TABLE: &str = "host-exposures";
 
-/// The transport of one host exposure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExposureProto {
-    /// TCP: the protocol of an entry that names none.
-    #[default]
-    Tcp,
-    /// UDP.
-    Udp,
-}
-
-impl ExposureProto {
-    /// The IPv4 protocol number of this transport.
-    #[must_use]
-    pub fn ip_protocol(self) -> u8 {
-        match self {
-            Self::Tcp => 6,
-            Self::Udp => 17,
-        }
-    }
-}
-
-/// One `[host-exposures.<name>]` entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// One `[host-exposures.<name>]` entry: a TCP port on the host's loopback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostExposure {
-    /// The port on the host's loopback, never 0.
+    /// The port, never 0.
     pub port: u16,
-    /// The transport. `tcp` when the entry names none.
-    #[serde(default)]
-    pub proto: ExposureProto,
+}
+
+/// An entry as the file spells it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    port: u16,
+    proto: Option<String>,
 }
 
 /// One entry the reader skipped because it is not an exposure.
@@ -84,12 +67,10 @@ pub struct HostExposures {
 }
 
 impl HostExposures {
-    /// Whether an entry opens `port` over the IPv4 protocol `ip_protocol`.
+    /// Whether an entry opens `port`.
     #[must_use]
-    pub fn opens(&self, ip_protocol: u8, port: u16) -> bool {
-        self.entries
-            .values()
-            .any(|entry| entry.port == port && entry.proto.ip_protocol() == ip_protocol)
+    pub fn opens(&self, port: u16) -> bool {
+        self.entries.values().any(|entry| entry.port == port)
     }
 
     /// The number of entries.
@@ -147,14 +128,19 @@ pub enum HostExposuresError {
 
 /// One entry's value as an exposure, or why it is not one.
 fn entry_exposure(value: &toml::Value) -> Result<HostExposure, String> {
-    let entry: HostExposure = value
+    let entry: Entry = value
         .clone()
         .try_into()
         .map_err(|error| error.to_string())?;
+    match entry.proto.as_deref() {
+        None | Some("tcp") => {}
+        Some("udp") => return Err("a host exposure carries TCP only".to_string()),
+        Some(other) => return Err(format!("`{other}` is not a protocol of a host exposure")),
+    }
     if entry.port == 0 {
         return Err("port 0 is not a port".to_string());
     }
-    Ok(entry)
+    Ok(HostExposure { port: entry.port })
 }
 
 /// Parses the `[host-exposures]` table out of the text of a `config.toml`.
@@ -365,8 +351,7 @@ impl HostExposuresFile {
                             entry = %skipped.name,
                             value = %skipped.value,
                             reason = %skipped.reason,
-                            "skipped a host exposure that is not {{ proto = \"tcp\" or \"udp\", \
-                             port = 1 to 65535 }}"
+                            "skipped a host exposure that is not {{ port = 1 to 65535 }} over TCP"
                         );
                     }
                     table
@@ -408,14 +393,15 @@ mod tests {
                     [host-exposures.db]\nport = 5432\n\n\
                     [host-exposures.dns]\nport = 5353\nproto = \"udp\"\n";
         let table = parse_host_exposures(text, Path::new("config.toml")).unwrap();
-        assert_eq!(table.len(), 2);
-        assert!(table.opens(6, 5432));
-        assert!(!table.opens(17, 5432));
-        assert!(table.opens(17, 5353));
-        assert!(!table.opens(6, 5353));
+        assert_eq!(table.len(), 1);
+        assert!(table.opens(5432));
+        // An exposure carries TCP only: the UDP entry is skipped and named.
+        assert!(!table.opens(5353));
+        let skipped: Vec<&str> = table.skipped().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(skipped, ["dns"]);
         let inline = "[host-exposures]\nvite = { port = 5173 }\n";
         let table = parse_host_exposures(inline, Path::new("config.toml")).unwrap();
-        assert!(table.opens(6, 5173), "the inline spelling reads the same");
+        assert!(table.opens(5173), "the inline spelling reads the same");
     }
 
     /// A bad entry is skipped and named, and the good entries beside it
@@ -436,7 +422,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.len(), 1);
-        assert!(table.opens(6, 8080));
+        assert!(table.opens(8080));
         let mut skipped: Vec<&str> = table.skipped().iter().map(|s| s.name.as_str()).collect();
         skipped.sort_unstable();
         assert_eq!(skipped, ["bare", "big", "extra", "icmp", "zero"]);
@@ -454,7 +440,7 @@ mod tests {
             "a missing file is an empty table"
         );
         std::fs::write(&path, "[host-exposures.web]\nport = 8080\n").unwrap();
-        assert!(file.current().opens(6, 8080));
+        assert!(file.current().opens(8080));
         std::fs::write(&path, "# no exposures any more\n").unwrap();
         assert!(file.current().is_empty());
         std::fs::write(&path, "[host-exposures.web\n").unwrap();
@@ -484,7 +470,7 @@ mod tests {
         std::fs::write(&path, "[host-exposures.web]\nport = 8080\n").unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         let file = HostExposuresFile::new(path.clone());
-        assert!(file.current().opens(6, 8080));
+        assert!(file.current().opens(8080));
         // The same length and inode, and the modification time put back:
         // an edit inside one timestamp tick.
         std::fs::write(&path, "[host-exposures.web]\nport = 8081\n").unwrap();
@@ -495,8 +481,8 @@ mod tests {
             .set_modified(modified)
             .unwrap();
         let table = file.current();
-        assert!(!table.opens(6, 8080), "the removed port is closed");
-        assert!(table.opens(6, 8081), "the new port is open");
+        assert!(!table.opens(8080), "the removed port is closed");
+        assert!(table.opens(8081), "the new port is open");
     }
 
     /// An edit that keeps the length and restores an old modification time,
@@ -517,14 +503,14 @@ mod tests {
         std::fs::write(&path, "[host-exposures.web]\nport = 8080\n").unwrap();
         set_old(&path);
         let file = HostExposuresFile::new(path.clone());
-        assert!(file.current().opens(6, 8080));
+        assert!(file.current().opens(8080));
         // Some kernels keep a coarse change time, so let one tick pass.
         std::thread::sleep(Duration::from_millis(50));
         std::fs::write(&path, "[host-exposures.web]\nport = 8081\n").unwrap();
         set_old(&path);
         let table = file.current();
-        assert!(!table.opens(6, 8080), "the removed port is closed");
-        assert!(table.opens(6, 8081), "the new port is open");
+        assert!(!table.opens(8080), "the removed port is closed");
+        assert!(table.opens(8081), "the new port is open");
     }
 
     /// A modification time after the read is racy for one more read only.

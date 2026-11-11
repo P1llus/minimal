@@ -25,9 +25,6 @@ use super::endpoints::Service;
 use super::engine::{Engine, Installed, Peers};
 use crate::events::{NetRefusal, Source};
 
-/// TCP's number in an IP header, as the exposure table names protocols.
-const TCP: u8 = 6;
-
 /// How long a host service may take to accept.
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
@@ -225,13 +222,13 @@ impl Dial for NativeHostPorts {
             let port = original.port();
             // Subscribed before the read, so no change after it is missed.
             let mut table = self.table.subscribe();
-            if !self.refresh().opens(TCP, port) || OwnListeners::daemon().holds(port) {
+            if !self.refresh().opens(port) || OwnListeners::daemon().holds(port) {
                 return Err(Refused::NotExposed);
             }
             let stream = dial_loopback(port).await.map_err(Refused::Unreachable)?;
             let revoked = async move {
                 loop {
-                    if !table.borrow_and_update().opens(TCP, port) {
+                    if !table.borrow_and_update().opens(port) {
                         return;
                     }
                     // With nobody left to read the table, nobody can say
@@ -541,7 +538,7 @@ mod tests {
     async fn a_port_the_table_does_not_open_is_reset_and_reported() {
         let (port, _service) = service(false).await;
         let dir = tempfile::tempdir().unwrap();
-        // The table opens the port for UDP, which is another port.
+        // A UDP entry opens nothing: an exposure carries TCP only.
         let table = exposures(
             dir.path(),
             &format!("[host-exposures]\ndb = {{ port = {port}, proto = \"udp\" }}\n"),
