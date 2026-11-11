@@ -88,6 +88,8 @@ impl std::fmt::Display for Absent {
 /// Why a box cannot run here with its network policy applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unenforceable {
+    /// The node has no network to give the box.
+    NoNetwork(&'static str),
     /// A setting nothing applies yet to a box that shares the node's
     /// address.
     Setting(&'static str),
@@ -100,6 +102,11 @@ impl std::fmt::Display for Unenforceable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the box did not start: ")?;
         match self {
+            Self::NoNetwork(why) => write!(
+                f,
+                "it asks for a network, and this VM has none: {why}. A box with \
+                 `--network none` starts."
+            ),
             Self::Setting(setting) => write!(
                 f,
                 "its network policy sets `{setting}`, which this version of Minimal cannot \
@@ -665,6 +672,11 @@ impl Engine {
         policy: &BoxPolicy,
         deny_all_opt_out: bool,
     ) -> Result<(), Unenforceable> {
+        if mode != NetworkMode::NoNet
+            && let Some(why) = crate::guest_net::missing()
+        {
+            return Err(Unenforceable::NoNetwork(why));
+        }
         if let Some(setting) = Self::unapplied_setting(mode, policy) {
             return Err(Unenforceable::Setting(setting));
         }

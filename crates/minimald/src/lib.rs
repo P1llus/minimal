@@ -19,6 +19,8 @@ mod events;
 mod exec;
 #[cfg(target_os = "linux")]
 pub mod guest;
+#[cfg(target_os = "linux")]
+pub mod guest_net;
 mod hooks;
 mod maintenance;
 #[cfg(target_os = "linux")]

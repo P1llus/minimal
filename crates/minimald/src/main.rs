@@ -393,10 +393,7 @@ fn main() -> Result<(), MainError> {
         .enable_all()
         .build()
         .unwrap();
-    // The microVM's own egress lives outside the server runtime, so the
-    // final telemetry flush below still has a network; see [`GuestEgress`].
-    let mut egress = GuestEgress::new(is_minimal_microvm());
-    let result = runtime.block_on(async_main(&mut egress));
+    let result = runtime.block_on(async_main());
 
     // Drop the tasks still running when `async_main` returns (the connection
     // that sent `Shutdown`, a session reaper) before the final telemetry
@@ -418,8 +415,6 @@ fn main() -> Result<(), MainError> {
             "telemetry forward: records still queued at shutdown; the host spool keeps what arrived"
         );
     }
-    // Only now, with the flush done (or given up on), take the egress down.
-    egress.tear_down();
 
     // As the microVM's daemon we must not return: exiting init panics the
     // guest kernel and wedges the VM (#730), and when the daemon runs as pid
@@ -619,88 +614,7 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-/// The microVM daemon's own egress: the root-netns tap relayed to the host
-/// gvproxy over the vsock shuttle ([`minimald::guest::bring_up_root_egress`]).
-///
-/// `main` owns it, not the server future, and its relay runs on a small
-/// runtime of its own. `main` shuts the server runtime down before the
-/// bounded telemetry flush (so the spans of the tasks it drops end and are
-/// exported), and a relay held by the server future, or running on that
-/// runtime, would be torn down with it: the guest's final flush would then
-/// have no network. [`GuestEgress::tear_down`] runs after the flush.
-struct GuestEgress {
-    /// The relay's runtime: `None` off the microVM, and the build error when
-    /// it could not be built. Either way the relay then runs on the server
-    /// runtime, as it did before it had one of its own.
-    runtime: Option<std::io::Result<tokio::runtime::Runtime>>,
-    /// The relay, once [`GuestEgress::bring_up`] succeeded. Dropping it
-    /// aborts the relay's tasks.
-    relay: Option<minimald::net::switch::SwitchRelay>,
-}
-
-impl GuestEgress {
-    /// Prepares the egress for the microVM's init (`in_microvm`) by building
-    /// the relay's runtime. Brings nothing up yet: `async_main` does, once
-    /// the guest is ready.
-    fn new(in_microvm: bool) -> Self {
-        let runtime = in_microvm.then(|| {
-            Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("minimald-egress")
-                .enable_all()
-                .build()
-        });
-        Self {
-            runtime,
-            relay: None,
-        }
-    }
-
-    /// Brings the egress up and holds it until [`GuestEgress::tear_down`].
-    /// Best effort: if the host gvproxy is absent the daemon serves without
-    /// network, the prior behaviour.
-    async fn bring_up(&mut self) {
-        use minimald::guest::bring_up_root_egress;
-
-        let relay = match &self.runtime {
-            Some(Ok(runtime)) => match runtime
-                .spawn(tracing::Instrument::in_current_span(bring_up_root_egress()))
-                .await
-            {
-                Ok(relay) => relay,
-                Err(join) => Err(std::io::Error::other(join)),
-            },
-            Some(Err(e)) => {
-                tracing::warn!(
-                    error = %e,
-                    "no runtime of its own for the guest root egress; \
-                     the final telemetry flush will go without network"
-                );
-                bring_up_root_egress().await
-            }
-            None => bring_up_root_egress().await,
-        };
-        match relay {
-            Ok(relay) => self.relay = Some(relay),
-            Err(e) => {
-                tracing::warn!(error = %e, "guest root egress unavailable; serving without network");
-            }
-        }
-    }
-
-    /// Takes the egress down: aborts the relay's tasks, then drops its
-    /// runtime without waiting (the relay keeps no state worth draining).
-    /// Call outside any runtime, after the final telemetry flush.
-    fn tear_down(self) {
-        let Self { runtime, relay } = self;
-        drop(relay);
-        if let Some(Ok(runtime)) = runtime {
-            runtime.shutdown_background();
-        }
-    }
-}
-
-async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
+async fn async_main() -> Result<(), MainError> {
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //
@@ -906,7 +820,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // The guest's kernel leaves `lo` down, and the guest's own listeners
     // bind on it.
     if guest::is_microvm_daemon()
-        && let Err(e) = guest::bring_up_loopback()
+        && let Err(e) = minimald::guest_net::loopback_up()
     {
         tracing::error!(error = %e, "bringing up the guest's loopback interface");
     }
@@ -1279,10 +1193,9 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
 
-        // Bring up the daemon's own egress: a primary tap in the root netns
-        // attached to the host gvproxy over the vsock shuttle. Held by `main`
-        // past the server's lifetime, through the final telemetry flush.
-        egress.bring_up().await;
+        // The node's network, before the first request is served: a launch
+        // that needs it finds the result and never the wiring under way.
+        minimald::guest_net::wire_at_boot(minimald::net::DEFAULT_SUBNET);
 
         Server::run(config, listener, log_release)
             .await
@@ -1466,24 +1379,5 @@ mod tests {
             sock.as_str(),
             "/tmp/minimald-test-state/providers/local-minimald3/ssh.sock"
         );
-    }
-
-    /// Off the microVM there is no relay runtime to build, and tearing the
-    /// egress down is a no-op.
-    #[test]
-    fn a_native_daemon_builds_no_egress_runtime() {
-        let egress = GuestEgress::new(false);
-        assert!(egress.runtime.is_none());
-        assert!(egress.relay.is_none());
-        egress.tear_down();
-    }
-
-    /// The microVM's relay runtime is built up front and taken down outside
-    /// any runtime, as `main` does after its final flush, without blocking.
-    #[test]
-    fn the_microvm_egress_runtime_is_built_up_front_and_torn_down_cleanly() {
-        let egress = GuestEgress::new(true);
-        assert!(matches!(egress.runtime, Some(Ok(_))));
-        egress.tear_down();
     }
 }
