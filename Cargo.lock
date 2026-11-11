@@ -685,6 +685,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxbpf"
+version = "0.0.1"
+
+[[package]]
 name = "boxes"
 version = "0.0.1"
 dependencies = [
@@ -4619,6 +4623,16 @@ dependencies = [
  "bytes",
  "libc",
  "log",
+]
+
+[[package]]
+name = "netpol"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

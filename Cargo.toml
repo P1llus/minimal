@@ -26,10 +26,12 @@ members = [
     "crates/minvmd",
     "crates/minzoned",
     "crates/mlog",
+    "crates/netpol",
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox",
     "crates/boxes",
+    "crates/boxbpf",
     "crates/stdlib",
     "crates/switch",
     "crates/version",
@@ -126,6 +128,7 @@ aes-gcm = "0.11"
 anyhow = "1.0"
 arbitrary = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
+aya = "0.16"
 async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
 base64 = "0.23"
 blake3 = { version = "1", features = ["serde"] }
@@ -287,6 +290,8 @@ remote-proto = { path = "crates/remote-proto" }
 remote-client = { path = "crates/remote-client" }
 sandbox = { path = "crates/sandbox" }
 boxes = { path = "crates/boxes" }
+boxbpf = { path = "crates/boxbpf" }
+netpol = { path = "crates/netpol" }
 switch = { path = "crates/switch" }
 version = { path = "crates/version" }
 
