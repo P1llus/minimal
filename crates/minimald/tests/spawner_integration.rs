@@ -101,20 +101,20 @@ impl Fixture {
         extra: &[(&str, &Path)],
         args: &[&str],
     ) -> TestBox {
-        self.launch_weighted(name, cgroup, plan, extra, args, None)
+        self.try_launch(name, cgroup, plan, extra, args)
             .await
+            .expect("starting the box")
     }
 
-    /// [`Self::launch`], with a CPU weight for the box's sandbox.
-    async fn launch_weighted(
+    /// [`Self::launch`], for a start that may be refused.
+    async fn try_launch(
         &self,
         name: &str,
         cgroup: Option<&BoxCgroup>,
         plan: Option<NetPlan>,
         extra: &[(&str, &Path)],
         args: &[&str],
-        cpu_weight: Option<u64>,
-    ) -> TestBox {
+    ) -> std::io::Result<TestBox> {
         let source = self.dir.path().join(format!("{name}-rootfs"));
         let bin = source.join("usr/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -124,13 +124,10 @@ impl Fixture {
         for (program, file) in extra {
             std::fs::copy(file, bin.join(program)).unwrap();
         }
-        let mut config = Config::new(name)
+        let config = Config::new(name)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false)
             .with_box_cgroup(cgroup.cloned());
-        if let Some(weight) = cpu_weight {
-            config = config.with_cpu_weight(weight);
-        }
         let mut sandbox = config
             .build(self.dir.path().join(name), ())
             .await
@@ -141,19 +138,19 @@ impl Fixture {
             .command(&container, "/usr/bin/probe", args, [("", ""); 0])
             .expect("the probe's command");
         command.stdin(Stdio::Null).stdout(Stdio::MakePipe);
-        let mut child = command.spawn().expect("starting the box");
+        let mut child = command.spawn()?;
         let report = Report::read(child.stdout.take().expect("the probe's stdout"));
         let run = sandbox
             .rootfs()
             .parent()
             .expect("a rootfs has a parent")
             .join("run");
-        TestBox {
+        Ok(TestBox {
             child,
             report,
             run,
             _sandbox: sandbox,
-        }
+        })
     }
 }
 
@@ -495,11 +492,10 @@ async fn a_signal_to_a_boxs_own_process_group_stays_in_the_box() {
     for signal in [libc::SIGKILL, libc::SIGSTOP] {
         let kill0 = format!("KILL0:{signal}");
         let cgroup = root.create_box(BOX_ID).expect("the box's cgroup");
-        // A box's first program, and the first program of a container that
-        // belongs to no box. The program is the init of its PID namespace,
+        // A box's first program. It is the init of its PID namespace,
         // which the kernel shields from a signal sent inside the
         // namespace, so it outlives its own signal and ends by itself.
-        for (name, cgroup) in [("first", Some(&cgroup)), ("unboxed", None)] {
+        for (name, cgroup) in [("first", Some(&cgroup))] {
             let name = format!("{name}-{signal}");
             let noisy = fixture
                 .launch(&name, cgroup, None, &[], &[&kill0, "HOLD:/run/release"])
@@ -586,52 +582,39 @@ async fn a_program_gets_no_descriptor_but_its_own() {
     assert_eq!(boxed.report.finish()["fds"], "0 1 2");
 }
 
-/// A daemon with a cgroup root runs no container in its own cgroup: a
-/// container that belongs to no box gets a cgroup of its own, with the CPU
-/// weight its sandbox asked for, and the cgroup goes when the container
-/// ends.
+/// Where the starter has a cgroup root, a container is started only in
+/// a cgroup the starter names. One without would run beside the starter and
+/// its spawner, where nothing of a box belongs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_container_of_no_box_gets_a_cgroup_of_its_own() {
-    let Some(fixture) = Fixture::new("a_container_of_no_box_gets_a_cgroup_of_its_own", true) else {
+async fn a_container_is_not_started_without_a_cgroup_where_there_is_a_root() {
+    let Some(fixture) = Fixture::new(
+        "a_container_is_not_started_without_a_cgroup_where_there_is_a_root",
+        true,
+    ) else {
         return;
     };
     let root = fixture.root();
-    let build = fixture
-        .launch_weighted(
-            "unboxed",
-            None,
-            None,
-            &[],
-            &["HOLD:/run/release"],
-            Some(300),
-        )
-        .await;
-    let supervisor = build.child.id();
-    let program = eventually("the container has its program", || init_of(supervisor).ok());
-    let own = root.dir().join("boxes/build-0");
-    let in_own = format!("0::{}/boxes/build-0", root.name());
-    assert_eq!(cgroup_of(supervisor), in_own);
-    assert_eq!(cgroup_of(program), in_own);
-    if root.controllers().cpu {
-        assert_eq!(
-            std::fs::read_to_string(own.join("cpu.weight"))
-                .unwrap()
-                .trim(),
-            "300"
-        );
-    }
+    let refused = fixture
+        .try_launch("unboxed", None, None, &[], &["HOLD:/run/release"])
+        .await
+        .err()
+        .expect("a container with no cgroup");
+    assert!(
+        refused.to_string().contains("a container needs a cgroup"),
+        "{refused}"
+    );
     assert_eq!(
         procs_in(&root.dir().join("supervisor")).len(),
         2,
         "the daemon's cgroup holds the daemon and the spawner only"
     );
-
-    build.release("release");
-    assert!(build.child.exited().await.success());
-    assert_eq!(build.report.finish()["self_cgroup"], "0::/");
-    eventually("the container's cgroup is removed", || {
-        (!own.exists()).then_some(())
-    });
+    assert!(
+        std::fs::read_dir(root.dir().join("boxes"))
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.path().is_dir()),
+        "no cgroup was made for it"
+    );
 }
 
 /// A program that enters a box is in every namespace of the box's program,
@@ -820,7 +803,13 @@ async fn a_job_dies_with_its_handle_and_a_box_with_its_spawner() {
             .find(|pid| *pid != spawner && comm(*pid) == "minimal-spawner")
     });
 
-    let again = fixture.launch("after", None, None, &[], &["EXIT:7"]).await;
+    let after = fixture
+        .root()
+        .create_box("after")
+        .expect("a cgroup for the next box");
+    let again = fixture
+        .launch("after", Some(&after), None, &[], &["EXIT:7"])
+        .await;
     assert_eq!(parent_of(again.child.id()), renewed);
     let status = again.child.exited().await;
     assert_eq!(status.exit_code, Some(7), "{status:?}");

@@ -68,6 +68,9 @@ struct Server {
     exe: Option<PathBuf>,
     /// Whether this is a spawner process, which names what it forks.
     titled: bool,
+    /// Whether the starter has a cgroup root, and so names a cgroup for
+    /// every container.
+    rooted: bool,
     jobs: HashMap<u64, Job>,
     /// Set once the peer cannot be told anything more.
     peer_gone: bool,
@@ -85,7 +88,8 @@ pub(crate) fn main(mut args: impl Iterator<Item = OsString>) -> ! {
     // Nothing this process execs gets the socket.
     // SAFETY: `fcntl` on the descriptor just adopted.
     unsafe { libc::fcntl(SOCKET_FD, libc::F_SETFD, libc::FD_CLOEXEC) };
-    serve(sock, exe, true);
+    // A starter that names its helpers cgroup has a cgroup root.
+    serve(sock, exe, true, helpers.is_some());
     // The process this spawner worked for is gone, however it went. Its
     // helper programs have nobody to serve and nobody else to end them.
     if let Some(helpers) = helpers {
@@ -95,11 +99,12 @@ pub(crate) fn main(mut args: impl Iterator<Item = OsString>) -> ! {
 }
 
 /// Serves `sock` until its peer closes it, then ends every job.
-pub(crate) fn serve(sock: UnixStream, exe: Option<PathBuf>, titled: bool) {
+pub(crate) fn serve(sock: UnixStream, exe: Option<PathBuf>, titled: bool, rooted: bool) {
     let mut server = Server {
         sock,
         exe,
         titled,
+        rooted,
         jobs: HashMap::new(),
         peer_gone: false,
     };
@@ -207,8 +212,17 @@ impl Server {
         match request {
             Request::Run { id, run, cgroup } => {
                 let foreground = run.session == wire::Session::Foreground;
-                let started = stdio_and_cgroup(fds, cgroup)
-                    .and_then(|(stdio, cgroup)| core::run(&run, stdio, cgroup, self.titled));
+                // With a cgroup root every container has a cgroup. One
+                // without would start here, beside the spawner.
+                let started = if self.rooted && !cgroup {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a container needs a cgroup: the request named none",
+                    ))
+                } else {
+                    stdio_and_cgroup(fds, cgroup)
+                        .and_then(|(stdio, cgroup)| core::run(&run, stdio, cgroup, self.titled))
+                };
                 match started {
                     Ok(mut container) => {
                         let netns = container.netns.take();

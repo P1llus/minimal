@@ -13,7 +13,6 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use super::ExitStatus;
 use super::wire::{self, Event, Request};
-use crate::cgroup::BoxCgroup;
 
 /// Runs a wait that holds the calling thread. A worker of a multi-threaded
 /// tokio runtime tells the runtime first, which moves the worker's other
@@ -96,36 +95,12 @@ struct Job {
     container: bool,
     /// The pid of the job's process, once it has started.
     pid: Option<u32>,
-    /// The cgroup made for this one container, which goes when it does.
-    own_cgroup: Option<BoxCgroup>,
 }
 
 impl Job {
     /// The job is over.
     fn end(self, status: ExitStatus) {
         self.outcome.end(status);
-        if let Some(cgroup) = self.own_cgroup {
-            remove_own_cgroup(cgroup);
-        }
-    }
-}
-
-/// How long the processes of an ended container get to leave its cgroup.
-const OWN_CGROUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Removes the cgroup of a container that has ended, on a thread of its
-/// own: the last processes of the container may still be on their way out,
-/// and the events thread does not wait for them.
-fn remove_own_cgroup(cgroup: BoxCgroup) {
-    let removal = std::thread::Builder::new()
-        .name("spawner-cgroup".into())
-        .spawn(move || {
-            if let Err(error) = cgroup.destroy_blocking(OWN_CGROUP_LIMIT) {
-                tracing::warn!(%error, "removing the cgroup of an ended container");
-            }
-        });
-    if let Err(error) = removal {
-        tracing::warn!(%error, "no thread to remove the cgroup of an ended container");
     }
 }
 
@@ -327,21 +302,18 @@ impl Connection {
     }
 
     /// Starts a job: `make` builds a `Run` or an `Enter` request. A
-    /// container is a `Run`, and `own_cgroup` is the cgroup made for it
-    /// alone, which is removed when it ends.
+    /// container is a `Run`.
     pub(crate) fn start(
         &self,
         make: impl FnOnce(u64) -> Request,
         fds: &[BorrowedFd<'_>],
         container: bool,
-        own_cgroup: Option<BoxCgroup>,
     ) -> io::Result<Started> {
         let outcome = Arc::<Outcome>::default();
         let job = Job {
             outcome: Arc::clone(&outcome),
             container,
             pid: None,
-            own_cgroup,
         };
         match self.ask(make, fds, Some(job))? {
             (id, Answer::Started { pid, netns, tap }) => Ok(Started {

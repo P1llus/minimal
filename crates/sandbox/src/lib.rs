@@ -1092,7 +1092,6 @@ impl<C: Channel> Sandbox<C> {
                 lo_up: isolate && plan.tap().is_none(),
                 ping_gid: isolate.then_some(config::BOX_GID),
                 cgroup: self.config.box_cgroup.clone(),
-                cpu_weight: self.config.cpu_weight,
             },
         })
     }

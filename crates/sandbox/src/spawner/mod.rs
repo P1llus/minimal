@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::cgroup::{BoxCgroup, CpuWeight, LimitError, Root};
+use crate::cgroup::{BoxCgroup, Root};
 use client::Connection;
 pub(crate) use wire::{ContainerSpec, Mount, Session, Tap};
 
@@ -305,7 +305,7 @@ impl Spawner {
             Backend::Thread => {
                 std::thread::Builder::new()
                     .name("spawner".into())
-                    .spawn(move || server::serve(theirs, None, false))?;
+                    .spawn(move || server::serve(theirs, None, false, false))?;
                 Connection::open(ours, None, None)?
             }
         };
@@ -380,35 +380,6 @@ impl Spawner {
             .expect("spawner lock")
             .as_ref()
             .is_some_and(|connection| connection.supervises(pid))
-    }
-
-    /// A cgroup for one container that has no box cgroup, below `root`.
-    fn own_cgroup(root: &Root, cpu_weight: Option<u64>) -> io::Result<BoxCgroup> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let name = format!(
-            "build-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let cgroup = root.create_box(&name).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("creating the cgroup `{name}` for a container: {error}"),
-            )
-        })?;
-        if let Some(weight) = cpu_weight {
-            match cgroup.set_cpu_weight(CpuWeight::clamped(weight)) {
-                Ok(()) => {}
-                // A weight is a share of what is there to share. Without
-                // the controller the container runs unweighted.
-                Err(LimitError::ControllerNotDelegated(_) | LimitError::NoCgroup) => {
-                    tracing::debug!(cgroup = %name, weight, "no cpu controller for a CPU weight");
-                }
-                Err(LimitError::Io(error)) => {
-                    tracing::warn!(cgroup = %name, weight, %error, "setting a CPU weight");
-                }
-            }
-        }
-        Ok(cgroup)
     }
 
     /// A command that runs `program` in a new container.
@@ -491,9 +462,6 @@ pub(crate) struct Launch {
     pub(crate) ping_gid: Option<u32>,
     /// The cgroup of the box the container belongs to.
     pub(crate) cgroup: Option<BoxCgroup>,
-    /// The CPU weight of a container that gets a cgroup of its own. A
-    /// container in a box's cgroup shares the box's CPU time unweighted.
-    pub(crate) cpu_weight: Option<u64>,
 }
 
 enum Target {
@@ -635,23 +603,27 @@ impl Command {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
 
-        let (connection, cgroup, own_cgroup) = match &self.target {
+        let (connection, cgroup) = match &self.target {
             Target::Container { spawner, launch } => {
                 let connection = spawner.connection()?;
                 match (&launch.cgroup, &spawner.inner.root) {
-                    (Some(cgroup), _) => (connection, Some(cgroup.clone()), None),
-                    (None, Some(root)) => {
-                        let own = Spawner::own_cgroup(root, launch.cpu_weight)?;
-                        (connection, Some(own.clone()), Some(own))
+                    (Some(cgroup), _) => (connection, Some(cgroup.clone())),
+                    // The caller has a cgroup root, so every container it
+                    // starts has a cgroup of its own. One without would
+                    // run beside the caller and the spawner.
+                    (None, Some(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "a container needs a cgroup: its starter has a cgroup root and \
+                             named none for it",
+                        ));
                     }
-                    (None, None) => (connection, None, None),
+                    (None, None) => (connection, None),
                 }
             }
-            Target::Running(entrance) => (
-                Arc::clone(&entrance.connection),
-                entrance.cgroup.clone(),
-                None,
-            ),
+            Target::Running(entrance) => {
+                (Arc::clone(&entrance.connection), entrance.cgroup.clone())
+            }
         };
         let mut fds = vec![stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
         fds.extend(cgroup.as_ref().map(BoxCgroup::dir_fd));
@@ -677,7 +649,6 @@ impl Command {
                     },
                     &fds,
                     true,
-                    own_cgroup,
                 )?
             }
             Target::Running(entrance) => {
@@ -697,7 +668,6 @@ impl Command {
                     },
                     &fds,
                     false,
-                    None,
                 )?
             }
         };
