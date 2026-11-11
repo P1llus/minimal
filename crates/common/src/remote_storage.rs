@@ -740,7 +740,7 @@ mod placed {
                     Ok(Ok(stream)) => return Ok(stream),
                     Ok(Err(e)) => {
                         tracing::debug!("could not connect to {addr}: {e}");
-                        last = Some(e);
+                        last = Some(refused_by_policy(&self.placement, e, host, addr));
                         last_unanswered = false;
                     }
                     Err(_) => {
@@ -919,7 +919,10 @@ mod placed {
                     answered = true;
                     no_such_name = Some(io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("could not resolve {host}: {code}"),
+                        format!(
+                            "could not resolve {host}: {code}{}",
+                            unlisted_name_hint(placement)
+                        ),
                     ));
                 }
                 code => {
@@ -1080,6 +1083,46 @@ mod placed {
     }
 
     /// A socket of `placement`.
+    /// `EPERM`, which has this number on every system this builds for.
+    const EPERM: i32 = 1;
+
+    /// A connect that the box's network policy refuses fails at the system
+    /// call with `EPERM`, which reads as "Operation not permitted" and
+    /// names neither the box nor its rules. This says both, for a download
+    /// made with the box's sockets.
+    fn refused_by_policy(
+        placement: &Placement,
+        error: io::Error,
+        host: &str,
+        addr: SocketAddr,
+    ) -> io::Error {
+        let for_a_box = matches!(placement, Placement::Box(_) | Placement::Namespace(_));
+        if !for_a_box || error.raw_os_error() != Some(EPERM) {
+            return error;
+        }
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the box's own network policy refused the connection to {host} at {addr}. \
+                 What is fetched for a box goes out under the box's egress rules: allow the \
+                 name (`allow_dns_hosts`) or the address (`allow_subnets`) to fetch it"
+            ),
+        )
+    }
+
+    /// What to add when a name did not resolve for a download made with a
+    /// box's sockets: the box's resolver answers a name the box's policy
+    /// does not list as not existing.
+    fn unlisted_name_hint(placement: &Placement) -> &'static str {
+        match placement {
+            Placement::Box(_) | Placement::Namespace(_) => {
+                ". What is fetched for a box is resolved under the box's own network policy, \
+                 and a box that lists the names it allows (`allow_dns_hosts`) resolves no other"
+            }
+            Placement::Refused(_) => "",
+        }
+    }
+
     fn placed_socket(
         placement: &Placement,
         v6: bool,
@@ -1581,6 +1624,43 @@ mod placed {
             assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
             assert_eq!(e.to_string(), "no answer after 800ms");
             assert!(took < bound * 2, "it waited {took:?}");
+        }
+
+        #[test]
+        fn a_refusal_by_the_box_s_policy_names_the_policy_and_the_destination() {
+            let addr: SocketAddr = "192.0.2.7:443".parse().unwrap();
+            let boxed = Placement::Box(Sockets::new(|_, _| Err(io::Error::other("unused"))));
+            let refused = refused_by_policy(
+                &boxed,
+                io::Error::from_raw_os_error(EPERM),
+                "pkgs.example",
+                addr,
+            );
+            let text = refused.to_string();
+            assert!(
+                text.contains("the box's own network policy refused"),
+                "{text}"
+            );
+            assert!(text.contains("pkgs.example at 192.0.2.7:443"), "{text}");
+            assert!(text.contains("allow_dns_hosts") && text.contains("allow_subnets"));
+            // Any other failure is reported as it is.
+            let reset = refused_by_policy(
+                &boxed,
+                io::Error::from(io::ErrorKind::ConnectionRefused),
+                "pkgs.example",
+                addr,
+            );
+            assert_eq!(reset.kind(), io::ErrorKind::ConnectionRefused);
+            // And so is a refusal of a download that is not a box's.
+            let own = refused_by_policy(
+                &Placement::Refused("no"),
+                io::Error::from_raw_os_error(EPERM),
+                "pkgs.example",
+                addr,
+            );
+            assert_eq!(own.raw_os_error(), Some(EPERM));
+            assert!(unlisted_name_hint(&boxed).contains("allow_dns_hosts"));
+            assert_eq!(unlisted_name_hint(&Placement::Refused("no")), "");
         }
 
         /// A host whose last address refuses, after earlier ones gave no
