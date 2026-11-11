@@ -184,7 +184,7 @@ impl ExposedMapping {
 pub struct PortForwarder {
     mapping: ExposedMapping,
     internal_port: u16,
-    gate: Option<Arc<super::switch::BoxGate>>,
+    gate: Option<Arc<super::ingress_gate::IngressGate>>,
     /// Whether this forwarder's ingress was revoked already — set by
     /// [`Self::revoke`] once its unbind has *succeeded*, so a revocation that
     /// failed at the switch stays unrevoked and both a retry and the
@@ -207,7 +207,7 @@ impl PortForwarder {
     fn bound(
         mapping: ExposedMapping,
         internal_port: u16,
-        gate: Option<Arc<super::switch::BoxGate>>,
+        gate: Option<Arc<super::ingress_gate::IngressGate>>,
     ) -> Self {
         let listener_hold = loopback_listener_hold(&mapping);
         Self {
@@ -317,12 +317,11 @@ impl PortForwarder {
                     "unbinding ingress forwarder"
                 );
             } else {
-                let terminated = gate.revoke_port(self.internal_port());
+                gate.revoke_port(self.internal_port());
                 tracing::info!(
                     host,
                     port = external_port,
                     internal_port = self.internal_port(),
-                    terminated,
                     reason = "ingress revoked",
                     "unbinding ingress forwarder"
                 );
@@ -447,7 +446,7 @@ pub async fn apply_ingress(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
     yielded: &[super::dns::SharedPortCollision],
 ) -> io::Result<Vec<PortForwarder>> {
     apply_ingress_naming_holders(
@@ -475,7 +474,7 @@ pub async fn apply_ingress_naming_holders(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
@@ -548,7 +547,7 @@ async fn apply_declared(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
@@ -796,7 +795,7 @@ pub async fn bind_handed_port(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     mapping: &PortMapping,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
 ) -> io::Result<HandedBind> {
     let req = expose_request(mapping, published, ptask_ip);
     let answer = post_json(control, "/services/forwarder/expose", &req).await;
@@ -1393,7 +1392,7 @@ pub async fn expose_dynamic(
     ptask_ip: Ipv4Addr,
     port: u16,
     proto: IpProto,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
 ) -> io::Result<PortForwarder> {
     let req = ExposeRequest {
         local: format!("{published}:{port}"),

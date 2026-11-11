@@ -2261,7 +2261,7 @@ impl HostnameRegistry {
         self.by_session
             .get(route.session())
             .and_then(|registration| self.own.get(&registration.id))
-            .and_then(|own| super::switch::live_gate(own.lease))
+            .and_then(|own| super::ingress_gate::live_gate(own.lease))
             .map(|gate| gate.runtime_published_tcp())
             .unwrap_or_default()
     }

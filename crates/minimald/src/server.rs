@@ -547,6 +547,10 @@ impl ServerState {
         );
         #[cfg(not(target_os = "linux"))]
         let (hostname_proxy_port, hostname_proxy_pending) = (None, false);
+        // The engine judges a box with an address of its own by the
+        // network that address is on.
+        #[cfg(target_os = "linux")]
+        crate::net::engine::Engine::current().set_node_switch(switch_subnet);
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
@@ -1738,10 +1742,25 @@ async fn start_policy_engine_tasks(state: &ServerStateHandle, in_microvm: bool) 
     let zone: Arc<dyn crate::net::answerer::Zone> = hostnames.clone();
     let resolver = Resolver::new(engine, Zone::new(zone), upstream);
     let router = Router::new(hostnames, proxied_request_verdict);
+    // A box reaches the host's loopback through the host alias only where
+    // the user's host exposures table opens the port. A native node reads
+    // the table itself. In a VM the VM host does, at its stream door.
+    let host_relay: Arc<dyn crate::net::relay::Dial> = if in_microvm {
+        Arc::new(crate::net::relay::DoorHostPorts::new(Arc::new(
+            crate::net::door::VmHost::of_this_guest(),
+        )))
+    } else {
+        crate::net::relay::NativeHostPorts::new(Arc::new(
+            client_config::host_exposures::HostExposuresFile::new(
+                paths::minimal_config_dir_with_override(None).join("config.toml"),
+            ),
+        ))
+    };
     engine.start_tasks(Serving {
         runtime: tokio::runtime::Handle::current(),
         resolver: Arc::new(resolver),
         hostname_proxy: Arc::new(BoxEndpoints::new(router, engine)),
+        host_relay,
     });
 }
 

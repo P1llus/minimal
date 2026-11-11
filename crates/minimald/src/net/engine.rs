@@ -90,8 +90,7 @@ impl std::fmt::Display for Absent {
 pub(crate) enum Unenforceable {
     /// The node has no network to give the box.
     NoNetwork(&'static str),
-    /// A setting nothing applies yet to a box that shares the node's
-    /// address.
+    /// A setting nothing applies yet.
     Setting(&'static str),
     NoEngine(Absent),
     Spec(SpecError),
@@ -110,8 +109,7 @@ impl std::fmt::Display for Unenforceable {
             Self::Setting(setting) => write!(
                 f,
                 "its network policy sets `{setting}`, which this version of Minimal cannot \
-                 apply to a box that shares the host's address (`host_ip`). Give the box its \
-                 own address (`own_ip`), or remove the setting."
+                 apply. Remove the setting."
             ),
             Self::NoEngine(why) => {
                 write!(
@@ -160,6 +158,9 @@ pub(crate) struct Installed {
     session: SessionId,
     id: BoxId,
     block: Option<Block>,
+    /// Whether the box's processes have a network namespace of their own,
+    /// where its endpoints are bound when it has one.
+    own_namespace: bool,
     wants: Wants,
     /// The box's entry and what it was written for. Every writer takes
     /// this lock first and the engine's handles second.
@@ -255,6 +256,8 @@ pub(crate) struct Serving {
     pub(crate) resolver: Arc<super::resolver::Resolver>,
     /// Serves one hostname proxy listener of one box.
     pub(crate) hostname_proxy: Arc<dyn BoxProxy>,
+    /// Opens the host's end of a connection a box made to the host alias.
+    pub(crate) host_relay: Arc<dyn super::relay::Dial>,
 }
 
 /// The hostname proxy, as the engine starts it for a box.
@@ -271,7 +274,7 @@ pub(crate) trait BoxProxy: Send + Sync {
 /// own.
 pub(crate) struct Peers {
     flows: Flows,
-    /// The network namespace the endpoint is in: the daemon's own.
+    /// The network namespace the endpoint is in.
     netns: u64,
 }
 
@@ -295,6 +298,49 @@ impl Peers {
                 tracing::warn!(%error, %peer, "looking up the peer of a box endpoint");
                 None
             }
+        }
+    }
+}
+
+/// One network namespace of a box's own, with the box's address in it
+/// known to the engine and the daemon's endpoints served inside.
+pub(crate) struct Namespace {
+    engine: &'static Engine,
+    of: Arc<Installed>,
+    address: std::net::Ipv4Addr,
+    /// The namespace's cookie, when endpoints are served in it.
+    netns: Option<u64>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Namespace {
+    /// The cookie the engine keys this namespace's flows and listening
+    /// sockets by.
+    pub(crate) const fn cookie(&self) -> Option<u64> {
+        self.netns
+    }
+}
+
+impl Drop for Namespace {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        let Some(attached) = self.engine.attached_state() else {
+            return;
+        };
+        let removed = attached
+            .handles
+            .lock()
+            .expect("engine lock")
+            .remove_own_address(self.of.id, self.address.into());
+        if let Err(error) = removed {
+            tracing::warn!(
+                box_id = %self.of.session,
+                address = %self.address,
+                %error,
+                "a box's address stays in its policy"
+            );
         }
     }
 }
@@ -652,10 +698,10 @@ impl Engine {
         }
     }
 
-    /// The first setting of `policy` that nothing applies to a box sharing
-    /// the node's address.
+    /// The first setting of `policy` that nothing applies to a box with a
+    /// network.
     fn unapplied_setting(mode: NetworkMode, policy: &BoxPolicy) -> Option<&'static str> {
-        if mode != NetworkMode::HostNet {
+        if mode == NetworkMode::NoNet {
             return None;
         }
         if policy.credentialed_upstream.is_some() {
@@ -698,12 +744,17 @@ impl Engine {
             }
             State::Absent(why) => {
                 // Without the programs a box runs unjudged. That is what a
-                // box with no network or with nothing to enforce asks for,
-                // and a box with its own address is judged by its relay.
+                // box with no network or with nothing to enforce asks for.
+                // A box with its own address is closed unless it says
+                // otherwise, so only one that opens everything runs.
+                let unjudged = match mode {
+                    NetworkMode::OwnIp => Verdict::Deny,
+                    _ => Verdict::Allow,
+                };
                 let nothing_to_enforce =
-                    own.rules().is_empty() && own.egress_default(Verdict::Allow) == Verdict::Allow;
+                    own.rules().is_empty() && own.egress_default(unjudged) == Verdict::Allow;
                 match mode {
-                    NetworkMode::NoNet | NetworkMode::OwnIp => Ok(()),
+                    NetworkMode::NoNet => Ok(()),
                     _ if nothing_to_enforce => Ok(()),
                     _ => Err(Unenforceable::NoEngine(why.clone())),
                 }
@@ -714,7 +765,8 @@ impl Engine {
     fn wants(node: &Node, mode: NetworkMode, own: &netpol::BoxPolicy) -> Wants {
         Wants {
             resolver: spec::needs_resolver(node, mode, own),
-            hostname_proxy: mode == NetworkMode::HostNet,
+            hostname_proxy: mode != NetworkMode::NoNet,
+            host_relay: mode == NetworkMode::OwnIp,
         }
     }
 
@@ -731,9 +783,16 @@ impl Engine {
             hostname_proxy: wants
                 .hostname_proxy
                 .then(|| block.endpoint(Service::HostnameProxy)),
-            host_relay: None,
+            host_relay: wants.host_relay.then(|| block.endpoint(Service::HostRelay)),
         });
-        let ranges = spec::endpoint_ranges(&endpoints::addresses(), endpoints::port_range());
+        // In a namespace of its own a box has one block, and the rest of
+        // the range is its own to bind.
+        let ports = if mode == NetworkMode::OwnIp {
+            endpoints::own_namespace_ports()
+        } else {
+            endpoints::port_range()
+        };
+        let ranges = spec::endpoint_ranges(&endpoints::addresses(), ports);
         Spec {
             deployment: spec::deployment(node, mode, services, ranges),
             policy: own,
@@ -747,7 +806,7 @@ impl Engine {
     /// A daemon without an engine installs nothing, and refuses here the
     /// box it cannot enforce.
     pub(crate) fn install(
-        &self,
+        &'static self,
         cgroup: &BoxCgroup,
         facts: BoxFacts,
         log: Arc<dyn Log>,
@@ -764,7 +823,12 @@ impl Engine {
         .map_err(Unenforceable::Spec)?;
         let node = attached.node.read().expect("engine lock").clone();
         let wants = Self::wants(&node, facts.mode, &own);
-        let (block, sockets) = if wants.any() {
+        let own_namespace = facts.mode == NetworkMode::OwnIp;
+        let (block, sockets) = if own_namespace {
+            // Bound inside the namespace, once it exists.
+            let block = Block::own_namespace(attached.allocator.v6());
+            (Some(block), Sockets::default())
+        } else if wants.any() {
             let (block, sockets) = attached
                 .allocator
                 .take(wants)
@@ -783,7 +847,7 @@ impl Engine {
         let live = match live {
             Ok(live) => live,
             Err(error) => {
-                if let Some(block) = block {
+                if let Some(block) = block.filter(|_| !own_namespace) {
                     drop(sockets);
                     attached.allocator.release(block);
                 }
@@ -797,6 +861,7 @@ impl Engine {
             session: facts.session,
             id,
             block,
+            own_namespace,
             wants,
             compiled: RwLock::new(Arc::clone(live.compiled())),
             entry: Mutex::new(Entry {
@@ -818,7 +883,16 @@ impl Engine {
             .write()
             .expect("engine lock")
             .insert(installed.session, id);
-        self.serve(attached, &installed, sockets);
+        if !own_namespace {
+            let tasks = match boxbpf::current_netns_cookie() {
+                Ok(netns) => self.serve(attached, &installed, sockets, netns),
+                Err(error) => {
+                    tracing::error!(%error, "the daemon's network namespace cannot be named");
+                    Vec::new()
+                }
+            };
+            *installed.serving.lock().expect("endpoint task lock") = tasks;
+        }
         tracing::debug!(
             box_id = %installed.session,
             cgroup_id = id.0,
@@ -828,7 +902,15 @@ impl Engine {
         Ok(Some(installed))
     }
 
-    fn serve(&self, attached: &Attached, of: &Arc<Installed>, sockets: Sockets) {
+    /// Serves `sockets`, the endpoints of `of` in the network namespace
+    /// `netns`, and returns the tasks that do.
+    fn serve(
+        &'static self,
+        attached: &Attached,
+        of: &Arc<Installed>,
+        sockets: Sockets,
+        netns: u64,
+    ) -> Vec<tokio::task::AbortHandle> {
         let Some(serving) = attached.serving.get() else {
             if of.wants.any() {
                 tracing::error!(
@@ -836,20 +918,16 @@ impl Engine {
                     "the box's endpoints have nothing to serve them; its DNS will not answer"
                 );
             }
-            return;
+            return Vec::new();
         };
         let _in_runtime = serving.runtime.enter();
         let mut tasks = Vec::new();
         let peers = || -> Option<Peers> {
-            let made = attached.flows.try_clone().and_then(|flows| {
-                let netns =
-                    boxbpf::current_netns_cookie().map_err(|source| boxbpf::Error::Sys {
-                        what: "read the network namespace cookie",
-                        source,
-                    })?;
-                Ok(Peers { flows, netns })
-            });
-            match made {
+            match attached
+                .flows
+                .try_clone()
+                .map(|flows| Peers { flows, netns })
+            {
                 Ok(peers) => Some(peers),
                 Err(error) => {
                     tracing::error!(%error, "an endpoint cannot ask the engine for its peers");
@@ -915,7 +993,26 @@ impl Engine {
                 Err(error) => tracing::error!(%error, "a proxy endpoint cannot be served"),
             }
         }
-        *of.serving.lock().expect("endpoint task lock") = tasks;
+        for listener in sockets.host_relay {
+            let Some(peers) = peers() else { continue };
+            match listen(listener) {
+                Ok(listener) => tasks.push(
+                    serving
+                        .runtime
+                        .spawn(super::relay::serve(
+                            listener,
+                            self,
+                            Arc::clone(of),
+                            peers,
+                            Service::HostRelay,
+                            Arc::clone(&serving.host_relay),
+                        ))
+                        .abort_handle(),
+                ),
+                Err(error) => tracing::error!(%error, "a host relay endpoint cannot be served"),
+            }
+        }
+        tasks
     }
 
     /// Compiles the box's policy again and writes what changed: after its
@@ -991,6 +1088,76 @@ impl Engine {
         Ok(())
     }
 
+    /// Makes a network namespace of the box's own usable: `address` becomes
+    /// an address the box may send from, and the daemon's endpoints for the
+    /// box are bound and served inside, on sockets `spawned` makes there.
+    /// Dropping the result takes both back.
+    ///
+    /// A box has one such namespace for its session and one for each task
+    /// that runs beside it.
+    pub(crate) fn serve_namespace(
+        &'static self,
+        of: &Arc<Installed>,
+        spawned: &sandbox::Spawned,
+        address: std::net::Ipv4Addr,
+    ) -> Result<Namespace, InstallError> {
+        let Some(attached) = self.attached_state() else {
+            return Ok(Namespace {
+                engine: self,
+                of: Arc::clone(of),
+                address,
+                netns: None,
+                tasks: Vec::new(),
+            });
+        };
+        attached
+            .handles
+            .lock()
+            .expect("engine lock")
+            .add_own_address(of.id, address.into())?;
+        // From here the address is taken back when this returns early.
+        let mut namespace = Namespace {
+            engine: self,
+            of: Arc::clone(of),
+            address,
+            netns: None,
+            tasks: Vec::new(),
+        };
+        let Some(block) = of.block.filter(|_| of.own_namespace) else {
+            return Ok(namespace);
+        };
+        let sockets = endpoints::bind_with(block, of.wants, &|v6, datagram| {
+            spawned.socket_for_daemon(v6, datagram)
+        })
+        .map_err(InstallError::Endpoints)?;
+        let netns = sockets
+            .resolver_udp
+            .first()
+            .map(|socket| std::os::fd::AsFd::as_fd(socket))
+            .or_else(|| {
+                sockets
+                    .hostname_proxy
+                    .first()
+                    .map(|socket| std::os::fd::AsFd::as_fd(socket))
+            })
+            .map(boxbpf::netns_cookie)
+            .transpose()
+            .map_err(InstallError::Endpoints)?;
+        if let Some(netns) = netns {
+            namespace.netns = Some(netns);
+            namespace.tasks = self.serve(attached, of, sockets, netns);
+        }
+        Ok(namespace)
+    }
+
+    /// Tells the engine which virtual network boxes with an address of
+    /// their own sit on, once the node's switch is made.
+    pub(crate) fn set_node_switch(&self, subnet: switch::SwitchSubnet) {
+        if let Some(attached) = self.attached_state() {
+            attached.node.write().expect("engine lock").switch = Some(subnet);
+        }
+    }
+
     /// Whether the box's entry was written for these facts.
     pub(crate) fn matches(of: &Installed, facts: &BoxFacts) -> bool {
         let entry = of.entry.lock().expect("box entry lock");
@@ -1063,7 +1230,7 @@ impl Engine {
         if let Err(error) = removed {
             tracing::warn!(box_id = %session, %error, "removing the box's network policy");
         }
-        if let Some(block) = of.block {
+        if let Some(block) = of.block.filter(|_| !of.own_namespace) {
             attached.allocator.release(block);
         }
         if let Some(c) = counters {
@@ -1091,6 +1258,13 @@ impl Engine {
         self.by_cgroup(BoxId(cgroup.id()))
             .filter(|of| of.wants.resolver)
             .map(|_| endpoints::V4)
+    }
+
+    /// The box whose cgroup is `cgroup`, when the engine judges it.
+    // Only the real launches ask, which the unit tests replace.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn of_cgroup(&self, cgroup: &BoxCgroup) -> Option<Arc<Installed>> {
+        self.by_cgroup(BoxId(cgroup.id()))
     }
 
     pub(crate) fn installed(&self, session: SessionId) -> Option<Arc<Installed>> {
@@ -1218,15 +1392,17 @@ mod tests {
             );
             let text = refusal.to_string();
             assert!(text.contains("min finalize-install"), "{text}");
-            // A box with no network has nothing to enforce, and one with
-            // its own address is judged by its relay.
+            // A box with no network has nothing to enforce. One with its
+            // own address has, as much as one that shares the node's.
             assert_eq!(
                 engine.can_enforce(NetworkMode::NoNet, policy, false),
                 Ok(())
             );
             assert_eq!(
                 engine.can_enforce(NetworkMode::OwnIp, policy, false),
-                Ok(())
+                Err(Unenforceable::NoEngine(Absent::NoLoader {
+                    socket: socket.clone()
+                }))
             );
         }
     }
@@ -1369,6 +1545,32 @@ mod tests {
         );
         assert_eq!(
             engine.can_enforce(NetworkMode::OwnIp, &blocked, false),
+            Err(Unenforceable::Setting("quic443"))
+        );
+        assert_eq!(
+            engine.can_enforce(NetworkMode::NoNet, &blocked, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_box_with_its_own_address_is_closed_unless_it_says_otherwise() {
+        let engine = Engine::absent(Absent::NoCgroupRoot);
+        let silent = BoxPolicy::new(None, None);
+        // No egress section means nothing leaves, which only an engine
+        // can hold the box to.
+        assert!(
+            engine
+                .can_enforce(NetworkMode::OwnIp, &silent, false)
+                .is_err()
+        );
+        // Under the daemon's opt-out the same box allows everything.
+        assert_eq!(
+            engine.can_enforce(NetworkMode::OwnIp, &silent, true),
+            Ok(())
+        );
+        assert_eq!(
+            engine.can_enforce(NetworkMode::HostNet, &silent, false),
             Ok(())
         );
     }

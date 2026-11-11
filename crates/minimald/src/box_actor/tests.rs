@@ -7657,13 +7657,7 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
         .await
         .control_socket();
     let (forwarder, served) = fake_forwarder(sock.clone(), 200).await;
-    let gate = Arc::new(crate::net::switch::BoxGate::for_session(
-        "web".to_string(),
-        lease,
-        &listen_policy_over(range),
-        crate::net::SwitchSubnet::default(),
-        None,
-    ));
+    let gate = crate::net::ingress_gate::IngressGate::detached(&listen_policy_over(range));
     crate::box_actor::listen_plan_seam::seed(
         web,
         crate::box_actor::listen_plan_seam::Seeded {
@@ -7840,13 +7834,9 @@ async fn a_listen_port_whose_move_failed_releases_its_hold_where_it_was_bound() 
             lease,
             published: interim,
             control: crate::net::policy::ControlChannel::Unix(sock),
-            gate: Arc::new(crate::net::switch::BoxGate::for_session(
-                "web".to_string(),
-                lease,
-                &listen_policy_over((listened, listened)),
-                crate::net::SwitchSubnet::default(),
-                None,
-            )),
+            gate: crate::net::ingress_gate::IngressGate::detached(&listen_policy_over((
+                listened, listened,
+            ))),
         },
     );
     handle
@@ -9883,14 +9873,8 @@ async fn expose_allow_publishes_and_lists() {
     // The box's relay gate, registered under its switch address as the
     // relay's spawn registers it, and the lease its attach reports to the
     // hostname registry: what a direct connection and the proxy both meet.
-    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
-        "listweb".to_string(),
-        switch,
-        &boxes::BoxPolicy::default(),
-        crate::net::SwitchSubnet::default(),
-        None,
-    ));
-    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let gate = crate::net::ingress_gate::IngressGate::detached(&boxes::BoxPolicy::default());
+    crate::net::ingress_gate::register(switch, &gate);
     let hostnames = manager.hostnames();
     hostnames
         .write()
@@ -10086,14 +10070,8 @@ async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
         .ensure_host("tester".to_string())
         .await
         .expect("the allowing box launches its host");
-    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
-        "gateweb".to_string(),
-        switch,
-        &boxes::BoxPolicy::default(),
-        crate::net::SwitchSubnet::default(),
-        None,
-    ));
-    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let gate = crate::net::ingress_gate::IngressGate::detached(&boxes::BoxPolicy::default());
+    crate::net::ingress_gate::register(switch, &gate);
     let sock = handle
         .net_switch()
         .await
@@ -11864,7 +11842,7 @@ pub(crate) async fn box_with_listen_plan(
     range: (u16, u16),
 ) -> (
     crate::box_actor::BoxHandle,
-    std::sync::Arc<crate::net::switch::BoxGate>,
+    std::sync::Arc<crate::net::ingress_gate::IngressGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     let (handle, gate, served, _gate, _id) = box_with_scripted_plan(
@@ -11908,7 +11886,7 @@ async fn box_with_scripted_plan(
     script: Vec<(u16, GateAnswer)>,
 ) -> (
     crate::box_actor::BoxHandle,
-    std::sync::Arc<crate::net::switch::BoxGate>,
+    std::sync::Arc<crate::net::ingress_gate::IngressGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     tokio::sync::watch::Sender<u64>,
     boxes::SessionId,
@@ -11962,13 +11940,7 @@ async fn box_with_scripted_plan(
     // The plan a real launch gathers itself, seeded into this one: the facts
     // a box's host builds its watcher from, riding the mock's `Launched` the
     // way a real launch's plan rides its own.
-    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
-        name.to_string(),
-        switch,
-        &listen_policy_over(range),
-        crate::net::SwitchSubnet::default(),
-        None,
-    ));
+    let gate = crate::net::ingress_gate::IngressGate::detached(&listen_policy_over(range));
     crate::box_actor::listen_plan_seam::seed(
         id,
         crate::box_actor::listen_plan_seam::Seeded {
@@ -12459,7 +12431,7 @@ async fn expose_on_listen_published_port_answers_published_already() {
     // published: the port is not reachable, so it is the refusal. The
     // relay publishes its gate under the box's switch address at spawn;
     // this harness has no relay, so the test publishes the plan's gate.
-    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    crate::net::ingress_gate::register(switch, &gate);
     gate.withdraw_published(port);
     match handle.expose_dynamic(port).await {
         Err(crate::net::policy::ExposeFailure::Refused(

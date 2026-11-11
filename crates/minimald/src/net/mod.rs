@@ -52,6 +52,7 @@ pub(crate) mod door;
 // Whether a box's network policy can be enforced on this host.
 pub(crate) mod endpoints;
 pub(crate) mod engine;
+pub mod ingress_gate;
 #[allow(
     dead_code,
     reason = "no caller until the engine reports listening sockets"

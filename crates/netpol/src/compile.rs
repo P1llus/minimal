@@ -157,15 +157,6 @@ pub struct Spec {
 
 impl Spec {
     pub fn compile(&self) -> Result<Compiled, CompileError> {
-        if self.deployment.transport_enforces {
-            // The transport judges this box's traffic. The engine lets
-            // everything through, so the box's rules are not compiled.
-            return compile(
-                &BasePolicy::pass_through(),
-                &BoxPolicy::default(),
-                self.options,
-            );
-        }
         compile(&base_policy(&self.deployment), &self.policy, self.options)
     }
 }
@@ -1014,25 +1005,5 @@ mod tests {
         assert_eq!(c.config.defaults.egress, Verdict::Deny);
         assert!(c.config.source_check && c.config.log_flows);
         assert!(c.to_string().contains("(the box itself)"));
-    }
-
-    #[test]
-    fn a_box_whose_transport_enforces_gets_an_entry_that_refuses_nothing() {
-        let mut deployment = Deployment::new(NodeKind::Native, Mode::OwnIp);
-        deployment.transport_enforces = true;
-        let spec = Spec {
-            deployment,
-            policy: BoxPolicy {
-                deny: vec!["10.0.0.0/8".parse().unwrap()],
-                ..BoxPolicy::default()
-            },
-            options: Options::default(),
-        };
-        let compiled = spec.compile().unwrap();
-        assert!(compiled.rules.is_empty());
-        assert!(!compiled.config.source_check);
-        for direction in Direction::ALL {
-            assert_eq!(compiled.config.defaults.of(direction), Verdict::Allow);
-        }
     }
 }

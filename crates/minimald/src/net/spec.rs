@@ -28,12 +28,25 @@ pub(crate) enum SpecError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Node {
     pub(crate) kind: NodeKind,
-    /// The virtual network the node itself sits on: a VM guest's.
+    /// The virtual network the node itself sits on, which a box that
+    /// shares the node's address sits on with it: a VM guest's.
     pub(crate) network: Option<VirtualNetwork>,
     /// The address that stands for the host's loopback there.
     pub(crate) host_alias: Option<IpAddr>,
+    /// The virtual network of boxes with an address of their own. A native
+    /// node learns it when its switch is made.
+    pub(crate) switch: Option<switch::SwitchSubnet>,
     /// Where the node's hostname proxy listens for programs outside boxes.
     pub(crate) hostname_proxy: Vec<SocketAddr>,
+}
+
+fn virtual_network(subnet: switch::SwitchSubnet) -> Option<VirtualNetwork> {
+    Prefix::new(IpAddr::V4(subnet.network()), subnet.prefix())
+        .ok()
+        .map(|prefix| VirtualNetwork {
+            subnet: prefix,
+            gateway: IpAddr::V4(subnet.gateway()),
+        })
 }
 
 impl Node {
@@ -42,22 +55,18 @@ impl Node {
             kind: NodeKind::Native,
             network: None,
             host_alias: None,
+            switch: None,
             hostname_proxy: Vec::new(),
         }
     }
 
     /// A VM guest on `subnet`.
     pub(crate) fn guest(subnet: switch::SwitchSubnet) -> Self {
-        let network = Prefix::new(IpAddr::V4(subnet.network()), subnet.prefix())
-            .ok()
-            .map(|prefix| VirtualNetwork {
-                subnet: prefix,
-                gateway: IpAddr::V4(subnet.gateway()),
-            });
         Self {
             kind: NodeKind::Guest,
-            network,
+            network: virtual_network(subnet),
             host_alias: Some(IpAddr::V4(subnet.host_alias())),
+            switch: Some(subnet),
             hostname_proxy: Vec::new(),
         }
     }
@@ -134,10 +143,16 @@ pub(crate) fn box_policy(
 /// box may reach. A native box that allows everything asks the node's
 /// resolver itself.
 pub(crate) fn needs_resolver(node: &Node, mode: NetworkMode, policy: &netpol::BoxPolicy) -> bool {
-    mode == NetworkMode::HostNet
-        && (node.kind == NodeKind::Guest
-            || !policy.names.is_empty()
-            || policy.egress_default(Verdict::Allow) == Verdict::Deny)
+    match mode {
+        NetworkMode::NoNet => false,
+        // Its namespace has no other resolver the box may reach.
+        NetworkMode::OwnIp => true,
+        _ => {
+            node.kind == NodeKind::Guest
+                || !policy.names.is_empty()
+                || policy.egress_default(Verdict::Allow) == Verdict::Deny
+        }
+    }
 }
 
 /// The deployment of one box. `services` are the box's endpoints and
@@ -160,7 +175,17 @@ pub(crate) fn deployment(
     );
     match mode {
         NetworkMode::NoNet => {}
-        NetworkMode::OwnIp => d.transport_enforces = true,
+        NetworkMode::OwnIp => {
+            // The box sits on the virtual network alone, in a namespace of
+            // its own, and the daemon's endpoints for it are in there too.
+            if let Some(subnet) = node.switch {
+                d.network = virtual_network(subnet);
+                d.host_alias = Some(IpAddr::V4(subnet.host_alias()));
+            }
+            d.services = services;
+            d.endpoint_ranges = ranges;
+            d.node_hostname_proxy.clone_from(&node.hostname_proxy);
+        }
         _ => {
             d.network = node.network;
             d.host_alias = node.host_alias;
@@ -331,7 +356,8 @@ mod tests {
         // The guest's resolver is the gateway, which no box may reach.
         assert!(needs_resolver(&guest, host, &allow_all));
         assert!(!needs_resolver(&guest, NetworkMode::NoNet, &allow_all));
-        assert!(!needs_resolver(&native, NetworkMode::OwnIp, &by_name));
+        // In a namespace of its own a box has no other resolver.
+        assert!(needs_resolver(&native, NetworkMode::OwnIp, &allow_all));
     }
 
     #[test]
@@ -355,10 +381,17 @@ mod tests {
         let none = d(&guest, NetworkMode::NoNet);
         assert_eq!((none.mode, none.network), (Mode::None, None));
 
-        // A box with its own address is judged by the relay it sends
-        // through, so its entry refuses nothing.
-        let own = d(&native, NetworkMode::OwnIp);
-        assert!(own.transport_enforces);
+        // A box with its own address sits on the node's switch, behind the
+        // rules of its own entry.
+        let mut switched = native.clone();
+        switched.switch = Some(switch::DEFAULT_SUBNET);
+        let own = d(&switched, NetworkMode::OwnIp);
+        assert_eq!(own.mode, Mode::OwnIp);
+        assert!(own.network.is_some() && !own.transport_ipv6);
+        assert_eq!(
+            own.host_alias,
+            Some(IpAddr::V4(switch::DEFAULT_SUBNET.host_alias()))
+        );
         let compiled = Spec {
             deployment: own,
             policy: box_policy(Some(&EgressPolicy::deny_all()), NetworkMode::OwnIp, false)
@@ -376,7 +409,7 @@ mod tests {
         };
         assert_eq!(
             compiled.evaluate(&flow, |_| None).verdict,
-            FlowVerdict::Allow
+            FlowVerdict::Deny
         );
     }
 

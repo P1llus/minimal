@@ -234,6 +234,8 @@ smallvec = {version = "1.15", features = ["serde"]}
 # adapters — the frames arrive over the shuttle's channels, not a host
 # interface.
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "iface-max-addr-count-4"] }
+# Binding a socket that was made in a box's network namespace.
+socket2 = "0.6"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.27"

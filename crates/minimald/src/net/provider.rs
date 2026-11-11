@@ -457,6 +457,7 @@ pub(crate) fn network_for(
     policy: Option<boxes::BoxPolicy>,
     own_address: Option<OwnAddressReporter>,
     box_addresses: Option<boxes::BoxAddresses>,
+    engine_box: Option<crate::net::gvproxy_network::EngineBox>,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
@@ -469,6 +470,7 @@ pub(crate) fn network_for(
             own_address,
             box_addresses,
             task_slots: None,
+            engine_box,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox::NoNet),
@@ -527,6 +529,7 @@ pub(crate) fn task_network_for(
     identity: &str,
     policy: Option<boxes::BoxPolicy>,
     task_addresses: Vec<std::net::Ipv4Addr>,
+    engine_box: Option<crate::net::gvproxy_network::EngineBox>,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
@@ -536,9 +539,10 @@ pub(crate) fn task_network_for(
             own_address: None,
             box_addresses: None,
             task_slots: Some(task_addresses),
+            engine_box,
             reserved: std::sync::Mutex::new(None),
         }),
-        _ => network_for(mode, switch, identity, policy, None, None),
+        _ => network_for(mode, switch, identity, policy, None, None, None),
     }
 }
 
@@ -623,6 +627,9 @@ struct OwnIpNetwork {
     /// host registered with the session's box (NET-138): the PTask attaches
     /// at the first one no task run holds. `None` for a box's own launch.
     task_slots: Option<Vec<std::net::Ipv4Addr>>,
+    /// The box's entry in the engine, which judges what the box sends and
+    /// takes. `None` for a box that runs unjudged.
+    engine_box: Option<crate::net::gvproxy_network::EngineBox>,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -748,14 +755,13 @@ impl OwnIpNetwork {
             tap_fd,
             reserved.control,
             reserved.lease,
-            &self.identity,
-            self.policy.as_ref(),
-            self.own_address.as_ref(),
-            self.box_addresses.is_some()
-                || self
-                    .task_slots
-                    .as_ref()
-                    .is_some_and(|slots| !slots.is_empty()),
+            crate::net::gvproxy_network::AttachInputs {
+                session_name: &self.identity,
+                policy: self.policy.as_ref(),
+                own_address: self.own_address.as_ref(),
+                engine_box: self.engine_box.as_ref(),
+                spawned: &spawned,
+            },
         )
         .await
         .map_err(NetworkError::new)?;
@@ -791,7 +797,7 @@ mod tests {
         let switch = counting_switch();
         let endpoint = crate::net::endpoints::V4;
         let plan = with_box_resolver(
-            network_for(NetworkMode::HostNet, &switch, "s", None, None, None),
+            network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None),
             endpoint,
         )
         .plan()
@@ -808,7 +814,7 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
@@ -822,14 +828,14 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && !no_net.wired());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -856,7 +862,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -893,6 +899,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
             })
             .collect();
@@ -924,7 +931,7 @@ mod tests {
             "/usr/bin/gvproxy",
             "/run/minimal/gvproxy",
         )));
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
@@ -940,7 +947,7 @@ mod tests {
 
         // VM-host host-address: the node's DNS layer answers the same name.
         let vm = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();

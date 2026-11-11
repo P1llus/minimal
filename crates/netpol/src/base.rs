@@ -107,10 +107,6 @@ pub struct Deployment {
     /// Where the node's hostname proxy listens for programs outside boxes.
     /// A box that dials one of these gets its own proxy endpoint instead.
     pub node_hostname_proxy: Vec<SocketAddr>,
-    /// The transport under the box enforces its policy, not the engine:
-    /// the box's entry lets everything through. True for `own_ip` while its
-    /// frames still pass the daemon's relay.
-    pub transport_enforces: bool,
 }
 
 impl Deployment {
@@ -133,7 +129,6 @@ impl Deployment {
             endpoint_ranges: Vec::new(),
             steered: Vec::new(),
             node_hostname_proxy: Vec::new(),
-            transport_enforces: false,
         }
     }
 }
@@ -151,26 +146,6 @@ pub struct BasePolicy {
     /// Packets must leave from the box's own addresses: the set the daemon
     /// keeps for the box.
     pub source_check: bool,
-}
-
-impl BasePolicy {
-    /// The base policy of a box whose transport enforces its policy:
-    /// nothing is refused here.
-    #[must_use]
-    pub const fn pass_through() -> Self {
-        let allow = Verdict::Allow;
-        Self {
-            before: Vec::new(),
-            protected: Vec::new(),
-            defaults: Defaults {
-                egress: allow,
-                ingress: allow,
-                bind: allow,
-            },
-            endpoints: Vec::new(),
-            source_check: false,
-        }
-    }
 }
 
 const LOOPBACK4: Prefix = prefix4(Ipv4Addr::new(127, 0, 0, 0), 8);

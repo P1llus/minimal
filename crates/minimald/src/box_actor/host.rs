@@ -529,7 +529,7 @@ impl BoxActor {
             // coming down. A relay already gone took its gate with it.
             if let Some(gate) = self
                 .reported_switch_address
-                .and_then(crate::net::switch::live_gate)
+                .and_then(crate::net::ingress_gate::live_gate)
             {
                 for forwarder in &forwarders {
                     gate.withdraw_exposed(forwarder.internal_port());

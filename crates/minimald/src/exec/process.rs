@@ -130,6 +130,17 @@ impl TaskExec {
     }
 }
 
+/// The entry of box `session` in the daemon's policy engine, when the
+/// engine judges the box.
+pub(crate) fn engine_box(
+    session: boxes::SessionId,
+) -> Option<crate::net::gvproxy_network::EngineBox> {
+    let engine = crate::net::engine::Engine::current();
+    engine
+        .installed(session)
+        .map(|of| crate::net::gvproxy_network::EngineBox { engine, of })
+}
+
 /// The network a task gets: the provider for its session's mode (017-005),
 /// carrying the session's *effective* egress (NET-074) — a task in an
 /// own-address session runs under whatever the session's own gate enforces:
@@ -163,6 +174,7 @@ pub(crate) fn task_network(
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     phase: boxes::EgressDefaultPhase,
     deny_all_opt_out: bool,
+    engine_box: Option<crate::net::gvproxy_network::EngineBox>,
 ) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
@@ -187,6 +199,7 @@ pub(crate) fn task_network(
         // none, draws from its reserve (`crate::net::self_allocation_run`);
         // an in-VM one refuses the draw (`SwitchClient::attach`).
         record.task_addresses.clone(),
+        engine_box,
     )
 }
 
@@ -455,6 +468,7 @@ pub(super) async fn task_producer(
             &switch,
             boxes::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
+            engine_box(record.id),
         );
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own

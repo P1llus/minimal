@@ -96,6 +96,7 @@ pub(crate) fn own_address_build_network(
                     &switch,
                     boxes::EGRESS_DEFAULT_PHASE,
                     deny_all_opt_out,
+                    crate::exec::engine_box(record.id),
                 ),
                 record: record.clone(),
                 switch: Arc::clone(&switch),

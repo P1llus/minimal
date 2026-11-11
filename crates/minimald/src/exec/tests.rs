@@ -341,6 +341,7 @@ async fn a_task_takes_the_network_of_its_session() {
         &switch,
         boxes::EGRESS_DEFAULT_PHASE,
         false,
+        None,
     );
     assert!(!host.plan().await.unwrap().isolates_netns());
 
@@ -349,6 +350,7 @@ async fn a_task_takes_the_network_of_its_session() {
         &switch,
         boxes::EGRESS_DEFAULT_PHASE,
         false,
+        None,
     );
     let plan = no_net.plan().await.unwrap();
     assert!(plan.isolates_netns() && !plan.wired());
@@ -359,7 +361,7 @@ async fn a_task_takes_the_network_of_its_session() {
     // A VM host's switch draws nothing (NET-138): the task attaches at a
     // task address its box's registration filed.
     record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
-    let own_ip = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
+    let own_ip = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
     let plan = own_ip.plan().await.unwrap();
     assert!(
         plan.isolates_netns(),
@@ -393,6 +395,7 @@ async fn a_task_takes_the_network_of_its_session() {
         &switch,
         boxes::EGRESS_DEFAULT_PHASE,
         false,
+        None,
     );
     assert!(format!("{unnamed:?}").contains(&boxes::SessionId::nil().to_string()));
 }
@@ -425,9 +428,9 @@ async fn in_box_run_task_draws_a_task_slot() {
         std::net::Ipv4Addr::new(100, 64, 128, 2),
         std::net::Ipv4Addr::new(100, 64, 128, 3),
     ];
-    let first = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
+    let first = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
     first.plan().await.expect("a free task address");
-    let second = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
+    let second = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
     second.plan().await.expect("a second free task address");
     let held: Vec<_> = switch
         .lock()
@@ -441,7 +444,7 @@ async fn in_box_run_task_draws_a_task_slot() {
         "each run holds one task address"
     );
 
-    let third = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
+    let third = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
     let err = third.plan().await.expect_err("every task address is held");
     assert!(
         err.to_string()
@@ -463,7 +466,7 @@ async fn in_box_run_task_draws_a_task_slot() {
 async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
     let switch = vm_host_switch();
     let record = record_with(boxes::NetworkMode::OwnIp);
-    let task = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
+    let task = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
     let err = task.plan().await.expect_err("nothing is drawn");
     assert!(
         err.to_string()
@@ -527,6 +530,7 @@ async fn a_task_gate_follows_the_egress_default() {
         &switch,
         boxes::EgressDefaultPhase::Announced,
         false,
+        None,
     );
     assert!(
         format!("{announced:?}").contains("has_policy: false"),
@@ -545,7 +549,13 @@ async fn a_task_gate_follows_the_egress_default() {
         Some(boxes::EgressPolicy::deny_all()),
         "the in-force default resolves an absent section to deny-all"
     );
-    let in_force = super::task_network(&record, &switch, boxes::EgressDefaultPhase::InForce, false);
+    let in_force = super::task_network(
+        &record,
+        &switch,
+        boxes::EgressDefaultPhase::InForce,
+        false,
+        None,
+    );
     assert!(
         format!("{in_force:?}").contains("has_policy: true"),
         "the in-force default gates a bare box's task: {in_force:?}"
@@ -593,6 +603,7 @@ async fn a_task_gate_follows_the_egress_default() {
         &switch,
         boxes::EGRESS_DEFAULT_PHASE,
         false,
+        None,
     );
     assert!(
         format!("{declared:?}").contains("has_policy: true"),

@@ -36,6 +36,7 @@ const BLOCKS: u16 = (LAST_PORT - FIRST_PORT + 1) / BLOCK;
 pub(crate) enum Service {
     Resolver,
     HostnameProxy,
+    HostRelay,
 }
 
 impl Service {
@@ -43,6 +44,7 @@ impl Service {
         match self {
             Self::Resolver => 0,
             Self::HostnameProxy => 1,
+            Self::HostRelay => 3,
         }
     }
 
@@ -51,6 +53,7 @@ impl Service {
         match self {
             Self::Resolver => netpol::base::RESOLVER,
             Self::HostnameProxy => netpol::base::HOSTNAME_PROXY,
+            Self::HostRelay => netpol::base::HOST_RELAY,
         }
     }
 }
@@ -58,6 +61,12 @@ impl Service {
 /// The ports of every block, for the base policy.
 pub(crate) fn port_range() -> PortRange {
     PortRange::new(FIRST_PORT, LAST_PORT).unwrap_or(PortRange::ALL)
+}
+
+/// The ports of the one block a box has in a network namespace of its
+/// own, where no other box's endpoints are.
+pub(crate) fn own_namespace_ports() -> PortRange {
+    PortRange::new(FIRST_PORT, FIRST_PORT + BLOCK - 1).unwrap_or(PortRange::ALL)
 }
 
 /// The addresses endpoints sit on.
@@ -83,6 +92,11 @@ impl Block {
         }
     }
 
+    /// The block of a box in a network namespace of its own.
+    pub(crate) const fn own_namespace(v6: bool) -> Self {
+        Self { number: 0, v6 }
+    }
+
     const fn port(self, service: Service) -> u16 {
         FIRST_PORT + self.number * BLOCK + service.offset()
     }
@@ -102,11 +116,12 @@ impl Block {
 pub(crate) struct Wants {
     pub(crate) resolver: bool,
     pub(crate) hostname_proxy: bool,
+    pub(crate) host_relay: bool,
 }
 
 impl Wants {
     pub(crate) const fn any(self) -> bool {
-        self.resolver || self.hostname_proxy
+        self.resolver || self.hostname_proxy || self.host_relay
     }
 }
 
@@ -116,6 +131,57 @@ pub(crate) struct Sockets {
     pub(crate) resolver_udp: Vec<UdpSocket>,
     pub(crate) resolver_tcp: Vec<TcpListener>,
     pub(crate) hostname_proxy: Vec<TcpListener>,
+    pub(crate) host_relay: Vec<TcpListener>,
+}
+
+/// Makes one unbound socket of a block: of the family asked for (`true`
+/// for IPv6), for datagrams (`true`) or streams.
+type Unbound<'a> = &'a dyn Fn(bool, bool) -> io::Result<std::os::fd::OwnedFd>;
+
+fn bound(
+    socket: std::os::fd::OwnedFd,
+    at: SocketAddr,
+    listen: bool,
+) -> io::Result<std::os::fd::OwnedFd> {
+    let socket = socket2::Socket::from(socket);
+    socket.set_reuse_address(true)?;
+    socket.bind(&at.into())?;
+    if listen {
+        socket.listen(1024)?;
+    }
+    Ok(socket.into())
+}
+
+/// Binds the endpoints of `block` on sockets `unbound` makes: those of a
+/// box in a network namespace of its own, where the daemon cannot bind
+/// with sockets of its own.
+pub(crate) fn bind_with(block: Block, wants: Wants, unbound: Unbound<'_>) -> io::Result<Sockets> {
+    let mut sockets = Sockets::default();
+    let mut addrs = vec![IpAddr::V4(V4)];
+    if block.v6 {
+        addrs.push(IpAddr::V6(V6));
+    }
+    for addr in addrs {
+        let v6 = addr.is_ipv6();
+        let stream = |service: Service| -> io::Result<TcpListener> {
+            let at = SocketAddr::new(addr, block.port(service));
+            Ok(TcpListener::from(bound(unbound(v6, false)?, at, true)?))
+        };
+        if wants.resolver {
+            let at = SocketAddr::new(addr, block.port(Service::Resolver));
+            sockets
+                .resolver_udp
+                .push(UdpSocket::from(bound(unbound(v6, true)?, at, false)?));
+            sockets.resolver_tcp.push(stream(Service::Resolver)?);
+        }
+        if wants.hostname_proxy {
+            sockets.hostname_proxy.push(stream(Service::HostnameProxy)?);
+        }
+        if wants.host_relay {
+            sockets.host_relay.push(stream(Service::HostRelay)?);
+        }
+    }
+    Ok(sockets)
 }
 
 /// Hands out blocks and binds their sockets.
@@ -158,6 +224,10 @@ impl Allocator {
                 let at = SocketAddr::new(addr, block.port(Service::HostnameProxy));
                 sockets.hostname_proxy.push(TcpListener::bind(at)?);
             }
+            if wants.host_relay {
+                let at = SocketAddr::new(addr, block.port(Service::HostRelay));
+                sockets.host_relay.push(TcpListener::bind(at)?);
+            }
         }
         Ok(sockets)
     }
@@ -191,6 +261,12 @@ impl Allocator {
         ))
     }
 
+    /// Whether the node has an IPv6 loopback, and with it every network
+    /// namespace made on it.
+    pub(crate) const fn v6(&self) -> bool {
+        self.v6
+    }
+
     pub(crate) fn release(&self, block: Block) {
         self.taken
             .lock()
@@ -210,7 +286,11 @@ mod tests {
         let mut seen = BTreeSet::new();
         for number in [0, 1, BLOCKS - 1] {
             let block = Block { number, v6: true };
-            for service in [Service::Resolver, Service::HostnameProxy] {
+            for service in [
+                Service::Resolver,
+                Service::HostnameProxy,
+                Service::HostRelay,
+            ] {
                 let endpoint = block.endpoint(service);
                 let port = endpoint.v4.expect("v4").port();
                 assert_eq!(endpoint.v6.expect("v6").port(), port);
@@ -235,6 +315,7 @@ mod tests {
         let wants = Wants {
             resolver: true,
             hostname_proxy: true,
+            host_relay: true,
         };
         let (first, sockets) = allocator.take(wants).expect("a block");
         let (second, _other) = allocator.take(wants).expect("another block");

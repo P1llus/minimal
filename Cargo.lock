@@ -4251,6 +4251,7 @@ dependencies = [
  "serde_json_lenient",
  "sha2 0.11.1",
  "size",
+ "socket2",
  "stdlib",
  "switch",
  "sysinfo",

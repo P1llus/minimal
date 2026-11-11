@@ -3279,9 +3279,9 @@ pub(crate) mod listen_plan_seam {
 
     use boxes::SessionId;
 
+    use crate::net::ingress_gate::IngressGate;
     use crate::net::listeners::BoxPublications;
     use crate::net::policy::ControlChannel;
-    use crate::net::switch::BoxGate;
 
     /// The facts a test hands the mock launch it seeds.
     pub(crate) struct Seeded {
@@ -3294,7 +3294,7 @@ pub(crate) mod listen_plan_seam {
         /// The gvproxy control channel the watcher's forwarder verbs ride.
         pub(crate) control: ControlChannel,
         /// The box's session gate: the permit decision and the admission.
-        pub(crate) gate: Arc<BoxGate>,
+        pub(crate) gate: Arc<IngressGate>,
     }
 
     static SEEDED: Mutex<Option<HashMap<SessionId, Seeded>>> = Mutex::new(None);

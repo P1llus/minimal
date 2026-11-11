@@ -1775,7 +1775,7 @@ mod tests {
     use crate::net::dns::DEFAULT_HOST_ID;
     use crate::net::policy::Direction;
     use crate::net::switch::{
-        BoxGate, NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, declared_request_ports,
+        NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, declared_request_ports,
         proxied_request_verdict,
     };
     use crate::test_harness::CaptureWriter;
@@ -3878,19 +3878,13 @@ mod tests {
         // The direct half: the relay's own gate for the same declaration —
         // the shared `declared_ingress_ports` derivation — admits the port
         // the declaration's connections terminate on, and refuses any other.
-        let gate = BoxGate::for_session(
-            "web".to_string(),
-            Ipv4Addr::LOCALHOST,
-            &policy,
-            SwitchSubnet::default(),
-            None,
-        );
+        let gate = crate::net::ingress_gate::IngressGate::detached(&policy);
         assert!(
-            gate.admits_direct_tcp(backend_port),
+            gate.admits_tcp(backend_port),
             "the declaration's own port is the one a direct connection terminates on"
         );
         assert!(
-            !gate.admits_direct_tcp(9000),
+            !gate.admits_tcp(9000),
             "the target's gate refuses a direct connection to an undeclared port"
         );
 
@@ -3974,14 +3968,8 @@ mod tests {
 
         // The box's relay gate, registered under its lease as the relay's
         // spawn registers it: the gate a direct connection meets.
-        let gate = Arc::new(BoxGate::for_session(
-            "rtweb".to_string(),
-            RUNTIME_LEASE,
-            &BoxPolicy::default(),
-            subnet,
-            None,
-        ));
-        crate::net::switch::register_live_gate_for_test(RUNTIME_LEASE, &gate);
+        let gate = crate::net::ingress_gate::IngressGate::detached(&BoxPolicy::default());
+        crate::net::ingress_gate::register(RUNTIME_LEASE, &gate);
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -4340,20 +4328,14 @@ mod tests {
             // The target's relay gate, registered under its lease as the
             // relay's spawn registers it, with the runtime publishes made:
             // the gate a direct connection to the target meets.
-            let gate = Arc::new(BoxGate::for_session(
-                "web".to_string(),
-                target_lease,
-                &target_policy,
-                subnet,
-                None,
-            ));
+            let gate = crate::net::ingress_gate::IngressGate::detached(&target_policy);
             if runtime & 1 != 0 {
                 gate.admit_exposed(3000);
             }
             if runtime & 2 != 0 {
                 gate.admit_published(3001);
             }
-            crate::net::switch::register_live_gate_for_test(target_lease, &gate);
+            crate::net::ingress_gate::register(target_lease, &gate);
             let runtime_ports: BTreeSet<u16> = [(1u8, 3000u16), (2, 3001)]
                 .into_iter()
                 .filter(|(bit, _)| runtime & bit != 0)
@@ -4546,15 +4528,9 @@ mod tests {
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
-        let gate = BoxGate::for_session(
-            "web".to_string(),
-            Ipv4Addr::LOCALHOST,
-            &policy,
-            SwitchSubnet::default(),
-            None,
-        );
+        let gate = crate::net::ingress_gate::IngressGate::detached(&policy);
         assert!(
-            !gate.admits_direct_tcp(18080),
+            !gate.admits_tcp(18080),
             "a box that declares no ingress admits no direct connection"
         );
 

@@ -936,6 +936,12 @@ impl BoxLauncher for SandboxLauncher {
             Some(policy),
             own_address.clone(),
             box_addresses,
+            ctx.box_cgroup().and_then(|cgroup| {
+                let engine = crate::net::engine::Engine::current();
+                engine
+                    .of_cgroup(cgroup)
+                    .map(|of| crate::net::gvproxy_network::EngineBox { engine, of })
+            }),
         );
         let network = match ctx
             .box_cgroup()
@@ -1312,7 +1318,7 @@ impl BoxLauncher for SandboxLauncher {
         let published = own_address
             .as_ref()
             .and_then(|reporter| reporter.published_address());
-        let gate = lease.and_then(crate::net::switch::live_gate);
+        let gate = lease.and_then(crate::net::ingress_gate::live_gate);
         // Design §7.1: a box that attached while the hostname proxy was not
         // serving past the settle was compiled with no node-address opening
         // (fail closed rather than at a port the proxy may not hold), so it

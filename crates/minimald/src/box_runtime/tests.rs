@@ -3328,14 +3328,8 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
         .await
         .unwrap()
         .expect("the asking box resolves");
-    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
-        "askgate".to_string(),
-        switch,
-        &boxes::BoxPolicy::default(),
-        crate::net::SwitchSubnet::default(),
-        None,
-    ));
-    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let gate = crate::net::ingress_gate::IngressGate::detached(&boxes::BoxPolicy::default());
+    crate::net::ingress_gate::register(switch, &gate);
     let sock = handle
         .net_switch()
         .await
@@ -3638,14 +3632,8 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         .unwrap()
         .expect("the allowing box resolves");
     let (_db, db_handle) = dynamic_ingress_box(&server, &mut client, "db", None, None).await;
-    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
-        "web".to_string(),
-        switch,
-        &boxes::BoxPolicy::default(),
-        crate::net::SwitchSubnet::default(),
-        None,
-    ));
-    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let gate = crate::net::ingress_gate::IngressGate::detached(&boxes::BoxPolicy::default());
+    crate::net::ingress_gate::register(switch, &gate);
     web_handle
         .ensure_host("tester".to_string())
         .await

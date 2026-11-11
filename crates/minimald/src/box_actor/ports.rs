@@ -675,7 +675,7 @@ impl BoxActor {
                         // through.
                         if let Some(gate) = self
                             .reported_switch_address
-                            .and_then(crate::net::switch::live_gate)
+                            .and_then(crate::net::ingress_gate::live_gate)
                         {
                             gate.admit_exposed(port);
                         }
@@ -909,7 +909,7 @@ impl BoxActor {
         // its forward unbinds. A relay already gone took its gate with it.
         if let Some(gate) = self
             .reported_switch_address
-            .and_then(crate::net::switch::live_gate)
+            .and_then(crate::net::ingress_gate::live_gate)
         {
             gate.withdraw_exposed(port);
         }
@@ -1099,7 +1099,7 @@ impl BoxActor {
                 // whose listener is closing: its withdrawal refuses the port
                 // at the gate before its row leaves the set, and keeps the
                 // row across a failed unexpose's retries.
-                let admitted = crate::net::switch::live_gate(switch_address)
+                let admitted = crate::net::ingress_gate::live_gate(switch_address)
                     .is_none_or(|gate| gate.admits_tcp(port));
                 if let Some(local) = self
                     .publications
@@ -1337,7 +1337,7 @@ impl BoxActor {
             return;
         };
         let control = self.switch_control().await;
-        let gate = crate::net::switch::live_gate(switch_address);
+        let gate = crate::net::ingress_gate::live_gate(switch_address);
         let mut bound_any = false;
         let mut refused_any = false;
         for mapping in &mappings {
