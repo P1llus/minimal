@@ -754,7 +754,10 @@ fn a_box_with_its_own_address_is_judged_published_and_named() {
     let loader = Loader::start(dir.path());
     let upstream = Upstream::start();
     // The virtual network dials these from the host, where they are local.
-    let port = targets(&[v4(OWN_OPEN4), v4(OWN_NAMED4)], v4(OWN_OPEN4));
+    let port = targets(
+        &[v4(OWN_OPEN4), v4(OWN_NAMED4), v4(Ipv4Addr::LOCALHOST)],
+        v4(OWN_OPEN4),
+    );
     let daemon = Daemon::start(dir.path(), &loader.socket, Some(upstream.at));
 
     // Fills the package cache, which a restricted box cannot.
@@ -791,6 +794,19 @@ fn a_box_with_its_own_address_is_judged_published_and_named() {
     let events = daemon.min(&["box", "events", "web"]);
     assert!(events.contains("net_refused"), "{events}");
     assert!(events.contains("name_not_allowed"), "{events}");
+
+    // The host's name is the alias, listed or not, and leads to a port of
+    // the host's loopback once the user has exposed it.
+    let host = daemon.exec("web", "getent hosts host.min.internal");
+    assert!(
+        host.starts_with("100.64.") && host.contains(".254 "),
+        "{host}"
+    );
+    let closed = daemon.greeting("web", "host.min.internal", port);
+    assert!(!closed.contains("hello"), "{closed}");
+    daemon.expose_host_port(port);
+    let exposed = daemon.greeting("web", "host.min.internal", port);
+    assert_eq!(exposed.trim(), "hello");
 
     // Ingress: the declared port, a port the box listens on inside the
     // range, and not a loopback listener or a port nobody published.

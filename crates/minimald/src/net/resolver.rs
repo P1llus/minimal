@@ -149,7 +149,10 @@ pub(crate) fn decide(query: &[u8], view: &View<'_>) -> Decided {
     let name = normalized(question.name());
     let qtype = question.query_type();
 
-    if !view.compiled.resolvable(&name) {
+    // The host's name is the daemon's own constant, which a box may also
+    // read from its hosts file. What the box reaches there is not decided
+    // by a name list.
+    if name != zone_answer::HOST_ROW_NAME && !view.compiled.resolvable(&name) {
         return match encoded(&empty(&message, ResponseCode::NXDomain)) {
             Some(reply) => Decided::Refused { reply, name },
             None => Decided::Drop,
@@ -993,6 +996,22 @@ mod tests {
                 ZoneAnswer::NoSuchName
             );
         }
+        // A box that lists other names still gets the host's name answered.
+        let others = by_name(&["example.com"]);
+        assert!(matches!(
+            decide(
+                &super::tests::query("host.min.internal", RecordType::A),
+                &view(&others)
+            ),
+            Decided::Zone { .. }
+        ));
+        assert!(matches!(
+            decide(
+                &super::tests::query("peer.min.internal", RecordType::A),
+                &view(&others)
+            ),
+            Decided::Refused { .. }
+        ));
         // A box that lists the host's name gets no pin for the alias.
         let listed = by_name(&["host.min.internal"]);
         let admitted = admit_zone(
