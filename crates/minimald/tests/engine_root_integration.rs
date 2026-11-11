@@ -453,13 +453,14 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
             "--allow-dns-hosts",
             "allowed.test",
             "--allow-dns-hosts",
-            "*.wild.test",
+            "a.wild.test",
             "--allow-dns-hosts",
             "rebind.test",
         ],
     );
     let (public4, public6) = (PUBLIC4.to_string(), PUBLIC6.to_string());
-    assert!(daemon.connect("names", &public4, port).contains(REFUSED));
+    let before = daemon.connect("names", &public4, port);
+    assert!(before.contains(REFUSED), "{before}");
     assert!(daemon.connect("names", &public6, port).contains(REFUSED));
     assert_eq!(daemon.connect("names", "allowed.test", port).trim(), "ok");
     assert_eq!(daemon.connect("names", &public4, port).trim(), "ok");
@@ -473,7 +474,7 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     let other = daemon.exec("names", "getent hosts other.test; echo rc=$?");
     assert!(other.contains("rc=2"), "{other}");
     assert!(!upstream.asked("other.test"));
-    // A pattern admits what is below it and not the domain itself.
+    // A second listed name has its own addresses admitted.
     assert_eq!(daemon.connect("names", "a.wild.test", port).trim(), "ok");
     let apex = daemon.exec("names", "getent hosts wild.test; echo rc=$?");
     assert!(apex.contains("rc=2"), "{apex}");

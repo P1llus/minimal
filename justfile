@@ -726,11 +726,16 @@ test-vm: _nextest _kvm artifacts initramfs minvmd-build gvproxy
 # can't unlock this surface — its namespaces come from hashed-path test
 # binaries and /usr/bin/unshare, which a per-binary profile can't cover.
 #
-# minimald's netns/tap proofs (the tests sudo their own netns commands).
+# minimald's netns/tap proofs (the tests sudo their own netns commands), the
+# policy engine's tests against the running kernel, and the engine under the
+# real daemon. The last drive boxes through `min`, which cargo builds beside
+# the daemon, and take their packages from the native cache when it exists.
 [linux]
-test-root-integration: _nextest gvproxy
+test-root-integration: _nextest gvproxy minimal-cli
     @[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ] || { echo "this host restricts unprivileged user namespaces, which this surface needs from hashed-path test binaries (the AppArmor policy can't cover those); leave this lane to CI, or see docs/reference/linux-host-setup.md before relaxing the restriction host-wide" >&2; exit 1; }
-    MINIMALD_NETNS_TEST=1 GVPROXY_BIN="{{gvproxy}}" cargo nextest run -p minimald --profile ci --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
+    MINIMALD_NETNS_TEST=1 BOXBPF_ROOT_TEST=1 GVPROXY_BIN="{{gvproxy}}" \
+      MINIMALD_TEST_CACHE_DIR="${MINIMALD_TEST_CACHE_DIR:-{{native-dir}}/cache}" \
+      cargo nextest run -p minimald -p boxbpf --profile ci --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
 
 # minvmd-build is LAST so its macOS codesign is the final touch on the binary.
 #
