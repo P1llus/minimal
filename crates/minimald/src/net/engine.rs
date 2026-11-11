@@ -307,7 +307,7 @@ const PIN_SWEEP: Duration = Duration::from_secs(30);
 /// and counted: a box cannot make the daemon hold its refusals in memory.
 const OBSERVATION_QUEUE: usize = 4096;
 
-fn loader_socket() -> PathBuf {
+pub(crate) fn loader_socket() -> PathBuf {
     std::env::var_os(LOADER_SOCKET_ENV)
         .map_or_else(|| PathBuf::from(paths::POLICY_LOADER_SOCKET), PathBuf::from)
 }

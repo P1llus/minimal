@@ -17,6 +17,50 @@ pub fn set_root(root: Option<Root>) {
     let _ = ROOT.set(root);
 }
 
+/// The root the policy loader handed this process, if it asked for one.
+static HANDED: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Asks the policy loader for a cgroup root, for a daemon nobody delegates
+/// one to: a host without a systemd user manager. The loader makes the
+/// root and moves this process into it, so call this before any thread
+/// starts. Says on standard error why there is none.
+pub fn take_root_from_loader() {
+    use std::os::fd::AsRawFd as _;
+
+    let socket = crate::net::engine::loader_socket();
+    if !socket.exists() {
+        eprintln!(
+            "minimald: no systemd user manager and no policy loader at {}; boxes get no cgroup",
+            socket.display()
+        );
+        return;
+    }
+    let root = boxbpf::loader::request_root(&socket)
+        .map_err(|error| error.to_string())
+        .and_then(|root| {
+            std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))
+                .map_err(|error| error.to_string())
+        });
+    match root {
+        Ok(path) => {
+            let _ = HANDED.set(path);
+        }
+        Err(error) => eprintln!(
+            "minimald: the policy loader gave no cgroup root ({error}); boxes get no cgroup"
+        ),
+    }
+}
+
+/// Where this daemon's cgroup root is: the one the loader handed it, or
+/// the delegated unit it runs in.
+#[must_use]
+pub fn located() -> sandbox::cgroup::Located {
+    match HANDED.get() {
+        Some(path) => sandbox::cgroup::Located::Handed(path.clone()),
+        None => sandbox::cgroup::locate(),
+    }
+}
+
 /// How long a box left by an earlier daemon gets to die at start.
 const SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -31,35 +75,37 @@ pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf, guest: b
     use sandbox::cgroup::Located;
 
     let root = match located {
-        Located::Guest(dir) | Located::DelegatedUnit(dir) => match Root::open(&dir) {
-            Ok(root) => {
-                // Boxes of a daemon that ran in this cgroup before and did
-                // not stop them. Their records are stopped at start too.
-                match root.sweep(SWEEP_LIMIT) {
-                    Ok(swept) if swept.is_empty() => {}
-                    Ok(swept) => tracing::warn!(
-                        boxes = ?swept,
-                        "removed box cgroups an earlier daemon left behind"
-                    ),
-                    Err(error) => tracing::warn!(%error, "sweeping leftover box cgroups"),
+        Located::Guest(dir) | Located::DelegatedUnit(dir) | Located::Handed(dir) => {
+            match Root::open(&dir) {
+                Ok(root) => {
+                    // Boxes of a daemon that ran in this cgroup before and did
+                    // not stop them. Their records are stopped at start too.
+                    match root.sweep(SWEEP_LIMIT) {
+                        Ok(swept) if swept.is_empty() => {}
+                        Ok(swept) => tracing::warn!(
+                            boxes = ?swept,
+                            "removed box cgroups an earlier daemon left behind"
+                        ),
+                        Err(error) => tracing::warn!(%error, "sweeping leftover box cgroups"),
+                    }
+                    tracing::info!(
+                        root = %root.dir().display(),
+                        controllers = ?root.controllers(),
+                        "box cgroups are below the daemon's cgroup root"
+                    );
+                    Some(root)
                 }
-                tracing::info!(
-                    root = %root.dir().display(),
-                    controllers = ?root.controllers(),
-                    "box cgroups are below the daemon's cgroup root"
-                );
-                Some(root)
+                Err(error) => {
+                    tracing::warn!(
+                        root = %dir.display(),
+                        %error,
+                        "the daemon's cgroup root cannot be used; boxes run without a cgroup, \
+                         and a box that needs one is refused"
+                    );
+                    None
+                }
             }
-            Err(error) => {
-                tracing::warn!(
-                    root = %dir.display(),
-                    %error,
-                    "the daemon's cgroup root cannot be used; boxes run without a cgroup, \
-                     and a box that needs one is refused"
-                );
-                None
-            }
-        },
+        }
         Located::None { why } => {
             tracing::warn!(
                 %why,

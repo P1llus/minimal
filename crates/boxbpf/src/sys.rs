@@ -237,11 +237,19 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<u64> {
 }
 
 /// True while the process behind the pidfd exists.
+///
+/// A pidfd becomes readable when its process exits. Asking that needs no
+/// capability, where sending signal 0 to another user's process does.
 pub(crate) fn pidfd_alive(pidfd: BorrowedFd<'_>) -> bool {
-    // SAFETY: a plain system call with a valid descriptor and signal 0.
-    let ret =
-        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), 0, 0usize, 0) };
-    ret == 0
+    let mut poll = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, and a zero timeout so the call returns at
+    // once.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    ready == 0
 }
 
 /// The boot-time clock in nanoseconds: what the programs stamp events with

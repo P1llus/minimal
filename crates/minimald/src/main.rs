@@ -495,8 +495,13 @@ fn enter_delegated_scope() {
     if args.detach
         || std::env::var_os(IN_SCOPE_ENV).is_some()
         || !matches!(locate(), Located::None { .. })
-        || !delegated_scope_available()
     {
+        return;
+    }
+    if !delegated_scope_available() {
+        // No systemd manager to delegate a cgroup: the policy loader makes
+        // a root, where one is installed.
+        minimald::box_cgroups::take_root_from_loader();
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -890,7 +895,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             )
         } else {
             (
-                sandbox::cgroup::locate(),
+                minimald::box_cgroups::located(),
                 std::env::current_exe()
                     .map_err(|e| MainError::IO(e, "resolving this daemon's executable"))?,
             )

@@ -108,6 +108,9 @@ pub enum Located {
     /// The cgroup of the systemd unit this process runs in, which the unit
     /// delegates to it.
     DelegatedUnit(PathBuf),
+    /// A root the policy loader made for this process and moved it into,
+    /// on a host where no systemd manager delegates one.
+    Handed(PathBuf),
     /// No cgroup this process may manage.
     None {
         /// What was found instead.
@@ -1106,7 +1109,7 @@ pub mod testing {
     pub fn delegated_root(test: &str) -> Option<Root> {
         if std::env::var_os(IN_SCOPE).is_some() {
             return match locate() {
-                Located::DelegatedUnit(dir) | Located::Guest(dir) => {
+                Located::DelegatedUnit(dir) | Located::Guest(dir) | Located::Handed(dir) => {
                     Some(Root::open(&dir).expect("taking the scope's cgroup as the root"))
                 }
                 Located::None { why } => panic!("the test's scope is not delegated: {why}"),
