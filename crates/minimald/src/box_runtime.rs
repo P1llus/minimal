@@ -796,13 +796,11 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // PID it holds and the watcher asks on every poll until the box's
         // program is there to be found (the module's nothing-is-one-shot
         // contract, held of its start).
-        let listen_watcher = listen_plan.map(|plan| {
-            crate::net::listeners::ListenWatcher::start(
-                plan,
-                crate::net::listeners::Leader::Pending {
-                    container_pid: process.container_pid(),
-                },
-            )
+        // The engine records the box's listening sockets. A box nothing
+        // judges has no such record, and publishes none by listening.
+        let listen_watcher = listen_plan.and_then(|plan| {
+            let source = plan.listeners()?;
+            Some(crate::net::listeners::ListenWatcher::start(plan, source))
         });
 
         // Read before the process moves into the host: a stop signals the

@@ -172,6 +172,8 @@ pub(crate) struct Installed {
     log: Arc<dyn Log>,
     /// The tasks serving the box's endpoints. Aborting one closes its socket.
     serving: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Notified when a socket of the box starts or stops listening.
+    listen_wake: Arc<tokio::sync::Notify>,
 }
 
 struct Entry {
@@ -314,10 +316,24 @@ pub(crate) struct Namespace {
 }
 
 impl Namespace {
-    /// The cookie the engine keys this namespace's flows and listening
-    /// sockets by.
-    pub(crate) const fn cookie(&self) -> Option<u64> {
-        self.netns
+    /// The listening sockets of the box in this namespace, as the engine
+    /// records them. `None` without an engine.
+    pub(crate) fn listeners(&self) -> Option<Arc<dyn super::listens::Listeners>> {
+        let attached = self.engine.attached_state()?;
+        let netns = self.netns?;
+        let table = match attached.handles.lock().expect("engine lock").listens() {
+            Ok(table) => table,
+            Err(error) => {
+                tracing::warn!(%error, "the engine's table of listening sockets cannot be read");
+                return None;
+            }
+        };
+        Some(Arc::new(super::listens::EngineListeners {
+            table,
+            of: self.of.id,
+            netns,
+            wake: Arc::clone(&self.of.listen_wake),
+        }))
     }
 }
 
@@ -648,6 +664,13 @@ impl Engine {
         loop {
             let event = match reader.next().await {
                 Ok(netpol::event::Event::Net(event)) => event,
+                Ok(netpol::event::Event::Listen(event)) => {
+                    // The table is what counts. This only says to read it.
+                    if let Some(of) = self.by_cgroup(BoxId(event.box_id)) {
+                        of.listen_wake.notify_one();
+                    }
+                    continue;
+                }
                 Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(%error, "reading the policy engine's events stopped");
@@ -872,6 +895,7 @@ impl Engine {
             limiter: Mutex::new(Limiter::new(Instant::now())),
             log,
             serving: Mutex::default(),
+            listen_wake: Arc::default(),
         });
         attached
             .boxes

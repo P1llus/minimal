@@ -14,6 +14,7 @@ use boxes::core::ingress::{DynamicPortVerdict, IngressRules, ListenVerdict};
 use boxes::{IngressPolicy, IpProto};
 use netpol::{Protocols, base::PortOf};
 
+use super::listens::Listeners;
 use super::publish::Admission;
 
 #[derive(Default)]
@@ -34,6 +35,9 @@ pub struct IngressGate {
     declared: BTreeSet<u16>,
     open: Mutex<Open>,
     admission: Arc<dyn Admission>,
+    /// The listening sockets of the box's namespace, where the engine
+    /// records them.
+    listeners: Option<Arc<dyn Listeners>>,
 }
 
 impl std::fmt::Debug for IngressGate {
@@ -61,6 +65,7 @@ impl IngressGate {
     pub(crate) fn new(
         ingress: Option<&IngressPolicy>,
         admission: Arc<dyn Admission>,
+        listeners: Option<Arc<dyn Listeners>>,
     ) -> Result<Arc<Self>, String> {
         let rules = IngressRules::from_policy(ingress);
         for proto in [IpProto::Tcp, IpProto::Udp] {
@@ -78,6 +83,7 @@ impl IngressGate {
             rules,
             open: Mutex::default(),
             admission,
+            listeners,
         }))
     }
 
@@ -158,6 +164,12 @@ impl IngressGate {
         open.listening.union(&open.exposed).copied().collect()
     }
 
+    /// The box's listening sockets, for the watcher that publishes them.
+    /// `None` for a box no engine judges: nothing records its sockets.
+    pub(crate) fn listeners(&self) -> Option<Arc<dyn Listeners>> {
+        self.listeners.clone()
+    }
+
     pub(crate) fn listen_verdict(&self, proto: IpProto, port: u16) -> ListenVerdict {
         self.rules.listen_verdict(proto, port)
     }
@@ -179,7 +191,7 @@ impl IngressGate {
                 Ok(())
             }
         }
-        Self::new(policy.ingress.as_ref(), Arc::new(Nowhere)).expect("nothing to fail")
+        Self::new(policy.ingress.as_ref(), Arc::new(Nowhere), None).expect("nothing to fail")
     }
 }
 
@@ -287,8 +299,12 @@ mod tests {
             dynamic_allowed_range: Some((3000, 3010)),
             dynamic_ingress: Some(DynamicIngress::Allow),
         };
-        let gate =
-            IngressGate::new(Some(&ingress), Arc::clone(&journal) as Arc<dyn Admission>).unwrap();
+        let gate = IngressGate::new(
+            Some(&ingress),
+            Arc::clone(&journal) as Arc<dyn Admission>,
+            None,
+        )
+        .unwrap();
         (gate, journal)
     }
 

@@ -47,6 +47,54 @@ pub(crate) trait Listeners: Send + Sync {
     fn changed(&self) -> BoxFuture<'_, ()>;
 }
 
+/// The ports among `listening` that a connection from outside the
+/// namespace can reach: those of sockets bound to every address or to
+/// `address`, the namespace's own. A socket bound to the loopback takes
+/// nothing from outside.
+pub(crate) fn reachable_ports(
+    listening: &[Listener],
+    address: std::net::Ipv4Addr,
+) -> std::collections::HashSet<u16> {
+    listening
+        .iter()
+        .filter(|listener| {
+            listener.address.is_unspecified() || listener.address == IpAddr::V4(address)
+        })
+        .map(|listener| listener.port)
+        .collect()
+}
+
+/// The listening sockets of one namespace of a box, read from the
+/// engine's table.
+pub(crate) struct EngineListeners {
+    pub(crate) table: boxbpf::Listens,
+    pub(crate) of: boxbpf::BoxId,
+    pub(crate) netns: u64,
+    /// Notified when the engine reports that a socket of the box started
+    /// or stopped listening.
+    pub(crate) wake: Arc<tokio::sync::Notify>,
+}
+
+impl Listeners for EngineListeners {
+    fn listening(&self) -> io::Result<Vec<Listener>> {
+        let listening = self
+            .table
+            .listening(self.of, self.netns)
+            .map_err(io::Error::other)?;
+        Ok(listening
+            .into_iter()
+            .map(|socket| Listener {
+                address: socket.address,
+                port: socket.port,
+            })
+            .collect())
+    }
+
+    fn changed(&self) -> BoxFuture<'_, ()> {
+        Box::pin(self.wake.notified())
+    }
+}
+
 /// What became of the try to open a port.
 pub(crate) enum Opened<T> {
     Open(T),

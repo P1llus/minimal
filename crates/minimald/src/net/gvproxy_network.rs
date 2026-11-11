@@ -238,7 +238,9 @@ pub(crate) async fn complete_own_ip_attach(
                 }),
                 None => Arc::new(Unjudged),
             };
-            IngressGate::new(policy.ingress.as_ref(), admission).map_err(io::Error::other)
+            let listeners = namespace.as_ref().and_then(Namespace::listeners);
+            IngressGate::new(policy.ingress.as_ref(), admission, listeners)
+                .map_err(io::Error::other)
         })
         .transpose()?;
     if let Some(gate) = &gate {
