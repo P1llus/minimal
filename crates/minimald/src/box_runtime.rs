@@ -204,15 +204,6 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     // the baseline snapshot could not be armed.
     workspace_root: std::path::PathBuf,
 
-    // Whether processes injected into this session are entering a none box.
-    // Set at launch from the plan's seal — the none plan's full seal is the
-    // one an injected process must be told about explicitly, every other
-    // box's confined-families seal is the shim's default — since the filter
-    // installed at launch is inherited by children of the first process, not
-    // by later processes that join its namespaces via `nsenter`.
-    #[cfg_attr(test, allow(dead_code))]
-    seal_injection: bool,
-
     /// The box's classifier leaf (NET-079): handed to every process injected
     /// into this session so it joins the leaf — in the shim, before it joins
     /// the box's namespaces, from the daemon's own cgroup namespace where the
@@ -1026,15 +1017,6 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             Some(leaf) => injection.with_classifier_leaf(leaf),
             None => injection,
         };
-        // Every injection is sealed: a none box's full seal is named
-        // explicitly, and any other box's confined-families seal is the
-        // shim's default — either way the shim reinstalls the filter the
-        // launch installed, which the joined process does not inherit.
-        let injection = if self.seal_injection {
-            injection.seal_none_box()
-        } else {
-            injection
-        };
         let mut command = injection.command()?;
         // BEP-018: once the shim is in its leaf, the cohort is checked again
         // under its lock. A shim in the blocked leaf is recorded under this
@@ -1174,12 +1156,6 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 leader_pid,
                 cwd: environment.cwd,
                 vars: environment.vars,
-                // A hook joins the namespaces rather than being forked from the
-                // filtered shell, so the box's seal has to be handed to it the
-                // same way the interactive attach path hands it to an injected
-                // command: the none box's full seal by flag, the shim's
-                // confined-families default for the rest.
-                seal_none_box: self.seal_injection,
             },
             composition,
             session_id: self.session_id,
@@ -1294,7 +1270,6 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             guard,
             net_guard,
             tty_path,
-            seal_injection,
             leaf,
             host_ip_enforcement,
             listen_plan,
@@ -1414,7 +1389,6 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             ends_with_entrypoint,
             connection_env,
             home_dir,
-            seal_injection,
             leaf,
             start_gate,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),

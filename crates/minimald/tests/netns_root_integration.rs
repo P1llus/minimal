@@ -534,8 +534,7 @@ fn proc_session_and_tty(pid: u32) -> (u32, i32) {
 /// `ENETUNREACH`, and `AF_VSOCK` fails with `EAFNOSUPPORT` while `AF_UNIX`
 /// still works.
 ///
-/// The plan comes from the production provider, not the `NetPlan::none()`
-/// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
+/// The plan comes from the production provider: `network_for(NetworkMode::NoNet)` maps every no-net consumer
 /// to `sandbox::NoNet` — a `--network none` session's box and a no-net
 /// task's sandbox alike, since `task_network` goes through the same mapping —
 /// so this proof runs the exact plan a no-net task's sandbox is built with
@@ -557,11 +556,6 @@ async fn network_none_blocks_all_outside_sockets() {
         .plan()
         .await
         .expect("the production NoNet provider plans do not fail");
-    assert!(
-        no_net.blocks_outside_sockets(),
-        "the NoNet provider must seal every consumer it plans, tasks included"
-    );
-
     let config = Config::new("none-sockets")
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
@@ -644,7 +638,7 @@ async fn network_none_attach_works() {
     let config = Config::new("none-attach")
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
-        .with_plan(NetPlan::none());
+        .with_plan(NetPlan::isolated());
     let tmp = tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the box base");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
@@ -768,8 +762,7 @@ async fn network_none_attach_works() {
     let injection = Injection::new(leader, "/usr/bin/probe", ["attach"])
         .with_shim(shim())
         .with_cwd(expected_cwd)
-        .with_env(env)
-        .seal_none_box();
+        .with_env(env);
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {

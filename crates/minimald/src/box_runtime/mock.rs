@@ -252,7 +252,6 @@ impl BoxLauncher for MockLauncher {
             guard: (),
             net_guard: self.net_guard,
             tty_path,
-            seal_injection: false,
             // The mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
             host_ip_enforcement: self.host_ip_enforcement,

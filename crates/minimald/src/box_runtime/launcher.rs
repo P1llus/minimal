@@ -353,12 +353,6 @@ pub(crate) struct Launched<P, G> {
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     pub(super) tty_path: std::path::PathBuf,
-    /// Whether processes injected into this session are entering a none box,
-    /// so the shim must reinstall the none plan's full socket-family seal;
-    /// every other box's injected processes reinstall the confined-families
-    /// seal the shim defaults to.  Every injection is sealed, since the
-    /// filter is inherited only by children of the filtered process.
-    pub(super) seal_injection: bool,
     /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
     /// decided on, and the one every process of the session — injected ones
     /// included — is placed in. `None` on a host that places no box: the tree
@@ -1481,13 +1475,6 @@ impl BoxLauncher for SandboxLauncher {
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
 
-        // The none plan's full seal is the one an injected process has to be
-        // told about explicitly (`--seal-none-box`); every other box's
-        // confined-families seal is the shim's default. Derived from the plan
-        // itself — the same data `new_container` seals the box from — so
-        // launch and injection agree by construction.
-        let seal_injection = planned.plan().seal() == sandbox::SocketSeal::Full;
-
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
         // (required for a usable interactive shell) unioned with
@@ -2067,7 +2054,6 @@ impl BoxLauncher for SandboxLauncher {
             guard: env,
             net_guard,
             tty_path,
-            seal_injection,
             // The launch's own placement outcome for this box, so the
             // session can record it without re-deriving it from things a
             // person never sees.

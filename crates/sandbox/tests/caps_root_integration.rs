@@ -485,13 +485,9 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
 /// hold are dropped from the bounding set — the one set an exec does not clear
 /// — so they cannot come back.
 ///
-/// Both halves matter. An open box has no socket-family filter, so a raw socket
-/// there is refused by the missing capability alone, while a stream socket
-/// still works — the refusal is about the capability, not a broken network
-/// stack. A none box carries the family filter on top of the same credentials,
-/// so the raw socket is refused by the seal before the capability check is
-/// reached, and what its report adds is that the credentials and the filter
-/// hold together in the one launch closure that applies both.
+/// A raw socket is refused by the missing capability alone, while a stream
+/// socket still works: the refusal is about the capability, not a broken
+/// network stack.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boxes_lack_cap_net_raw() {
     if let Some(reason) = sandbox::user_namespaces_restriction() {
@@ -518,15 +514,6 @@ async fn boxes_lack_cap_net_raw() {
         "a stream socket needs no capability, so an open box refusing raw \
          but not stream is the refusal about the capability, not a broken \
          network stack"
-    );
-
-    let none = box_report(NetPlan::none()).await;
-    assert_box_credentials(&none, "a none box");
-    assert_eq!(
-        reported_errno(&none, "raw_socket_errno", "a none box"),
-        libc::EAFNOSUPPORT,
-        "a none box's family filter must still refuse the socket family \
-         itself, seal and credentials together in the same launch"
     );
 }
 

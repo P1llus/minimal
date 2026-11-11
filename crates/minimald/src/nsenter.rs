@@ -427,7 +427,6 @@ pub struct Injection {
     cwd: Option<PathBuf>,
     env: Option<BTreeMap<String, String>>,
     shim_exe: Option<PathBuf>,
-    seal_none_box: bool,
     /// The box's classifier leaf (NET-079), joined before the namespaces.
     /// `None` on a host that places no box.
     leaf: Option<sandbox::config::ClassifierLeaf>,
@@ -450,7 +449,6 @@ impl Injection {
             cwd: None,
             env: None,
             shim_exe: None,
-            seal_none_box: false,
             leaf: None,
         }
     }
@@ -483,26 +481,6 @@ impl Injection {
     /// path is unrunnable uses [`set_shim_exe`] instead.
     pub fn with_shim(mut self, shim_exe: impl Into<PathBuf>) -> Self {
         self.shim_exe = Some(shim_exe.into());
-        self
-    }
-
-    /// Mark this injection as entering a none box, so the shim reinstalls the
-    /// none plan's full socket-family seal — every family but the ones the
-    /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
-    /// `AF_INET6`, `AF_NETLINK` with `NETLINK_ROUTE` only) — after joining
-    /// the namespaces.  That seal applies only when the injection joins the
-    /// box's own network namespace; one that does not falls back to `AF_UNIX`
-    /// alone
-    /// ([`injection_socket_filter`]).
-    ///
-    /// Every injection is sealed: without this marker the shim reinstalls the
-    /// confined-families seal, the one every networked box launches under,
-    /// which admits the families the box's own network namespace confines
-    /// and refuses the rest.  Either way the filter installed at launch is
-    /// inherited by children of the filtered process only, and an injected
-    /// process joins the namespaces later.
-    pub fn seal_none_box(mut self) -> Self {
-        self.seal_none_box = true;
         self
     }
 
@@ -570,24 +548,9 @@ impl Injection {
         if let Some(cwd) = &self.cwd {
             cmd.arg("--chdir").arg(cwd);
         }
-        if self.seal_none_box {
-            cmd.arg("--seal-none-box");
-        }
         if let Some(leaf) = &self.leaf {
             cmd.arg("--classifier-leaf").arg(leaf.dir());
         }
-        // One debug line per injection naming the seal the joined process will
-        // run under (observability). Resolved through the filters rather than
-        // restated here, so the log names exactly what the shim installs; the
-        // shim itself has no tracing subscriber — it is the daemon re-exec'd
-        // before its runtime is built.
-        let seal = injection_socket_filter(self.seal_none_box, &namespaces).seal;
-        tracing::debug!(
-            leader_pid = self.leader_pid,
-            program = %self.program.to_string_lossy(),
-            socket_seal = %seal,
-            "nsenter injection: joining the box under its socket-family seal"
-        );
         if let Some(env) = self.env {
             // The shim needs nothing from the daemon's environment — it holds
             // its pidfd on a descriptor and everything else in argv — so this
@@ -646,18 +609,6 @@ pub struct ShimArgs {
     /// working directory at the container's root.
     #[arg(long)]
     chdir: Option<PathBuf>,
-
-    /// When present, the target session is a none box and the shim must
-    /// re-install its full socket-family seal after joining the namespaces —
-    /// unix, inet, inet6 and netlink route admitted when the join enters the box's
-    /// own network namespace, `AF_UNIX` alone when it does not. When absent the shim re-installs the
-    /// confined-families seal, the one every other box launches under, which
-    /// admits the families the box's namespace confines and refuses the
-    /// rest.  Either way the filter is inherited by children of the filtered
-    /// process, but an injected process joins the namespaces later and must
-    /// load it itself.
-    #[arg(long)]
-    seal_none_box: bool,
 
     /// The classifier leaf of the box being joined, so the shim can move
     /// itself into it **before** `setns` — the write has to happen from the
@@ -799,13 +750,8 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         cmd.current_dir(dir);
     }
 
-    // Resolved here, before the fork: building the filter allocates, and the
-    // first `OnceLock` access is what builds it. Only the `&'static` result
-    // crosses into the child. Every injection is sealed — the none box's
-    // full seal (unix-only unless the join entered the box's own network
-    // namespace), or the confined-families seal every other box launches
-    // under.
-    let socket_family_filter = injection_socket_filter(args.seal_none_box, &args.join);
+    // Compiled before the fork, so the child only loads it.
+    let seccomp_program = sandbox::seccomp::box_program();
 
     // A tty exec hands the shim the slave side of its PTY as stdin. The
     // injected process then makes that PTY its controlling terminal, so job
@@ -882,17 +828,9 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             sandbox::assume_box_credentials()
         });
 
-        cmd.pre_exec(move || {
-            // Re-install the box's socket-family seal — the none box's full
-            // seal, or the confined-families seal every other box launches
-            // under.  The filter installed at sandbox launch is inherited by
-            // children of the filtered process, but this injected process
-            // joins the namespaces later and must load it itself.
-            // SAFETY: `filter` is a `&'static` owned by the process-wide
-            // OnceLock, valid and immutable for the program's lifetime.
-            sandbox::install_socket_family_filter(socket_family_filter)?;
-            Ok(())
-        });
+        // The profile the box's own processes run under. A process that joins
+        // the box later does not inherit it.
+        cmd.pre_exec(move || sandbox::seccomp::install(seccomp_program));
     }
 
     // The handlers go in before the spawn, so a SIGTERM or SIGHUP that arrives
@@ -1394,24 +1332,6 @@ fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) 
     source.raw_os_error() == Some(libc::ENOENT) && chdir.is_some_and(|dir| !dir.is_dir())
 }
 
-/// The socket-family filter an injected process installs after joining a
-/// box.  A none box's relaxed seal admits inet and netlink route only because the
-/// box's own network namespace confines them, so it applies only when the
-/// join enters that namespace (`join` names `Net`); an injection that stays
-/// in the daemon's namespace gets the unix-only seal instead, fail closed
-/// ([`sandbox::SocketSeal::in_netns`]).
-fn injection_socket_filter(
-    seal_none_box: bool,
-    join: &[Namespace],
-) -> &'static sandbox::SocketFamilyFilter {
-    if seal_none_box {
-        let joins_box_netns = join.contains(&Namespace::Net);
-        sandbox::socket_family_filter_for_seal(sandbox::SocketSeal::Full.in_netns(joins_box_netns))
-    } else {
-        sandbox::socket_family_filter_for_confined_families()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1460,31 +1380,6 @@ mod tests {
         assert!(!spawn_failed_on_missing_chdir(&missing, None));
         assert!(!spawn_failed_on_missing_chdir(&denied, chdir));
         assert!(!spawn_failed_on_missing_chdir(&no_exec, chdir));
-    }
-
-    /// The fail-closed gate on the injection path: a none-box injection
-    /// gets the relaxed none seal only when it joins the box's network
-    /// namespace, and the unix-only seal when the join set leaves `Net` out.
-    #[test]
-    fn none_injection_relaxes_only_when_joining_the_box_netns() {
-        use sandbox::SocketSeal;
-        let with_net = [Namespace::User, Namespace::Mnt, Namespace::Net];
-        let without_net = [Namespace::User, Namespace::Mnt];
-        assert_eq!(
-            injection_socket_filter(true, &with_net).seal,
-            SocketSeal::Full
-        );
-        assert_eq!(
-            injection_socket_filter(true, &without_net).seal,
-            SocketSeal::UnixOnly,
-            "a none-box injection outside the box's netns must keep the unix-only seal"
-        );
-        for join in [&with_net[..], &without_net[..]] {
-            assert_eq!(
-                injection_socket_filter(false, join).seal,
-                SocketSeal::ConfinedFamilies
-            );
-        }
     }
 
     /// A process whose only child is known: `sh` prints the PID of the
