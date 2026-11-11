@@ -544,7 +544,7 @@ impl Resolver {
             Decided::Zone { name, query } => {
                 let answer = self
                     .zone
-                    .lookup(&name, of.has_own_namespace(), of.host_alias());
+                    .lookup(&name, of.on_virtual_network(), of.host_alias());
                 let admitted = admit_zone(answer, &name, &view);
                 if let Some(address) = admitted.pin {
                     self.pin(of, address, &name);

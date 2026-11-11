@@ -161,6 +161,9 @@ pub(crate) struct Installed {
     /// Whether the box's processes have a network namespace of their own,
     /// where its endpoints are bound when it has one.
     own_namespace: bool,
+    /// Whether the box sits on the virtual network: alone in a namespace of
+    /// its own, or with a guest node whose address is on it.
+    on_virtual_network: bool,
     /// The address the box is told for the host's name.
     host_alias: Option<Ipv4Addr>,
     wants: Wants,
@@ -200,10 +203,11 @@ impl Installed {
         self.session
     }
 
-    /// Whether the box's processes have a network namespace of their own,
-    /// on the virtual network.
-    pub(crate) const fn has_own_namespace(&self) -> bool {
-        self.own_namespace
+    /// Whether the box reaches a peer at the peer's address on the virtual
+    /// network. A box that shares a native node's address reaches it at
+    /// the node's loopback, where the peer's ports are published.
+    pub(crate) const fn on_virtual_network(&self) -> bool {
+        self.on_virtual_network
     }
 
     /// The address that stands for the host's loopback for this box.
@@ -927,6 +931,7 @@ impl Engine {
         };
         let id = BoxId(cgroup.id());
         let spec = Self::spec_of(&node, facts.mode, own, block);
+        let on_virtual_network = spec.deployment.network.is_some();
         let host_alias = match spec.deployment.host_alias {
             Some(IpAddr::V4(alias)) => Some(alias),
             _ => None,
@@ -954,6 +959,7 @@ impl Engine {
             id,
             block,
             own_namespace,
+            on_virtual_network,
             host_alias,
             wants,
             compiled: RwLock::new(Arc::clone(live.compiled())),
