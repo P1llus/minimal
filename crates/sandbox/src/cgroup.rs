@@ -172,17 +172,21 @@ pub fn locate() -> Located {
     }
 }
 
-/// The command that runs `program` with `args` in a new transient scope of
-/// the user manager with a delegated cgroup. `systemd-run --scope` execs the
-/// program in place, so the process keeps its pid.
+/// The command that runs `program` with `args` in a new transient scope
+/// with a delegated cgroup: a scope of the user manager, or of the system
+/// manager for root. `systemd-run --scope` execs the program in place, so
+/// the process keeps its pid.
 #[must_use]
 pub fn delegated_scope_command(
     program: &Path,
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> std::process::Command {
     let mut run = std::process::Command::new("systemd-run");
+    // SAFETY: `geteuid` reads this process's credentials.
+    if unsafe { libc::geteuid() } != 0 {
+        run.arg("--user");
+    }
     run.args([
-        "--user",
         "--scope",
         "--quiet",
         "--collect",
@@ -192,6 +196,20 @@ pub fn delegated_scope_command(
     .arg(program)
     .args(args);
     run
+}
+
+/// Whether [`delegated_scope_command`] works on this host, found by running
+/// `true` through it. A process asks before it replaces itself with the
+/// command, because a host with no service manager to ask would leave it
+/// with nothing running.
+#[must_use]
+pub fn delegated_scope_available() -> bool {
+    delegated_scope_command(Path::new("true"), [])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The daemon's cgroup root, with its `supervisor` and `boxes` children.

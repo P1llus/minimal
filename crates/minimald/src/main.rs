@@ -145,12 +145,6 @@ enum Command {
     Completions(CompletionsArgs),
     /// Runs the minimald server in the foreground.
     Run(ListenArgs),
-    /// Internal: join a session's namespaces and run a program there.
-    ///
-    /// Not a supported command line — this is the daemon re-execing itself to
-    /// power launching a process in existing namespaces.
-    #[command(name = minimald::nsenter::SUBCOMMAND, hide = true)]
-    Nsenter(minimald::nsenter::ShimArgs),
 }
 
 /// The arguments for the completions subcommand.
@@ -321,15 +315,6 @@ impl From<russh::keys::Error> for MainError {
     }
 }
 
-/// Flattens an error and its `source()` chain into one line, so a typed error
-/// reaching [`MainError::Other`] keeps the context its variants carry.
-fn error_chain(err: &dyn std::error::Error) -> String {
-    std::iter::successors(err.source(), |e| e.source()).fold(err.to_string(), |mut acc, e| {
-        acc.push_str(&format!(": {e}"));
-        acc
-    })
-}
-
 /// The `guest.ready` span: the microVM guest's READY beacon, a child of the
 /// `TRACEPARENT` minvmd put on the kernel command line (which the kernel
 /// hands `/init` as its environment) when telemetry is on. Its ids are
@@ -378,22 +363,10 @@ fn open_lock_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs:
 }
 
 fn main() -> Result<(), MainError> {
-    // We re-exec to power some machinery for joining namespaces, do that before async/other-threads
-    // are setup.
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| arg == minimald::nsenter::SUBCOMMAND)
-    {
-        let Command::Nsenter(args) = Cli::parse().command else {
-            unreachable!(
-                "argv[1] is {}, so clap parsed that subcommand",
-                minimald::nsenter::SUBCOMMAND
-            )
-        };
-        let code =
-            minimald::nsenter::shim_main(args).map_err(|e| MainError::Other(error_chain(&e)))?;
-        std::process::exit(code);
-    }
+    // This binary is also the daemon's spawner and its enter shim. Both run
+    // here, before anything else of the daemon does.
+    #[cfg(target_os = "linux")]
+    sandbox::spawner::run_internal_mode();
 
     // As the microVM's init, fork the daemon off before anything else, while
     // this process is still single-threaded: pid 1 stays behind and reaps
@@ -403,6 +376,11 @@ fn main() -> Result<(), MainError> {
     #[cfg(target_os = "linux")]
     if is_minimal_microvm() {
         minimald::reaper::split_init();
+    }
+
+    #[cfg(target_os = "linux")]
+    if !is_minimal_microvm() {
+        enter_delegated_scope();
     }
 
     let runtime = Builder::new_multi_thread()
@@ -464,6 +442,46 @@ fn main() -> Result<(), MainError> {
     }
 
     result
+}
+
+/// Set in the daemon that [`enter_delegated_scope`] started, so a scope that
+/// turns out not to be delegated is not tried again.
+#[cfg(target_os = "linux")]
+const IN_SCOPE_ENV: &str = "MINIMALD_IN_DELEGATED_SCOPE";
+
+/// Replaces a foreground server that runs in no delegated cgroup with the
+/// same server in a transient delegated scope, which gives its boxes their
+/// cgroups however the daemon was started. Returns for any other command,
+/// for a server that has its cgroup, and on a host that cannot make the
+/// scope, where the server runs its boxes without cgroups.
+#[cfg(target_os = "linux")]
+fn enter_delegated_scope() {
+    use std::os::unix::process::CommandExt as _;
+
+    use sandbox::cgroup::{Located, delegated_scope_available, delegated_scope_command, locate};
+
+    // A command line that does not parse is reported by the parse below.
+    let Ok(Cli {
+        command: Command::Run(args),
+        ..
+    }) = Cli::try_parse()
+    else {
+        return;
+    };
+    if args.detach
+        || std::env::var_os(IN_SCOPE_ENV).is_some()
+        || !matches!(locate(), Located::None { .. })
+        || !delegated_scope_available()
+    {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let error = delegated_scope_command(&exe, std::env::args_os().skip(1))
+        .env(IN_SCOPE_ENV, "1")
+        .exec();
+    eprintln!("minimald: could not start in a delegated scope ({error}); boxes get no cgroup");
 }
 
 /// Re-exec this binary in a new session (`setsid`) with `--detach` stripped, so
@@ -693,7 +711,6 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
 
     // Handle non-{launch,run} commands.
     let mut cli = match cli.command {
-        Command::Nsenter(_) => unreachable!("nsenter is intercepted before CLI args are parsed"),
         Command::Completions(CompletionsArgs { shell }) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -776,32 +793,6 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         return spawn_detached(&cli);
     }
 
-    // Pin the path this daemon re-execs itself from as the `__nsenter` shim,
-    // now, while the file is certainly still there. Resolved per-spawn instead,
-    // `current_exe()` reads `/proc/self/exe`, which the kernel reports as a
-    // dangling `<path> (deleted)` once the binary has been replaced — so every
-    // lifecycle hook and in-session exec fails with `ENOENT` after any rebuild
-    // of a running daemon. `just min` rebuilds `-p minimald` on every
-    // invocation, so a dev daemon meets that the first time its source changes.
-    // The path resolved here keeps naming whatever now lives at it.
-    //
-    // Not in the microVM: pid-1's own path is the initramfs `/init`, which is
-    // unreachable after the rootfs switch, so the guest stages a runnable copy
-    // and registers *that* (#1175). Registration is first-wins, so claiming it
-    // here would lock the guest's out.
-    if !is_minimal_microvm() {
-        match std::env::current_exe() {
-            Ok(exe) => minimald::nsenter::set_shim_exe(exe),
-            // Non-fatal: without a registration each injection falls back to
-            // resolving `current_exe()` itself, which is the prior behaviour.
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not resolve this daemon's executable to register as the nsenter shim; \
-                 in-session exec will re-resolve it per spawn",
-            ),
-        }
-    }
-
     // Handle setup specific to operating in a micro-vm.
     use minimald::guest;
     // Before anything forks from us and inherits the limits. Best effort: the
@@ -841,6 +832,28 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // starts. Never on a native daemon: those are the host's to set.
     if is_minimal_microvm() {
         guest::apply_microvm_sysctls();
+    }
+
+    // The daemon's cgroup root and its spawner, before any box starts. A
+    // guest's daemon owns the real root. A native one owns the cgroup of
+    // the unit it runs in. The spawner is this binary: the path it has now,
+    // which keeps naming whatever is installed there, or the copy a guest
+    // staged, because pid 1's own path is gone after the switch of rootfs.
+    #[cfg(target_os = "linux")]
+    {
+        let (located, exe) = if is_minimal_microvm() {
+            (
+                sandbox::cgroup::Located::Guest(sandbox::cgroup::MOUNT.into()),
+                std::path::PathBuf::from(guest::STAGED_SELF_EXE),
+            )
+        } else {
+            (
+                sandbox::cgroup::locate(),
+                std::env::current_exe()
+                    .map_err(|e| MainError::IO(e, "resolving this daemon's executable"))?,
+            )
+        };
+        minimald::box_cgroups::boot(located, exe);
     }
 
     // The guest's kernel leaves `lo` down, and the guest's own listeners

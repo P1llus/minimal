@@ -1574,7 +1574,7 @@ async fn exec_client_loss_ends_exec_keeps_box() {
         .unwrap();
 
     let exit = timeout(
-        crate::nsenter::SHIM_ESCALATION + Duration::from_secs(10),
+        sandbox::spawner::enter::SHIM_ESCALATION + Duration::from_secs(10),
         bridge_task,
     )
     .await
@@ -1587,9 +1587,9 @@ async fn exec_client_loss_ends_exec_keeps_box() {
     let term = std::fs::read_to_string(&term_marker).unwrap_or_default();
     assert_eq!(term, "term\n", "the exec is sent SIGTERM first");
     assert!(
-        elapsed >= crate::nsenter::SHIM_ESCALATION,
+        elapsed >= sandbox::spawner::enter::SHIM_ESCALATION,
         "the daemon waits {:?} before the SIGKILL, ended after {elapsed:?}",
-        crate::nsenter::SHIM_ESCALATION,
+        sandbox::spawner::enter::SHIM_ESCALATION,
     );
     // SAFETY: signal 0 only checks that the pid exists; it sends nothing.
     let alive = unsafe { libc::kill(exec_pid as libc::pid_t, 0) } == 0;
@@ -3202,7 +3202,7 @@ mod managed {
                         argv: words,
                     },
                 },
-                command,
+                command.into(),
                 graceful,
             )
             .expect("the exec starts")
@@ -3440,7 +3440,7 @@ mod managed {
                 winsize: (24, 80),
                 facts: ExecFacts::default(),
             },
-            command,
+            command.into(),
             false,
             limits,
         )
@@ -3674,7 +3674,7 @@ mod managed {
         assert!(took >= timeout, "{took:?}");
         // The SIGTERM was ignored, so the SIGKILL after the wait ended it.
         assert!(
-            took >= crate::nsenter::SHIM_ESCALATION,
+            took >= sandbox::spawner::enter::SHIM_ESCALATION,
             "the SIGKILL waits out the grace: {took:?}"
         );
         assert!(took < Duration::from_secs(25), "{took:?}");
@@ -4078,7 +4078,7 @@ wait"#;
                 winsize: (24, 80),
                 facts: ExecFacts::default(),
             },
-            command,
+            command.into(),
             true,
         )
         .expect("the exec starts");
@@ -4101,7 +4101,7 @@ wait"#;
         }
 
         let exit = tokio::time::timeout(
-            crate::nsenter::SHIM_ESCALATION + Duration::from_secs(10),
+            sandbox::spawner::enter::SHIM_ESCALATION + Duration::from_secs(10),
             super::super::stop_exec(box_id, &entry.id),
         )
         .await
@@ -4237,136 +4237,6 @@ wait"#;
         assert!(
             matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
             "{answer:?}"
-        );
-    }
-
-    /// BOX-151: a tty exec leads its own session, and a shell with job
-    /// control puts a background job in a process group of its own. The
-    /// injection shim's stop reaches that job through the session: SIGTERM
-    /// to the leader's group and to every other group of the session, then
-    /// SIGKILL to what is left. The job here ignores SIGTERM, so only the
-    /// SIGKILL ends it. The unit tests cannot run the shim binary, so this
-    /// drives the session calls the shim makes.
-    #[test]
-    fn stop_exec_ends_process_group_of_every_tty_job() {
-        use std::os::unix::process::CommandExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let member = dir.path().join("member");
-        let (master, slave) = super::super::open_terminal((24, 80)).unwrap();
-        let script =
-            r#"set -m; sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 600' sh "$1" & wait"#;
-        let mut shell = std::process::Command::new("sh");
-        shell
-            .args(["-c", script, "sh"])
-            .arg(&member)
-            .stdin(slave.try_clone().unwrap())
-            .stdout(slave.try_clone().unwrap())
-            .stderr(slave);
-        // SAFETY: the step makes only async-signal-safe calls.
-        unsafe {
-            shell.pre_exec(|| crate::nsenter::lead_session_on_terminal());
-        }
-        let mut shell = shell.spawn().expect("the shell starts");
-        let sid = libc::pid_t::try_from(shell.id()).unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let job: libc::pid_t = loop {
-            if let Some(pid) = std::fs::read_to_string(&member)
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
-            {
-                break pid;
-            }
-            assert!(Instant::now() < deadline, "the job never started");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        // SAFETY: both calls only query the kernel.
-        let (job_group, job_session) = unsafe { (libc::getpgid(job), libc::getsid(job)) };
-        assert_eq!(job_session, sid, "the job is in the exec's session");
-        assert_ne!(job_group, sid, "the job has a process group of its own");
-
-        let proc_dir = std::fs::File::open("/proc").unwrap();
-        // The shim's handler: SIGTERM to the leader's group. Its main flow:
-        // SIGTERM to the session's other groups.
-        // SAFETY: `sid` is the group this test spawned.
-        unsafe { libc::kill(-sid, libc::SIGTERM) };
-        crate::nsenter::signal_session(&proc_dir, sid, libc::SIGTERM, Some(sid));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !process_gone(shell.id()) {
-            assert!(Instant::now() < deadline, "the shell outlived its SIGTERM");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        let job_pid = u32::try_from(job).unwrap();
-        assert!(!process_gone(job_pid), "the job ignores SIGTERM");
-        assert!(
-            crate::nsenter::session_has_live_member(&proc_dir, sid),
-            "the session still has the job"
-        );
-
-        // The grace period ends: SIGKILL to the whole session. The shell is
-        // still unreaped, so its session id is not recycled.
-        crate::nsenter::signal_session(&proc_dir, sid, libc::SIGKILL, None);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !process_gone(job_pid) {
-            assert!(Instant::now() < deadline, "the job outlived the stop");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!crate::nsenter::session_has_live_member(&proc_dir, sid));
-        let _ = shell.wait();
-        drop(master);
-    }
-
-    /// BOX-149: the PTY of a tty exec is the controlling terminal of the
-    /// process the injection shim starts on it. The shim's pre-exec step
-    /// makes the process lead a new session, and the PTY's foreground
-    /// process group is then that process. A process started without the
-    /// step has no controlling terminal on the PTY.
-    #[tokio::test]
-    async fn tty_exec_pty_is_controlling_terminal() {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::process::CommandExt as _;
-
-        let spawn_on_pty = |lead: bool| {
-            let (master, slave) = super::super::open_terminal((24, 80)).unwrap();
-            let mut command = std::process::Command::new("sleep");
-            command
-                .arg("30")
-                .stdin(slave.try_clone().unwrap())
-                .stdout(slave.try_clone().unwrap())
-                .stderr(slave);
-            if lead {
-                // SAFETY: the step makes only async-signal-safe calls.
-                unsafe {
-                    command.pre_exec(|| crate::nsenter::lead_session_on_terminal());
-                }
-            }
-            let child = command.spawn().expect("the process starts");
-            (master, child)
-        };
-
-        let (master, mut child) = spawn_on_pty(true);
-        let pid = i32::try_from(child.id()).unwrap();
-        // SAFETY: both calls only query the kernel.
-        let (foreground, sid) = unsafe { (libc::tcgetpgrp(master.as_raw_fd()), libc::getsid(pid)) };
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_eq!(sid, pid, "the process leads its own session");
-        assert_eq!(
-            foreground, pid,
-            "the PTY is the controlling terminal of the process"
-        );
-
-        let (master, mut child) = spawn_on_pty(false);
-        let pid = i32::try_from(child.id()).unwrap();
-        // SAFETY: only queries the kernel.
-        let foreground = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_ne!(
-            foreground, pid,
-            "without the step the PTY is no one's terminal"
         );
     }
 
@@ -5318,7 +5188,7 @@ mod end_to_end {
         };
 
         let answer = tokio::time::timeout(
-            crate::nsenter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
+            sandbox::spawner::enter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
             crate::rpc::stop_exec_answer(&state_dir, session_id, &exec_id),
         )
         .await
@@ -5373,7 +5243,7 @@ mod end_to_end {
             timeout_secs: None,
         });
         tokio::time::timeout(
-            crate::nsenter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
+            sandbox::spawner::enter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
             client.exec(
                 &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                 false,
@@ -5546,13 +5416,10 @@ async fn a_sandbox_failure_reaches_the_client_stderr() {
 /// task the daemon killed are not reported as a sandbox failure.
 #[test]
 fn only_a_container_failure_is_a_sandbox_failure() {
-    let status = |code, exit_code: Option<i32>, reason: &str| hakoniwa::ExitStatus {
+    let status = |code, exit_code: Option<i32>, reason: &str| sandbox::ExitStatus {
         code,
         reason: reason.to_string(),
         exit_code,
-        rusage: None,
-        proc_pid_smaps_rollup: None,
-        proc_pid_status: None,
     };
     assert_eq!(
         super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT"), false),

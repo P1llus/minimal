@@ -157,23 +157,33 @@ impl BuildNetwork {
     }
 
     /// The namespace for a source fetch, and what keeps it up, which the
-    /// fetch holds until it ends. `exec_base` holds the namespace's sandbox.
+    /// fetch holds until it ends. `exec_base` holds the namespace's sandbox,
+    /// which runs in `cgroup` when the box has one.
     pub(crate) async fn hold(
         &self,
         exec_base: &std::path::Path,
+        cgroup: Option<&sandbox::cgroup::BoxCgroup>,
     ) -> anyhow::Result<(common::NetNamespace, std::sync::Arc<sandbox::HeldNetwork>)> {
         let mut fetching = self.fetching.lock().await;
         let held = match fetching.upgrade() {
             Some(held) => held,
             None => {
-                let held =
-                    std::sync::Arc::new(sandbox::hold_network(exec_base, self.network()).await?);
+                let held = std::sync::Arc::new(
+                    sandbox::hold_network(exec_base, self.network(), cgroup.cloned()).await?,
+                );
                 *fetching = std::sync::Arc::downgrade(&held);
                 held
             }
         };
+        let sockets = {
+            let held = std::sync::Arc::clone(&held);
+            common::Sockets::new(move |v6, kind| {
+                held.socket(v6, kind == common::SocketKind::Datagram)
+            })
+        };
         let namespace = common::NetNamespace::of_process(
             held.pid(),
+            sockets,
             held.nameservers(),
             self.admits_name.clone(),
         )?;
@@ -196,7 +206,11 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         exec_base: &'b std::path::Path,
     ) -> Option<crate::SourcePlace<'b>> {
         match (&self.box_network, &self.box_cgroup) {
-            (Some(network), _) => Some(crate::SourcePlace::Network { network, exec_base }),
+            (Some(network), cgroup) => Some(crate::SourcePlace::Network {
+                network,
+                exec_base,
+                cgroup: cgroup.as_ref(),
+            }),
             (None, Some(cgroup)) => Some(crate::SourcePlace::Box(cgroup)),
             (None, None) => None,
         }
@@ -564,9 +578,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         if let Some(id) = daemon_id {
             config = config.with_daemon_id(id.clone());
         }
-        if let Some(cgroup) = &self.box_cgroup {
-            config = config.with_box_cgroup(cgroup.clone());
-        }
+        config = config.with_box_cgroup(self.box_cgroup.clone());
         // NET-155: a build that needs the network, for an own-address box,
         // runs on that box's network and under its egress verdict.
         if let Some(network) = &self.box_network

@@ -78,7 +78,7 @@ async fn the_sandbox_layer_builds_the_tap_a_plan_asks_for() {
         .expect("spawning the own-IP sandbox; a RustSlirp failure surfaces here");
 
     let mut spawned = Spawned::from_child(&mut child);
-    let status = child.wait().expect("waiting for /bin/true");
+    let status = child.exited().await;
     assert!(status.success(), "the probe did not run: {status:?}");
     assert!(
         spawned.take_tap_fd().is_some(),
@@ -142,14 +142,21 @@ async fn a_placed_fetch_leaves_from_the_held_namespace() {
     let op = ot::OpTracker::new_root();
     let url = format!("http://{addr}/pkg-1.0.tar.gz");
 
-    let held = sandbox::hold_network(&tmp.path().join("held"), Arc::new(Empty))
-        .await
-        .expect("a held namespace");
+    let held = Arc::new(
+        sandbox::hold_network(&tmp.path().join("held"), Arc::new(Empty), None)
+            .await
+            .expect("a held namespace"),
+    );
     let pid = held.pid();
     assert!(Path::new(&format!("/proc/{pid}")).exists());
     assert_eq!(held.nameservers(), &[Ipv4Addr::LOCALHOST]);
+    let sockets = {
+        let held = Arc::clone(&held);
+        common::Sockets::new(move |v6, kind| held.socket(v6, kind == common::SocketKind::Datagram))
+    };
     let namespace =
-        common::NetNamespace::of_process(pid, held.nameservers(), Arc::new(|_| true)).unwrap();
+        common::NetNamespace::of_process(pid, sockets, held.nameservers(), Arc::new(|_| true))
+            .unwrap();
 
     let placed = storage
         .download_web_placed(&url, sha, &common::Placement::Namespace(namespace), &op)

@@ -910,15 +910,12 @@ async fn dial_in_box(
             return Err(russh::ChannelOpenFailure::ConnectFailed);
         }
     };
-    use std::process::Stdio;
+    use crate::box_command::Stdio;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let child = match tokio::process::Command::from(command)
-        .kill_on_drop(true)
-        .spawn()
-    {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             tracing::warn!(
@@ -974,16 +971,16 @@ const TEST_RELAY_PATH_VAR: &str = "MINIMALD_TEST_RELAY_PATH";
 /// bytes being forwarded to it.
 ///
 /// The child is held — boxed, so this stays `Unpin` for [`relay_streams`] —
-/// because its drop is the kill: `kill_on_drop` on the injection shim, whose
-/// PDEATHSIG takes the in-box program with it. Never read on purpose.
+/// because its drop is the kill of the enter shim, whose PDEATHSIG takes the
+/// in-box program with it. Never read on purpose.
 struct ChildStdio {
     stdin: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
-    _child: Pin<Box<tokio::process::Child>>,
+    _child: Pin<Box<crate::box_command::BoxChild>>,
 }
 
 impl ChildStdio {
-    fn new(mut child: tokio::process::Child) -> Self {
+    fn new(mut child: crate::box_command::BoxChild) -> Self {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         Self {

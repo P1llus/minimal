@@ -164,8 +164,26 @@ pub(crate) fn enforce_science_mode() -> Result<(), Error> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+fn main() -> Result<(), Error> {
+    // This binary is also its own spawner and enter shim. Both run before
+    // any thread exists.
+    #[cfg(target_os = "linux")]
+    {
+        sandbox::spawner::run_internal_mode();
+        if let Ok(exe) = std::env::current_exe() {
+            // A build's program can be the terminal's foreground program.
+            let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Shared);
+            let _ = spawner.install();
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("building the tokio runtime")
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Error> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())

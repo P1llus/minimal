@@ -1512,7 +1512,7 @@ async fn acquire_at(
                 .await;
                 // The publish just landed over the channel: the service is
                 // live, so its bind (when the unit names one) is its own.
-                if !hold_the_publish(
+                hold_the_publish(
                     &registry,
                     &mut commands,
                     published.registration,
@@ -1523,11 +1523,7 @@ async fn acquire_at(
                     &mut erroring,
                     &shutdown,
                 )
-                .await
-                {
-                    // The connection's end is the whole withdrawal: the
-                    // cell this publish fed clears with it.
-                }
+                .await;
                 continue;
             }
             // The service is installed and its channel did not answer: an
@@ -1660,9 +1656,9 @@ async fn wait_out_commands(
 /// diff-poll on the [`CONNECTION_POLL`] cadence for every other change),
 /// the [`PORT_RECHECK`] bound (a full re-publish), a handover command (a
 /// no-op while publishing — there is no interim to release), or the
-/// shutdown. Returns whether the connection is still held — `false` is the
-/// withdrawal, and the registration drops with the return: the
-/// connection's end is the whole withdrawal.
+/// shutdown. Returns when the connection is no longer held. The
+/// registration drops with the return, and the connection's end is the
+/// whole withdrawal.
 ///
 /// The diff baseline is `carried`, the rows the first publish sent at
 /// `carried_generation`, never a fresh read: a row registered while the
@@ -1679,7 +1675,7 @@ async fn hold_the_publish(
     node: &str,
     erroring: &mut bool,
     shutdown: &CancellationToken,
-) -> bool {
+) {
     let track = publish_track_of(registry);
     track.acknowledge(carried_generation);
     let mut last = carried;
@@ -1688,11 +1684,11 @@ async fn hold_the_publish(
         let sent = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                return false;
+                return;
             }
             command = commands.recv() => {
                 let Some(command) = command else {
-                    return false;
+                    return;
                 };
                 refuse_command(command);
                 continue;
@@ -1715,7 +1711,7 @@ async fn hold_the_publish(
                         erroring,
                         "the answerer's end of the channel closed (a service restart)",
                     );
-                    return false;
+                    return;
                 }
                 send_observed(registry, &mut registration, node, &mut last, false).await
             }
@@ -1729,7 +1725,7 @@ async fn hold_the_publish(
                      publish (a service restart): {error}"
                 ),
             );
-            return false;
+            return;
         }
     }
 }
@@ -1972,7 +1968,7 @@ async fn host_the_interim(
                                         unit_warned,
                                     )
                                     .await;
-                                    if !hold_the_publish(
+                                    hold_the_publish(
                                         registry,
                                         commands,
                                         published.registration,
@@ -1983,9 +1979,7 @@ async fn host_the_interim(
                                         erroring,
                                         shutdown,
                                     )
-                                    .await
-                                    {
-                                    }
+                                    .await;
                                     return;
                                 }
                                 WindowEnd::Cancelled(reply_to) => {

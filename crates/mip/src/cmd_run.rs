@@ -305,22 +305,12 @@ pub async fn run_task(
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?;
-        let guard = match planned
+        // A failed attach drops the child, which kills it.
+        let guard = planned
             .attach(sandbox::Spawned::from_child(&mut child))
-            .await
-        {
-            Ok(guard) => guard,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e.into());
-            }
-        };
-        let status = child
-            .wait()
-            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)));
+            .await?;
+        let status = child.exited().await;
         guard.teardown().await;
-        let status = status?;
         if !status.success() {
             return Err(Error::Execution {
                 idx: i,

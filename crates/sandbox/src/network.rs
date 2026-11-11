@@ -275,23 +275,16 @@ impl Spawned {
         self.tap_fd.take()
     }
 
-    /// Reads a just-spawned container process: its PID, and the tap descriptor
-    /// hakoniwa produced if the plan asked for a tap. Taking it out of the
-    /// child is what makes it once-only: a `hakoniwa::Child` never closes the
-    /// fd, so a second reader could adopt and double-close it.
+    /// Reads a just-started container: the pid of its supervisor, and the
+    /// tap it was started with if the plan asked for one, taken out of the
+    /// child so no second reader gets it.
     #[cfg(target_os = "linux")]
     #[must_use]
-    pub fn from_child(child: &mut hakoniwa::Child) -> Self {
-        use std::os::fd::FromRawFd as _;
-
-        let netns_pid = child.id();
-        // SAFETY: hakoniwa hands out a live, owned tap fd, and `take` makes
-        // this the only adoption of it.
-        let tap_fd = child
-            .rustslirp_tapfd
-            .take()
-            .map(|raw| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-        Self { netns_pid, tap_fd }
+    pub fn from_child(child: &mut crate::Child) -> Self {
+        Self {
+            netns_pid: child.id(),
+            tap_fd: child.take_tap_fd(),
+        }
     }
 }
 

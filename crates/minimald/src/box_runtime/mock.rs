@@ -41,6 +41,10 @@ impl ProcessBackend for MockBackend {
         self.child.id()
     }
 
+    fn entrance(&self) -> crate::box_command::BoxEntrance {
+        crate::box_command::BoxEntrance::Host
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<ExitReport>> {
         let status = self.child.try_wait()?;
         Ok(status.map(Self::report))

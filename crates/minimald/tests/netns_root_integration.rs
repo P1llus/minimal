@@ -108,7 +108,7 @@ use std::time::Duration;
 use boxes::BoxPolicy;
 use minimald::net::switch::{BoxGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
-use minimald::nsenter::GROUP_GRACE;
+use sandbox::spawner::enter::{GROUP_GRACE, init_of as session_leader_pid};
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
 /// default `cargo test` run (and this sandbox) never attempts privileged netns
@@ -486,9 +486,29 @@ fn probe_rootfs(dir: &Path, probe: &Path) {
     std::fs::create_dir_all(dir.join("etc")).expect("create rootfs etc dir");
 }
 
-/// The `minimald` binary under test, used as the namespace-joining shim.
-fn shim() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_minimald"))
+/// Makes the `minimald` binary under test this process's spawner, as it is
+/// the daemon's: the boxes of a proof are its jobs, and a process a proof
+/// starts in a running box is started by its enter shim.
+fn use_daemon_spawner() {
+    let spawner =
+        sandbox::Spawner::process(env!("CARGO_BIN_EXE_minimald"), sandbox::Terminal::Detached);
+    // Proofs that share a process share the first one's spawner.
+    let _installed = spawner.install();
+}
+
+/// A command that runs the probe with `args` in the box `held` holds, with
+/// the working directory and environment of `sandbox`, as an attach has.
+fn enter<I, S>(held: &LiveBox, sandbox: &sandbox::Sandbox, args: I) -> sandbox::Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut command = held.child.entrance().command("/usr/bin/probe", args);
+    command
+        .current_dir(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .envs(sandbox.command_env())
+        .stdin(sandbox::Stdio::Null);
+    command
 }
 
 /// Runs `sudo <args...>` and asserts it succeeded.
@@ -542,6 +562,7 @@ async fn network_none_blocks_all_outside_sockets() {
         return;
     }
     announce_to_the_runner("network_none_blocks_all_outside_sockets");
+    use_daemon_spawner();
 
     let rootfs_tmp =
         tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the box base");
@@ -569,7 +590,7 @@ async fn network_none_blocks_all_outside_sockets() {
         .new_container(&plan)
         .expect("building none-box container");
 
-    let mut child = sandbox
+    let child = sandbox
         .command(
             &container,
             "/usr/bin/probe",
@@ -579,14 +600,9 @@ async fn network_none_blocks_all_outside_sockets() {
         .expect("building probe command")
         .spawn()
         .expect("spawning probe in none box");
-    let status = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await
-    .expect("waiting for probe timed out")
-    .expect("spawn_blocking join")
-    .expect("waiting for probe");
+    let status = tokio::time::timeout(Duration::from_secs(30), child.exited())
+        .await
+        .expect("waiting for probe timed out");
     assert!(
         status.success(),
         "probe in none box did not report all outside sockets blocked: {status:?}"
@@ -619,8 +635,8 @@ async fn network_none_attach_works() {
         return;
     }
     announce_to_the_runner("network_none_attach_works");
+    use_daemon_spawner();
     use minimald::box_runtime::{Pty, WinSize};
-    use minimald::nsenter::{Injection, session_leader_pid};
     use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
@@ -681,7 +697,7 @@ async fn network_none_attach_works() {
         ypixel: 0,
     })
     .expect("opening the launch-path pty");
-    hold.stdin(hakoniwa::Stdio::from(
+    hold.stdin(sandbox::Stdio::from(
         pty.dup_slave_fd()
             .expect("duplicating the launch-path pty slave"),
     ));
@@ -690,8 +706,8 @@ async fn network_none_attach_works() {
     // supervisor when its parent-death signal does not land, and a process
     // holding the test's streams past the proof's exit is what the lane's
     // leak window fails with no message of the proof's own.
-    hold.stdout(hakoniwa::Stdio::MakePipe);
-    hold.stderr(hakoniwa::Stdio::MakePipe);
+    hold.stdout(sandbox::Stdio::MakePipe);
+    hold.stderr(sandbox::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in none box");
 
     let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
@@ -754,20 +770,12 @@ async fn network_none_attach_works() {
          without a terminal"
     );
 
-    let mut env = sandbox.command_env();
-    env.insert("SHELL".to_string(), PROBE_SHELL.to_string());
-    let injection = Injection::new(leader, "/usr/bin/probe", ["attach"])
-        .with_shim(shim())
-        .with_cwd(expected_cwd)
-        .with_env(env);
+    let mut injection = enter(&guard, &sandbox, ["attach"]);
+    injection.env("SHELL", PROBE_SHELL);
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
-            injection
-                .command()
-                .expect("building injection command")
-                .output()
-                .expect("running injected attach probe")
+            injection.output().expect("running injected attach probe")
         }),
     )
     .await
@@ -783,7 +791,7 @@ async fn network_none_attach_works() {
     assert!(
         output.status.success(),
         "attach probe in none box failed: status={:?}\nstderr={stderr}",
-        output.status.code(),
+        output.status.exit_code,
     );
     let attach_report: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1027,14 +1035,14 @@ fn capability_mask(report: &BTreeMap<String, String>, set: &str, what: &str) -> 
 /// proof's child, so nothing else reaps it — is given a moment to take its
 /// `PDEATHSIG` before the proof returns.
 struct LiveBox {
-    child: hakoniwa::Child,
+    child: sandbox::Child,
     /// The program the injection targets, once the box has reported; only
     /// then can stopping the box wait for the program to be gone.
     leader: Option<i32>,
 }
 
 impl LiveBox {
-    fn new(child: hakoniwa::Child) -> Self {
+    fn new(child: sandbox::Child) -> Self {
         Self {
             child,
             leader: None,
@@ -1053,12 +1061,12 @@ impl LiveBox {
         self.child.id()
     }
 
-    /// Stops the box and waits out what it held. Safe to call twice: hakoniwa
-    /// ignores `kill` on an already-reaped child and `wait` returns the status
-    /// it collected, so the drop after an explicit stop is a no-op.
-    fn stop(&mut self) -> hakoniwa::Result<hakoniwa::ExitStatus> {
-        let _signalled = self.child.kill();
-        let status = self.child.wait()?;
+    /// Stops the box and waits out what it held. Safe to call twice: a box
+    /// that has ended takes no signal and `wait` returns the status it
+    /// ended with, so the drop after an explicit stop is a no-op.
+    fn stop(&mut self) -> sandbox::ExitStatus {
+        self.child.kill();
+        let status = self.child.wait();
         if let Some(leader) = self.leader {
             let program = format!("/proc/{leader}");
             // The program is the supervisor's child, not this proof's, so it
@@ -1083,7 +1091,7 @@ impl LiveBox {
                 eprintln!("warning: program {leader} outlived the box that ran it");
             }
         }
-        Ok(status)
+        status
     }
 }
 
@@ -1119,7 +1127,7 @@ async fn injected_process_lacks_cap_net_raw() {
         return;
     }
     announce_to_the_runner("injected_process_lacks_cap_net_raw");
-    use minimald::nsenter::{Injection, session_leader_pid};
+    use_daemon_spawner();
     use std::io::{BufRead as _, Read as _};
 
     let proofs = proof_base_dir();
@@ -1152,8 +1160,8 @@ async fn injected_process_lacks_cap_net_raw() {
             std::iter::empty::<(&str, &str)>(),
         )
         .expect("building hold command");
-    hold.stdout(hakoniwa::Stdio::MakePipe);
-    hold.stderr(hakoniwa::Stdio::MakePipe);
+    hold.stdout(sandbox::Stdio::MakePipe);
+    hold.stderr(sandbox::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in open box");
 
     // The hold report is what proves the launch reached the program the
@@ -1198,16 +1206,11 @@ async fn injected_process_lacks_cap_net_raw() {
         session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
     guard.holds(leader);
 
-    let injection = Injection::new(leader, "/usr/bin/probe", ["caps"])
-        .with_shim(shim())
-        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
-        .with_env(sandbox.command_env());
+    let mut injection = enter(&guard, &sandbox, ["caps"]);
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
             injection
-                .command()
-                .expect("building injection command")
                 .output()
                 .expect("running injected capability probe")
         }),
@@ -1227,7 +1230,7 @@ async fn injected_process_lacks_cap_net_raw() {
     assert!(
         output.status.success(),
         "capability probe injected into an open box failed: status={:?}\nstderr={stderr}",
-        output.status.code(),
+        output.status.exit_code,
     );
     let report = parse_report(&String::from_utf8_lossy(&output.stdout));
     assert_box_credentials(&report, "the injected process");
@@ -1267,7 +1270,7 @@ fn dead_or_zombie(pid: u32) -> bool {
 /// half a second into the grace period, and whether the injected process and
 /// the grandchild are dead, plus whether the marker file exists in the box.
 struct GroupKillOutcome {
-    status: std::process::ExitStatus,
+    status: sandbox::ExitStatus,
     shim_exit_after: Duration,
     grandchild_alive_mid_grace: bool,
     injected: u32,
@@ -1296,7 +1299,7 @@ async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOu
         return None;
     }
     announce_to_the_runner(name);
-    use minimald::nsenter::{Injection, session_leader_pid};
+    use_daemon_spawner();
     use std::io::BufRead as _;
 
     let proofs = proof_base_dir();
@@ -1329,7 +1332,7 @@ async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOu
             std::iter::empty::<(&str, &str)>(),
         )
         .expect("building hold command");
-    hold.stdout(hakoniwa::Stdio::MakePipe);
+    hold.stdout(sandbox::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in open box");
     let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
     let mut guard = LiveBox::new(child);
@@ -1348,17 +1351,12 @@ async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOu
         session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
     guard.holds(leader);
 
-    let injection = Injection::new(leader, "/usr/bin/probe", probe_args.iter().copied())
-        .with_shim(shim())
-        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
-        .with_env(sandbox.command_env());
+    let mut injection = enter(&guard, &sandbox, probe_args.iter().copied());
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
             let mut shim = injection
-                .command()
-                .expect("building injection command")
-                .stdout(std::process::Stdio::piped())
+                .stdout(sandbox::Stdio::MakePipe)
                 .spawn()
                 .expect("spawning the injection shim");
             let mut line = String::new();
@@ -1372,13 +1370,11 @@ async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOu
             let injected = session_leader_pid(shim.id()).expect("resolving the injected pid");
             let grandchild = session_leader_pid(injected).expect("resolving the grandchild pid");
 
-            let shim_pid = i32::try_from(shim.id()).expect("the shim pid fits an i32");
             let signalled = std::time::Instant::now();
-            // SAFETY: `kill` is a plain syscall on a pid this proof spawned.
-            assert_eq!(unsafe { libc::kill(shim_pid, libc::SIGTERM) }, 0);
+            shim.signal(libc::SIGTERM, sandbox::SignalTarget::Job);
             std::thread::sleep(Duration::from_millis(500));
             let grandchild_alive_mid_grace = !dead_or_zombie(grandchild);
-            let status = shim.wait().expect("reaping the shim");
+            let status = shim.wait();
             let shim_exit_after = signalled.elapsed();
 
             // From the SIGTERM: the grace period, then a margin for the
@@ -1435,7 +1431,7 @@ async fn sigterm_to_the_shim_kills_the_injected_group() {
         return;
     };
     assert_eq!(
-        outcome.status.code(),
+        outcome.status.exit_code,
         Some(128 + libc::SIGTERM),
         "the shim must exit through its SIGTERM handler: {:?}",
         outcome.status
@@ -1468,7 +1464,7 @@ async fn a_group_member_that_traps_sigterm_runs_its_trap() {
         return;
     };
     assert_eq!(
-        outcome.status.code(),
+        outcome.status.exit_code,
         Some(128 + libc::SIGTERM),
         "the shim must exit through its SIGTERM handler: {:?}",
         outcome.status
@@ -1496,7 +1492,7 @@ async fn a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace() {
         return;
     };
     assert_eq!(
-        outcome.status.code(),
+        outcome.status.exit_code,
         Some(128 + libc::SIGTERM),
         "the shim must exit through its SIGTERM handler: {:?}",
         outcome.status
@@ -1559,7 +1555,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
         return;
     }
     announce_to_the_runner("joined_process_refuses_namespace_bypass_families");
-    use minimald::nsenter::{Injection, session_leader_pid};
+    use_daemon_spawner();
     use std::io::{BufRead as _, Read as _};
 
     let proofs = proof_base_dir();
@@ -1616,8 +1612,8 @@ async fn joined_process_refuses_namespace_bypass_families() {
             std::iter::empty::<(&str, &str)>(),
         )
         .expect("building hold command");
-    hold.stdout(hakoniwa::Stdio::MakePipe);
-    hold.stderr(hakoniwa::Stdio::MakePipe);
+    hold.stdout(sandbox::Stdio::MakePipe);
+    hold.stderr(sandbox::Stdio::MakePipe);
     let mut child = hold
         .spawn()
         .expect("spawning hold process in host-address box");
@@ -1658,18 +1654,11 @@ async fn joined_process_refuses_namespace_bypass_families() {
         session_leader_pid(guard.child_id()).expect("resolving the host-address box's program pid");
     guard.holds(leader);
 
-    let injection = Injection::new(leader, "/usr/bin/probe", ["caps"])
-        .with_shim(shim())
-        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
-        .with_env(sandbox.command_env());
+    let mut injection = enter(&guard, &sandbox, ["caps"]);
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
-            injection
-                .command()
-                .expect("building injection command")
-                .output()
-                .expect("running injected seal probe")
+            injection.output().expect("running injected seal probe")
         }),
     )
     .await
@@ -1685,7 +1674,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
     assert!(
         output.status.success(),
         "seal probe injected into a host-address box failed: status={:?}\nstderr={stderr}",
-        output.status.code(),
+        output.status.exit_code,
     );
     let report = parse_report(&String::from_utf8_lossy(&output.stdout));
     assert_box_credentials(&report, "the injected process");

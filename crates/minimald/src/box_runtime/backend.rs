@@ -50,8 +50,10 @@ pub(crate) trait BoxProcess: Send + 'static {
     /// valid handle for all of them except the PID namespace, which it created
     /// for its children without entering. Use
     /// [`Host::session_leader_pid`](Host::session_leader_pid) for the shell's
-    /// own PID; see [`crate::nsenter`] for why the distinction matters.
+    /// own PID.
     fn container_pid(&self) -> u32;
+    /// The way into the box for more programs.
+    fn entrance(&self) -> crate::box_command::BoxEntrance;
     /// Returns `Some(code)` if the process has exited, `None` if still running.
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
     /// Blocks until the process exits, returning its exit code.
@@ -83,6 +85,8 @@ pub(crate) struct ExitReport {
 pub(crate) trait ProcessBackend: Send + 'static {
     /// See [`BoxProcess::container_pid`].
     fn container_pid(&self) -> u32;
+    /// See [`BoxProcess::entrance`].
+    fn entrance(&self) -> crate::box_command::BoxEntrance;
     /// See [`BoxProcess::try_wait`]; `Ok(None)` while the process runs.
     fn try_wait(&mut self) -> io::Result<Option<ExitReport>>;
     /// See [`BoxProcess::wait`].
@@ -133,6 +137,10 @@ impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
         self.backend.container_pid()
     }
 
+    fn entrance(&self) -> crate::box_command::BoxEntrance {
+        self.backend.entrance()
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         let report = self.backend.try_wait()?;
         Ok(report.map(|r| self.record_exit(r)))
@@ -152,16 +160,16 @@ impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
     }
 }
 
-/// The real sandboxed child backend: a [`hakoniwa::Child`].
+/// The real sandboxed child backend: a container the spawner runs.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) struct SandboxBackend {
-    pub(super) child: hakoniwa::Child,
+    pub(super) child: sandbox::Child,
 }
 
 #[cfg_attr(test, allow(dead_code))]
 impl SandboxBackend {
-    /// Reduces `hakoniwa`'s account of an exit to the shared [`ExitReport`].
-    fn report(s: hakoniwa::ExitStatus) -> ExitReport {
+    /// Reduces the spawner's account of an exit to the shared [`ExitReport`].
+    fn report(s: sandbox::ExitStatus) -> ExitReport {
         ExitReport {
             code: s.code,
             reason: ExitReason {
@@ -178,29 +186,24 @@ impl ProcessBackend for SandboxBackend {
         self.child.id()
     }
 
+    fn entrance(&self) -> crate::box_command::BoxEntrance {
+        crate::box_command::BoxEntrance::Sandbox(self.child.entrance())
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<ExitReport>> {
-        let status = self
-            .child
-            .try_wait()
-            .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
-        Ok(status.map(Self::report))
+        Ok(self.child.try_wait().map(Self::report))
     }
 
     fn wait(&mut self) -> io::Result<ExitReport> {
-        // The blocking reap the pty/step error path takes — in practice the
+        // The blocking wait the pty/step error path takes — in practice the
         // one that fires, since the master's `EIO` beats the loop's `try_wait`
         // poll to every ordinary exit.
-        let s = self
-            .child
-            .wait()
-            .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
-        Ok(Self::report(s))
+        Ok(Self::report(self.child.wait()))
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.child
-            .kill()
-            .map_err(|e| io::Error::other(format!("kill failed: {e}")))
+        self.child.kill();
+        Ok(())
     }
 
     /// Logs on every exit, not just the non-zero ones, exactly once per session
@@ -227,21 +230,15 @@ impl ProcessBackend for SandboxBackend {
 }
 
 impl Drop for SandboxBackend {
-    /// Ends the box if nothing has yet. A [`hakoniwa::Child`] does not
-    /// terminate when dropped, and a host loop that was aborted never
-    /// reaped its process. After a reap both calls return at once.
+    /// Ends the box if nothing has yet, and waits until it is gone: a host
+    /// loop that was aborted never waited for its process. After an exit
+    /// both calls return at once.
     fn drop(&mut self) {
-        // A process that already exited refuses the kill and still needs
-        // the reap.
-        if let Err(e) = self.child.kill() {
-            tracing::warn!(error = %e, "killing session process at teardown");
-        }
-        if let Err(e) = self.child.wait() {
-            tracing::warn!(error = %e, "reaping session process at teardown");
-        }
+        self.child.kill();
+        self.child.wait();
     }
 }
 
-/// A launched session process backed by a sandboxed [`hakoniwa::Child`].
+/// A launched session process backed by a sandboxed [`sandbox::Child`].
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) type SandboxProcess = HostProcess<SandboxBackend>;

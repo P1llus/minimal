@@ -33,9 +33,9 @@
 //! caller's job; this module runs a set of hooks for one event and
 //! reports what happened.
 
+use crate::box_command::Stdio;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::process::Stdio;
 use std::time::Duration;
 
 use boxes::SessionId;
@@ -104,7 +104,7 @@ pub(crate) trait BoxCommands {
         program: &str,
         args: &[&str],
         extra_env: BTreeMap<String, String>,
-    ) -> impl std::future::Future<Output = std::io::Result<std::process::Command>> + Send;
+    ) -> impl std::future::Future<Output = std::io::Result<crate::box_command::BoxCommand>> + Send;
 }
 
 /// A [`BoxCommands`] owning everything needed to build an
@@ -116,7 +116,7 @@ pub(crate) trait BoxCommands {
 /// off the stack across an await — a `Host` holds a non-`Sync`
 /// `dyn NetGuard`, which would make the whole session future non-`Send`.
 pub(crate) struct InjectedCommands {
-    pub(crate) leader_pid: u32,
+    pub(crate) entrance: crate::box_command::BoxEntrance,
     pub(crate) cwd: String,
     pub(crate) vars: BTreeMap<String, String>,
 }
@@ -127,13 +127,10 @@ impl BoxCommands for InjectedCommands {
         program: &str,
         args: &[&str],
         extra_env: BTreeMap<String, String>,
-    ) -> std::io::Result<std::process::Command> {
+    ) -> std::io::Result<crate::box_command::BoxCommand> {
         let mut vars = self.vars.clone();
         vars.extend(extra_env);
-        let injection = crate::nsenter::Injection::new(self.leader_pid, program, args)
-            .with_cwd(self.cwd.clone())
-            .with_env(vars);
-        injection.command().map_err(std::io::Error::other)
+        Ok(self.entrance.command(program, args, vars, &self.cwd))
     }
 }
 
@@ -143,10 +140,11 @@ impl BoxCommands for crate::box_runtime::HostHandle {
         program: &str,
         args: &[&str],
         extra_env: BTreeMap<String, String>,
-    ) -> impl std::future::Future<Output = std::io::Result<std::process::Command>> + Send {
+    ) -> impl std::future::Future<Output = std::io::Result<crate::box_command::BoxCommand>> + Send
+    {
         let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
         let program = program.to_string();
-        async move { self.command_in_session_env(program, args, extra_env).await }
+        async move { self.command_in_session_env(&program, args, extra_env).await }
     }
 }
 
@@ -507,7 +505,7 @@ async fn run_one<C: BoxCommands>(
         }
     };
 
-    let mut cmd = tokio::process::Command::from(built);
+    let mut cmd = built;
     cmd.stdin(Stdio::piped());
     let capturing = match output {
         HookOutput::Capture => {
@@ -530,8 +528,6 @@ async fn run_one<C: BoxCommands>(
             false
         }
     };
-    cmd.kill_on_drop(true);
-
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -864,13 +860,13 @@ mod tests {
             program: &str,
             args: &[&str],
             extra_env: BTreeMap<String, String>,
-        ) -> impl std::future::Future<Output = std::io::Result<std::process::Command>> + Send
+        ) -> impl std::future::Future<Output = std::io::Result<crate::box_command::BoxCommand>> + Send
         {
             let mut cmd = std::process::Command::new(program);
             cmd.args(args);
             cmd.env_clear();
             cmd.envs(extra_env);
-            async move { Ok(cmd) }
+            async move { Ok(cmd.into()) }
         }
     }
 
@@ -884,7 +880,7 @@ mod tests {
             _program: &str,
             _args: &[&str],
             _extra_env: BTreeMap<String, String>,
-        ) -> std::io::Result<std::process::Command> {
+        ) -> std::io::Result<crate::box_command::BoxCommand> {
             Err(std::io::Error::other("no session leader"))
         }
     }

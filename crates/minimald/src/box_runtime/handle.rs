@@ -25,13 +25,13 @@ pub(super) enum Message {
     /// the host can: it holds the session process (whose namespaces are joined)
     /// and the guard (which knows the session's current environment).
     CommandInSession {
-        program: std::ffi::OsString,
-        args: Vec<std::ffi::OsString>,
+        program: String,
+        args: Vec<String>,
         /// Layered over the session's own variables, replacing on a
         /// shared key. Empty for callers that want the session
         /// environment verbatim.
         extra_env: std::collections::BTreeMap<String, String>,
-        reply: oneshot::Sender<Result<std::process::Command, crate::nsenter::NsenterError>>,
+        reply: oneshot::Sender<crate::box_command::BoxCommand>,
     },
 
     /// Snapshot the terminal screen for a read-only preview (`min dash`).
@@ -378,61 +378,36 @@ impl HostHandle {
         !self.sender.is_closed()
     }
 
-    /// Builds a command that runs `program` inside this session's sandbox,
-    /// joining the namespaces of the running session process.
+    /// Builds a command that runs `program` inside this session's box, with
+    /// `extra_env` layered over the session's own variables. The merge
+    /// happens host-side, where the session's variables live.
     ///
-    /// The returned command has no stdio configured: that belongs to whoever is
-    /// wiring it up (an SSH exec channel pipes all three, an interactive
-    /// attach would hand it a PTY). See [`Host::command_in_session`].
+    /// The returned command has no stdio configured: that belongs to whoever
+    /// is wiring it up. See [`Host::command_in_session`].
     ///
     /// # Errors
     ///
-    /// The session process having exited, its namespaces being unreadable, or
-    /// the host having stopped between this call and its reply.
-    pub async fn command_in_session<I, S>(
+    /// The host having stopped between this call and its reply.
+    pub(crate) async fn command_in_session_env<I, S>(
         &self,
-        program: impl AsRef<std::ffi::OsStr>,
-        args: I,
-    ) -> io::Result<std::process::Command>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        self.command_in_session_env(program, args, std::collections::BTreeMap::new())
-            .await
-    }
-
-    /// [`Self::command_in_session`], with `extra_env` layered over the
-    /// session's own variables.
-    ///
-    /// Separate rather than an extra parameter on the common form
-    /// because [`crate::nsenter::Injection::with_env`] *replaces* the
-    /// environment outright — merging has to happen host-side, where
-    /// the session's variables live, and every caller that doesn't need
-    /// it should keep saying so by not passing anything.
-    pub async fn command_in_session_env<I, S>(
-        &self,
-        program: impl AsRef<std::ffi::OsStr>,
+        program: &str,
         args: I,
         extra_env: std::collections::BTreeMap<String, String>,
-    ) -> io::Result<std::process::Command>
+    ) -> io::Result<crate::box_command::BoxCommand>
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
+        S: AsRef<str>,
     {
         let (reply, recv) = oneshot::channel();
         let message = Message::CommandInSession {
-            program: program.as_ref().to_os_string(),
-            args: args
-                .into_iter()
-                .map(|a| a.as_ref().to_os_string())
-                .collect(),
+            program: program.to_string(),
+            args: args.into_iter().map(|a| a.as_ref().to_string()).collect(),
             extra_env,
             reply,
         };
         let dead = || io::Error::other("session host stopped before the command could be built");
         self.sender.send(message).await.map_err(|_| dead())?;
-        recv.await.map_err(|_| dead())?.map_err(io::Error::other)
+        recv.await.map_err(|_| dead())
     }
 
     /// Returns the terminal attributes. A host that goes away between the

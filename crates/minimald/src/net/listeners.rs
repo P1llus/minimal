@@ -2067,7 +2067,7 @@ impl WatchState {
         match self.leader {
             Leader::Resolved(leader) => Some(leader),
             Leader::Pending { container_pid } => {
-                match crate::nsenter::session_leader_pid(container_pid) {
+                match sandbox::spawner::enter::init_of(container_pid) {
                     Ok(leader) => {
                         // The streak of refused resolutions — if there was
                         // one — is over, and a later refusal is a streak of

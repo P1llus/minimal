@@ -34,21 +34,30 @@ pub mod cgroup {
     /// The cgroup of one box.
     #[derive(Debug, Clone)]
     pub enum BoxCgroup {}
+
+    impl BoxCgroup {
+        /// The cgroup's name, the id of its box.
+        #[must_use]
+        pub fn name(&self) -> &str {
+            match *self {}
+        }
+    }
 }
 pub mod error;
-pub mod forker;
 #[cfg(target_os = "linux")]
 pub mod seccomp;
+#[cfg(target_os = "linux")]
+pub mod spawner;
 #[cfg(target_os = "linux")]
 use crate::config::Invocation;
 use crate::config::WdSetup;
 #[cfg(target_os = "linux")]
 use crate::error::ExecutionError;
 pub use error::Error;
-/// Re-export so downstream crates (e.g. `mctx`) can use the command type
-/// without depending on `hakoniwa` directly.
 #[cfg(target_os = "linux")]
-pub use hakoniwa::Command;
+pub use spawner::{
+    Child, Command, Entrance, ExitStatus, Output, SignalTarget, Spawner, Stdio, Terminal,
+};
 
 mod listener;
 
@@ -219,7 +228,7 @@ impl<C: Channel> Sandbox<C> {
                 std::io::Error::last_os_error(),
             ));
         }
-        container.start_gate = Some(Path::new("/run").join(&name));
+        container.launch.gate = Some(Path::new("/run").join(&name));
         Ok(StartGate {
             // SAFETY: `fd` is a fresh descriptor nothing else owns.
             _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
@@ -451,21 +460,11 @@ impl<C: Channel> Sandbox<C> {
     }
 }
 
-/// An initialized sandbox environment.
+/// A container of this sandbox, ready to run commands: what
+/// [`Sandbox::new_container`] decided, as the spawner takes it.
 #[cfg(target_os = "linux")]
 pub struct Container {
-    container: hakoniwa::Container,
-    /// Whether a command's pre-exec closure brings `lo` up: the launch gives
-    /// the box a fresh network namespace and hakoniwa builds no tap in it.
-    lo_up: bool,
-    /// The start gate a command from this container waits at before it execs
-    /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
-    /// [`Sandbox::hold_start`]; `None` runs the program at once.
-    start_gate: Option<PathBuf>,
-    /// Whether a command from this container calls `setsid(2)` in its
-    /// pre-exec closure, without taking a controlling terminal. Set by
-    /// [`Container::set_session_leader_without_terminal`].
-    new_session: bool,
+    launch: spawner::Launch,
 }
 
 /// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
@@ -499,65 +498,18 @@ impl Drop for StartGate {
 }
 
 #[cfg(target_os = "linux")]
-impl AsRef<hakoniwa::Container> for Container {
-    fn as_ref(&self) -> &hakoniwa::Container {
-        &self.container
-    }
-}
-
-#[cfg(target_os = "linux")]
 impl Container {
-    /// Instructs the container to perform the setsid() & associate controlling
-    /// terminal dance.
+    /// Makes each command from this container the leader of a new session
+    /// whose controlling terminal is the command's stdin.
     pub fn set_session_leader(&mut self) {
-        self.container.runctl(hakoniwa::Runctl::NewSession);
+        self.launch.session = spawner::Session::NewWithTerminal;
     }
 
     /// Makes each command from this container the leader of a new session
-    /// and process group, as [`Self::set_session_leader`] does, without a
-    /// controlling terminal. For a program whose stdin is not a terminal:
-    /// hakoniwa's own session step fails there, on `TIOCSCTTY`, before the
-    /// program runs.
+    /// and process group, without a controlling terminal. For a program
+    /// whose stdin is not a terminal, where taking one fails.
     pub fn set_session_leader_without_terminal(&mut self) {
-        self.new_session = true;
-    }
-
-    fn command_inner<C, I, IE, ArgS, EnvK, EnvV>(
-        &self,
-        sandbox: &Sandbox<C>,
-        program: &str,
-        args: I,
-        envs: IE,
-    ) -> Result<hakoniwa::Command, Error>
-    where
-        C: Channel,
-        I: IntoIterator<Item = ArgS>,
-        ArgS: AsRef<str>,
-        IE: IntoIterator<Item = (EnvK, EnvV)>,
-        EnvK: AsRef<str>,
-        EnvV: AsRef<str>,
-    {
-        let mut command = self.container.command(program);
-        command.args(args);
-        // Both are derived from the config rather than built here, so that a
-        // process injected into a *running* sandbox (minimald's `nsenter`) can
-        // reproduce the same working directory and environment without a second
-        // definition of them drifting from this one.
-        command.current_dir(sandbox.config.command_cwd()?);
-        command.envs(sandbox.config.command_env());
-        for (k, v) in envs.into_iter() {
-            command.env(k.as_ref(), v.as_ref());
-        }
-
-        with_box_closure(
-            &self.container,
-            &mut command,
-            self.lo_up,
-            self.start_gate.clone(),
-            self.new_session,
-        );
-
-        Ok(command)
+        self.launch.session = spawner::Session::New;
     }
 }
 
@@ -576,7 +528,7 @@ impl Container {
 /// returned command afterwards (`SHELL`, `PS1`, stdio) lands on the closure
 /// command and reaches the program the same way.
 #[cfg(target_os = "linux")]
-fn with_box_closure(
+pub(crate) fn with_box_closure(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
     lo_up: bool,
@@ -829,7 +781,7 @@ impl<C: Channel> Sandbox<C> {
         path: &Path,
         container_path: &str,
         opts: BindOpts,
-        container: &mut hakoniwa::Container,
+        mounts: &mut Vec<spawner::Mount>,
     ) -> Result<(), Error> {
         let mut flags = hakoniwa::MountOptions::BIND
             | hakoniwa::MountOptions::NOSUID
@@ -840,18 +792,19 @@ impl<C: Channel> Sandbox<C> {
         if opts.read_only {
             flags |= hakoniwa::MountOptions::RDONLY;
         }
-        container.mount(
-            path.to_str().ok_or_else(|| {
-                Error::Execution(ExecutionError::MountError {
-                    msg: "Unable to convert path to unicode string",
-                    path: path.to_path_buf(),
-                })
-            })?,
-            container_path,
-            "",
-            flags,
-            None,
-        );
+        let source = path.to_str().ok_or_else(|| {
+            Error::Execution(ExecutionError::MountError {
+                msg: "Unable to convert path to unicode string",
+                path: path.to_path_buf(),
+            })
+        })?;
+        mounts.push(spawner::Mount {
+            source: source.to_string(),
+            target: container_path.to_string(),
+            fstype: String::new(),
+            options: flags.bits(),
+            data: None,
+        });
         Ok(())
     }
 
@@ -885,177 +838,52 @@ impl<C: Channel> Sandbox<C> {
         PlannedLaunch::begin(network)
     }
 
-    /// Builds the hakoniwa [`Container`] for this sandbox, configured for
-    /// `plan`.
-    ///
-    /// Spawning this container (`Command::spawn`) does a bare in-process `fork()`
-    /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
-    /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
-    /// for the thread-affinity constraints this imposes on callers.
+    /// Decides the container for this sandbox under `plan`: its mounts, its
+    /// namespaces and its network. A command of the container starts it,
+    /// through the spawner, in the sandbox's box cgroup when it has one.
     #[cfg(target_os = "linux")]
     pub fn new_container(&self, plan: &network::NetPlan) -> Result<Container, Error> {
-        let mut container = hakoniwa::Container::new();
-        container
-            .rootfs(self.rootfs())
-            .unwrap()
-            // The box's uid and gid inside its user namespace, mapped onto
-            // the daemon's own. The map has this one entry, so the box holds
-            // no other id, and with `no_new_privs` an exec as this uid leaves
-            // every capability set empty.
-            .uidmap(config::BOX_UID)
-            .gidmap(config::BOX_GID)
-            .devfsmount("/dev")
-            .tmpfsmount("/tmp");
-        // The box's own devpts instance, with a limit on its PTY count: PTYs
-        // are one pool for the machine, and without a per-instance limit a
-        // single box can take them all.
-        container.mount(
-            "devpts",
-            "/dev/pts",
-            "devpts",
-            hakoniwa::MountOptions::NOSUID | hakoniwa::MountOptions::NOEXEC,
-            Some(config::BOX_DEVPTS_OPTIONS.to_string()),
-        );
-
-        // Every box maps onto the daemon's one kernel uid, so IPC permission
-        // bits cannot keep boxes apart. Only the namespace does.
-        container.unshare(hakoniwa::Namespace::Ipc);
-
-        // The cgroup namespace is rooted at the cgroup the box's first
-        // process is in when it unshares: the box cgroup, which it joins
-        // before that. With that root a process of the box cannot name any
-        // other cgroup, another box's included.
-        container.unshare(hakoniwa::Namespace::Cgroup);
-        if let Some(cgroup) = &self.config.box_cgroup {
-            let dir = cgroup.dir_fd().try_clone_to_owned().map_err(|e| {
-                Error::IO("duplicating the box cgroup", cgroup.path().to_path_buf(), e)
-            })?;
-            container.cgroup(dir);
-            // The box's view of its own cgroup, where a runtime looks for
-            // its limits. Read-only, and the namespace root is all it shows.
-            container.mount(
-                "cgroup2",
-                "/sys/fs/cgroup",
-                "cgroup2",
-                hakoniwa::MountOptions::RDONLY
-                    | hakoniwa::MountOptions::NOSUID
-                    | hakoniwa::MountOptions::NODEV
-                    | hakoniwa::MountOptions::NOEXEC,
-                None,
-            );
-        }
-
-        // Network isolation (R1.4/R1.7). An isolating plan gets a fresh network
-        // namespace with only `lo`; wiring it is the provider's job, after the
-        // process exists. It fails closed when the host cannot make the
-        // namespace.
+        // An isolating plan gets a network namespace with only `lo`, which
+        // the provider wires once the process exists. A host that cannot
+        // make the namespace fails the launch.
         let isolate = isolation_decision(plan, network_namespaces_available())?;
-        if isolate {
-            container.unshare(hakoniwa::Namespace::Network);
-        }
-
-        // Have hakoniwa create + configure the TAP inside the sandbox's user+net
-        // namespace (rootless). `network()` does not imply the netns unshare,
-        // so it must follow the `unshare` above — which a tap-carrying plan
-        // guarantees, since `NetPlan` cannot describe a tap without isolation.
-        if let Some(tap) = plan.tap() {
-            container.network(
-                hakoniwa::RustSlirp::default()
-                    // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
-                    .mode(hakoniwa::RustSlirpMode::TAP)
-                    .address(tap.address)
-                    .netmask(tap.netmask)
-                    // Next-hop default route (`0.0.0.0/0 via gateway`); gvproxy is a
-                    // real gateway and does not proxy-ARP, so an on-link route fails.
-                    .gateway(hakoniwa::RustSlirpGateway::IfaceWithAddr(tap.gateway))
-                    .mtu(tap.mtu)
-                    .clone(),
-            );
-        }
+        // A plan cannot describe a tap without isolation.
+        let tap = plan.tap().map(|tap| spawner::Tap {
+            address: tap.address,
+            netmask: tap.netmask,
+            gateway: tap.gateway,
+            mtu: tap.mtu,
+        });
+        let mut mounts = Vec::new();
+        let mut symlinks = Vec::new();
 
         let rec = BindOpts {
             recursive: true,
             read_only: false,
         };
-        Self::bind_mount(&self.state_dir, "/state", rec, &mut container)?;
-        Self::bind_mount(&self.base_dir.join("run"), "/run", rec, &mut container)?;
+        Self::bind_mount(&self.state_dir, "/state", rec, &mut mounts)?;
+        Self::bind_mount(&self.base_dir.join("run"), "/run", rec, &mut mounts)?;
 
-        // MINIMAL_INTERNAL_CS_BUILD: undocumented bundle of behaviors
-        // needed for running minimal as a library inside a GCP
-        // Confidential Space workload. Not for general callers; we
-        // expose it as a private "I am the trusted CS builder" flag so
-        // it can't accidentally enable non-hermetic behavior in normal
-        // `minimal package <pkg>` invocations.
-        //
-        // What the bundle does:
-        //
-        // 1. Bind-mount the outer /proc into the sandbox + enable
-        //    Runctl::MountFallback. CS workload containers get OCI
-        //    MaskedPaths (containerd's default — tmpfs over
-        //    /proc/{kcore,scsi,keys,...}). The Linux kernel's
-        //    anti-unmask guard then refuses any nested procfsmount
-        //    over a masked parent, so hakoniwa's implicit
-        //    `Container::new()::procfsmount("/proc")` returns EPERM.
-        //    Workaround: bind the outer (already-masked) /proc instead
-        //    of trying to mount a fresh procfs. The MountFallback
-        //    runctl is required for the same reason — hakoniwa emits
-        //    a mandatory MS_REMOUNT after every bind, which also
-        //    fails on the masked /proc until we let it retry with the
-        //    source mount's existing flags.
-        //
-        //    Caveat (noted by @twitchyliquid64 on the PR): MountFallback
-        //    is a container-global runctl, not per-mount. It applies
-        //    to every bind in the sandbox — a sandbox that wanted to
-        //    assert e.g. NOEXEC on a target may silently end up with
-        //    the source's existing flags instead. Acceptable inside
-        //    the CS attested boundary where outer isolation handles
-        //    the actual security property; the inner hakoniwa is for
-        //    build-script reproducibility, not isolation. Filed
-        //    upstream to see if hakoniwa would accept a per-mount
-        //    runctl that would let us scope this to /proc only.
-        //
-        // 2. (Cache delivery for hermetic-builder's ecosystem caches —
-        //    cargo-vendor, npm-cache, pnpm-store, bun-cache,
-        //    pip-wheels, rust-stage0, goproxy — happens in Sandbox::new
-        //    via hardlink_dir_contents from the convention path
-        //    /root/.cache/minimal/cs-mirror/. Earlier iteration of
-        //    this PR used /state/cs-mirror-pointing symlinks here,
-        //    but /state inside each sandbox is per-build state, not
-        //    shared with the orchestrator's outer state_dir, so the
-        //    symlinks pointed at unreachable paths. The hardlink
-        //    mechanism (matching the old extra_rootfs behavior) does
-        //    the right thing without expanding public API surface.)
-        //
-        // Inert when the env var is unset; default `minimal package`
-        // invocations see no behavior change.
-        if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
-            container.bindmount_rw("/proc", "/proc");
-            container.runctl(hakoniwa::Runctl::MountFallback);
-            // Cache delivery (cargo-vendor, npm-cache, ...) is handled
-            // by the hardlink_dir_contents call in Sandbox::new — see
-            // lib.rs near line ~105. Earlier iteration of this PR
-            // used /state/<...>-pointing symlinks here, but /state
-            // inside each sandbox is per-build state (created via
-            // base_dir.join("state") in Sandbox::new), not shared with
-            // the orchestrator's outer state_dir, so the symlinks
-            // pointed at unreachable paths. The hardlink mechanism
-            // replaces them.
-        }
+        // A build inside a container that masks parts of `/proc`: the
+        // kernel refuses a fresh procfs over a masked one, so the outer
+        // `/proc` is bound in, and each mount may keep the flags of its
+        // source where the kernel refuses to change them.
+        let mount_fallback = std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1");
 
         if self.needs_bin_symlink()? {
-            container.symlink("/usr/bin", "/bin");
+            symlinks.push(("/usr/bin".to_string(), "/bin".to_string()));
         }
         if self.needs_lib64_symlink()? {
-            container.symlink("/usr/lib", "/lib64");
+            symlinks.push(("/usr/lib".to_string(), "/lib64".to_string()));
         }
         if self.needs_lib_symlink()? {
-            container.symlink("/usr/lib", "/lib");
+            symlinks.push(("/usr/lib".to_string(), "/lib".to_string()));
         }
 
         // Mount in the working directory
         match &self.config.wd {
             WdSetup::Isolated { .. } => {
-                Self::bind_mount(&self.base_dir.join("build"), "/build", rec, &mut container)?;
+                Self::bind_mount(&self.base_dir.join("build"), "/build", rec, &mut mounts)?;
             }
             WdSetup::BoundDir {
                 path, read_only, ..
@@ -1073,7 +901,7 @@ impl<C: Channel> Sandbox<C> {
                     recursive: true,
                     read_only: *read_only,
                 };
-                Self::bind_mount(path, &container_path, opts, &mut container)?;
+                Self::bind_mount(path, &container_path, opts, &mut mounts)?;
             }
             WdSetup::Session {
                 home,
@@ -1089,7 +917,7 @@ impl<C: Channel> Sandbox<C> {
                         recursive: true,
                         read_only: false,
                     },
-                    &mut container,
+                    &mut mounts,
                 )?;
                 // mount the given working directory to /{SESSION_DEFAULT_WD} (unless overridden)
                 Self::bind_mount(
@@ -1105,7 +933,7 @@ impl<C: Channel> Sandbox<C> {
                         recursive: true,
                         read_only: false,
                     },
-                    &mut container,
+                    &mut mounts,
                 )?;
             }
         }
@@ -1121,7 +949,7 @@ impl<C: Channel> Sandbox<C> {
                 Path::new(&m.host_path),
                 &m.path_in_sandbox(),
                 opts,
-                &mut container,
+                &mut mounts,
             )?;
         }
 
@@ -1133,8 +961,6 @@ impl<C: Channel> Sandbox<C> {
                 std::fs::write(&etc_hostname, format!("{}\n", hn))
                     .map_err(|e| Error::IO("writing /etc/hostname", etc_hostname.clone(), e))?;
             }
-            container.unshare(hakoniwa::Namespace::Uts);
-            container.hostname(hn);
         }
 
         // The resolver the plan names, written to the rootfs before spawn like
@@ -1146,14 +972,30 @@ impl<C: Channel> Sandbox<C> {
         write_hosts(&self.rootfs(), plan.hosts(), ipv6_disabled())?;
 
         Ok(Container {
-            container,
-            lo_up: isolate && plan.tap().is_none(),
-            start_gate: None,
-            new_session: false,
+            launch: spawner::Launch {
+                container: spawner::ContainerSpec {
+                    rootfs: self.rootfs(),
+                    uid: config::BOX_UID,
+                    gid: config::BOX_GID,
+                    mounts,
+                    symlinks,
+                    hostname: self.config.hostname.clone(),
+                    netns: isolate,
+                    tap,
+                    mount_fallback,
+                },
+                gate: None,
+                session: spawner::Session::Inherit,
+                // hakoniwa brings `lo` up only where it builds a tap.
+                lo_up: isolate && plan.tap().is_none(),
+                cgroup: self.config.box_cgroup.clone(),
+            },
         })
     }
 
-    /// Initializes a hakoniwa command structure.
+    /// A command that runs `program` in a new instance of `container`, with
+    /// this sandbox's working directory and environment and `env_vars` on
+    /// top. The process's spawner starts it ([`Spawner::current`]).
     #[cfg(target_os = "linux")]
     pub fn command<I, ArgS, IE, EnvK, EnvV>(
         &mut self,
@@ -1161,7 +1003,7 @@ impl<C: Channel> Sandbox<C> {
         program: &str,
         args: I,
         env_vars: IE,
-    ) -> Result<hakoniwa::Command, Error>
+    ) -> Result<Command, Error>
     where
         I: IntoIterator<Item = ArgS>,
         ArgS: AsRef<str>,
@@ -1190,13 +1032,17 @@ impl<C: Channel> Sandbox<C> {
             }
         }
 
-        container.command_inner(self, &program, args, env_vars)
+        let mut command = Spawner::current().run(container.launch.clone(), &program);
+        command.args(args);
+        // Both come from the config, so a program that enters the running
+        // container later can be given the same ones.
+        command.current_dir(self.config.command_cwd()?);
+        command.envs(self.config.command_env());
+        command.envs(env_vars);
+        Ok(command)
     }
 
     /// Runs the invocations in the sandbox to completion.
-    ///
-    /// Delegates to [`run_with_cancel`](Self::run_with_cancel) — see its docs for
-    /// the important thread-affinity constraint on the sandbox container.
     #[cfg(target_os = "linux")]
     pub async fn run<W1, W2>(
         &mut self,
@@ -1219,15 +1065,6 @@ impl<C: Channel> Sandbox<C> {
 
     /// Runs the invocations in the sandbox, killing the container if `cancel`
     /// fires.
-    ///
-    /// # Container lifetime (hakoniwa `PR_SET_PDEATHSIG`)
-    ///
-    /// The forked container arms `PR_SET_PDEATHSIG(SIGKILL)`, which Linux
-    /// delivers when the forking *thread* exits, so every container is forked
-    /// on the process-wide fork thread ([`forker::on_fork_thread`]) rather than
-    /// on the caller's. That thread is never retired, so this future may be
-    /// driven from any runtime thread, worker or blocking-pool; see the
-    /// [`forker`] module docs for the failure the fork thread rules out.
     #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
@@ -1245,33 +1082,24 @@ impl<C: Channel> Sandbox<C> {
                 return Err(Error::Execution(ExecutionError::Cancelled));
             }
 
-            // One launch per invocation: hakoniwa unshares per `spawn()`, so
-            // each invocation has its own netns and needs its own plan.
+            // One launch per invocation: each spawn makes a container of its
+            // own, with its own network namespace, so each needs its own plan.
             let planned = self.plan_launch().await?;
             let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
-            cmd.stderr(hakoniwa::Stdio::MakePipe);
-            cmd.stdout(hakoniwa::Stdio::MakePipe);
+            cmd.stderr(Stdio::MakePipe);
+            cmd.stdout(Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
-            let mut child = forker::on_fork_thread(move || cmd.spawn())
+            let mut child = cmd
+                .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
             // Step 3: wire this invocation's netns. Torn down explicitly once
-            // the invocation completes (both arms).
-            let net_guard = match planned.attach_child(&mut child).await {
-                Ok(guard) => guard,
-                Err(e) => {
-                    // Attach failed after spawn: kill+reap the child so it
-                    // doesn't outlive its sandbox (a `hakoniwa::Child` does
-                    // not terminate on drop). `wait` runs regardless of
-                    // `kill` (the process may have already exited).
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e);
-                }
-            };
+            // the invocation completes (both arms). A failed attach drops
+            // the child, which kills it.
+            let net_guard = planned.attach_child(&mut child).await?;
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
@@ -1392,7 +1220,7 @@ impl<C: Channel> Sandbox<C> {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    let _ = child.kill();
+                    child.kill();
 
                     // Recover stdout/stderr files from the reader threads.
                     // The threads will finish promptly now that pipes are closed.
@@ -1403,14 +1231,16 @@ impl<C: Channel> Sandbox<C> {
                         self.stderr = f;
                     }
 
-                    // Reap the child process, then tear down its network.
-                    let _ = child.wait();
+                    // Wait for the child to be gone, then tear down its network.
+                    child.exited().await;
                     if let Some(net_guard) = net_guard {
                         net_guard.teardown().await;
                     }
                     return Err(Error::Execution(ExecutionError::Cancelled));
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
+                    // The pipes are drained, so the child is exiting.
+                    let status = child.exited().await;
                     // Compute the invocation outcome with a closure so every
                     // failure path (reader-thread error, async writer error, wait
                     // error, non-zero exit) funnels through one point; then tear
@@ -1431,18 +1261,13 @@ impl<C: Channel> Sandbox<C> {
                         stdout_fwd_res?;
                         stderr_fwd_res?;
 
-                        // The pipes are drained, so the child should have exited.
-                        let status = child
-                            .wait()
-                            .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
-
                         if !status.success() {
                             let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
                             let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
                             return Err(Error::Execution(ExecutionError::InvocationFailed {
                                 idx: i,
                                 code: status.code,
-                                reason: status.reason.clone(),
+                                reason: status.reason,
                                 stderr: stderr_str,
                                 stdout: stdout_str,
                             }));
@@ -1931,12 +1756,9 @@ impl PlannedLaunch {
     ///
     /// Propagates the provider's attach failure while the process still runs.
     #[cfg(target_os = "linux")]
-    pub async fn attach_child(
-        self,
-        child: &mut hakoniwa::Child,
-    ) -> Result<Option<Box<dyn NetGuard>>, Error> {
+    pub async fn attach_child(self, child: &mut Child) -> Result<Option<Box<dyn NetGuard>>, Error> {
         let spawned = network::Spawned::from_child(child);
-        self.attach_unless_ended(spawned, || matches!(child.try_wait(), Ok(Some(_))))
+        self.attach_unless_ended(spawned, || child.try_wait().is_some())
             .await
     }
 
@@ -1991,6 +1813,8 @@ pub struct HeldNetwork {
     pid: u32,
     nameservers: Vec<std::net::Ipv4Addr>,
     #[cfg(target_os = "linux")]
+    entrance: Entrance,
+    #[cfg(target_os = "linux")]
     _held: std::sync::Mutex<Held>,
 }
 
@@ -2010,6 +1834,26 @@ impl HeldNetwork {
         self.pid
     }
 
+    /// Creates a socket in the namespace, and in the cgroup the network is
+    /// held in.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the held process has ended or the socket cannot be created.
+    pub fn socket(&self, v6: bool, datagram: bool) -> std::io::Result<std::os::fd::OwnedFd> {
+        #[cfg(target_os = "linux")]
+        {
+            self.entrance.socket(v6, datagram)
+        }
+        // No network is held anywhere else, so there is no value to call
+        // this on.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (v6, datagram);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
     /// The name servers the network's plan names, which answer inside the
     /// namespace.
     #[must_use]
@@ -2022,7 +1866,7 @@ impl HeldNetwork {
 /// gate and never runs a program, so its rootfs holds nothing to run.
 #[cfg(target_os = "linux")]
 struct Held {
-    child: hakoniwa::Child,
+    child: Child,
     guard: Option<Box<dyn NetGuard>>,
     _gate: StartGate,
     _sandbox: Sandbox<()>,
@@ -2042,21 +1886,16 @@ impl Drop for Held {
     }
 }
 
-/// Ends a held process and reaps it. A process that already exited refuses
-/// the kill, and the wait still reaps it.
+/// Ends a held process and waits until it is gone.
 #[cfg(target_os = "linux")]
-fn end_held(child: &mut hakoniwa::Child) {
-    if let Err(e) = child.kill() {
-        tracing::debug!(error = %e, "a held process refused the kill");
-    }
-    if let Err(e) = child.wait() {
-        tracing::warn!(error = %e, "could not reap a held process");
-    }
+fn end_held(child: &mut Child) {
+    child.kill();
+    child.wait();
 }
 
 /// The error for a held process that ended before its network was attached.
 #[cfg(target_os = "linux")]
-fn held_process_ended(status: &hakoniwa::ExitStatus) -> Error {
+fn held_process_ended(status: &ExitStatus) -> Error {
     Error::Execution(ExecutionError::InvocationFailed {
         idx: 0,
         code: status.code,
@@ -2075,6 +1914,7 @@ fn held_process_ended(status: &hakoniwa::ExitStatus) -> Error {
 async fn held_sandbox(
     base_dir: &Path,
     network: std::sync::Arc<dyn network::Network>,
+    cgroup: Option<cgroup::BoxCgroup>,
 ) -> Result<Sandbox<()>, Error> {
     let rootfs = tempfile::tempdir()
         .map_err(|e| Error::IO("create held rootfs", base_dir.to_path_buf(), e))?;
@@ -2083,12 +1923,14 @@ async fn held_sandbox(
     Config::new("held-network")
         .with_add_rootfs(config::SandboxMapped::TempDir(rootfs))
         .with_network(network)
+        .with_box_cgroup(cgroup)
         .build(base_dir, ())
         .await
 }
 
 /// Starts a sandbox under `base_dir` that holds `network` up with no program
-/// in it.
+/// in it. The held process, and every socket made in the namespace, is in
+/// `cgroup` when one is given.
 ///
 /// # Errors
 ///
@@ -2097,8 +1939,9 @@ async fn held_sandbox(
 pub async fn hold_network(
     base_dir: &Path,
     network: std::sync::Arc<dyn network::Network>,
+    cgroup: Option<cgroup::BoxCgroup>,
 ) -> Result<HeldNetwork, Error> {
-    let mut sandbox = held_sandbox(base_dir, network).await?;
+    let mut sandbox = held_sandbox(base_dir, network, cgroup).await?;
     let planned = sandbox.plan_launch().await?;
     let nameservers = match planned.plan().resolver() {
         network::Resolver::Nameservers(nameservers) => nameservers.clone(),
@@ -2107,22 +1950,15 @@ pub async fn hold_network(
     let mut container = sandbox.new_container(planned.plan())?;
     let gate = sandbox.hold_start(&mut container)?;
     let mut cmd = sandbox.command(&container, "/held-network", [""; 0], [("", ""); 0])?;
-    // A held process reads and writes nothing, so its stdio is /dev/null. It
-    // must not take the daemon's terminal: hakoniwa binds a terminal stdout
-    // as the box's console, and a daemon whose stdout is a microVM guest's
-    // console has none it can bind there.
-    let null = || {
-        std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .map(hakoniwa::Stdio::from)
-            .map_err(|e| Error::IO("open the held network's stdio", "/dev/null".into(), e))
-    };
-    cmd.stdin(null()?);
-    cmd.stdout(null()?);
-    cmd.stderr(null()?);
-    let mut child = forker::on_fork_thread(move || cmd.spawn())
+    // A held process reads and writes nothing. It must not take the
+    // requester's terminal: hakoniwa binds a terminal stdout as the box's
+    // console, and a daemon whose stdout is a microVM guest's console has
+    // none it can bind there.
+    cmd.stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null);
+    let mut child = cmd
+        .spawn()
         .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
     let pid = child.id();
     let spawned = network::Spawned::from_child(&mut child);
@@ -2133,14 +1969,13 @@ pub async fn hold_network(
         Ok(guard) => {
             // An attach that touches no namespace succeeds over an ended
             // process too.
-            if let Ok(Some(status)) = child.try_wait() {
-                end_held(&mut child);
+            if let Some(status) = child.try_wait() {
                 return Err(held_process_ended(&status));
             }
             guard
         }
         Err(e) => {
-            let ended = child.try_wait().ok().flatten();
+            let ended = child.try_wait();
             end_held(&mut child);
             return Err(match ended {
                 Some(status) => held_process_ended(&status),
@@ -2151,6 +1986,7 @@ pub async fn hold_network(
     Ok(HeldNetwork {
         pid,
         nameservers,
+        entrance: child.entrance(),
         _held: std::sync::Mutex::new(Held {
             child,
             guard: Some(guard),
@@ -2170,6 +2006,7 @@ pub async fn hold_network(
 pub async fn hold_network(
     base_dir: &Path,
     _network: std::sync::Arc<dyn network::Network>,
+    _cgroup: Option<cgroup::BoxCgroup>,
 ) -> Result<HeldNetwork, Error> {
     Err(Error::IO(
         "holding a network",
@@ -3200,293 +3037,15 @@ ff02::2\tip6-allrouters
     }
 
     // ---------------------------------------------------------------------
-    // NET-079: each host-address box in its own classifier leaf, kept there.
+    // Boxes that run a probe: cgroups, namespaces, the start gate.
     // ---------------------------------------------------------------------
 
-    /// C source for the probe this proof runs inside a box. It reports its
-    /// own pid (the one that wrote itself into its leaf), the box's own
-    /// cgroup as the kernel names it, the cover its pre-exec closure took
-    /// (`MINIMAL_CLASSIFIER_COVER`: the design's `cgroup2` view of its own
-    /// namespace root, or the recorded `tmpfs-fallback`), and then whatever
-    /// its argv asks of the mountpoint — what filesystem sits there, what
-    /// the box can read there, which migration paths open for writing — and
-    /// can hold the box in its leaf until a release file appears, so the
-    /// test can read the host's side of the tree while the box is still in
-    /// it. The IPC namespace proof runs it too: it reports the box's
-    /// namespaces and creates or looks up System V and POSIX IPC objects.
+    /// The program a test box runs: `/usr/bin/probe` of its rootfs. It
+    /// prints its own cgroup as the kernel names it and its pid, then does
+    /// what its arguments ask and prints one `key: value` line per result.
+    /// The source lists the operations.
     #[cfg(target_os = "linux")]
-    const CGROUP_PROBE_C: &str = r#"
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <sched.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ipc.h>
-#include <sys/mount.h>
-#include <sys/msg.h>
-#include <sys/sem.h>
-#include <sys/shm.h>
-#include <sys/stat.h>
-#include <sys/statfs.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
-#include <time.h>
-#include <unistd.h>
-
-int main(int argc, char **argv) {
-    /* Unbuffered: every line is through the pipe the moment it is printed,
-       so a box held in its leaf reports live — the report does not wait for
-       the exit the hold delays, and a lost release file still leaves the
-       reader a report it can read. */
-    setvbuf(stdout, NULL, _IONBF, 0);
-
-    /* The box's own cgroup as the kernel names it: 0::/ when the box stands
-       at the root of its own cgroup namespace. */
-    FILE *cg = fopen("/proc/self/cgroup", "r");
-    char line[256];
-    if (cg && fgets(line, sizeof line, cg)) {
-        line[strcspn(line, "\n")] = 0;
-        printf("self_cgroup: %s\n", line);
-    } else {
-        printf("self_cgroup: unreadable\n");
-    }
-    if (cg) fclose(cg);
-
-    /* For the test to find in the box cgroup's own cgroup.procs. */
-    printf("pid: %ld\n", (long)getpid());
-
-    /* argv[i] names an operation on a path:
-         STATFS:<path>  what filesystem is mounted there;
-         READ:<path>    whether the path opens for reading;
-         WRITE:<path>   whether the path opens for writing;
-         MKDIR:<path>   whether a directory can be made there;
-         NESTED:<name>  what a process of the box can do to cgroups from a
-                        user, mount and cgroup namespace of its own, where
-                        it is root and mounts cgroup2 itself: make a child
-                        cgroup, and name the sibling box <name> to move into;
-         MOUNTINFO:<path>  the mountinfo line of the mount on top of the
-                        path: the box's /dev/pts, after its devpts remount;
-         OPENPTY        whether the box's own user can open a PTY pair;
-         HOLD:<path>    stay until that path appears, so the test can read
-                        the host's side of the box's cgroup while the box is
-                        still in it. The hold runs last, when every line of
-                        the report is already out.
-       and, for the IPC namespace proof:
-         NS:<kind>      the namespace the box is in, /proc/self/ns/<kind>;
-         SYSV:<key>     create a System V message queue, semaphore set and
-                        shared memory segment under that key, removed again
-                        at exit;
-         SYSVGET:<key>  look the three up by key without creating them;
-         MQ:<name>      create a POSIX message queue under that name, unlinked
-                        again at exit (the raw syscall, which takes the name
-                        without its leading slash, so no -lrt is needed);
-         MQOPEN:<name>  open that queue without creating it;
-         MARK:<path>    create that file, telling the test the operations
-                        before it have run. */
-    const char *release = NULL;
-    int msq = -1, sem = -1, shm = -1;
-    const char *mq = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "STATFS:", 7) == 0) {
-            const char *path = argv[i] + 7;
-            struct statfs st;
-            if (statfs(path, &st) == 0)
-                printf("fstype %s: magic %lu\n", path, (unsigned long)st.f_type);
-            else
-                printf("fstype %s: errno %d\n", path, errno);
-        } else if (strncmp(argv[i], "READ:", 5) == 0) {
-            const char *path = argv[i] + 5;
-            int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                printf("read %s: errno 0\n", path);
-                close(fd);
-            } else {
-                printf("read %s: errno %d\n", path, errno);
-            }
-        } else if (strncmp(argv[i], "WRITE:", 6) == 0) {
-            const char *path = argv[i] + 6;
-            int fd = open(path, O_WRONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                printf("open %s: errno 0\n", path);
-                close(fd);
-            } else {
-                printf("open %s: errno %d\n", path, errno);
-            }
-        } else if (strncmp(argv[i], "MKDIR:", 6) == 0) {
-            const char *path = argv[i] + 6;
-            if (mkdir(path, 0700) == 0) {
-                printf("mkdir %s: errno 0\n", path);
-                rmdir(path);
-            } else {
-                printf("mkdir %s: errno %d\n", path, errno);
-            }
-        } else if (strncmp(argv[i], "NESTED:", 7) == 0) {
-            const char *sibling = argv[i] + 7;
-            long uid = (long)getuid(), gid = (long)getgid();
-            fflush(stdout);
-            pid_t child = fork();
-            if (child == 0) {
-                char buf[512];
-                int fd;
-                if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWCGROUP) != 0) {
-                    printf("nested unshare: errno %d\n", errno);
-                    _exit(0);
-                }
-                printf("nested unshare: errno 0\n");
-                fd = open("/proc/self/setgroups", O_WRONLY);
-                if (fd >= 0) { if (write(fd, "deny", 4) < 0) {} close(fd); }
-                snprintf(buf, sizeof buf, "0 %ld 1", uid);
-                fd = open("/proc/self/uid_map", O_WRONLY);
-                if (fd >= 0) { if (write(fd, buf, strlen(buf)) < 0) {} close(fd); }
-                snprintf(buf, sizeof buf, "0 %ld 1", gid);
-                fd = open("/proc/self/gid_map", O_WRONLY);
-                if (fd >= 0) { if (write(fd, buf, strlen(buf)) < 0) {} close(fd); }
-                mkdir("/tmp/nested-cg", 0700);
-                if (mount("cgroup2", "/tmp/nested-cg", "cgroup2", 0, NULL) != 0) {
-                    printf("nested mount: errno %d\n", errno);
-                    _exit(0);
-                }
-                printf("nested mount: errno 0\n");
-                FILE *own = fopen("/proc/self/cgroup", "r");
-                if (own && fgets(buf, sizeof buf, own)) {
-                    buf[strcspn(buf, "\n")] = 0;
-                    printf("nested self_cgroup: %s\n", buf);
-                }
-                if (own) fclose(own);
-                /* Its own root is writable to it: the move is to where it is. */
-                fd = open("/tmp/nested-cg/cgroup.procs", O_WRONLY);
-                if (fd >= 0) {
-                    printf("nested own procs: errno %d\n", write(fd, "0", 1) == 1 ? 0 : errno);
-                    close(fd);
-                } else {
-                    printf("nested own procs: errno %d\n", errno);
-                }
-                printf("nested mkdir: errno %d\n", mkdir("/tmp/nested-cg/sub", 0700) == 0 ? 0 : errno);
-                fd = open("/tmp/nested-cg/cgroup.max.descendants", O_WRONLY);
-                if (fd >= 0) {
-                    printf("nested raise descendants: errno %d\n", write(fd, "max", 3) == 3 ? 0 : errno);
-                    close(fd);
-                } else {
-                    printf("nested raise descendants: errno %d\n", errno);
-                }
-                /* Every spelling that could name the sibling box. */
-                const char *spellings[] = {"/tmp/nested-cg/%s/cgroup.procs",
-                                           "/tmp/nested-cg/../%s/cgroup.procs",
-                                           "/sys/fs/cgroup/../%s/cgroup.procs"};
-                int reached = 0;
-                for (int k = 0; k < 3; k++) {
-                    snprintf(buf, sizeof buf, spellings[k], sibling);
-                    fd = open(buf, O_WRONLY);
-                    if (fd >= 0) {
-                        if (write(fd, "0", 1) == 1) reached = 1;
-                        close(fd);
-                    }
-                }
-                printf("nested sibling reached: %d\n", reached);
-                _exit(0);
-            }
-            int status;
-            waitpid(child, &status, 0);
-        } else if (strncmp(argv[i], "MOUNTINFO:", 10) == 0) {
-            /* The last /proc/self/mountinfo line whose mount point is the
-               path: the mount on top, its per-mount flags and its
-               superblock options. */
-            const char *path = argv[i] + 10;
-            char found[1024] = "absent";
-            char row[1024];
-            FILE *mi = fopen("/proc/self/mountinfo", "r");
-            while (mi && fgets(row, sizeof row, mi)) {
-                char point[512];
-                if (sscanf(row, "%*s %*s %*s %*s %511s", point) == 1 &&
-                    strcmp(point, path) == 0) {
-                    row[strcspn(row, "\n")] = 0;
-                    snprintf(found, sizeof found, "%s", row);
-                }
-            }
-            if (mi) fclose(mi);
-            printf("mountinfo %s: %s\n", path, found);
-        } else if (strcmp(argv[i], "OPENPTY") == 0) {
-            /* Whether the box's own user can open a PTY pair: the master
-               through /dev/ptmx, then the slave it names. */
-            printf("openpty uid: %ld\n", (long)getuid());
-            int master = posix_openpt(O_RDWR | O_NOCTTY);
-            int err = 0;
-            if (master < 0) {
-                err = errno;
-            } else if (grantpt(master) != 0 || unlockpt(master) != 0) {
-                err = errno;
-            } else {
-                const char *name = ptsname(master);
-                int slave = name ? open(name, O_RDWR | O_NOCTTY) : -1;
-                if (slave < 0) err = name ? errno : ENOENT;
-                else close(slave);
-            }
-            if (master >= 0) close(master);
-            printf("openpty: errno %d\n", err);
-        } else if (strncmp(argv[i], "HOLD:", 5) == 0) {
-            release = argv[i] + 5;
-        } else if (strncmp(argv[i], "NS:", 3) == 0) {
-            char path[64], link[128];
-            snprintf(path, sizeof path, "/proc/self/ns/%s", argv[i] + 3);
-            ssize_t n = readlink(path, link, sizeof link - 1);
-            if (n >= 0) {
-                link[n] = 0;
-                printf("ns %s: %s\n", argv[i] + 3, link);
-            } else {
-                printf("ns %s: errno %d\n", argv[i] + 3, errno);
-            }
-        } else if (strncmp(argv[i], "SYSV:", 5) == 0) {
-            key_t key = (key_t)strtol(argv[i] + 5, NULL, 0);
-            msq = msgget(key, IPC_CREAT | IPC_EXCL | 0600);
-            printf("sysv create msg: errno %d\n", msq >= 0 ? 0 : errno);
-            sem = semget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
-            printf("sysv create sem: errno %d\n", sem >= 0 ? 0 : errno);
-            shm = shmget(key, 4096, IPC_CREAT | IPC_EXCL | 0600);
-            printf("sysv create shm: errno %d\n", shm >= 0 ? 0 : errno);
-        } else if (strncmp(argv[i], "SYSVGET:", 8) == 0) {
-            key_t key = (key_t)strtol(argv[i] + 8, NULL, 0);
-            printf("sysv get msg: errno %d\n", msgget(key, 0) >= 0 ? 0 : errno);
-            printf("sysv get sem: errno %d\n", semget(key, 0, 0) >= 0 ? 0 : errno);
-            printf("sysv get shm: errno %d\n", shmget(key, 0, 0) >= 0 ? 0 : errno);
-        } else if (strncmp(argv[i], "MQ:", 3) == 0) {
-            long fd = syscall(SYS_mq_open, argv[i] + 3, O_RDWR | O_CREAT | O_EXCL, 0600, NULL);
-            printf("mq create: errno %d\n", fd >= 0 ? 0 : errno);
-            if (fd >= 0) {
-                mq = argv[i] + 3;
-                close((int)fd);
-            }
-        } else if (strncmp(argv[i], "MQOPEN:", 7) == 0) {
-            long fd = syscall(SYS_mq_open, argv[i] + 7, O_RDWR, 0, NULL);
-            printf("mq open: errno %d\n", fd >= 0 ? 0 : errno);
-            if (fd >= 0) close((int)fd);
-        } else if (strncmp(argv[i], "MARK:", 5) == 0) {
-            int fd = open(argv[i] + 5, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-            printf("mark: errno %d\n", fd >= 0 ? 0 : errno);
-            if (fd >= 0) close(fd);
-        }
-    }
-
-    /* 10s of waiting — shorter than the reader's deadline, so a lost release
-       file is a box the reader still sees out, never a report that times
-       out. */
-    if (release) {
-        for (int tries = 0; tries < 200 && access(release, F_OK) != 0; tries++) {
-            struct timespec ts = {0, 50 * 1000 * 1000};
-            nanosleep(&ts, 0);
-        }
-    }
-
-    /* What SYSV: and MQ: created, removed so a run never leaves them behind
-       in whatever IPC namespace the box was in. */
-    if (msq >= 0) msgctl(msq, IPC_RMID, NULL);
-    if (sem >= 0) semctl(sem, 0, IPC_RMID);
-    if (shm >= 0) shmctl(shm, IPC_RMID, NULL);
-    if (mq) syscall(SYS_mq_unlink, mq);
-    return 0;
-}
-"#;
+    const CGROUP_PROBE_C: &str = include_str!("testdata/box_probe.c");
 
     /// What `statfs` reports for a cgroup2 mount.
     #[cfg(target_os = "linux")]
@@ -3616,15 +3175,15 @@ int main(int argc, char **argv) {
         std::fs::create_dir_all(dir.join("etc")).expect("creating the probe rootfs etc");
     }
 
-    /// A probe box this proof launched and is holding in its leaf: the
-    /// report is not read yet — the probe's `HOLD:` argument keeps the box
-    /// in its leaf until the release file appears — so the test can read the
-    /// host's side of the tree while the box is still in it.
+    /// A probe box a test launched and is holding. The probe's `HOLD:`
+    /// argument keeps the box running until the release file appears, so the
+    /// test can read the host's side of the box's cgroup while the box is
+    /// still in it. The report is read afterwards.
     ///
-    /// The release handshake and the closure's report both run through the
-    /// sandbox's `/run`: it is the one live directory the host and the box
-    /// share — the bind is of the same directory, not a copy — where the
-    /// rootfs is assembled by hardlink, so a file created in its source
+    /// The release handshake runs through the sandbox's `/run`. It is the
+    /// one live directory the host and the box share: the bind is of the
+    /// same directory, not a copy. The rootfs is assembled by hardlink, so
+    /// a file created in its source
     /// directory after the build never appears inside the box at all.
     #[cfg(target_os = "linux")]
     struct HeldProbe {
@@ -3710,12 +3269,10 @@ int main(int argc, char **argv) {
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
 
-        let mut config = Config::new(name)
+        let config = Config::new(name)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
-            .with_dns(false);
-        if let Some(cgroup) = cgroup {
-            config = config.with_box_cgroup(cgroup);
-        }
+            .with_dns(false)
+            .with_box_cgroup(cgroup);
         let sandbox_home = tempfile::tempdir_in(&base_dir)
             .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
         let mut sandbox = config
@@ -3735,7 +3292,7 @@ int main(int argc, char **argv) {
                 std::iter::empty::<(&str, &str)>(),
             )
             .expect("building the probe command");
-        command.stdout(hakoniwa::Stdio::MakePipe);
+        command.stdout(Stdio::MakePipe);
         let mut child = command.spawn().expect("spawning the probe in the box");
 
         // The box's own `/run`, host-side: the hold's release file lands
@@ -3766,14 +3323,9 @@ int main(int argc, char **argv) {
             .await
             .map_err(|_| "the probe in the box did not report in time".to_string())?
             .expect("spawn_blocking join");
-            let status = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || child.wait()),
-            )
-            .await
-            .map_err(|_| "waiting for the probe in the box timed out".to_string())?
-            .expect("spawn_blocking join")
-            .expect("waiting for the probe in the box");
+            let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.exited())
+                .await
+                .map_err(|_| "waiting for the probe in the box timed out".to_string())?;
             if !status.success() {
                 return Err(format!(
                     "the probe in the box failed: {status:?}\nreport: {}",
@@ -3883,23 +3435,19 @@ int main(int argc, char **argv) {
                 mark.display()
             );
             assert!(
-                child.try_wait().expect("polling the held box").is_none(),
+                child.try_wait().is_none(),
                 "a held box exited before its start was released"
             );
         }
 
         // Released in reverse: the second gate starts only the second box.
-        let (first_mark, first_gate, mut first_child, _first_container) = held.remove(0);
-        let (second_mark, second_gate, mut second_child, _second_container) = held.remove(0);
+        let (first_mark, first_gate, first_child, _first_container) = held.remove(0);
+        let (second_mark, second_gate, second_child, _second_container) = held.remove(0);
         second_gate.release();
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || second_child.wait()),
-        )
-        .await
-        .expect("the released box ran to completion in time")
-        .expect("spawn_blocking join")
-        .expect("waiting for the released box");
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(30), second_child.exited())
+                .await
+                .expect("the released box ran to completion in time");
         assert!(status.success(), "the released probe failed: {status:?}");
         assert!(
             second_mark.exists(),
@@ -3911,28 +3459,96 @@ int main(int argc, char **argv) {
             "releasing the second gate started the first box's program"
         );
         assert!(
-            first_child
-                .try_wait()
-                .expect("polling the still-held box")
-                .is_none(),
+            first_child.try_wait().is_none(),
             "the first box exited while its own gate was still held"
         );
 
         first_gate.release();
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || first_child.wait()),
-        )
-        .await
-        .expect("the released box ran to completion in time")
-        .expect("spawn_blocking join")
-        .expect("waiting for the released box");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), first_child.exited())
+            .await
+            .expect("the released box ran to completion in time");
         assert!(status.success(), "the released probe failed: {status:?}");
         assert!(
             first_mark.exists(),
             "the released program never ran: no mark at {}",
             first_mark.display()
         );
+    }
+
+    /// A spawner whose requester is gone reads the end of its socket and
+    /// kills every box it started. The box's handle says why it ended.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawner_kills_its_boxes_when_its_requester_is_gone() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping a_spawner_kills_its_boxes_when_its_requester_is_gone: this host \
+                 denies the unprivileged user namespace every sandbox starts by \
+                 unsharing: {reason}"
+            );
+            return;
+        }
+
+        let name = "orphaned";
+        let base_dir = box_base_dir(name);
+        let build = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let probe = compile_cgroup_probe(build.path());
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &probe);
+        let mut sandbox = Config::new(name)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .build(build.path().join("sandbox"), ())
+            .await
+            .expect("building the box");
+        let plan = sandbox.built_in_plan();
+        let container = sandbox
+            .new_container(&plan)
+            .expect("building the box's container");
+        let mut command = sandbox
+            .command(
+                &container,
+                "/usr/bin/probe",
+                ["HOLD:/run/never"],
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .expect("building the probe command");
+        command.stdout(Stdio::Null);
+        let child = command.spawn().expect("spawning the probe in the box");
+        let supervisor = child.id();
+        let alive = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let program = loop {
+            if let Ok(program) = spawner::enter::init_of(supervisor) {
+                break program;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the box never had a program"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        Spawner::current().hang_up();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.exited())
+            .await
+            .expect("the box's handle learns of the end");
+        assert_eq!(status.code, ExitStatus::FAILURE, "{status:?}");
+        assert_eq!(status.reason, "the spawner exited");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while alive(supervisor) || alive(program) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the box outlived the requester of its spawner"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// A held network builds with no package in its rootfs, holds a namespace
@@ -3946,7 +3562,7 @@ int main(int argc, char **argv) {
         let home = tempfile::tempdir_in(&base_dir)
             .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
         let rec = std::sync::Arc::new(Recorder::default());
-        held_sandbox(home.path(), rec.clone())
+        held_sandbox(home.path(), rec.clone(), None)
             .await
             .expect("building the held sandbox");
 
@@ -3959,7 +3575,7 @@ int main(int argc, char **argv) {
             return;
         }
 
-        let held = hold_network(home.path(), rec.clone())
+        let held = hold_network(home.path(), rec.clone(), None)
             .await
             .expect("holding the network");
         let proc_dir = PathBuf::from(format!("/proc/{}", held.pid()));

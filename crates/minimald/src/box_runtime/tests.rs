@@ -4863,7 +4863,6 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
     // The host's half: what it runs in the box sees the sealed value.
     let output = host
         .command_in_session("sh", ["-c", "printenv GH_TOKEN"], Default::default())
-        .expect("a host-side command under test")
         .output()
         .expect("printenv runs");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), SEALED);

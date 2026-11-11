@@ -1,27 +1,21 @@
-//! Injecting additional processes into a running session's namespaces.
+//! Entering a running box.
 //!
-//! A session shell is launched into a sandbox by [`crate::box_runtime`], which
-//! hands hakoniwa a container and gets back a [`hakoniwa::Child`]. Running a
-//! *second* program in that same sandbox means joining the namespaces via
-//! `setns(2)`.
+//! A program that joins a box later than its first process is started by a
+//! shim: this binary, re-executed in the box's cgroup with the box init's
+//! pidfd on a fixed descriptor. The shim joins the box's namespaces with one
+//! `setns`, forks the program into them, and stays outside the box's PID
+//! namespace as the program's parent, so it can report the program's status
+//! and end the program's process group when it is told to stop.
 
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use nix::sched::CloneFlags;
-
-/// `argv[1]` the daemon re-execs itself with to run [`shim_main`].
-pub const SUBCOMMAND: &str = "__nsenter";
-
-/// Where this daemon can re-exec itself from. Registered by [`set_shim_exe`].
-static SHIM_EXE: OnceLock<PathBuf> = OnceLock::new();
 
 /// How long the shim gives the injected process group between the SIGTERM it
 /// forwards and the SIGKILL that ends the group. Ending an exec is SIGTERM, a
@@ -84,37 +78,11 @@ static GROUP_TERMED: AtomicBool = AtomicBool::new(false);
 /// Set by the SIGALRM handler once [`GROUP_GRACE`] has run out.
 static GRACE_EXPIRED: AtomicBool = AtomicBool::new(false);
 
-/// Registers `path` as the [`SUBCOMMAND`] shim, overriding `current_exe()` for
-/// every later [`Injection`].
-///
-/// For the microVM's pid-1, whose `current_exe()` is the initramfs `/init` —
-/// unreachable once it switches into the rootfs, so every re-exec is an ENOENT
-/// (#1175). Its boot path stages a runnable copy and names it here.
-///
-/// First registration wins: a stale path is worse than the one in use.
-pub fn set_shim_exe(path: impl Into<PathBuf>) {
-    let path = path.into();
-    if let Err(rejected) = SHIM_EXE.set(path) {
-        tracing::warn!(
-            in_use = %SHIM_EXE.get().expect("set failed, so a value is present").display(),
-            rejected = %rejected.display(),
-            "the nsenter shim path is already registered; keeping the first one",
-        );
-    }
-}
-
-/// The registered shim executable, if [`set_shim_exe`] has been called.
-#[must_use]
-pub fn shim_exe() -> Option<&'static Path> {
-    SHIM_EXE.get().map(PathBuf::as_path)
-}
-
-/// Descriptor number the pidfd is placed on, the shim joins the namespaces
-/// associated with this process.
-const PIDFD_FD: RawFd = 3;
+/// The descriptor the box init's pidfd is on when the shim starts.
+pub(crate) const PIDFD_FD: RawFd = 3;
 
 /// A namespace an injected process can join.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Namespace {
     /// Must be joined in the same `setns` call as any other namespace it owns.
     User,
@@ -139,8 +107,13 @@ impl Namespace {
         Self::Net,
     ];
 
+    /// The namespace an entry name under `/proc/<pid>/ns/` stands for.
+    fn from_proc_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|ns| ns.proc_name() == name)
+    }
+
     /// The entry name under `/proc/<pid>/ns/`.
-    fn proc_name(self) -> &'static str {
+    pub(crate) fn proc_name(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Mnt => "mnt",
@@ -167,13 +140,13 @@ impl Namespace {
 
     /// The namespace `pid` is in, as the kernel's `ns:[inode]` identity, or
     /// `None` if this kernel has no such namespace type.
-    fn identity(self, pid: Option<u32>) -> Result<Option<String>, NsenterError> {
+    fn identity(self, pid: Option<u32>) -> Result<Option<String>, EnterError> {
         let who = pid.map_or_else(|| "self".to_string(), |p| p.to_string());
         let path = format!("/proc/{who}/ns/{}", self.proc_name());
         match std::fs::read_link(&path) {
             Ok(target) => Ok(Some(target.to_string_lossy().into_owned())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(NsenterError::ReadNamespace { path, source }),
+            Err(source) => Err(EnterError::ReadNamespace { path, source }),
         }
     }
 }
@@ -202,9 +175,9 @@ impl Namespace {
 ///
 /// # Errors
 ///
-/// [`NsenterError::ReadNamespace`] if `/proc` cannot be read for either process;
+/// [`EnterError::ReadNamespace`] if `/proc` cannot be read for either process;
 /// a namespace type this kernel does not implement is skipped, not an error.
-pub fn namespaces_to_join(leader_pid: u32) -> Result<Vec<Namespace>, NsenterError> {
+pub fn namespaces_to_join(leader_pid: u32) -> Result<Vec<Namespace>, EnterError> {
     Namespace::ALL
         .into_iter()
         .filter_map(|ns| {
@@ -227,7 +200,7 @@ pub fn namespaces_to_join(leader_pid: u32) -> Result<Vec<Namespace>, NsenterErro
 /// A failure injecting a process into a session's namespaces.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum NsenterError {
+pub enum EnterError {
     /// The supervisor's `children` file could not be read. Absent on a kernel
     /// built without `CONFIG_PROC_CHILDREN`; `ENOENT` also means the supervisor
     /// itself is gone, i.e. the session has ended.
@@ -275,28 +248,6 @@ pub enum NsenterError {
         source: std::io::Error,
     },
 
-    /// The daemon binary could not be located to re-exec.
-    #[error("resolving the running executable to re-exec as the {SUBCOMMAND} shim")]
-    CurrentExe {
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// The shim path resolved to something that is no longer on disk. The
-    /// usual cause is a daemon whose own binary was replaced or deleted while
-    /// it was running: `current_exe()` reads `/proc/self/exe`, which the
-    /// kernel then reports as a dangling `<path> (deleted)`.
-    ///
-    /// Checked before the spawn because the `ENOENT` it would otherwise
-    /// produce names the *injected* program, sending whoever reads it looking
-    /// for a missing `bash` inside the session instead of a missing daemon
-    /// outside it.
-    #[error(
-        "the daemon's own executable is gone from {path:?} — it was replaced or deleted while \
-         the daemon was running (a rebuild, typically); restart minimald"
-    )]
-    ShimMissing { path: PathBuf },
-
     /// `setns(2)` failed. `EPERM` on an otherwise sound setup means one of: the
     /// caller is multi-threaded (which the user namespace forbids), the set
     /// includes a namespace the sandbox never unshared (see
@@ -309,20 +260,9 @@ pub enum NsenterError {
         source: nix::Error,
     },
 
-    /// The shim could not move itself into a deny-all box's classifier leaf
-    /// before joining its namespaces. The join is the one write that must
-    /// precede `setns` (see [`shim_main`]), and for a deny-all box it is also
-    /// the one placement a verdict cannot survive failing: a process left
-    /// outside the leaf runs where nothing refuses its connections, so the
-    /// injected run stops rather than silently run unenforced. For any other
-    /// leaf the same failure is advisory (NET-079's exception) and never
-    /// yields this error.
-    #[error("joining the deny-all box's classifier leaf {}", leaf.display())]
-    JoinDenyLeaf {
-        leaf: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    /// The shim was started with arguments it does not read.
+    #[error("the enter shim was started with bad arguments: {0}")]
+    Usage(String),
 
     /// The injected program could not be started for a reason a shell would
     /// not report as its own (those are exit codes 127/126). `ENOMEM` from the
@@ -357,24 +297,24 @@ pub enum NsenterError {
 ///
 /// # Errors
 ///
-/// [`NsenterError::NoSessionLeader`] once the session program has exited, and
-/// [`NsenterError::ReadChildren`] if `/proc` cannot answer — including on a
+/// [`EnterError::NoSessionLeader`] once the session program has exited, and
+/// [`EnterError::ReadChildren`] if `/proc` cannot answer — including on a
 /// kernel without `CONFIG_PROC_CHILDREN`.
-pub fn session_leader_pid(container_pid: u32) -> Result<u32, NsenterError> {
+pub fn init_of(container_pid: u32) -> Result<u32, EnterError> {
     let path = format!("/proc/{container_pid}/task/{container_pid}/children");
-    let raw = std::fs::read_to_string(&path).map_err(|source| NsenterError::ReadChildren {
+    let raw = std::fs::read_to_string(&path).map_err(|source| EnterError::ReadChildren {
         pid: container_pid,
         source,
     })?;
 
     let children: Vec<&str> = raw.split_ascii_whitespace().collect();
     match children.as_slice() {
-        [] => Err(NsenterError::NoSessionLeader { pid: container_pid }),
-        [child] => child.parse().map_err(|_| NsenterError::MalformedChild {
+        [] => Err(EnterError::NoSessionLeader { pid: container_pid }),
+        [child] => child.parse().map_err(|_| EnterError::MalformedChild {
             pid: container_pid,
             child: (*child).to_string(),
         }),
-        many => Err(NsenterError::AmbiguousSessionLeader {
+        many => Err(EnterError::AmbiguousSessionLeader {
             pid: container_pid,
             count: many.len(),
             children: many.join(" "),
@@ -383,14 +323,14 @@ pub fn session_leader_pid(container_pid: u32) -> Result<u32, NsenterError> {
 }
 
 /// Pins `pid` as a pidfd, so later use cannot be misdirected by PID reuse.
-fn pidfd_open(pid: u32) -> Result<OwnedFd, NsenterError> {
+pub(crate) fn pidfd_open(pid: u32) -> Result<OwnedFd, EnterError> {
     // SAFETY: `pidfd_open` takes a pid and a flags word and returns a fresh
     // descriptor or -1; it reads no user memory. On success we own the
     // descriptor and hand it straight to `OwnedFd`, which closes it exactly
     // once.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if fd < 0 {
-        return Err(NsenterError::PidfdOpen {
+        return Err(EnterError::PidfdOpen {
             pid,
             source: std::io::Error::last_os_error(),
         });
@@ -399,197 +339,100 @@ fn pidfd_open(pid: u32) -> Result<OwnedFd, NsenterError> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
-/// A program to run inside a running session's sandbox.
-///
-/// Built against the PID of the session process — resolve it with
-/// [`session_leader_pid`], never `hakoniwa::Child::id()` — and turned into a
-/// [`Command`] by [`Self::command`]. What the namespaces do not carry is set
-/// here:
-///
-/// - **working directory** via [`Self::with_cwd`]. Without it the process
-///   starts at the container root, because joining a mount namespace puts both
-///   root and cwd there.
-/// - **environment** via [`Self::with_env`]. Without it the process inherits the
-///   daemon's environment, which describes the host rather than the sandbox.
-/// - **stdio** on the returned [`Command`], which the caller owns. For a PTY,
-///   open it daemon-side and pass slave descriptors exactly as the session
-///   launcher does — descriptors cross namespaces untouched.
-///
-/// `minimald` gets both of the first two from the session's
-/// [`BoxEnvironment`](crate::box_runtime::BoxEnvironment), which is
-/// what the session's own shell was launched with.
-#[derive(Debug)]
-#[must_use = "an Injection does nothing until `command` is called"]
-pub struct Injection {
-    leader_pid: u32,
-    program: OsString,
-    args: Vec<OsString>,
-    cwd: Option<PathBuf>,
-    env: Option<BTreeMap<String, String>>,
-    shim_exe: Option<PathBuf>,
+/// What a shim is asked to do, as its command line carries it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ShimArgs {
+    /// The namespaces of the box init to join. Naming one the box does not
+    /// have of its own is refused by the kernel, so the set is computed by
+    /// [`namespaces_to_join`], never assumed.
+    pub(crate) join: Vec<Namespace>,
+    /// The directory to start in, as the box names it.
+    pub(crate) chdir: Option<PathBuf>,
+    /// The program and its arguments.
+    pub(crate) argv: Vec<OsString>,
 }
 
-impl Injection {
-    /// Runs `program` in the namespaces of the session process `leader_pid`.
-    pub fn new<I, S>(leader_pid: u32, program: impl AsRef<OsStr>, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        Self {
-            leader_pid,
-            program: program.as_ref().to_os_string(),
-            args: args
-                .into_iter()
-                .map(|a| a.as_ref().to_os_string())
-                .collect(),
-            cwd: None,
-            env: None,
-            shim_exe: None,
+impl ShimArgs {
+    /// The command line that carries these arguments, after the mode word:
+    /// `[--join a,b] [--chdir dir] -- program args...`. The names of the
+    /// joined namespaces are in it so `ps` shows what a shim joined.
+    pub(crate) fn to_command_line(&self) -> Vec<OsString> {
+        let mut line = Vec::new();
+        if !self.join.is_empty() {
+            let names: Vec<&str> = self.join.iter().map(|ns| ns.proc_name()).collect();
+            line.push("--join".into());
+            line.push(names.join(",").into());
         }
+        if let Some(dir) = &self.chdir {
+            line.push("--chdir".into());
+            line.push(dir.clone().into_os_string());
+        }
+        line.push("--".into());
+        line.extend(self.argv.iter().cloned());
+        line
     }
 
-    /// Starts the program in `cwd`, a path inside the container (`/workbench`
-    /// for a session's workspace).
-    ///
-    /// Applied by the shim after it joins, since the path only exists there.
-    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    /// Runs the program with exactly `env`, replacing the daemon's environment
-    /// rather than adding to it.
-    ///
-    /// Carried on the shim's own environment and inherited from there, so no
-    /// value is ever visible in `ps` output.
-    pub fn with_env(mut self, env: impl Into<BTreeMap<String, String>>) -> Self {
-        self.env = Some(env.into());
-        self
-    }
-
-    /// Uses `shim_exe` as the namespace-joining shim instead of the running
-    /// executable.
-    ///
-    /// The daemon always wants the running executable — it re-execs itself.
-    /// This is for callers that are not the daemon: an integration test driving
-    /// the real shim out of `CARGO_BIN_EXE_minimald`, say. A daemon whose own
-    /// path is unrunnable uses [`set_shim_exe`] instead.
-    pub fn with_shim(mut self, shim_exe: impl Into<PathBuf>) -> Self {
-        self.shim_exe = Some(shim_exe.into());
-        self
-    }
-
-    /// Builds the command that runs this program in the session.
-    ///
-    /// The pidfd is owned by the returned command and closed when it drops, so
-    /// the pin against PID reuse lasts exactly as long as it is needed. Waiting
-    /// on the resulting child waits on the shim, whose exit status is the
-    /// injected program's.
-    ///
-    /// # Errors
-    ///
-    /// [`NsenterError::PidfdOpen`] if the session program exited before it
-    /// could be pinned, [`NsenterError::ReadNamespace`] if its namespaces
-    /// cannot be enumerated, [`NsenterError::CurrentExe`] if no shim was named
-    /// or registered and this binary cannot be located.
-    pub fn command(self) -> Result<Command, NsenterError> {
-        // Resolved here rather than in the shim: the daemon holds the session's
-        // PID and the shim holds only a pidfd, and naming the namespaces on the
-        // command line puts them in `ps` output for whoever is debugging a
-        // joined process.
-        let namespaces = namespaces_to_join(self.leader_pid)?;
-        let pidfd = pidfd_open(self.leader_pid)?;
-        // Caller's choice, then the registration, then our own path.
-        let shim = match self.shim_exe.or_else(|| shim_exe().map(Path::to_path_buf)) {
-            Some(exe) => exe,
-            None => {
-                std::env::current_exe().map_err(|source| NsenterError::CurrentExe { source })?
-            }
-        };
-        // See [`NsenterError::ShimMissing`]: a path that has gone away since it
-        // was resolved is worth its own error, because the spawn's `ENOENT`
-        // blames the injected program for the daemon's problem.
-        if !shim.exists() {
-            return Err(NsenterError::ShimMissing { path: shim });
-        }
-
-        let mut cmd = Command::new(shim);
-        cmd.arg(SUBCOMMAND).arg("--pidfd").arg(PIDFD_FD.to_string());
-        if !namespaces.is_empty() {
-            cmd.arg("--join").arg(
-                namespaces
-                    .iter()
-                    .map(|ns| ns.proc_name())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-        if let Some(cwd) = &self.cwd {
-            cmd.arg("--chdir").arg(cwd);
-        }
-        if let Some(env) = self.env {
-            // The shim needs nothing from the daemon's environment — it holds
-            // its pidfd on a descriptor and everything else in argv — so this
-            // is the session's environment exactly, passed down by inheritance.
-            cmd.env_clear().envs(env);
-        }
-        cmd.arg("--").arg(&self.program).args(&self.args);
-
-        // SAFETY: the closure runs in the forked child between `fork` and
-        // `exec`, where only async-signal-safe calls are legal. `dup2` and
-        // `fcntl` are both on that list, and the closure allocates nothing and
-        // touches no lock. It borrows only `pidfd`, which it owns.
-        //
-        // std installs the child's stdio before running pre_exec closures, so
-        // fds 0-2 are already final and fd 3 is free to claim.
-        unsafe {
-            cmd.pre_exec(move || {
-                let raw = pidfd.as_raw_fd();
-                if raw == PIDFD_FD {
-                    // `dup2(fd, fd)` is a no-op that, unlike the copying case,
-                    // leaves FD_CLOEXEC set — which would close the pidfd out
-                    // from under the exec. Clear it directly instead.
-                    if libc::fcntl(raw, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
+    /// Reads a command line [`Self::to_command_line`] wrote.
+    pub(crate) fn parse(line: impl IntoIterator<Item = OsString>) -> Result<Self, EnterError> {
+        let mut line = line.into_iter();
+        let mut join = Vec::new();
+        let mut chdir = None;
+        loop {
+            let word = line
+                .next()
+                .ok_or_else(|| EnterError::Usage("no `--` before the program".into()))?;
+            match word.to_str() {
+                Some("--") => break,
+                Some("--join") => {
+                    let names = line.next().and_then(|names| names.into_string().ok());
+                    let names =
+                        names.ok_or_else(|| EnterError::Usage("--join takes names".into()))?;
+                    for name in names.split(',') {
+                        join.push(Namespace::from_proc_name(name).ok_or_else(|| {
+                            EnterError::Usage(format!("`{name}` is not a namespace"))
+                        })?);
                     }
-                } else if libc::dup2(raw, PIDFD_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
                 }
-                Ok(())
-            });
+                Some("--chdir") => {
+                    chdir = Some(PathBuf::from(line.next().ok_or_else(|| {
+                        EnterError::Usage("--chdir takes a directory".into())
+                    })?));
+                }
+                _ => {
+                    return Err(EnterError::Usage(format!(
+                        "unexpected `{}`",
+                        word.to_string_lossy()
+                    )));
+                }
+            }
         }
-
-        Ok(cmd)
+        let argv: Vec<OsString> = line.collect();
+        if argv.is_empty() {
+            return Err(EnterError::Usage("no program".into()));
+        }
+        Ok(Self { join, chdir, argv })
     }
 }
 
-/// Arguments for the internal [`SUBCOMMAND`] shim.
-#[derive(Debug, clap::Args)]
-pub struct ShimArgs {
-    /// Descriptor number carrying the pidfd of the session process to join.
-    #[arg(long, default_value_t = PIDFD_FD)]
-    pidfd: RawFd,
-
-    /// Namespaces to join, as `/proc/<pid>/ns` names.
-    ///
-    /// Computed by [`namespaces_to_join`] rather than assumed: naming a
-    /// namespace the session does not have of its own is an `EPERM`, not a
-    /// no-op. Empty means the target shares every namespace with us and there
-    /// is nothing to join.
-    #[arg(long, value_delimiter = ',')]
-    join: Vec<Namespace>,
-
-    /// Directory to enter after joining, resolved inside the container.
-    ///
-    /// Optional: joining the mount namespace already puts both the root and the
-    /// working directory at the container's root.
-    #[arg(long)]
-    chdir: Option<PathBuf>,
-
-    /// The program to run inside the session, followed by its arguments.
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-    argv: Vec<OsString>,
+/// Runs the shim for the command line `line` and exits with the program's
+/// status. An error of the shim's own is one line on stderr and status 125.
+pub(crate) fn main(line: impl IntoIterator<Item = OsString>) -> ! {
+    super::title::set_comm(c"minimal-enter");
+    let code = match ShimArgs::parse(line).and_then(shim_main) {
+        Ok(code) => code,
+        Err(error) => {
+            let mut text = error.to_string();
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                text.push_str(": ");
+                text.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            eprintln!("minimal: entering the box failed: {text}");
+            125
+        }
+    };
+    std::process::exit(code)
 }
 
 /// Point this process's fd 0 at `/dev/null`, closing its copy of whatever
@@ -622,19 +465,17 @@ fn release_stdin() {
 ///
 /// # Errors
 ///
-/// [`NsenterError::JoinDenyLeaf`] if the box is deny-all and its classifier
-/// leaf cannot be joined, [`NsenterError::Setns`] if the namespaces cannot be
-/// joined, [`NsenterError::Spawn`] if the program cannot be started for a
-/// reason a shell would not report, and [`NsenterError::Wait`] if the started
+/// [`EnterError::JoinDenyLeaf`] if the box is deny-all and its classifier
+/// leaf cannot be joined, [`EnterError::Setns`] if the namespaces cannot be
+/// joined, [`EnterError::Spawn`] if the program cannot be started for a
+/// reason a shell would not report, and [`EnterError::Wait`] if the started
 /// program cannot be reaped. A program that is missing, not executable, or not
 /// an executable format is reported on stderr and returned as the shell's exit
 /// code (127/126) rather than as an error.
-pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
-    // SAFETY: `command_in_session` placed a pidfd on this descriptor and it
-    // survived the exec; nothing else in this freshly-exec'd process owns it.
-    // A wrong `--pidfd` yields a closed or unrelated descriptor, which fails
-    // `setns` with EBADF/EINVAL rather than doing damage.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(args.pidfd) };
+fn shim_main(args: ShimArgs) -> Result<i32, EnterError> {
+    // SAFETY: whoever started this shim placed the box init's pidfd on this
+    // descriptor, and nothing else in this freshly exec'd process owns it.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(PIDFD_FD) };
 
     // The daemon's procfs, opened before the join: the grace period below scans
     // it for live members of the injected group, by the pids and group ids this
@@ -655,7 +496,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             .join
             .iter()
             .fold(CloneFlags::empty(), |acc, ns| acc | ns.clone_flag());
-        nix::sched::setns(&pidfd, flags).map_err(|source| NsenterError::Setns {
+        nix::sched::setns(&pidfd, flags).map_err(|source| EnterError::Setns {
             namespaces: args
                 .join
                 .iter()
@@ -670,7 +511,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     let (program, rest) = args
         .argv
         .split_first()
-        .expect("clap requires at least one argv entry");
+        .expect("the parser requires a program");
 
     let mut cmd = Command::new(program);
     cmd.args(rest);
@@ -679,7 +520,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     }
 
     // Compiled before the fork, so the child only loads it.
-    let seccomp_program = sandbox::seccomp::box_program();
+    let seccomp_program = crate::seccomp::box_program();
 
     // A tty exec hands the shim the slave side of its PTY as stdin. The
     // injected process then makes that PTY its controlling terminal, so job
@@ -741,7 +582,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
 
         // The profile the box's own processes run under. A process that joins
         // the box later does not inherit it.
-        cmd.pre_exec(move || sandbox::seccomp::install(seccomp_program));
+        cmd.pre_exec(move || crate::seccomp::install(seccomp_program));
     }
 
     // The handlers go in before the spawn, so a SIGTERM or SIGHUP that arrives
@@ -776,7 +617,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
                 spawn_failure_code_and_message(&source)
             };
             let Some((code, msg)) = mapped else {
-                return Err(NsenterError::Spawn { program, source });
+                return Err(EnterError::Spawn { program, source });
             };
             eprintln!("{program}: {msg}", program = program.display());
             return Ok(code);
@@ -825,7 +666,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         }
         let source = std::io::Error::last_os_error();
         if source.kind() != std::io::ErrorKind::Interrupted {
-            return Err(NsenterError::Wait { program, source });
+            return Err(EnterError::Wait { program, source });
         }
     }
 
@@ -874,7 +715,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     unsafe { libc::alarm(0) };
     CHILD_PGID.store(0, Ordering::SeqCst);
 
-    let status = child.wait().map_err(|source| NsenterError::Wait {
+    let status = child.wait().map_err(|source| EnterError::Wait {
         program: program.clone(),
         source,
     })?;
@@ -1218,12 +1059,12 @@ fn stat_live_member(stat: &str) -> Option<ProcMember> {
 /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
 /// (126), and `ENOEXEC` is "cannot execute" (126). Any other failure — a
 /// fork's `ENOMEM`, or an `EPERM` from a `pre_exec` hook, included — is not the
-/// program's to report, so it is `None` and stays a [`NsenterError::Spawn`].
+/// program's to report, so it is `None` and stays a [`EnterError::Spawn`].
 /// `EACCES` is matched by errno rather than [`std::io::ErrorKind::PermissionDenied`],
 /// which also covers `EPERM`.
 ///
 /// The message is the plain text a shell would print, without the debug
-/// wrapper `main` adds to [`NsenterError`] — a script must be able to tell
+/// wrapper `main` adds to [`EnterError`] — a script must be able to tell
 /// "not found" from the command's own failure.
 fn spawn_failure_code_and_message(source: &std::io::Error) -> Option<(i32, String)> {
     match source.raw_os_error()? {
@@ -1246,12 +1087,13 @@ fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// A failed spawn maps to the shell's exit-code and message conventions:
     /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
     /// (126), and `ENOEXEC` is "cannot execute" (126). Anything else, such as
     /// the fork's `ENOMEM` or a `pre_exec` hook's `EPERM`, is left to
-    /// [`NsenterError::Spawn`].
+    /// [`EnterError::Spawn`].
     #[test]
     fn spawn_failures_map_to_shell_exit_codes_and_messages() {
         let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
@@ -1332,7 +1174,7 @@ mod tests {
     fn resolves_the_grandchild_not_the_forking_process() {
         let (mut sh, expected) = shell_with_one_child();
 
-        let resolved = session_leader_pid(sh.id());
+        let resolved = init_of(sh.id());
 
         let _ = sh.kill();
         let _ = sh.wait();
@@ -1489,80 +1331,6 @@ mod tests {
         let _ = sleep.wait();
     }
 
-    /// The production path: no shim is named per injection (only tests do
-    /// that), so this resolution order is what keeps #1175 fixed. One test,
-    /// because [`SHIM_EXE`] is process-wide and set once.
-    ///
-    /// Both stand-in shims are real files: a path that doesn't exist is now
-    /// [`NsenterError::ShimMissing`], which would mask the ordering under test.
-    #[test]
-    fn the_registered_shim_overrides_current_exe_and_yields_to_an_explicit_one() {
-        let registered_exe = tempfile::NamedTempFile::new().expect("a temp file to stand in");
-        let explicit_exe = tempfile::NamedTempFile::new().expect("a temp file to stand in");
-
-        // A plain child shares all our namespaces, so nothing is joined and no
-        // privilege is needed.
-        let mut sleep = Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawning /bin/sleep");
-        let target = sleep.id();
-        let injection = || Injection::new(target, "/bin/true", Vec::<&str>::new());
-
-        let unregistered = injection().command().map(|c| c.get_program().to_owned());
-        set_shim_exe(registered_exe.path());
-        let registered = injection().command().map(|c| c.get_program().to_owned());
-        let explicit = injection()
-            .with_shim(explicit_exe.path())
-            .command()
-            .map(|c| c.get_program().to_owned());
-
-        let _ = sleep.kill();
-        let _ = sleep.wait();
-        assert_eq!(
-            PathBuf::from(unregistered.expect("building the command")),
-            std::env::current_exe().expect("locating the test binary"),
-            "with nothing registered the daemon re-execs itself",
-        );
-        assert_eq!(
-            PathBuf::from(registered.expect("building the command")),
-            registered_exe.path(),
-            "the registered shim replaces current_exe()",
-        );
-        assert_eq!(
-            PathBuf::from(explicit.expect("building the command")),
-            explicit_exe.path(),
-            "a per-injection shim still wins over the registration",
-        );
-    }
-
-    /// A shim path that has gone away — the shape `current_exe()` takes after
-    /// the daemon's binary is replaced under it, which any rebuild of a running
-    /// daemon does — is reported as the daemon's problem. Spawning it instead
-    /// yields an `ENOENT` naming the injected program, which reads as a broken
-    /// session rather than a stale daemon.
-    #[test]
-    fn a_shim_that_is_no_longer_on_disk_is_named_as_the_failure() {
-        let missing = tempfile::NamedTempFile::new().expect("a temp file to stand in");
-        let path = missing.path().to_path_buf();
-        drop(missing); // Now a path that resolved a moment ago and no longer does.
-
-        let mut sleep = Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawning /bin/sleep");
-        let built = Injection::new(sleep.id(), "/bin/true", Vec::<&str>::new())
-            .with_shim(&path)
-            .command();
-
-        let _ = sleep.kill();
-        let _ = sleep.wait();
-        let Err(NsenterError::ShimMissing { path: reported }) = built else {
-            panic!("expected ShimMissing, got {:?}", built.map(|_| "a command"));
-        };
-        assert_eq!(reported, path);
-    }
-
     #[test]
     fn a_process_without_children_is_not_a_container_supervisor() {
         let mut sleep = Command::new("/bin/sleep")
@@ -1570,13 +1338,175 @@ mod tests {
             .spawn()
             .expect("spawning /bin/sleep");
 
-        let resolved = session_leader_pid(sleep.id());
+        let resolved = init_of(sleep.id());
 
         let _ = sleep.kill();
         let _ = sleep.wait();
         assert!(
-            matches!(resolved, Err(NsenterError::NoSessionLeader { .. })),
+            matches!(resolved, Err(EnterError::NoSessionLeader { .. })),
             "expected NoSessionLeader, got {resolved:?}"
+        );
+    }
+
+    /// A PTY: its master side and its slave side.
+    fn open_terminal() -> (std::fs::File, std::fs::File) {
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: valid out-pointers for both descriptors, and NULL for the
+        // optional name, termios and size.
+        let opened = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `openpty` succeeded, so both descriptors are open and ours.
+        unsafe {
+            (
+                std::fs::File::from(OwnedFd::from_raw_fd(master)),
+                std::fs::File::from(OwnedFd::from_raw_fd(slave)),
+            )
+        }
+    }
+
+    /// Whether `pid` is gone or a zombie.
+    fn process_gone(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    /// A program on a terminal leads its own session, and a shell with job
+    /// control puts a background job in a process group of its own. The
+    /// shim's stop reaches that job through the session: SIGTERM to the
+    /// leader's group and to every other group of the session, then SIGKILL
+    /// to what is left. The job here ignores SIGTERM, so only the SIGKILL
+    /// ends it. This drives the session calls the shim makes.
+    #[test]
+    fn a_stop_ends_every_process_group_of_the_session() {
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let member = dir.path().join("member");
+        let (master, slave) = open_terminal();
+        let script =
+            r#"set -m; sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 600' sh "$1" & wait"#;
+        let mut shell = std::process::Command::new("sh");
+        shell
+            .args(["-c", script, "sh"])
+            .arg(&member)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        // SAFETY: the step makes only async-signal-safe calls.
+        unsafe {
+            shell.pre_exec(|| lead_session_on_terminal());
+        }
+        let mut shell = shell.spawn().expect("the shell starts");
+        let sid = libc::pid_t::try_from(shell.id()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let job: libc::pid_t = loop {
+            if let Some(pid) = std::fs::read_to_string(&member)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the job never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // SAFETY: both calls only query the kernel.
+        let (job_group, job_session) = unsafe { (libc::getpgid(job), libc::getsid(job)) };
+        assert_eq!(job_session, sid, "the job is in the exec's session");
+        assert_ne!(job_group, sid, "the job has a process group of its own");
+
+        let proc_dir = std::fs::File::open("/proc").unwrap();
+        // The shim's handler: SIGTERM to the leader's group. Its main flow:
+        // SIGTERM to the session's other groups.
+        // SAFETY: `sid` is the group this test spawned.
+        unsafe { libc::kill(-sid, libc::SIGTERM) };
+        signal_session(&proc_dir, sid, libc::SIGTERM, Some(sid));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !process_gone(shell.id()) {
+            assert!(Instant::now() < deadline, "the shell outlived its SIGTERM");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let job_pid = u32::try_from(job).unwrap();
+        assert!(!process_gone(job_pid), "the job ignores SIGTERM");
+        assert!(
+            session_has_live_member(&proc_dir, sid),
+            "the session still has the job"
+        );
+
+        // The grace period ends: SIGKILL to the whole session. The shell is
+        // still unreaped, so its session id is not recycled.
+        signal_session(&proc_dir, sid, libc::SIGKILL, None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !process_gone(job_pid) {
+            assert!(Instant::now() < deadline, "the job outlived the stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!session_has_live_member(&proc_dir, sid));
+        let _ = shell.wait();
+        drop(master);
+    }
+
+    /// The PTY a program is started on is its controlling terminal. The
+    /// shim's pre-exec step makes the program lead a new session, and the
+    /// PTY's foreground process group is then that program. A program
+    /// started without the step has no controlling terminal on the PTY.
+    #[test]
+    fn a_program_on_a_pty_has_it_as_its_controlling_terminal() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let spawn_on_pty = |lead: bool| {
+            let (master, slave) = open_terminal();
+            let mut command = std::process::Command::new("sleep");
+            command
+                .arg("30")
+                .stdin(slave.try_clone().unwrap())
+                .stdout(slave.try_clone().unwrap())
+                .stderr(slave);
+            if lead {
+                // SAFETY: the step makes only async-signal-safe calls.
+                unsafe {
+                    command.pre_exec(|| lead_session_on_terminal());
+                }
+            }
+            let child = command.spawn().expect("the process starts");
+            (master, child)
+        };
+
+        let (master, mut child) = spawn_on_pty(true);
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: both calls only query the kernel.
+        let (foreground, sid) = unsafe { (libc::tcgetpgrp(master.as_raw_fd()), libc::getsid(pid)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(sid, pid, "the process leads its own session");
+        assert_eq!(
+            foreground, pid,
+            "the PTY is the controlling terminal of the process"
+        );
+
+        let (master, mut child) = spawn_on_pty(false);
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: only queries the kernel.
+        let foreground = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(
+            foreground, pid,
+            "without the step the PTY is no one's terminal"
         );
     }
 }

@@ -232,18 +232,17 @@ pub(crate) async fn ensure_task_rows_stand(
     }
 }
 
-/// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
+/// The slice of `sandbox::Child` the attach-failure arm needs, so the arm can
 /// be tested without a container.
 pub(super) trait Reapable {
     /// Kill the process and wait for it, so it does not outlive its sandbox.
     fn kill_and_reap(&mut self);
 }
 
-impl Reapable for hakoniwa::Child {
+impl Reapable for sandbox::Child {
     fn kill_and_reap(&mut self) {
-        // `wait` runs regardless of `kill`: the process may have already exited.
-        let _ = self.kill();
-        let _ = self.wait();
+        self.kill();
+        self.wait();
     }
 }
 
@@ -509,8 +508,8 @@ pub(super) async fn task_producer(
                 return Ok(());
             }
             let result = async {
-                // One plan, container and attach per invocation: hakoniwa
-                // unshares per `spawn()`, so each needs its own address.
+                // One plan, container and attach per invocation: each spawn
+                // makes a container of its own, which needs its own address.
                 let planned = env.plan_launch().await.map_err(|e| {
                     io::Error::other(format!("setting up the task's network failed: {e}"))
                 })?;
@@ -523,18 +522,11 @@ pub(super) async fn task_producer(
                 if let Some(dir) = &start_dir {
                     cmd.current_dir(dir);
                 }
-                cmd.stdin(hakoniwa::Stdio::piped())
-                    .stdout(hakoniwa::Stdio::piped())
-                    .stderr(hakoniwa::Stdio::piped());
-                // On the fork thread, never this one: hakoniwa arms
-                // `PR_SET_PDEATHSIG(SIGKILL)` in the container, so it dies
-                // with the thread that forked it, and a runtime worker is
-                // retired ~10 s after any `block_in_place` displaces it (see
-                // `sandbox::forker`). #1748 moved the session launch and
-                // `Sandbox::run_with_cancel` there; this spawn, a task run's,
-                // stayed on the worker, and idle task sessions died with it
-                // (inbox#710).
-                let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
+                cmd.stdin(sandbox::Stdio::piped())
+                    .stdout(sandbox::Stdio::piped())
+                    .stderr(sandbox::Stdio::piped());
+                let mut child = cmd
+                    .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
                 let spawned = sandbox::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
@@ -573,25 +565,12 @@ pub(super) async fn task_producer(
     }
 }
 
-/// `Process` implementation backed by [`hakoniwa::Child`].
-///
-/// `hakoniwa` exposes a blocking `wait`, so the wait runs on the tokio
-/// blocking pool. The blocking task owns the inner `Child` while it's
-/// alive, so signalling has to bypass `Child::kill` and go straight to
-/// the pid — hence the saved [`libc`] pid kept alongside the state.
-///
-/// Lifecycle is an explicit state machine:
-///
-/// ```text
-///   Spawned(Child) ──wait()──▶ Waiting(JoinHandle) ──ok─▶ Exited(code)
-///                                                     └──err─▶ Failed
-/// ```
-///
-/// `Exited` and `Failed` are terminal; further `wait()` calls observe
-/// the cached outcome. `take_stdio` is only meaningful in `Spawned`.
+/// `Process` implementation backed by a container the spawner runs.
 pub struct HakoniwaProcess {
-    pub(super) pid: libc::pid_t,
-    pub(super) state: WaitState,
+    pub(super) child: sandbox::Child,
+    /// The exit code, once [`wait`](Process::wait) has seen the exit:
+    /// shell-convention, `128 + signo` for a signal death.
+    pub(super) exited: Option<i32>,
     /// The network wiring this task's namespace got, released at the end of
     /// [`wait`](Process::wait).
     pub(super) net: NetRelease,
@@ -652,31 +631,11 @@ impl NetRelease {
     }
 }
 
-pub(super) enum WaitState {
-    /// Just spawned. Stdio handles still attached to the inner `Child`
-    /// and ready for `take_stdio`. Boxed because `hakoniwa::Child` is
-    /// hundreds of bytes — without indirection the other variants
-    /// would inherit that footprint.
-    Spawned(Box<hakoniwa::Child>),
-    /// `wait()` has been kicked off; the blocking task owns the
-    /// `Child`. The `JoinHandle` is retained across calls so a dropped
-    /// `wait` future can be re-polled (`&mut JoinHandle` is cancel-safe).
-    Waiting(JoinHandle<Result<hakoniwa::ExitStatus, hakoniwa::Error>>),
-    /// Cached exit status, shell-convention (`128 + signo` for a signal
-    /// death). `Option` for the terminal-state machinery; the success
-    /// path always fills it.
-    Exited(Option<i32>),
-    /// Wait itself errored. The original `io::Error` isn't `Clone`, so
-    /// repeat `wait()` calls get a generic "previously failed" error
-    /// rather than the original cause.
-    Failed,
-}
-
 impl HakoniwaProcess {
-    pub(super) fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
+    pub(super) fn new(child: sandbox::Child, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
-            pid: child.id() as libc::pid_t,
-            state: WaitState::Spawned(Box::new(child)),
+            child,
+            exited: None,
             net: NetRelease::new(net_guard),
             stderr_notice: None,
             failure: None,
@@ -691,69 +650,32 @@ impl Process for HakoniwaProcess {
     type Stderr = pipe::Receiver;
 
     fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
-        let WaitState::Spawned(child) = &mut self.state else {
-            return None;
-        };
-        let stdin = pipe::Sender::from_owned_fd(child.stdin.take()?.into()).ok()?;
-        let stdout = pipe::Receiver::from_owned_fd(child.stdout.take()?.into()).ok()?;
-        let stderr = pipe::Receiver::from_owned_fd(child.stderr.take()?.into()).ok()?;
+        let stdin = pipe::Sender::from_owned_fd(self.child.stdin.take()?.into()).ok()?;
+        let stdout = pipe::Receiver::from_owned_fd(self.child.stdout.take()?.into()).ok()?;
+        let stderr = pipe::Receiver::from_owned_fd(self.child.stderr.take()?.into()).ok()?;
         Some((stdin, stdout, stderr))
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        // Spawned → Waiting: hand the child to the blocking pool.
-        // `State::Failed` is a benign mem::replace sentinel; the next
-        // line always overwrites it before any yield point.
-        if matches!(self.state, WaitState::Spawned(_)) {
-            let WaitState::Spawned(child) = std::mem::replace(&mut self.state, WaitState::Failed)
-            else {
-                unreachable!();
-            };
-            let mut child = *child;
-            self.state = WaitState::Waiting(crate::traced::spawn_blocking(move || child.wait()));
-        }
-
-        // Waiting → Exited / Failed. The `await` is the cancel point —
-        // if dropped mid-poll, the state stays `Waiting` and a fresh
-        // `wait()` call resumes the same `JoinHandle`.
-        if let WaitState::Waiting(handle) = &mut self.state {
-            self.state = match handle.await {
-                // `code` is the shell-convention status (`128 + signo` for a
-                // signal death), so a SIGKILL reports 137 rather than 1. The
-                // `exit_code` field is `None` for signals and would collapse
-                // to 1 downstream; `code` is what the session path reports too.
-                Ok(Ok(status)) => {
-                    self.failure = sandbox_failure(&status, self.killed);
-                    if let Some(reason) = &self.failure {
-                        tracing::warn!(pid = self.pid, %reason, "task: the sandbox failed");
-                    }
-                    WaitState::Exited(Some(status.code))
-                }
-                Ok(Err(_)) | Err(_) => WaitState::Failed,
-            };
-        }
-
-        // Terminal either way, so the network goes back now — on the `Failed`
-        // arm too, where the process is equally gone.
-        self.net.release().await;
-
-        match &self.state {
-            WaitState::Exited(code) => Ok(*code),
-            WaitState::Failed => Err(io::Error::other("hakoniwa wait previously failed")),
-            WaitState::Spawned(_) | WaitState::Waiting(_) => {
-                unreachable!("state must be terminal after the transitions above")
+        if self.exited.is_none() {
+            // Dropped mid-await, the next call waits again.
+            let status = self.child.exited().await;
+            self.failure = sandbox_failure(&status, self.killed);
+            if let Some(reason) = &self.failure {
+                tracing::warn!(pid = self.child.id(), %reason, "task: the sandbox failed");
             }
+            // `code` is the shell-convention status, so a SIGKILL reports
+            // 137. `exit_code` is `None` for a signal and would read as 1
+            // downstream. `code` is what the session path reports too.
+            self.exited = Some(status.code);
         }
+        // The process is gone, so the network goes back now.
+        self.net.release().await;
+        Ok(self.exited)
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
-        // The blocking-wait task owns the `Child` once `wait` has been
-        // called, so we can't go through `Child::kill`. Send SIGKILL
-        // directly; ESRCH (process already reaped) is benign.
-        // SAFETY: `kill(2)` is async-signal-safe and has no Rust-side
-        // invariants beyond the pid being a valid `pid_t`, which we
-        // captured from `Child::id()` at construction time.
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        self.child.kill();
         self.killed = true;
         Ok(())
     }
@@ -780,7 +702,7 @@ pub(super) const CONTAINER_SIGKILL_REASON: &str = "container received signal SIG
 /// a signalled one reports `128 + signo`, so neither is taken for it. A
 /// container that was killed, by the daemon (`killed`) or by anything else,
 /// is not a sandbox failure either.
-pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus, killed: bool) -> Option<String> {
+pub(super) fn sandbox_failure(status: &sandbox::ExitStatus, killed: bool) -> Option<String> {
     (!killed
         && status.code == SANDBOX_FAILURE_CODE
         && status.exit_code.is_none()
@@ -1573,37 +1495,25 @@ impl Exec for BoxExec {
                 .await
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             let (program, args) = self.program.argv();
-            let command = host
+            let mut command = host
                 .command_in_session_env(&program, &args, self.extra_env)
                 .await?;
-
-            let mut command = Command::from(command);
+            use crate::box_command::Stdio;
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            // This spawns the shim — us, re-exec'd — not the user's command, so
-            // a bare ENOENT reads as a missing shell. Name the path (#1175).
-            let shim = command.as_std().get_program().to_owned();
-            command.spawn().map(TokioProcess::shim).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "re-execing {} as the session-namespace shim: {e}",
-                        std::path::Path::new(&shim).display()
-                    ),
-                )
-            })
+                .stderr(Stdio::piped());
+            command.spawn().map(TokioProcess::shim)
         })
         .boxed()
     }
 }
 
-/// `Process` implementation backed by [`tokio::process::Child`].
+/// `Process` implementation backed by a program the daemon started for a
+/// box: one that entered the box, or one on the daemon's host.
 #[derive(Debug)]
 pub struct TokioProcess {
-    pub(super) child: Child,
+    pub(super) child: crate::box_command::BoxChild,
     /// Whether [`Process::start_kill`] sends SIGTERM, with a SIGKILL
     /// escalation in [`Process::wait`], rather than an immediate SIGKILL.
     /// Only the injection shim handles SIGTERM by killing its whole process
@@ -1616,9 +1526,9 @@ pub struct TokioProcess {
 
 impl TokioProcess {
     /// A child that [`Process::start_kill`] SIGKILLs at once.
-    pub(super) fn new(child: Child) -> Self {
+    pub(super) fn new(child: impl Into<crate::box_command::BoxChild>) -> Self {
         Self {
-            child,
+            child: child.into(),
             graceful: false,
             terminating: false,
         }
@@ -1626,7 +1536,7 @@ impl TokioProcess {
 
     /// The injection shim, which [`Process::start_kill`] SIGTERMs so its
     /// handler can kill the injected process's whole group.
-    pub(super) fn shim(child: Child) -> Self {
+    pub(super) fn shim(child: impl Into<crate::box_command::BoxChild>) -> Self {
         Self {
             graceful: true,
             ..Self::new(child)
@@ -1654,8 +1564,10 @@ impl Process for TokioProcess {
         }
         // Longer than the shim's own grace period for the group, so the shim
         // always delivers the group's SIGKILL itself; this one is the fallback
-        // for a wedged shim (see `nsenter::GROUP_GRACE`).
-        match tokio::time::timeout(crate::nsenter::SHIM_ESCALATION, self.child.wait()).await {
+        // for a wedged shim (see `enter::GROUP_GRACE`).
+        match tokio::time::timeout(sandbox::spawner::enter::SHIM_ESCALATION, self.child.wait())
+            .await
+        {
             Ok(status) => status.map(|s| s.code()),
             // The shim did not exit: escalate to SIGKILL and wait it out.
             Err(_elapsed) => {
@@ -1669,23 +1581,11 @@ impl Process for TokioProcess {
         if !self.graceful {
             return self.child.start_kill();
         }
-        // The shim is the direct child; SIGTERM reaches it and, through the
-        // handler it installs, its whole process group, which the shim SIGKILLs
-        // after its grace period. If the shim itself does not exit within
+        // SIGTERM reaches the shim and, through the handler it installs,
+        // its whole process group, which the shim SIGKILLs after its grace
+        // period. If the shim itself does not exit within
         // `SHIM_ESCALATION`, `wait` escalates to SIGKILL (above).
-        // `id()` is `None` once the child has been reaped; nothing to signal.
-        if let Some(pid) = self.child.id() {
-            // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
-            // async-signal-safe and has no Rust-side invariants.
-            if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
-                let err = io::Error::last_os_error();
-                // ESRCH means it already exited between `id()` and `kill`; that
-                // is success, not an error the caller must handle.
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(err);
-                }
-            }
-        }
+        self.child.start_terminate()?;
         self.terminating = true;
         Ok(())
     }
@@ -1698,8 +1598,8 @@ pub(crate) fn mint_exec_id() -> ExecId {
 }
 
 /// The program and arguments an exec's argv runs as, with no shell between
-/// the client's words and the process (BOX-149). The box host joins them to
-/// the box's namespaces and cgroup ([`crate::nsenter::Injection`]).
+/// the client's words and the process (BOX-149). The box host starts them in
+/// the box's namespaces and cgroup.
 pub(crate) fn exec_argv(argv: Vec<String>) -> (String, Vec<String>) {
     BoxProgram::Argv(argv).argv()
 }
@@ -1882,7 +1782,7 @@ pub(crate) struct ManagedStart {
 /// can end the exec's whole process group, then SIGKILLs.
 pub(crate) fn start_managed_exec(
     start: ManagedStart,
-    command: std::process::Command,
+    command: crate::box_command::BoxCommand,
     graceful: bool,
 ) -> io::Result<Arc<ExecEntry>> {
     start_managed_exec_within(start, command, graceful, HeldInputLimits::for_daemon())
@@ -1892,7 +1792,7 @@ pub(crate) fn start_managed_exec(
 /// holds of the input that clients type.
 pub(super) fn start_managed_exec_within(
     start: ManagedStart,
-    mut command: std::process::Command,
+    mut command: crate::box_command::BoxCommand,
     graceful: bool,
     input_limits: HeldInputLimits,
 ) -> io::Result<Arc<ExecEntry>> {
@@ -1904,6 +1804,7 @@ pub(super) fn start_managed_exec_within(
         winsize,
         facts,
     } = start;
+    use crate::box_command::Stdio as BoxStdio;
     let transcript_path = boxes::store::exec_transcript_path(&exec_box.dir, id.as_str());
     if let Some(dir) = transcript_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -1914,9 +1815,9 @@ pub(super) fn start_managed_exec_within(
         ExecMode::Tty => {
             let (master, slave) = open_terminal(winsize)?;
             command
-                .stdin(Stdio::from(slave.try_clone()?))
-                .stdout(Stdio::from(slave.try_clone()?))
-                .stderr(Stdio::from(slave));
+                .stdin(BoxStdio::from(slave.try_clone()?))
+                .stdout(BoxStdio::from(slave.try_clone()?))
+                .stderr(BoxStdio::from(slave));
             master
         }
         ExecMode::Detached | ExecMode::Attached => {
@@ -1924,9 +1825,9 @@ pub(super) fn start_managed_exec_within(
             // command gets through `dup2` are not.
             let (reader, writer) = std::io::pipe()?;
             command
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(writer.try_clone()?))
-                .stderr(Stdio::from(writer));
+                .stdin(BoxStdio::null())
+                .stdout(BoxStdio::from(writer.try_clone()?))
+                .stderr(BoxStdio::from(writer));
             std::fs::File::from(std::os::fd::OwnedFd::from(reader))
         }
     };
@@ -1934,13 +1835,10 @@ pub(super) fn start_managed_exec_within(
     // blocking thread, so the supervisor can stop them. A write to a terminal
     // whose program reads nothing would otherwise hold a thread for good.
     crate::net::switch::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&source))?;
-    let mut command = Command::from(command);
-    command.kill_on_drop(true);
+    // The command holds the daemon's copies of the terminal's slave side
+    // or the pipe's write end. The spawn consumes it, so the pump sees the
+    // end of the output when the exec ends.
     let child = command.spawn()?;
-    // The command holds the parent's copies of the terminal's slave side or
-    // the pipe's write end. Dropped now, so the pump sees the end of the
-    // output when the exec ends.
-    drop(command);
     let process = if graceful {
         TokioProcess::shim(child)
     } else {
@@ -2223,7 +2121,7 @@ pub(crate) async fn wait_with_timeout<P: Process>(
 /// Longer than the shim's own escalation to SIGKILL, so a command that the
 /// stop reaches always ends inside it.
 pub(crate) const STOP_BOUND: Duration =
-    Duration::from_secs(crate::nsenter::SHIM_ESCALATION.as_secs() + 5);
+    Duration::from_secs(sandbox::spawner::enter::SHIM_ESCALATION.as_secs() + 5);
 
 /// Waits for `process` after a stop at its timeout, for at most
 /// [`STOP_BOUND`]. A command that the stop did not reach, or that does not

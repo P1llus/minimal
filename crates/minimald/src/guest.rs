@@ -552,21 +552,14 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
 /// On the `/run` tmpfs: boot-ephemeral, and the rootfs is read-only.
 pub const STAGED_SELF_EXE: &str = "/run/minimald";
 
-/// Stages a runnable copy of this binary at [`STAGED_SELF_EXE`] and registers it
-/// as the namespace-joining shim.
+/// Stages a runnable copy of this binary at [`STAGED_SELF_EXE`], which the
+/// daemon then starts as its spawner.
 ///
-/// pid-1 *is* the initramfs `/init`, which the switch above just made
-/// unreachable — the initramfs stays mounted, but nothing names it. Since
-/// `current_exe()` still reports `/init`, every re-exec of ourselves fails with
-/// ENOENT; `min session attach <name> -c '<cmd>'` re-execs us as the
-/// [`crate::nsenter::SUBCOMMAND`] shim, so it broke (#1175).
-///
-/// The copy works post-switch because *opening* `/proc/self/exe` resolves to the
-/// inode, not the path. Costs one binary's worth of tmpfs (RAM) per boot.
-///
-/// Best-effort: this failing costs in-session exec, which is not worth
-/// downgrading the boot over — but it is logged loudly enough to explain the
-/// exec failures that follow.
+/// pid 1 is the initramfs `/init`, which the switch above made unreachable:
+/// the initramfs stays mounted, but nothing names it, so running this binary
+/// again by its own path fails with ENOENT. The copy works after the switch
+/// because opening `/proc/self/exe` resolves to the inode, not the path. It
+/// costs one binary's worth of tmpfs per boot.
 fn stage_self_exe() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -576,7 +569,6 @@ fn stage_self_exe() {
     };
     match staged() {
         Ok(()) => {
-            crate::nsenter::set_shim_exe(STAGED_SELF_EXE);
             tracing::info!(
                 path = STAGED_SELF_EXE,
                 "staged the daemon binary post-switch"
@@ -585,8 +577,7 @@ fn stage_self_exe() {
         Err(e) => tracing::error!(
             error = %e,
             path = STAGED_SELF_EXE,
-            "could not stage the daemon binary; running a command in a session \
-             (`min session exec`) will fail with ENOENT",
+            "could not stage the daemon binary; the spawner cannot start, so no box can run",
         ),
     }
 }

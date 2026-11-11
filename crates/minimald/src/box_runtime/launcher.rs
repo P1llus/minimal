@@ -819,12 +819,12 @@ pub(crate) struct SandboxLauncher {
 pub(super) struct SpawnedProcessGuard {
     /// `None` once the process has been handed off — see
     /// [`Self::release`].
-    process: Option<hakoniwa::Child>,
+    process: Option<sandbox::Child>,
 }
 
 #[cfg_attr(test, allow(dead_code))]
 impl SpawnedProcessGuard {
-    fn new(process: hakoniwa::Child) -> Self {
+    fn new(process: sandbox::Child) -> Self {
         Self {
             process: Some(process),
         }
@@ -832,14 +832,14 @@ impl SpawnedProcessGuard {
 
     /// Borrow the guarded process, for the post-spawn wiring that still
     /// needs it while the guard stays responsible for it.
-    fn get_mut(&mut self) -> &mut hakoniwa::Child {
+    fn get_mut(&mut self) -> &mut sandbox::Child {
         self.process
             .as_mut()
             .expect("the process is taken only by `release`, which consumes the guard")
     }
 
     /// Hand the process off, disarming the guard.
-    fn release(mut self) -> hakoniwa::Child {
+    fn release(mut self) -> sandbox::Child {
         self.process
             .take()
             .expect("the process is taken only here, and this consumes the guard")
@@ -851,14 +851,10 @@ impl Drop for SpawnedProcessGuard {
         let Some(mut process) = self.process.take() else {
             return;
         };
-        // `kill` and `wait` are independent: a process that already
-        // exited fails the kill with `ESRCH` but still needs reaping.
-        if let Err(e) = process.kill() {
-            tracing::warn!(error = %e, "killing sandbox process after an abandoned launch");
-        }
-        if let Err(e) = process.wait() {
-            tracing::warn!(error = %e, "reaping sandbox process after an abandoned launch");
-        }
+        // Waited for, so the sandbox's directories are free of it when
+        // this returns.
+        process.kill();
+        process.wait();
     }
 }
 
@@ -1244,9 +1240,9 @@ impl BoxLauncher for SandboxLauncher {
             // master, and nothing holds the terminal opened above.
             let (master, tty_path, late_notice_fd, pipes) = if on_pipes {
                 let child = ChildPipes::open()?;
-                command.stdin(hakoniwa::Stdio::from(child.stdin));
-                command.stdout(hakoniwa::Stdio::from(child.stdout));
-                command.stderr(hakoniwa::Stdio::from(child.stderr));
+                command.stdin(sandbox::Stdio::from(child.stdin));
+                command.stdout(sandbox::Stdio::from(child.stdout));
+                command.stderr(sandbox::Stdio::from(child.stderr));
                 drop(pty);
                 (
                     child.stdout_reader,
@@ -1255,8 +1251,8 @@ impl BoxLauncher for SandboxLauncher {
                     Some(child.parent),
                 )
             } else {
-                command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-                command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+                command.stdin(sandbox::Stdio::from(pty.dup_slave_fd()?));
+                command.stdout(sandbox::Stdio::from(pty.dup_slave_fd()?));
                 let tty_path = pty.slave_path().to_path_buf();
                 // Kept for one notice written after the switch attach below
                 // (an own-address box the hostname proxy stranded), so it is
@@ -1268,13 +1264,12 @@ impl BoxLauncher for SandboxLauncher {
                     .then(|| pty.dup_slave_fd().ok())
                     .flatten();
                 let (master, slave) = pty.into_fds();
-                command.stderr(hakoniwa::Stdio::from(slave));
+                command.stderr(sandbox::Stdio::from(slave));
                 (master, tty_path, late_notice_fd, None)
             };
 
-            // On the fork thread, never this one: the container dies with
-            // the thread that forked it (see `sandbox::forker`).
-            let process = sandbox::forker::on_fork_thread(move || command.spawn())
+            let process = command
+                .spawn()
                 .map_err(|e| io::Error::other(format!("exec failed: {e}")))?;
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.

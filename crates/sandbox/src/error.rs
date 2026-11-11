@@ -33,7 +33,7 @@ pub enum ExecutionError {
     },
     #[cfg(target_os = "linux")]
     #[error("Invocation spawn failed: {0}")]
-    SpawnFailed(#[source] hakoniwa::Error),
+    SpawnFailed(#[source] std::io::Error),
     #[error("Failed to mount {}: {}", path.display(), msg)]
     MountError { msg: &'static str, path: PathBuf },
     /// A plan that requires its own network namespace was given, but this host

@@ -38,14 +38,48 @@ pub fn gcs_object_url(bucket: &str, object: &str) -> Result<String> {
     Ok(url.into())
 }
 
+/// The kind of socket a placed download asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketKind {
+    /// A TCP socket, for a connection.
+    Stream,
+    /// A UDP socket, for a name query.
+    Datagram,
+}
+
+/// What creates the sockets of a placed download, so each one belongs to
+/// the box from its creation. It is asked for an IPv6 socket or an IPv4 one,
+/// of a kind.
+#[derive(Clone)]
+pub struct Sockets(Arc<dyn Fn(bool, SocketKind) -> std::io::Result<OwnedFd> + Send + Sync>);
+
+impl Sockets {
+    /// Sockets that `create` makes: `create(v6, kind)`.
+    pub fn new(
+        create: impl Fn(bool, SocketKind) -> std::io::Result<OwnedFd> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(create))
+    }
+
+    fn create(&self, v6: bool, kind: SocketKind) -> std::io::Result<OwnedFd> {
+        (self.0)(v6, kind)
+    }
+}
+
+impl std::fmt::Debug for Sockets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sockets")
+    }
+}
+
 /// Where a placed download opens its connections (NET-155).
 #[derive(Debug, Clone)]
 pub enum Placement {
     /// It opens none. Every connection fails with this reason before any
     /// name is resolved, so nothing leaves.
     Refused(&'static str),
-    /// In the cgroup whose `cgroup.procs` is this path.
-    Cgroup(PathBuf),
+    /// In a box that shares this daemon's network, from these sockets.
+    Box(Sockets),
     /// In a network namespace.
     Namespace(NetNamespace),
 }
@@ -54,7 +88,7 @@ impl std::fmt::Display for Placement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(why) => write!(f, "nowhere: {why}"),
-            Self::Cgroup(procs) => write!(f, "{}", procs.display()),
+            Self::Box(_) => f.write_str("a box's cgroup"),
             Self::Namespace(_) => f.write_str("a box's network namespace"),
         }
     }
@@ -65,12 +99,7 @@ impl std::fmt::Display for Placement {
 /// resolver and `hosts` file play no part.
 #[derive(Clone)]
 pub struct NetNamespace {
-    /// The user namespace that owns `net`. A process needs it to enter `net`.
-    // Only Linux joins a namespace, so only Linux reads `user` and `net`.
-    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
-    user: Arc<OwnedFd>,
-    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
-    net: Arc<OwnedFd>,
+    sockets: Sockets,
     nameservers: Vec<std::net::SocketAddr>,
     /// Whether the namespace's egress rules allow a host name.
     admits_name: Arc<dyn Fn(&str) -> bool + Send + Sync>,
@@ -85,25 +114,24 @@ impl std::fmt::Debug for NetNamespace {
 }
 
 impl NetNamespace {
-    /// The namespaces of the running process `pid`. `nameservers` answer on
-    /// port 53 in the namespace, and `admits_name` says whether its egress
-    /// rules allow a host name. Refuses a process that shares this daemon's
-    /// network namespace, because a socket opened there would leave under no
-    /// rule of the box.
+    /// The network namespace of the running process `pid`, in which
+    /// `sockets` creates. `nameservers` answer on port 53 in the namespace,
+    /// and `admits_name` says whether its egress rules allow a host name.
+    /// Refuses a process that shares this daemon's network namespace,
+    /// because a socket opened there would leave under no rule of the box.
     pub fn of_process(
         pid: u32,
+        sockets: Sockets,
         nameservers: &[std::net::Ipv4Addr],
         admits_name: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     ) -> Result<Self> {
         use std::os::unix::fs::MetadataExt;
-        let open = |ns: &str| -> Result<File> { Ok(File::open(format!("/proc/{pid}/ns/{ns}"))?) };
-        let net = open("net")?;
-        if net.metadata()?.ino() == std::fs::metadata("/proc/self/ns/net")?.ino() {
+        let net = std::fs::metadata(format!("/proc/{pid}/ns/net"))?;
+        if net.ino() == std::fs::metadata("/proc/self/ns/net")?.ino() {
             anyhow::bail!("process {pid} shares this daemon's network namespace");
         }
         Ok(Self {
-            user: Arc::new(open("user")?.into()),
-            net: Arc::new(net.into()),
+            sockets,
             nameservers: nameservers
                 .iter()
                 .map(|ip| std::net::SocketAddr::from((*ip, 53)))
@@ -1056,238 +1084,49 @@ mod placed {
         )
     }
 
-    /// The kind of socket a child makes at a placement.
-    #[derive(Debug, Clone, Copy)]
-    enum SocketKind {
-        /// A TCP socket, for a connection.
-        Stream,
-        /// A UDP socket, for a name query.
-        Datagram,
-    }
-
-    /// What the child that makes a socket does first, on descriptors the
-    /// parent opened for it.
-    #[cfg(target_os = "linux")]
-    #[derive(Debug, Clone, Copy)]
-    enum Join {
-        /// Write itself into this `cgroup.procs`.
-        Cgroup(libc::c_int),
-        /// Enter this user namespace, then this network namespace.
-        Namespace(libc::c_int, libc::c_int),
-    }
-
-    /// A socket that a child process created after it joined the placement,
-    /// so the socket belongs to the placement's cgroup or namespace.
-    #[cfg(target_os = "linux")]
+    /// A socket of `placement`.
     fn placed_socket(
         placement: &Placement,
         v6: bool,
         kind: SocketKind,
     ) -> io::Result<std::os::fd::OwnedFd> {
-        use std::os::fd::AsRawFd;
-
-        // Open until the fork, which hands the child the descriptor.
-        let procs_file;
-        let join = match placement {
-            Placement::Refused(why) => {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, *why));
-            }
-            Placement::Cgroup(procs) => {
-                procs_file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(procs)
-                    .map_err(|e| {
-                        io::Error::new(e.kind(), format!("could not open {}: {e}", procs.display()))
-                    })?;
-                Join::Cgroup(procs_file.as_raw_fd())
-            }
-            Placement::Namespace(namespace) => {
-                Join::Namespace(namespace.user.as_raw_fd(), namespace.net.as_raw_fd())
-            }
-        };
-        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
-        let domain = if v6 { libc::AF_INET6 } else { libc::AF_INET };
-        let ty = match kind {
-            SocketKind::Stream => libc::SOCK_STREAM,
-            SocketKind::Datagram => libc::SOCK_DGRAM,
-        };
-        let theirs_fd = theirs.as_raw_fd();
-        // SAFETY: the child calls only async-signal-safe functions (`write`,
-        // `setns`, `socket`, `sendmsg`, `_exit`) on memory it owns, so the locks other
-        // threads of this process held at the fork never matter to it.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if pid == 0 {
-            // SAFETY: see above. The child never returns.
-            unsafe { socket_child(join, theirs_fd, domain, ty) }
-        }
-        drop(theirs);
-        let received = receive_socket(&ours);
-        let mut status = 0;
-        // SAFETY: `pid` is the child this call forked, reaped exactly once.
-        while unsafe { libc::waitpid(pid, &mut status, 0) } < 0
-            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-        {}
-        match received? {
-            Report::Socket(fd) => Ok(fd),
-            Report::Join(errno) => Err(io::Error::new(
-                io::Error::from_raw_os_error(errno).kind(),
-                format!(
-                    "could not move a process into {placement}: {}",
-                    io::Error::from_raw_os_error(errno)
-                ),
-            )),
-            Report::Create(errno) => Err(io::Error::from_raw_os_error(errno)),
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn placed_socket(
-        _placement: &Placement,
-        _v6: bool,
-        _kind: SocketKind,
-    ) -> io::Result<std::os::fd::OwnedFd> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "a placed download runs only on Linux",
-        ))
-    }
-
-    /// What the child process that creates a placed socket reports.
-    #[cfg(target_os = "linux")]
-    enum Report {
-        Socket(std::os::fd::OwnedFd),
-        /// The child could not join the placement: the errno.
-        Join(i32),
-        /// The child could not create the socket: the errno.
-        Create(i32),
-    }
-
-    /// The child's report: one step byte (0 done, 1 join, 2 create) and an
-    /// errno, little-endian.
-    #[cfg(target_os = "linux")]
-    const REPORT_LEN: usize = 5;
-
-    /// The forked child: joins the placement, creates the socket, sends it
-    /// to the parent over `out`, and exits.
-    ///
-    /// # Safety
-    ///
-    /// Call only in the child of a `fork`. It never returns.
-    #[cfg(target_os = "linux")]
-    unsafe fn socket_child(
-        join: Join,
-        out: libc::c_int,
-        domain: libc::c_int,
-        ty: libc::c_int,
-    ) -> ! {
-        // SAFETY: plain syscalls on descriptors the parent opened for the
-        // child, and on stack memory; no allocation, no lock.
-        unsafe {
-            let mut report = [0u8; REPORT_LEN];
-            let mut fd = -1;
-            let joined = match join {
-                Join::Cgroup(procs) => libc::write(procs, b"0".as_ptr().cast(), 1) == 1,
-                Join::Namespace(user, net) => {
-                    libc::setns(user, libc::CLONE_NEWUSER) == 0
-                        && libc::setns(net, libc::CLONE_NEWNET) == 0
-                }
-            };
-            if !joined {
-                report[0] = 1;
-                report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
-            } else {
-                fd = libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0);
-                if fd < 0 {
-                    report[0] = 2;
-                    report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
-                }
-            }
-            let mut iov = libc::iovec {
-                iov_base: report.as_mut_ptr().cast(),
-                iov_len: report.len(),
-            };
-            let mut control = [0u64; 4];
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            if fd >= 0 {
-                msg.msg_control = control.as_mut_ptr().cast();
-                msg.msg_controllen = libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as _;
-                let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
-                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), fd);
-            }
-            libc::sendmsg(out, &msg, 0);
-            libc::_exit(0)
-        }
-    }
-
-    /// Reads the child's report, and the socket it sent with it.
-    #[cfg(target_os = "linux")]
-    fn receive_socket(sock: &std::os::unix::net::UnixStream) -> io::Result<Report> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-        let mut report = [0u8; REPORT_LEN];
-        let mut iov = libc::iovec {
-            iov_base: report.as_mut_ptr().cast(),
-            iov_len: report.len(),
-        };
-        let mut control = [0u64; 4];
-        // SAFETY: a zeroed `msghdr` is valid; the pointers set next outlive
-        // the `recvmsg` call that reads them.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = size_of_val(&control) as _;
-        let n = loop {
-            // SAFETY: `msg` points at live buffers of the lengths it names.
-            let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break n;
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut socket = None;
-        // SAFETY: the kernel filled `control` and set `msg_controllen`; the
-        // macros walk only within it.
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                    let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
-                    socket = Some(OwnedFd::from_raw_fd(fd));
-                }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-        }
-        if n as usize != REPORT_LEN {
-            return Err(io::Error::other(
-                "the process that creates a placed socket exited without a report",
-            ));
-        }
-        let errno = i32::from_le_bytes([report[1], report[2], report[3], report[4]]);
-        match (report[0], socket) {
-            (0, Some(fd)) => Ok(Report::Socket(fd)),
-            (1, _) => Ok(Report::Join(errno)),
-            (2, _) => Ok(Report::Create(errno)),
-            _ => Err(io::Error::other(
-                "the process that creates a placed socket sent no socket",
-            )),
+        match placement {
+            Placement::Refused(why) => Err(io::Error::new(io::ErrorKind::PermissionDenied, *why)),
+            Placement::Box(sockets) => sockets.create(v6, kind),
+            Placement::Namespace(namespace) => namespace.sockets.create(v6, kind),
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A placement whose sockets are plain ones of this process. Each
+        /// socket it makes writes `0` to `marker`, so a test can tell
+        /// whether one was made.
+        fn marked(marker: &std::path::Path) -> Placement {
+            let marker = marker.to_path_buf();
+            Placement::Box(Sockets::new(move |v6, kind| {
+                std::fs::write(&marker, "0")?;
+                let domain = if v6 { libc::AF_INET6 } else { libc::AF_INET };
+                let ty = match kind {
+                    SocketKind::Stream => libc::SOCK_STREAM,
+                    SocketKind::Datagram => libc::SOCK_DGRAM,
+                };
+                // SAFETY: `socket` takes three integers.
+                let fd = unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: a fresh descriptor that nothing else owns.
+                Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+            }))
+        }
+
+        /// A placement that can make no socket.
+        fn broken() -> Placement {
+            Placement::Box(Sockets::new(|_, _| Err(io::Error::other("no socket here"))))
+        }
 
         /// A loopback address that refuses every connection for as long as
         /// the returned socket lives: the socket holds the port bound and
@@ -1352,10 +1191,8 @@ mod placed {
         }
 
         /// NET-155: a placed web download reaches its destination through
-        /// the relay, from a socket that a child created after it wrote
-        /// itself into the placement's `cgroup.procs`, and the content-hash
-        /// check still applies. A plain file stands in for `cgroup.procs`:
-        /// the child's write lands in it, and the socket comes back.
+        /// the relay, from a socket the placement made, and the content-hash
+        /// check still applies.
         #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn a_placed_download_connects_from_the_placement() {
@@ -1370,7 +1207,7 @@ mod placed {
                 file_cache::FileCache::new_with_offline(tmp.path().join("cache"), false).unwrap();
             let url = format!("http://{addr}/pkg-1.0.tar.gz");
 
-            let placement = &Placement::Cgroup(procs.clone());
+            let placement = &marked(&procs);
             let fetched = download(&cache, &url, &sha, placement, &OpTracker::new_root())
                 .await
                 .expect("the placed download succeeds");
@@ -1379,7 +1216,7 @@ mod placed {
             assert_eq!(
                 std::fs::read_to_string(&procs).unwrap(),
                 "0",
-                "the child that made the socket joined the placement"
+                "the placement made the socket"
             );
 
             // The same source again: the download cache serves it, and the
@@ -1411,7 +1248,7 @@ mod placed {
             );
 
             // A placement whose rules admit nothing resolves no name and
-            // opens no socket: the child never joins the placement.
+            // makes no socket.
             std::fs::write(&procs, "").unwrap();
             let sealed = download(
                 &cache,
@@ -1429,33 +1266,6 @@ mod placed {
                 "{sealed:#}"
             );
             assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
-        }
-
-        /// NET-155: the child that makes a placed socket writes itself into
-        /// the placement's `cgroup.procs` before it creates the socket, and a
-        /// placement it cannot open is refused with its path. A plain file
-        /// stands in for `cgroup.procs`.
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_placed_socket_is_created_in_the_named_cgroup() {
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let placement = Placement::Cgroup(procs.clone());
-            let fd = placed_socket(&placement, false, SocketKind::Stream).expect("a placed socket");
-            let socket = std::net::TcpStream::from(fd);
-            socket.set_nonblocking(true).unwrap();
-            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
-            let refused = placed_socket(
-                &Placement::Cgroup("/nonexistent/cgroup.procs".into()),
-                false,
-                SocketKind::Stream,
-            )
-            .expect_err("no cgroup, no socket");
-            assert!(
-                refused.to_string().contains("/nonexistent/cgroup.procs"),
-                "{refused}"
-            );
         }
 
         /// How a test name server answers over UDP.
@@ -1580,7 +1390,7 @@ mod placed {
             let procs = tmp.path().join("cgroup.procs");
             std::fs::write(&procs, "").unwrap();
 
-            let addrs = lookup_placed(&Placement::Cgroup(procs.clone()), &[nameserver], "pkg.test")
+            let addrs = lookup_placed(&marked(&procs), &[nameserver], "pkg.test")
                 .await
                 .expect("the name resolves");
             assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
@@ -1590,13 +1400,9 @@ mod placed {
                 "the child that made the query socket joined the placement"
             );
 
-            let missing = lookup_placed(
-                &Placement::Cgroup(procs.clone()),
-                &[nameserver],
-                "missing.test",
-            )
-            .await
-            .expect_err("no such name");
+            let missing = lookup_placed(&marked(&procs), &[nameserver], "missing.test")
+                .await
+                .expect_err("no such name");
             assert!(
                 missing
                     .to_string()
@@ -1604,28 +1410,22 @@ mod placed {
                 "{missing}"
             );
 
-            // A placement the child cannot join sends no query.
-            let refused = lookup_placed(
-                &Placement::Cgroup("/nonexistent/cgroup.procs".into()),
-                &[nameserver],
-                "pkg.test",
-            )
-            .await
-            .expect_err("no cgroup, no query");
-            assert!(
-                refused.to_string().contains("/nonexistent/cgroup.procs"),
-                "{refused}"
-            );
+            // A placement that can make no socket sends no query.
+            let refused = lookup_placed(&broken(), &[nameserver], "pkg.test")
+                .await
+                .expect_err("no socket, no query");
+            assert!(refused.to_string().contains("no socket here"), "{refused}");
         }
 
-        /// A namespace placement whose descriptors enter nothing, for a test
-        /// that must end before any socket is made.
+        /// A namespace placement that can make no socket, for a test that
+        /// must end before any socket is made.
         #[cfg(target_os = "linux")]
         fn inert_namespace(nameserver: SocketAddr, allowed: &'static str) -> Placement {
-            let null = || Arc::new(OwnedFd::from(File::open("/dev/null").unwrap()));
+            let Placement::Box(sockets) = broken() else {
+                unreachable!()
+            };
             Placement::Namespace(NetNamespace {
-                user: null(),
-                net: null(),
+                sockets,
                 nameservers: vec![nameserver],
                 admits_name: Arc::new(move |host| host == allowed),
             })
@@ -1666,20 +1466,24 @@ mod placed {
         #[cfg(target_os = "linux")]
         #[test]
         fn a_process_in_the_daemons_namespace_is_no_placement() {
-            let refused = NetNamespace::of_process(std::process::id(), &[], Arc::new(|_| true))
-                .expect_err("this process shares its own namespace");
+            let Placement::Box(sockets) = broken() else {
+                unreachable!()
+            };
+            let refused =
+                NetNamespace::of_process(std::process::id(), sockets, &[], Arc::new(|_| true))
+                    .expect_err("this process shares its own namespace");
             assert!(
                 refused.to_string().contains("shares this daemon's network"),
                 "{refused}"
             );
         }
 
-        /// A relay for tests, with its connections placed by a plain file
-        /// that stands in for `cgroup.procs`.
+        /// A relay for tests, whose placement marks `procs` for each socket
+        /// it makes.
         #[cfg(target_os = "linux")]
         fn test_relay(procs: &std::path::Path, connect_timeout: std::time::Duration) -> Relay {
             Relay {
-                placement: Placement::Cgroup(procs.to_path_buf()),
+                placement: marked(procs),
                 hosts: procs.with_file_name("hosts"),
                 nameservers: None,
                 connect_timeout,
@@ -1986,16 +1790,12 @@ mod placed {
             let procs = tmp.path().join("cgroup.procs");
             std::fs::write(&procs, "").unwrap();
 
-            let addrs = lookup_placed(
-                &Placement::Cgroup(procs.clone()),
-                &[failing, answering],
-                "pkg.test",
-            )
-            .await
-            .expect("the second name server answers");
+            let addrs = lookup_placed(&marked(&procs), &[failing, answering], "pkg.test")
+                .await
+                .expect("the second name server answers");
             assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
 
-            let failed = lookup_placed(&Placement::Cgroup(procs.clone()), &[failing], "pkg.test")
+            let failed = lookup_placed(&marked(&procs), &[failing], "pkg.test")
                 .await
                 .expect_err("no name server answers");
             assert!(
@@ -2017,7 +1817,7 @@ mod placed {
             let procs = tmp.path().join("cgroup.procs");
             std::fs::write(&procs, "").unwrap();
 
-            let addrs = lookup_placed(&Placement::Cgroup(procs.clone()), &[nameserver], "pkg.test")
+            let addrs = lookup_placed(&marked(&procs), &[nameserver], "pkg.test")
                 .await
                 .expect("the answer over TCP carries the address");
             assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);

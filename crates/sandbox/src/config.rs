@@ -601,10 +601,11 @@ impl Config {
         self
     }
 
-    /// Runs the sandbox in `cgroup`, the cgroup of the box it belongs to.
+    /// Runs the sandbox in `cgroup`, the cgroup of the box it belongs to,
+    /// when the box has one.
     #[must_use]
-    pub fn with_box_cgroup(mut self, cgroup: crate::cgroup::BoxCgroup) -> Self {
-        self.box_cgroup = Some(cgroup);
+    pub fn with_box_cgroup(mut self, cgroup: Option<crate::cgroup::BoxCgroup>) -> Self {
+        self.box_cgroup = cgroup;
         self
     }
 

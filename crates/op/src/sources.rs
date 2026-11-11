@@ -15,13 +15,15 @@ use url::Url;
 /// box's egress rules decide them.
 #[derive(Debug, Clone, Copy)]
 pub enum SourcePlace<'a> {
-    /// In the box's classifier leaf.
+    /// On the network the box shares with the daemon, from sockets made in
+    /// the box's cgroup.
     Box(&'a BoxCgroup),
     /// On the box's own network. `exec_base` holds the sandbox that keeps
-    /// that network up for the fetch.
+    /// that network up for the fetch, in `cgroup` when the box has one.
     Network {
         network: &'a crate::BuildNetwork,
         exec_base: &'a Path,
+        cgroup: Option<&'a BoxCgroup>,
     },
 }
 
@@ -73,8 +75,12 @@ impl SourceFetcher for common::RemoteStorage {
         // Kept up until the download ends.
         let _held;
         let placement = match place {
-            SourcePlace::Box(cgroup) => Placement::Cgroup(cgroup.path().join("cgroup.procs")),
-            SourcePlace::Network { network, exec_base } => {
+            SourcePlace::Box(cgroup) => box_sockets(cgroup),
+            SourcePlace::Network {
+                network,
+                exec_base,
+                cgroup,
+            } => {
                 if let Some(why) = network.refusal() {
                     return self
                         .download_web_placed(url, sha256, &Placement::Refused(why), op)
@@ -84,7 +90,7 @@ impl SourceFetcher for common::RemoteStorage {
                 if let Some(path) = self.cached_web(url, sha256)? {
                     return Ok((path, false));
                 }
-                let (namespace, held) = network.hold(exec_base).await?;
+                let (namespace, held) = network.hold(exec_base, cgroup).await?;
                 _held = held;
                 Placement::Namespace(namespace)
             }
@@ -102,6 +108,23 @@ impl SourceFetcher for common::RemoteStorage {
         self.download_with_verification_and_caching(bucket_id, file, sha256, op)
             .await
     }
+}
+
+/// Where a fetch for a box that shares the daemon's network opens its
+/// connections: on sockets this process's spawner makes in the box's cgroup.
+#[cfg(target_os = "linux")]
+fn box_sockets(cgroup: &BoxCgroup) -> Placement {
+    let cgroup = cgroup.clone();
+    let spawner = sandbox::Spawner::current();
+    Placement::Box(common::Sockets::new(move |v6, kind| {
+        spawner.socket(Some(&cgroup), v6, kind == common::SocketKind::Datagram)
+    }))
+}
+
+/// Box cgroups exist on Linux only, so there is no box to fetch for.
+#[cfg(not(target_os = "linux"))]
+fn box_sockets(cgroup: &BoxCgroup) -> Placement {
+    match *cgroup {}
 }
 
 /// Loads a source.
@@ -447,6 +470,7 @@ mod tests {
             let place = SourcePlace::Network {
                 network: &network,
                 exec_base: tmp.path(),
+                cgroup: None,
             };
             let refused = storage
                 .download_web(
@@ -558,6 +582,7 @@ mod tests {
             place: Some(SourcePlace::Network {
                 network: &network,
                 exec_base: tmp.path(),
+                cgroup: None,
             }),
         }
         .run(&opts)

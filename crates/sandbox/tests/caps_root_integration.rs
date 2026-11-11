@@ -440,7 +440,7 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
             std::iter::empty::<(&str, &str)>(),
         )
         .expect("building the probe command");
-    command.stdout(hakoniwa::Stdio::MakePipe);
+    command.stdout(sandbox::Stdio::MakePipe);
     let mut child = command.spawn().expect("spawning the probe in the box");
 
     let stdout = child.stdout.take().expect("the probe's stdout pipe");
@@ -457,14 +457,9 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
     .await
     .expect("the probe in the box did not report in time")
     .expect("spawn_blocking join");
-    let status = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await
-    .expect("waiting for the probe in the box timed out")
-    .expect("spawn_blocking join")
-    .expect("waiting for the probe in the box");
+    let status = tokio::time::timeout(Duration::from_secs(10), child.exited())
+        .await
+        .expect("waiting for the probe in the box timed out");
     assert!(
         status.success(),
         "the probe in the box failed: {status:?}\nreport: {}",

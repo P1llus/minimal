@@ -35,7 +35,6 @@ fd-lock.workspace = true
 hickory-proto.workspace = true
 futures.workspace = true
 size.workspace = true
-hakoniwa.workspace = true
 libc.workspace = true
 nix.workspace = true
 russh.workspace = true
@@ -110,10 +109,6 @@ lcache.workspace = true
 # Property tests over the request parsers (NET spec, tiers: the T1 lane adds
 # this dev-dependency; see `net/proxy.rs` for the first property test).
 proptest.workspace = true
-# The classifier's held probe listeners are this daemon's own process-global
-# state; tests that hold or read them (NET-079, `net/classifier.rs`) mark
-# themselves serial so no two of them race one set of listeners.
-serial_test.workspace = true
 # An in-memory span exporter under the harness daemon's subscriber, so a
 # test can see what a request exports (`exec.rs`: an opted-out request
 # exports nothing) without a collector or the process-wide tracer.

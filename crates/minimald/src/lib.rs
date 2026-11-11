@@ -6,6 +6,7 @@ mod attach_shell;
 mod audit;
 mod box_actor;
 pub mod box_cgroups;
+mod box_command;
 mod box_manager;
 pub mod box_ops;
 pub mod box_runtime;
@@ -20,7 +21,6 @@ mod hooks;
 mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;
-pub mod nsenter;
 #[cfg(target_os = "linux")]
 pub mod reaper;
 pub mod rpc;

@@ -618,92 +618,43 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     ///
     /// # Errors
     ///
-    /// [`NsenterError::NoSessionLeader`](crate::nsenter::NsenterError::NoSessionLeader)
+    /// [`EnterError::NoSessionLeader`](sandbox::spawner::enter::EnterError::NoSessionLeader)
     /// once the shell has exited; the session's namespaces do not outlive it.
-    pub(crate) fn session_leader_pid(&self) -> Result<u32, crate::nsenter::NsenterError> {
-        crate::nsenter::session_leader_pid(self.process.container_pid())
+    pub(crate) fn session_leader_pid(&self) -> Result<u32, sandbox::spawner::enter::EnterError> {
+        sandbox::spawner::enter::init_of(self.process.container_pid())
     }
 
-    /// Builds a command that runs `program` inside this session's sandbox.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the shell's PID cannot be resolved or pinned; see
-    /// [`Self::session_leader_pid`].
-    #[cfg(not(test))]
+    /// Builds a command that runs `program` inside this session's box, with
+    /// the session's variables, then the attached terminal's facts, then
+    /// `extra_env`. The terminal's facts sit above the session's own for the
+    /// same reason they do at launch: `TERM` describes the terminal, and the
+    /// session's copy of it is only as fresh as the attach that started the
+    /// shell.
     pub(crate) fn command_in_session<I, S>(
         &self,
-        program: impl AsRef<std::ffi::OsStr>,
+        program: &str,
         args: I,
         extra_env: std::collections::BTreeMap<String, String>,
-    ) -> Result<std::process::Command, crate::nsenter::NsenterError>
+    ) -> crate::box_command::BoxCommand
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let environment = self.guard.command_environment();
-        // `with_env` replaces rather than extends, so the merge happens
-        // here: session variables first, then the attached terminal's facts,
-        // then `extra_env`. The connection layer sits above the session's own
-        // variables for the same reason it does at launch — `TERM` describes
-        // the terminal, and the session's copy of it is only ever as fresh as
-        // the attach that spawned the shell.
-        let mut vars = environment.vars;
-        vars.extend(self.connection_env.clone());
-        vars.extend(extra_env);
-        let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
-            .with_cwd(environment.cwd)
-            .with_env(vars);
-        let command = injection.command()?;
-        Ok(command)
-    }
-
-    /// Under test, build a plain host-side command instead of injecting into
-    /// a sandbox — the same swap [`MockLauncher`] makes for the launcher and
-    /// `()` makes for the guard.
-    ///
-    /// [`MockLauncher`]'s program is an un-sandboxed `/bin/sh` with no
-    /// children, so there is no container supervisor to resolve and
-    /// [`Self::session_leader_pid`] cannot succeed; a test reaching this
-    /// would only ever see `NoSessionLeader`. Running host-side instead
-    /// keeps everything above the injection under test — the session
-    /// environment, the script piping, output capture, outcome reporting,
-    /// and the actor wiring that decides *when* hooks run — while
-    /// [`crate::nsenter`]'s own tests cover the injection itself.
-    #[cfg(test)]
-    pub(crate) fn command_in_session<I, S>(
-        &self,
-        program: impl AsRef<std::ffi::OsStr>,
-        args: I,
-        extra_env: std::collections::BTreeMap<String, String>,
-    ) -> Result<std::process::Command, crate::nsenter::NsenterError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
+        S: AsRef<str>,
     {
         let environment = self.guard.command_environment();
         let mut vars = environment.vars;
         vars.extend(self.connection_env.clone());
         vars.extend(extra_env);
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(args);
-        cmd.env_clear();
-        cmd.envs(vars);
-        // The mock guard reports no cwd, and an empty one would make every
-        // spawn fail; a real sandbox path wouldn't resolve host-side anyway,
-        // so only set what exists here.
-        if !environment.cwd.is_empty() && std::path::Path::new(&environment.cwd).is_dir() {
-            cmd.current_dir(&environment.cwd);
-        }
-        Ok(cmd)
+        self.process
+            .entrance()
+            .command(program, args, vars, &environment.cwd)
     }
 
     /// Snapshot what a hook run needs, or `None` when there is nothing
     /// to run or nothing to run it in.
     fn hook_plan(&self, event: crate::hooks::HookEvent) -> Option<HookPlan> {
         let composition = self.composition.clone()?;
-        let leader_pid = match self.session_leader_pid() {
-            Ok(pid) => pid,
+        match self.session_leader_pid() {
+            Ok(_) => {}
             Err(e) => {
                 tracing::debug!(
                     event = event.as_str(),
@@ -717,7 +668,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         Some(HookPlan {
             event,
             commands: crate::hooks::InjectedCommands {
-                leader_pid,
+                entrance: self.process.entrance(),
                 cwd: environment.cwd,
                 vars: environment.vars,
             },
@@ -1503,7 +1454,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         extra_env,
                         reply,
                     } => {
-                        let _ = reply.send(self.command_in_session(program, args, extra_env));
+                        let _ = reply.send(self.command_in_session(&program, args, extra_env));
                     }
                     Message::GetAtRisk(s) => {
                         // Computed on a spawned task: the git commands and

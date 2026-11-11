@@ -627,10 +627,7 @@ impl Env {
             .as_ref()
             .map_or_else(|| args.name.clone(), |cgroup| cgroup.name().to_owned());
         let box_cgroup = args.box_cgroup.clone();
-        let config = match args.box_cgroup {
-            Some(cgroup) => config.with_box_cgroup(cgroup),
-            None => config,
-        };
+        let config = config.with_box_cgroup(args.box_cgroup);
 
         // Wire up the channel actor and build the sandbox around the bridge.
         let (tx, rx) = mpsc::channel(8);
@@ -763,7 +760,7 @@ impl Env {
         container: &Container,
         program: &str,
         args: I,
-    ) -> std::io::Result<hakoniwa::Command>
+    ) -> std::io::Result<sandbox::Command>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -3444,20 +3441,15 @@ async fn run_invocations_in(
         }
         let mut stdin = stdin.as_deref_mut().filter(|_| idx == 0);
         if stdin.is_some() {
-            cmd.stdin(hakoniwa::Stdio::piped());
+            cmd.stdin(sandbox::Stdio::piped());
         }
-        cmd.stdout(hakoniwa::Stdio::MakePipe);
-        cmd.stderr(hakoniwa::Stdio::MakePipe);
-        let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
+        cmd.stdout(sandbox::Stdio::MakePipe);
+        cmd.stderr(sandbox::Stdio::MakePipe);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| Error::Other(anyhow::anyhow!("spawn failed: {e}")))?;
-        let guard = match planned.attach_child(&mut child).await {
-            Ok(guard) => guard,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e.into());
-            }
-        };
+        // A failed attach drops the child, which kills it.
+        let guard = planned.attach_child(&mut child).await?;
         if let Some(slot) = stdin.as_deref_mut() {
             let started = match child.stdin.take() {
                 Some(pipe) => crate::exec::ForwardedStdin::start(
@@ -3477,8 +3469,8 @@ async fn run_invocations_in(
                     let _ = writeln!(stream, "stdin:");
                 }
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.kill();
+                    child.exited().await;
                     if let Some(guard) = guard {
                         guard.teardown().await;
                     }
@@ -3489,14 +3481,14 @@ async fn run_invocations_in(
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (out, err) = (shared.clone(), shared.clone());
-        let status = crate::traced::spawn_blocking(move || {
+        let forwarded = crate::traced::spawn_blocking(move || {
             let out = std::thread::spawn(move || stdout.map(|p| forward_lines(p, &out, "msg")));
             let err = std::thread::spawn(move || stderr.map(|p| forward_lines(p, &err, err_tag)));
             let _ = out.join();
             let _ = err.join();
-            child.wait()
         })
         .await;
+        let status = child.exited().await;
         // The task ended, so a read of the forwarded stdin that fails now
         // does not fail the run.
         if let Some(Some(forwarded)) = stdin.as_deref() {
@@ -3506,14 +3498,13 @@ async fn run_invocations_in(
             guard.teardown().await;
         }
         drop(container);
-        let status = status
-            .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?
-            .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?;
+        forwarded
+            .map_err(|e| Error::Other(anyhow::anyhow!("reading the task's output failed: {e}")))?;
         if !status.success() {
             return Err(Error::Execution {
                 idx,
                 code: status.code,
-                reason: status.reason.clone(),
+                reason: status.reason,
                 stderr: String::new(),
                 stdout: String::new(),
             });

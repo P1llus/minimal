@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    process::{ChildStderr, ChildStdin, ChildStdout, Command},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
