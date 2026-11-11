@@ -25,6 +25,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 pub mod error;
 pub mod forker;
 #[cfg(target_os = "linux")]
