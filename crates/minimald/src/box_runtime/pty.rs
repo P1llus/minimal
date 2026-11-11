@@ -1,7 +1,7 @@
 //! PTY + file-descriptor plumbing for [`super`]'s host.
 //!
 //! Owns the `WinSize`/`Pty` pair and the raw-`fd` helpers (`dup_fd`,
-//! `get_winsize`/`set_winsize`, `set_nonblocking`/`set_cloexec`) they and
+//! `get_winsize`/`set_winsize`, `set_nonblocking`) they and
 //! the host rely on.
 
 use super::*;
@@ -48,9 +48,8 @@ pub struct Pty {
     /// Exists so a caller that needs the terminal *later* — a lifecycle
     /// hook wanting a real tty for `[ -t 1 ]` and `tput` — can open a
     /// short-lived descriptor and close it again, instead of retaining
-    /// a spare slave fd for the session's lifetime. Retaining one is
-    /// precisely the leak the `set_cloexec` comment below warns about:
-    /// while any slave fd stays open the master never sees EOF, so the
+    /// a spare slave fd for the session's lifetime. Retaining one is a
+    /// leak: while any slave fd stays open the master never sees EOF, so the
     /// host never observes the shell exiting and the session is never
     /// reaped.
     slave_path: std::path::PathBuf,
@@ -59,44 +58,12 @@ pub struct Pty {
 impl Pty {
     /// Creates a new PTY pair via `openpty(3)` with the given initial size.
     pub fn open(size: WinSize) -> io::Result<Self> {
-        let mut master: RawFd = -1;
-        let mut slave: RawFd = -1;
-
-        let ws = libc::winsize {
+        let (master, slave) = open_pair(&libc::winsize {
             ws_row: size.rows,
             ws_col: size.cols,
             ws_xpixel: size.xpixel,
             ws_ypixel: size.ypixel,
-        };
-
-        // SAFETY: We pass valid pointers for the output fds and winsize, and
-        // NULL for the optional name/termios parameters.
-        let ret = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &ws,
-            )
-        };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // SAFETY: `openpty` returned successfully, so both fds are valid and
-        // open. We take ownership immediately.
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-
-        // `openpty` returns fds without close-on-exec. Set it so these fds
-        // don't leak into unrelated child processes that happen to `fork`
-        // concurrently: a leaked slave fd would keep this master from ever
-        // seeing EOF when our own child exits, stalling teardown. The child we
-        // intend to wire up still gets its stdio via `dup2`, which is unaffected
-        // by the source fd's close-on-exec flag.
-        set_cloexec(master.as_raw_fd())?;
-        set_cloexec(slave.as_raw_fd())?;
+        })?;
 
         // `ptsname_r`, not `ptsname`: the latter returns a pointer to a
         // static buffer, which is not safe to call from a daemon that
@@ -222,16 +189,39 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Marks a file descriptor close-on-exec (`FD_CLOEXEC`).
-pub(crate) fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fd is a valid open file descriptor.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
+/// Opens a PTY pair of the given size, both sides close-on-exec from the
+/// moment they exist. A descriptor that is open without the flag even for
+/// an instant can leak into a process another thread starts just then, and
+/// a leaked master is another box's terminal.
+pub(crate) fn open_pair(size: &libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `posix_openpt` takes flags and returns a fresh descriptor.
+    let master = unsafe { libc::posix_openpt(flags) };
+    if master < 0 {
         return Err(io::Error::last_os_error());
     }
-    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+    // SAFETY: a fresh descriptor that nothing else owns.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    // SAFETY: plain calls on the master just opened. `TIOCGPTPEER` opens the
+    // slave of this very master, with the flags given, and `TIOCSWINSZ`
+    // reads the size it is handed.
+    unsafe {
+        if libc::grantpt(master.as_raw_fd()) != 0 || libc::unlockpt(master.as_raw_fd()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave = libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags);
+        if slave < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave = OwnedFd::from_raw_fd(slave);
+        if libc::ioctl(
+            master.as_raw_fd(),
+            libc::TIOCSWINSZ,
+            std::ptr::from_ref(size),
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((master, slave))
     }
-    Ok(())
 }

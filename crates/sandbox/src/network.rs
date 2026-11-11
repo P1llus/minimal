@@ -240,20 +240,24 @@ pub trait Network: Send + Sync + std::fmt::Debug {
 ///
 /// Carries the tap descriptor by value: taken from the child once, moved here,
 /// and closed by the provider's guard at teardown (017-010).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Spawned {
-    netns_pid: u32,
+    netns: Option<std::os::fd::OwnedFd>,
     tap_fd: Option<std::os::fd::OwnedFd>,
 }
 
 impl Spawned {
-    /// A launched process with no tap of its own.
+    /// A launched process with no network namespace of its own and no tap.
     #[must_use]
-    pub fn new(netns_pid: u32) -> Self {
-        Self {
-            netns_pid,
-            tap_fd: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds the sandbox's own network namespace.
+    #[must_use]
+    pub fn with_netns(mut self, netns: std::os::fd::OwnedFd) -> Self {
+        self.netns = Some(netns);
+        self
     }
 
     /// Adds the tap descriptor the sandbox layer's in-namespace tap produced.
@@ -263,10 +267,13 @@ impl Spawned {
         self
     }
 
-    /// The PID whose `/proc/<pid>/ns/net` is the sandbox's network namespace.
+    /// The sandbox's network namespace, when it has one of its own. A
+    /// descriptor, not a pid: the spawner reaps the sandbox's processes, so
+    /// a pid the provider held could come to name another process.
     #[must_use]
-    pub fn netns_pid(&self) -> u32 {
-        self.netns_pid
+    pub fn netns(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd as _;
+        self.netns.as_ref().map(|fd| fd.as_fd())
     }
 
     /// Takes the tap descriptor, if the plan asked for one. Yields it once;
@@ -275,14 +282,16 @@ impl Spawned {
         self.tap_fd.take()
     }
 
-    /// Reads a just-started container: the pid of its supervisor, and the
-    /// tap it was started with if the plan asked for one, taken out of the
-    /// child so no second reader gets it.
+    /// Reads a just-started container: its network namespace, and the tap it
+    /// was started with if the plan asked for one, taken out of the child so
+    /// no second reader gets it.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn from_child(child: &mut crate::Child) -> Self {
         Self {
-            netns_pid: child.id(),
+            // A copy that cannot be made leaves the provider without the
+            // namespace, and an attach that needs it fails.
+            netns: child.netns().and_then(|fd| fd.try_clone_to_owned().ok()),
             tap_fd: child.take_tap_fd(),
         }
     }

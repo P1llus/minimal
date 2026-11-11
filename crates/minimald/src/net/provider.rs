@@ -634,26 +634,22 @@ fn own_ip_plan(
 async fn privileged_tap(
     lease: crate::net::PtaskLease,
     subnet: crate::net::SwitchSubnet,
-    netns_pid: u32,
+    netns: Option<std::os::fd::BorrowedFd<'_>>,
 ) -> std::io::Result<std::os::fd::OwnedFd> {
-    // Check the destination before making anything: a tap made for a namespace
-    // that is already gone is left in the daemon's own, holding its name.
-    let netns = format!("/proc/{netns_pid}/ns/net");
-    if !std::path::Path::new(&netns).exists() {
+    // Checked before anything is made: a tap made with no namespace to move
+    // it to is left in the daemon's own, holding its name.
+    let Some(netns) = netns else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!(
-                "the box's sandbox exited before its network could be set up \
-                 ({netns} does not exist)"
-            ),
+            "the box's sandbox has no network namespace of its own to set up",
         ));
-    }
+    };
     // Unique across every subnet the switch accepts (`/8` to `/29`), within
     // the 15-char `IFNAMSIZ` limit.
     let o = lease.ip.octets();
     let tap = format!("mtap{}_{}_{}", o[1], o[2], o[3]);
     let tap_fd = crate::net::switch::open_tap(&tap)?;
-    crate::net::switch::move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
+    crate::net::switch::move_tap_into_netns(&tap, netns, lease, subnet).await?;
     Ok(tap_fd)
 }
 
@@ -852,7 +848,7 @@ impl OwnIpNetwork {
                 fd
             }
             TapMechanism::Privileged => {
-                privileged_tap(reserved.lease, reserved.subnet, spawned.netns_pid())
+                privileged_tap(reserved.lease, reserved.subnet, spawned.netns())
                     .await
                     .map_err(NetworkError::new)?
             }
@@ -1041,10 +1037,10 @@ mod tests {
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
-        // A pid that cannot exist, so `privileged_tap`'s namespace check
-        // refuses before anything is created (`counting_switch` is
+        // No namespace, so `privileged_tap`'s check refuses before
+        // anything is created (`counting_switch` is
         // `HostShuttle`, so this is the privileged mechanism).
-        assert!(net.attach(Spawned::new(u32::MAX)).await.is_err());
+        assert!(net.attach(Spawned::new()).await.is_err());
 
         // The sandbox layer runs `abandon` on exactly this path.
         net.abandon().await;

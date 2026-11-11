@@ -104,6 +104,11 @@ fn exec_imp(
         sys::join_cgroup(dir.as_raw_fd())?;
     }
 
+    // Leave the caller's session and process group.
+    if container.runctl.contains(&Runctl::SupervisorNewSession) {
+        sys::setsid()?;
+    }
+
     // Redirect standard I/O stream.
     if let Some(stdin) = stdin.take() {
         sys::dup2_stdin(stdin.as_raw_fd())?;

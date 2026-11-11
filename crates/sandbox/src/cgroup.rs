@@ -18,7 +18,7 @@
 use std::fs;
 use std::io;
 use std::num::NonZeroU64;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -172,12 +172,79 @@ pub fn locate() -> Located {
     }
 }
 
+/// `systemctl` for the manager that runs this process's scopes: the user
+/// manager, or the system manager for root.
+fn systemctl() -> std::process::Command {
+    let mut systemctl = std::process::Command::new("systemctl");
+    // SAFETY: `geteuid` reads this process's credentials.
+    if unsafe { libc::geteuid() } != 0 {
+        systemctl.arg("--user");
+    }
+    systemctl
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    systemctl
+}
+
+/// A name for a transient scope, so a later start can find the scope an
+/// earlier one ran in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeUnit {
+    /// The unit name, ending in `.scope`.
+    pub name: String,
+    /// What `systemctl status` shows beside the name.
+    pub description: String,
+}
+
+impl ScopeUnit {
+    /// Whether the manager knows a unit of this name.
+    #[must_use]
+    pub fn exists(&self) -> bool {
+        systemctl()
+            .args(["show", "--property=LoadState", "--value", "--"])
+            .arg(&self.name)
+            .output()
+            .is_ok_and(|shown| String::from_utf8_lossy(&shown.stdout).trim() == "loaded")
+    }
+
+    /// Stops the scope: kills every process in it and waits until the
+    /// manager has let go of the unit.
+    ///
+    /// # Errors
+    ///
+    /// When `systemctl` cannot be run or the unit is still there afterwards.
+    pub fn stop(&self) -> io::Result<()> {
+        // The kill first: a plain stop waits out the unit's stop timeout
+        // for a process that ignores the termination signal.
+        for verb in [
+            &["kill", "--signal=SIGKILL", "--"][..],
+            &["stop", "--"],
+            &["reset-failed", "--"],
+        ] {
+            systemctl()
+                .args(verb)
+                .arg(&self.name)
+                .stdout(std::process::Stdio::null())
+                .status()?;
+        }
+        if self.exists() {
+            return Err(io::Error::other(format!(
+                "the unit {} is still there after its stop",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The command that runs `program` with `args` in a new transient scope
 /// with a delegated cgroup: a scope of the user manager, or of the system
 /// manager for root. `systemd-run --scope` execs the program in place, so
-/// the process keeps its pid.
+/// the process keeps its pid. With `unit` the scope gets that name, which
+/// must not be in use.
 #[must_use]
 pub fn delegated_scope_command(
+    unit: Option<&ScopeUnit>,
     program: &Path,
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> std::process::Command {
@@ -186,15 +253,12 @@ pub fn delegated_scope_command(
     if unsafe { libc::geteuid() } != 0 {
         run.arg("--user");
     }
-    run.args([
-        "--scope",
-        "--quiet",
-        "--collect",
-        "--property=Delegate=yes",
-        "--",
-    ])
-    .arg(program)
-    .args(args);
+    run.args(["--scope", "--quiet", "--collect", "--property=Delegate=yes"]);
+    if let Some(unit) = unit {
+        run.arg(format!("--unit={}", unit.name));
+        run.arg(format!("--description={}", unit.description));
+    }
+    run.arg("--").arg(program).args(args);
     run
 }
 
@@ -204,7 +268,7 @@ pub fn delegated_scope_command(
 /// with nothing running.
 #[must_use]
 pub fn delegated_scope_available() -> bool {
-    delegated_scope_command(Path::new("true"), [])
+    delegated_scope_command(None, Path::new("true"), [])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -216,6 +280,9 @@ pub fn delegated_scope_available() -> bool {
 #[derive(Debug, Clone)]
 pub struct Root {
     dir: PathBuf,
+    /// The `boxes` cgroup, open: what box cgroups are made in and removed
+    /// from.
+    boxes: Arc<OwnedFd>,
     /// The root as `/proc/<pid>/cgroup` spells it, with no trailing slash:
     /// empty for the real cgroup root.
     name: String,
@@ -230,9 +297,11 @@ impl Root {
     ///
     /// # Errors
     ///
-    /// When `dir` is not a cgroup this process may manage. Nothing is left
-    /// half-made that a later call cannot finish.
+    /// When `dir` is not a cgroup this process may manage, or its mount
+    /// lacks `nsdelegate`. Nothing is left half-made that a later call
+    /// cannot finish.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        mount_delegates(dir)?;
         let name = dir
             .strip_prefix(MOUNT)
             .map_err(|_| {
@@ -290,8 +359,12 @@ impl Root {
         let enabled = fs::read_to_string(boxes.join("cgroup.subtree_control"))
             .map_err(|e| named(e, "reading the controllers of", &boxes))?;
         let has = |controller: &str| enabled.split_whitespace().any(|have| have == controller);
+        let boxes_fd: OwnedFd = fs::File::open(&boxes)
+            .map_err(|e| named(e, "opening", &boxes))?
+            .into();
         Ok(Self {
             dir: dir.to_path_buf(),
+            boxes: Arc::new(boxes_fd),
             name,
             controllers: Controllers {
                 cpu: has("cpu"),
@@ -337,15 +410,16 @@ impl Root {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let dir = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            let removed = kill(&dir)
-                .and_then(|()| emptied_blocking(&dir, limit))
-                .and_then(|_| fs::remove_dir(&dir));
+            let removed = open_dir_in(self.boxes.as_fd(), &name).and_then(|dir| {
+                kill(dir.as_fd())?;
+                emptied_blocking(dir.as_fd(), limit)?;
+                remove(self.boxes.as_fd(), &name, cgroup_id(&dir)?)
+            });
             match removed {
                 Ok(()) => swept.push(name),
                 Err(error) => tracing::warn!(
-                    cgroup = %dir.display(),
+                    cgroup = %entry.path().display(),
                     %error,
                     "could not remove a box cgroup an earlier daemon left behind"
                 ),
@@ -354,9 +428,25 @@ impl Root {
         Ok(swept)
     }
 
+    /// Kills every process in every box cgroup, and removes nothing. For a
+    /// daemon whose spawner died: what the spawner had started is to die
+    /// with it, and this ends what did not.
+    pub fn kill_boxes(&self) {
+        let Ok(entries) = fs::read_dir(self.boxes()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(dir) = open_dir_in(self.boxes.as_fd(), &name) {
+                let _ = kill(dir.as_fd());
+            }
+        }
+    }
+
     /// Creates the cgroup of box `box_id`, empty and with no room for a
     /// cgroup below it. A cgroup of that name left by an incomplete teardown
-    /// is emptied and reused.
+    /// is emptied and removed first, so the new one is never the cgroup an
+    /// older handle still names.
     ///
     /// # Errors
     ///
@@ -365,31 +455,45 @@ impl Root {
     pub fn create_box(&self, box_id: &str) -> io::Result<BoxCgroup> {
         let name = box_name(box_id)?;
         let dir = self.boxes().join(&name);
-        match fs::create_dir(&dir) {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+        let make = || {
+            // SAFETY: `mkdirat` with a live descriptor and a NUL-terminated
+            // name.
+            if unsafe { libc::mkdirat(self.boxes.as_raw_fd(), c_name.as_ptr(), 0o755) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        };
+        match make() {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                kill(&dir).map_err(|e| named(e, "emptying the leftover", &dir))?;
-                if !emptied_blocking(&dir, Duration::from_secs(2))? {
+                let leftover = open_dir_in(self.boxes.as_fd(), &name)
+                    .map_err(|e| named(e, "opening the leftover", &dir))?;
+                kill(leftover.as_fd()).map_err(|e| named(e, "emptying the leftover", &dir))?;
+                if !emptied_blocking(leftover.as_fd(), Duration::from_secs(2))? {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         format!("{} still holds processes", dir.display()),
                     ));
                 }
+                remove(self.boxes.as_fd(), &name, cgroup_id(&leftover)?)
+                    .map_err(|e| named(e, "removing the leftover", &dir))?;
+                make().map_err(|e| named(e, "creating", &dir))?;
             }
             Err(e) => return Err(named(e, "creating", &dir)),
         }
+        let fd = open_dir_in(self.boxes.as_fd(), &name).map_err(|e| named(e, "opening", &dir))?;
         // No cgroup below the box, ever: a process in the box cannot create
         // one, whatever namespaces it makes, and cannot raise this limit.
-        fs::write(dir.join("cgroup.max.descendants"), "0")
+        write_in(fd.as_fd(), "cgroup.max.descendants", "0")
             .map_err(|e| named(e, "closing the subtree of", &dir))?;
-        let fd: OwnedFd = fs::File::open(&dir)
-            .map_err(|e| named(e, "opening", &dir))?
-            .into();
         let id = cgroup_id(&fd).map_err(|e| named(e, "reading the id of", &dir))?;
         Ok(BoxCgroup(Arc::new(Inner {
             name,
             dir,
             fd,
+            parent: Arc::clone(&self.boxes),
             id,
             controllers: self.controllers,
             destroyed: AtomicBool::new(false),
@@ -488,19 +592,135 @@ fn cgroup_id(dir: &OwnedFd) -> io::Result<u64> {
     Ok(handle.id)
 }
 
-fn kill(dir: &Path) -> io::Result<()> {
-    fs::write(dir.join("cgroup.kill"), "1")
+/// Whether the cgroup2 mount that covers `dir` has `nsdelegate`.
+///
+/// The option makes the root of a cgroup namespace a delegation boundary.
+/// A box runs with the daemon's uid, so file permissions let it write the
+/// limits of its own cgroup from a mount it makes itself. Only this option
+/// stops it.
+///
+/// # Errors
+///
+/// When the mount table cannot be read, no cgroup2 mount covers `dir`, or
+/// the mount lacks the option. The error names the option.
+pub fn mount_delegates(dir: &Path) -> io::Result<()> {
+    let table = fs::read_to_string("/proc/self/mountinfo")?;
+    match covering_cgroup2_mount(&table, dir) {
+        Some((_, options)) if options.split(',').any(|option| option == "nsdelegate") => Ok(()),
+        Some((mount, options)) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "the cgroup2 mount at {mount} is mounted without `nsdelegate` (its options are \
+                 `{options}`), so a box could change the limits of its own cgroup"
+            ),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("no cgroup2 mount covers {}", dir.display()),
+        )),
+    }
+}
+
+/// The mount point and superblock options of the cgroup2 mount that covers
+/// `dir`, from the text of a `mountinfo` file. The last mount on the longest
+/// matching mount point is the one in effect.
+fn covering_cgroup2_mount<'a>(table: &'a str, dir: &Path) -> Option<(&'a str, &'a str)> {
+    let mut found: Option<(&str, &str, &str)> = None;
+    for line in table.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(point) = before.split(' ').nth(4) else {
+            continue;
+        };
+        if !dir.starts_with(point) {
+            continue;
+        }
+        let mut after = after.split(' ');
+        let (Some(fstype), Some(_source), Some(options)) =
+            (after.next(), after.next(), after.next())
+        else {
+            continue;
+        };
+        if found.is_none_or(|(longest, _, _)| point.len() >= longest.len()) {
+            found = Some((point, fstype, options));
+        }
+    }
+    found
+        .filter(|(_, fstype, _)| *fstype == "cgroup2")
+        .map(|(point, _, options)| (point, options))
+}
+
+/// Opens the file `name` of the cgroup behind `dir`.
+fn open_in(dir: BorrowedFd<'_>, name: &str, flags: libc::c_int) -> io::Result<fs::File> {
+    let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `openat` with a live descriptor and a NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor that nothing else owns.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// Opens the cgroup `name` below the cgroup behind `parent`.
+fn open_dir_in(parent: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
+    open_in(parent, name, libc::O_RDONLY | libc::O_DIRECTORY).map(OwnedFd::from)
+}
+
+fn write_in(dir: BorrowedFd<'_>, file: &str, value: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    open_in(dir, file, libc::O_WRONLY)?.write_all(value.as_bytes())
+}
+
+fn read_in(dir: BorrowedFd<'_>, file: &str) -> io::Result<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    open_in(dir, file, libc::O_RDONLY)?.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+fn kill(dir: BorrowedFd<'_>) -> io::Result<()> {
+    write_in(dir, "cgroup.kill", "1")
+}
+
+/// Removes the cgroup `name` below `parent`, if it is still the cgroup with
+/// the id `id`. A cgroup made later under the same name is left alone.
+fn remove(parent: BorrowedFd<'_>, name: &str, id: u64) -> io::Result<()> {
+    match open_dir_in(parent, name) {
+        Ok(current) if cgroup_id(&current)? != id => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `unlinkat` with a live descriptor and a NUL-terminated name.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn populated(events: &str) -> bool {
     events.lines().any(|line| line.trim() == "populated 1")
 }
 
-/// Waits until the cgroup at `dir` holds no process, for at most `limit`.
-/// Whether it emptied.
-fn emptied_blocking(dir: &Path, limit: Duration) -> io::Result<bool> {
+/// Waits until the cgroup behind `dir` holds no process, for at most
+/// `limit`. Whether it emptied.
+fn emptied_blocking(dir: BorrowedFd<'_>, limit: Duration) -> io::Result<bool> {
     use std::io::{Read as _, Seek as _};
-    let mut events = fs::File::open(dir.join("cgroup.events"))?;
+    let mut events = open_in(dir, "cgroup.events", libc::O_RDONLY)?;
     let deadline = Instant::now() + limit;
     loop {
         let mut text = String::new();
@@ -531,14 +751,21 @@ fn emptied_blocking(dir: &Path, limit: Duration) -> io::Result<bool> {
 /// Clones name the same cgroup. The code that owns the box's lifetime calls
 /// [`BoxCgroup::destroy`] when the box is gone. Dropping the last clone
 /// without it only issues a kill and tries one removal.
+///
+/// Every operation goes through the open directory, never through the
+/// path: a handle that outlives its cgroup cannot touch a cgroup made later
+/// under the same name.
 #[derive(Debug, Clone)]
 pub struct BoxCgroup(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
     name: String,
+    /// For messages only.
     dir: PathBuf,
     fd: OwnedFd,
+    /// The `boxes` cgroup, which the cgroup is removed from.
+    parent: Arc<OwnedFd>,
     id: u64,
     controllers: Controllers,
     destroyed: AtomicBool,
@@ -551,7 +778,8 @@ impl BoxCgroup {
         &self.0.name
     }
 
-    /// The cgroup's directory.
+    /// The cgroup's directory, for a message or a test. Nothing here acts
+    /// on the path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.0.dir
@@ -571,7 +799,7 @@ impl BoxCgroup {
     }
 
     fn write(&self, file: &str, value: &str) -> io::Result<()> {
-        fs::write(self.0.dir.join(file), value)
+        write_in(self.0.fd.as_fd(), file, value)
     }
 
     /// Sets the box's share of CPU time under contention (`cpu.weight`).
@@ -619,10 +847,54 @@ impl BoxCgroup {
     ///
     /// When `cgroup.procs` cannot be read.
     pub fn procs(&self) -> io::Result<Vec<u32>> {
-        Ok(fs::read_to_string(self.0.dir.join("cgroup.procs"))?
+        Ok(read_in(self.0.fd.as_fd(), "cgroup.procs")?
             .lines()
             .filter_map(|line| line.trim().parse().ok())
             .collect())
+    }
+
+    /// Sends `signal` to every process in the cgroup that `skip` does not
+    /// name, and says how many it reached.
+    ///
+    /// Each process is pinned by a pidfd and signalled only if its pid is
+    /// still listed in the cgroup afterwards. A pid that a process outside
+    /// the box took over in between is not listed, and a process that left
+    /// after the check takes no signal through its pidfd.
+    ///
+    /// # Errors
+    ///
+    /// When `cgroup.procs` cannot be read.
+    pub fn signal(&self, signal: i32, skip: impl Fn(u32) -> bool) -> io::Result<usize> {
+        let pinned: Vec<(u32, OwnedFd)> = self
+            .procs()?
+            .into_iter()
+            .filter(|pid| !skip(*pid))
+            .filter_map(|pid| {
+                // SAFETY: `pidfd_open` takes a pid and flags.
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                // SAFETY: a fresh descriptor that nothing else owns.
+                (fd >= 0).then(|| (pid, unsafe { OwnedFd::from_raw_fd(fd as i32) }))
+            })
+            .collect();
+        let still = self.procs()?;
+        Ok(pinned
+            .iter()
+            .filter(|(pid, _)| still.contains(pid))
+            .filter(|(_, pidfd)| {
+                // SAFETY: `pidfd_send_signal` with no `siginfo` reads no
+                // memory.
+                let sent = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        signal,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                sent == 0
+            })
+            .count())
     }
 
     /// Whether the cgroup holds a live process.
@@ -631,9 +903,7 @@ impl BoxCgroup {
     ///
     /// When `cgroup.events` cannot be read.
     pub fn populated(&self) -> io::Result<bool> {
-        Ok(populated(&fs::read_to_string(
-            self.0.dir.join("cgroup.events"),
-        )?))
+        Ok(populated(&read_in(self.0.fd.as_fd(), "cgroup.events")?))
     }
 
     /// Kills every process in the cgroup (`cgroup.kill`).
@@ -642,7 +912,7 @@ impl BoxCgroup {
     ///
     /// When the kill cannot be written.
     pub fn kill(&self) -> io::Result<()> {
-        kill(&self.0.dir)
+        kill(self.0.fd.as_fd())
     }
 
     /// Waits until the cgroup holds no process, for at most `limit`. Whether
@@ -652,9 +922,9 @@ impl BoxCgroup {
     ///
     /// When `cgroup.events` cannot be read.
     pub async fn emptied(&self, limit: Duration) -> io::Result<bool> {
-        let dir = self.0.dir.clone();
+        let cgroup = self.clone();
         // The wait is a poll on `cgroup.events`, off the async threads.
-        tokio::task::spawn_blocking(move || emptied_blocking(&dir, limit))
+        tokio::task::spawn_blocking(move || emptied_blocking(cgroup.0.fd.as_fd(), limit))
             .await
             .map_err(io::Error::other)?
     }
@@ -685,14 +955,15 @@ impl BoxCgroup {
         }
         match self.kill() {
             Ok(()) => {}
-            // Removed already, by a sweep or by hand.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Removed already, by a sweep or by hand: the kernel answers
+            // `ENODEV` for a file of a cgroup that is gone.
+            Err(e) if is_gone(&e) => {
                 self.0.destroyed.store(true, Ordering::SeqCst);
                 return Ok(());
             }
             Err(e) => return Err(named(e, "killing", &self.0.dir)),
         }
-        if !emptied_blocking(&self.0.dir, limit)? {
+        if !emptied_blocking(self.0.fd.as_fd(), limit)? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -701,11 +972,8 @@ impl BoxCgroup {
                 ),
             ));
         }
-        match fs::remove_dir(&self.0.dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(named(e, "removing", &self.0.dir)),
-        }
+        remove(self.0.parent.as_fd(), &self.0.name, self.0.id)
+            .map_err(|e| named(e, "removing", &self.0.dir))?;
         self.0.destroyed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -722,9 +990,14 @@ impl Drop for Inner {
         if self.destroyed.load(Ordering::SeqCst) {
             return;
         }
-        let _ = kill(&self.dir);
-        let _ = fs::remove_dir(&self.dir);
+        let _ = kill(self.fd.as_fd());
+        let _ = remove(self.parent.as_fd(), &self.name, self.id);
     }
+}
+
+/// Whether an error on a cgroup's file says the cgroup is gone.
+fn is_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
 }
 
 /// A delegated cgroup for a test.
@@ -774,6 +1047,7 @@ pub mod testing {
         }
         let exe = std::env::current_exe().expect("this test binary's path");
         let run = super::delegated_scope_command(
+            None,
             &exe,
             ["--exact", test, "--nocapture", "--test-threads=1"].map(Into::into),
         )
@@ -968,6 +1242,95 @@ mod tests {
             sleep.pre_exec(move || fs::write(&procs, "0"));
         }
         sleep.spawn().unwrap()
+    }
+
+    #[test]
+    fn the_covering_mount_decides_whether_boxes_are_contained() {
+        let line = |point: &str, fstype: &str, options: &str| {
+            format!("30 25 0:26 / {point} rw,nosuid shared:4 - {fstype} {fstype} {options}\n")
+        };
+        let delegated = line("/", "ext4", "rw")
+            + &line("/sys", "sysfs", "rw")
+            + &line(
+                "/sys/fs/cgroup",
+                "cgroup2",
+                "rw,nsdelegate,memory_recursiveprot",
+            );
+        let dir = Path::new("/sys/fs/cgroup/user.slice/x.scope");
+        assert_eq!(
+            covering_cgroup2_mount(&delegated, dir),
+            Some(("/sys/fs/cgroup", "rw,nsdelegate,memory_recursiveprot"))
+        );
+        // A later mount on the same point is the one in effect.
+        let remounted = delegated.clone() + &line("/sys/fs/cgroup", "cgroup2", "rw");
+        assert_eq!(
+            covering_cgroup2_mount(&remounted, dir),
+            Some(("/sys/fs/cgroup", "rw"))
+        );
+        // A directory no cgroup2 mount covers has none.
+        assert_eq!(
+            covering_cgroup2_mount(&delegated, Path::new("/sys/fs")),
+            None
+        );
+        let hidden = delegated + &line("/sys/fs/cgroup/user.slice", "tmpfs", "rw");
+        assert_eq!(covering_cgroup2_mount(&hidden, dir), None);
+    }
+
+    /// A handle that outlives its cgroup does nothing to a cgroup made later
+    /// under the same name: not through its methods, and not when it drops.
+    #[tokio::test]
+    async fn a_stale_handle_cannot_touch_a_newer_cgroup_of_the_same_name() {
+        let Some(root) = delegated_root(
+            "cgroup::tests::a_stale_handle_cannot_touch_a_newer_cgroup_of_the_same_name",
+        ) else {
+            return;
+        };
+        let old = root.create_box("same").unwrap();
+        let newer = root.create_box("same").unwrap();
+        assert_ne!(
+            old.id(),
+            newer.id(),
+            "the leftover was replaced, not reused"
+        );
+        let mut sleeper = sleeper_in(&newer);
+
+        assert!(old.kill().is_err(), "the old cgroup is gone");
+        assert!(old.procs().is_err());
+        old.destroy(Duration::from_secs(1)).await.unwrap();
+        drop(old);
+        assert_eq!(newer.procs().unwrap(), [sleeper.id()]);
+        assert!(newer.path().exists());
+
+        // The same for a handle that is only dropped.
+        let old = newer;
+        let newest = root.create_box("same").unwrap();
+        sleeper.wait().unwrap();
+        let mut sleeper = sleeper_in(&newest);
+        drop(old);
+        assert_eq!(newest.procs().unwrap(), [sleeper.id()]);
+        newest.destroy(Duration::from_secs(10)).await.unwrap();
+        sleeper.wait().unwrap();
+    }
+
+    /// A signal reaches the processes of the cgroup, the skipped ones aside.
+    #[test]
+    fn a_signal_reaches_the_cgroups_processes_but_the_skipped() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let Some(root) =
+            delegated_root("cgroup::tests::a_signal_reaches_the_cgroups_processes_but_the_skipped")
+        else {
+            return;
+        };
+        let cgroup = root.create_box("signalled").unwrap();
+        let mut spared = sleeper_in(&cgroup);
+        let mut reached = sleeper_in(&cgroup);
+        let skip = spared.id();
+        assert_eq!(cgroup.signal(libc::SIGTERM, |pid| pid == skip).unwrap(), 1);
+        assert_eq!(reached.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert_eq!(cgroup.procs().unwrap(), [spared.id()]);
+        assert_eq!(cgroup.signal(libc::SIGKILL, |_| false).unwrap(), 1);
+        spared.wait().unwrap();
+        assert_eq!(cgroup.signal(libc::SIGKILL, |_| false).unwrap(), 0);
     }
 
     #[tokio::test]

@@ -29,9 +29,6 @@ use crate::box_manager::BoxControl;
 use crate::workspace_delta::DeltaSource;
 use boxes::NetworkMode;
 use boxes::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
-// The one per-box egress enforcement type (NET-079): shared with the session
-// record that carries a box's own launch outcome, so a launch's decision and
-// the record it lands on are one type with no conversion between them.
 use std::sync::Arc;
 
 mod pty;

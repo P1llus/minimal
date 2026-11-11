@@ -181,12 +181,8 @@ impl BuildNetwork {
                 held.socket(v6, kind == common::SocketKind::Datagram)
             })
         };
-        let namespace = common::NetNamespace::of_process(
-            held.pid(),
-            sockets,
-            held.nameservers(),
-            self.admits_name.clone(),
-        )?;
+        let namespace =
+            common::NetNamespace::new(sockets, held.nameservers(), self.admits_name.clone());
         Ok((namespace, held))
     }
 }

@@ -2143,39 +2143,12 @@ pub(crate) async fn wait_after_stop<P: Process>(process: &mut P) -> io::Result<O
 pub(super) fn open_terminal(
     (rows, cols): (u16, u16),
 ) -> io::Result<(std::fs::File, std::fs::File)> {
-    use std::os::fd::{FromRawFd as _, OwnedFd};
-
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let size = libc::winsize {
+    let (master, slave) = crate::box_runtime::open_pair(&libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
-    };
-    // SAFETY: valid out-pointers for both descriptors and the size, and
-    // NULL for the optional name and termios.
-    let ret = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &size,
-        )
-    };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `openpty` succeeded, so both descriptors are open and ours.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    for fd in [&master, &slave] {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: `fd` is a live descriptor this function owns.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    })?;
     Ok((std::fs::File::from(master), std::fs::File::from(slave)))
 }
 

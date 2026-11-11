@@ -1203,7 +1203,7 @@ where
 /// when the child forks a grandchild that inherits stdout/stderr and
 /// outlives it — `sh -c 'sleep 20 & echo STARTED'`. The write ends stay
 /// open, so waiting for EOF would hold the caller for as long as the
-/// grandchild lives. Note that the direct child here is the `nsenter`
+/// grandchild lives. Note that the direct child here is the enter
 /// shim, which itself blocks in `Child::wait` on the session shell, so
 /// "the child exited" already means "the user's command finished";
 /// pipelines and foreground jobs are waited on by that shell and are

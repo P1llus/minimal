@@ -449,11 +449,30 @@ fn main() -> Result<(), MainError> {
 #[cfg(target_os = "linux")]
 const IN_SCOPE_ENV: &str = "MINIMALD_IN_DELEGATED_SCOPE";
 
+/// The name of the scope the daemon for the instance directory `instance`
+/// runs in. The same directory gives the same name at every start, so a
+/// start finds the scope its predecessor left.
+#[cfg(target_os = "linux")]
+fn scope_unit(instance: &std::path::Path) -> sandbox::cgroup::ScopeUnit {
+    use sha2::Digest as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let digest = sha2::Sha256::digest(instance.as_os_str().as_bytes());
+    sandbox::cgroup::ScopeUnit {
+        name: format!("minimald-{}.scope", hex::encode(&digest[..8])),
+        description: format!("minimald for {}", instance.display()),
+    }
+}
+
 /// Replaces a foreground server that runs in no delegated cgroup with the
 /// same server in a transient delegated scope, which gives its boxes their
 /// cgroups however the daemon was started. Returns for any other command,
 /// for a server that has its cgroup, and on a host that cannot make the
 /// scope, where the server runs its boxes without cgroups.
+///
+/// The scope is named after the daemon's instance directory. A scope of
+/// that name that no live daemon answers for is what an earlier daemon
+/// left behind, with whatever still runs in it: it is stopped first, which
+/// kills all of that.
 #[cfg(target_os = "linux")]
 fn enter_delegated_scope() {
     use std::os::unix::process::CommandExt as _;
@@ -461,11 +480,10 @@ fn enter_delegated_scope() {
     use sandbox::cgroup::{Located, delegated_scope_available, delegated_scope_command, locate};
 
     // A command line that does not parse is reported by the parse below.
-    let Ok(Cli {
-        command: Command::Run(args),
-        ..
-    }) = Cli::try_parse()
-    else {
+    let Ok(cli) = Cli::try_parse() else {
+        return;
+    };
+    let Command::Run(args) = &cli.command else {
         return;
     };
     if args.detach
@@ -478,7 +496,25 @@ fn enter_delegated_scope() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let error = delegated_scope_command(&exe, std::env::args_os().skip(1))
+    let instance = cli.client_instance_dir();
+    let unit = scope_unit(std::path::Path::new(instance.as_utf8_path().as_str()));
+    if unit.exists() {
+        let lock = instance.sub_path_unchecked(paths::MINIMALD_LOCK_FILE);
+        // A live daemon holds the instance. This start fails on its lock
+        // below, with the message for that.
+        if lock_held(std::path::Path::new(lock.as_utf8_path().as_str())).unwrap_or(true) {
+            return;
+        }
+        if let Err(error) = unit.stop() {
+            eprintln!(
+                "minimald: the scope {} of an earlier daemon could not be stopped ({error}); \
+                 boxes get no cgroup",
+                unit.name
+            );
+            return;
+        }
+    }
+    let error = delegated_scope_command(Some(&unit), &exe, std::env::args_os().skip(1))
         .env(IN_SCOPE_ENV, "1")
         .exec();
     eprintln!("minimald: could not start in a delegated scope ({error}); boxes get no cgroup");

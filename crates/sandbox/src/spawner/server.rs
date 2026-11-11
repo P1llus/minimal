@@ -30,6 +30,8 @@ struct Job {
     process: Process,
     /// A container's first process, pinned the first time something needs it.
     init: Option<(u32, OwnedFd)>,
+    /// Whether the job took the foreground of the spawner's terminal.
+    foreground: bool,
 }
 
 impl Job {
@@ -162,6 +164,9 @@ impl Server {
                 Err(error) => ExitStatus::failure(format!("waiting for the enter shim: {error}")),
             },
         };
+        if job.foreground {
+            core::retake_foreground();
+        }
         self.jobs.remove(&id);
         self.send(&Event::Exited { id, status }, &[]);
     }
@@ -169,22 +174,28 @@ impl Server {
     fn handle(&mut self, request: Request, fds: Vec<OwnedFd>) {
         match request {
             Request::Run { id, run, cgroup } => {
+                let foreground = run.session == wire::Session::Foreground;
                 let started = stdio_and_cgroup(fds, cgroup)
                     .and_then(|(stdio, cgroup)| core::run(&run, stdio, cgroup, self.titled));
                 match started {
                     Ok(mut container) => {
+                        let netns = container.netns.take();
                         let tap = container.tap.take();
                         let event = Event::Started {
                             id,
                             pid: container.child.id(),
+                            netns: netns.is_some(),
                             tap: tap.is_some(),
                         };
-                        self.send(&event, tap.as_ref().map(|fd| fd.as_fd()).as_slice());
+                        let fds: Vec<BorrowedFd<'_>> =
+                            netns.iter().chain(&tap).map(|fd| fd.as_fd()).collect();
+                        self.send(&event, &fds);
                         self.jobs.insert(
                             id,
                             Job {
                                 process: Process::Container(Box::new(container)),
                                 init: None,
+                                foreground,
                             },
                         );
                     }
@@ -201,6 +212,7 @@ impl Server {
                     let event = Event::Started {
                         id,
                         pid: shim.pid,
+                        netns: false,
                         tap: false,
                     };
                     self.send(&event, &[]);
@@ -209,6 +221,7 @@ impl Server {
                         Job {
                             process: Process::Shim(shim),
                             init: None,
+                            foreground: false,
                         },
                     );
                 }

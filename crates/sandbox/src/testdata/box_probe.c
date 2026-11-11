@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
@@ -67,7 +69,9 @@ int main(int argc, char **argv) {
          MQOPEN:<name>  open that queue without creating it;
          MARK:<path>    create that file, telling the test the operations
                         before it have run;
-         EXIT:<code>    exit with that code at the end. */
+         EXIT:<code>    exit with that code at the end;
+         KILL0:<signal> send that signal to the program's own process group;
+         FDS            the descriptors the program has open. */
     const char *release = NULL;
     int exit_code = 0;
     int msq = -1, sem = -1, shm = -1;
@@ -245,6 +249,23 @@ int main(int argc, char **argv) {
             long fd = syscall(SYS_mq_open, argv[i] + 7, O_RDWR, 0, NULL);
             printf("mq open: errno %d\n", fd >= 0 ? 0 : errno);
             if (fd >= 0) close((int)fd);
+        } else if (strncmp(argv[i], "KILL0:", 6) == 0) {
+            /* A signal to the caller's own process group, which reaches
+               every member of the group in whatever namespace it is. */
+            int sig = atoi(argv[i] + 6);
+            printf("kill0 %d: sending\n", sig);
+            printf("kill0 %d: errno %d\n", sig, kill(0, sig) == 0 ? 0 : errno);
+        } else if (strcmp(argv[i], "FDS") == 0) {
+            /* The descriptors this program was started with. */
+            DIR *fds = opendir("/proc/self/fd");
+            printf("fds:");
+            struct dirent *entry;
+            while (fds && (entry = readdir(fds))) {
+                int fd = atoi(entry->d_name);
+                if (entry->d_name[0] != '.' && fd != dirfd(fds)) printf(" %d", fd);
+            }
+            printf("\n");
+            if (fds) closedir(fds);
         } else if (strncmp(argv[i], "EXIT:", 5) == 0) {
             exit_code = atoi(argv[i] + 5);
         } else if (strncmp(argv[i], "MARK:", 5) == 0) {

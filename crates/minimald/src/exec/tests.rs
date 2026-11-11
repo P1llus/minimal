@@ -636,7 +636,7 @@ async fn a_refused_task_attach_stops_the_task() {
     assert!(planned.plan().isolates_netns());
 
     let mut child = Child { reaped: false };
-    let err = super::attach_or_reap(planned, sandbox::Spawned::new(1), &mut child)
+    let err = super::attach_or_reap(planned, sandbox::Spawned::new(), &mut child)
         .await
         .err()
         .expect("a refused attach must surface as an error");

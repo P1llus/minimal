@@ -9,3 +9,5 @@ commit=d99c8f3a4400a3d196c0dd3d66e3824008274748
 # The SHA-256 of each carried patch. A patch that differs stops the script.
 patch.0001-container-join-a-caller-supplied-cgroup.patch=bb128612a1422e1f36232f639c8f7bbcbafbe377ce7a1261d849c195d5586e37
 patch.0002-mount-pass-any-filesystem-type-and-data.patch=b3063d1b4396ea8aca7d8d591b46c64fef5cd7a8bcb9c5c7dad84c925f4e4f2a
+patch.0003-runctl-run-the-supervisor-in-a-session-of-its-own.patch=9e3ba8b90a1a5ef376d336e7c6508db1a5098d0ceab003d7daebbf269d5ebaf7
+patch.0004-command-limit-how-long-spawn-waits-for-the-setup.patch=decf6b316a731e20b9b61ab966dbd068f86c919841e975c5c72ccb6ce8e1c259

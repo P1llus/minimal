@@ -114,30 +114,25 @@ impl std::fmt::Debug for NetNamespace {
 }
 
 impl NetNamespace {
-    /// The network namespace of the running process `pid`, in which
-    /// `sockets` creates. `nameservers` answer on port 53 in the namespace,
-    /// and `admits_name` says whether its egress rules allow a host name.
-    /// Refuses a process that shares this daemon's network namespace,
-    /// because a socket opened there would leave under no rule of the box.
-    pub fn of_process(
-        pid: u32,
+    /// A network namespace in which `sockets` creates. `nameservers`
+    /// answer on port 53 in the namespace, and `admits_name` says whether
+    /// its egress rules allow a host name. The caller answers for `sockets`
+    /// creating in a namespace of the box and not in this daemon's own,
+    /// where a socket would leave under no rule of the box.
+    #[must_use]
+    pub fn new(
         sockets: Sockets,
         nameservers: &[std::net::Ipv4Addr],
         admits_name: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    ) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let net = std::fs::metadata(format!("/proc/{pid}/ns/net"))?;
-        if net.ino() == std::fs::metadata("/proc/self/ns/net")?.ino() {
-            anyhow::bail!("process {pid} shares this daemon's network namespace");
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             sockets,
             nameservers: nameservers
                 .iter()
                 .map(|ip| std::net::SocketAddr::from((*ip, 53)))
                 .collect(),
             admits_name,
-        })
+        }
     }
 }
 
@@ -1458,23 +1453,6 @@ mod placed {
             assert_eq!(
                 refusal(&Placement::Refused(NO_NETWORK), "allowed.test"),
                 Some(NO_NETWORK)
-            );
-        }
-
-        /// NET-155: a process in this daemon's own network namespace is no
-        /// placement, because its sockets would leave under no rule of a box.
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_process_in_the_daemons_namespace_is_no_placement() {
-            let Placement::Box(sockets) = broken() else {
-                unreachable!()
-            };
-            let refused =
-                NetNamespace::of_process(std::process::id(), sockets, &[], Arc::new(|_| true))
-                    .expect_err("this process shares its own namespace");
-            assert!(
-                refused.to_string().contains("shares this daemon's network"),
-                "{refused}"
             );
         }
 

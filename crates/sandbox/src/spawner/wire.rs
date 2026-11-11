@@ -53,14 +53,22 @@ pub(crate) struct ContainerSpec {
 }
 
 /// The session of the container's program.
+///
+/// The program never shares a process group with the spawner or with the
+/// process that asked for it. A box runs with the spawner's uid, so
+/// `kill(0, sig)` from a shared group would reach them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum Session {
-    /// The session of whoever started it.
-    Inherit,
-    /// A new session with no controlling terminal.
+    /// A new session with no controlling terminal. The supervisor leaves
+    /// the spawner's session too.
     New,
-    /// A new session whose controlling terminal is the program's stdin.
+    /// A new session whose controlling terminal is the program's stdin. The
+    /// supervisor leaves the spawner's session too.
     NewWithTerminal,
+    /// The spawner's session, in a process group of its own that is made
+    /// the foreground group of the session's terminal, as a shell runs a
+    /// job. For a tool that runs one program on its user's terminal.
+    Foreground,
 }
 
 /// A program to run in a new container.
@@ -119,10 +127,12 @@ pub(crate) enum Request {
 /// What a spawner tells the process it serves.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Event {
-    /// The job's process exists. Descriptors: the tap if `tap`.
+    /// The job's process exists. Descriptors: the container's network
+    /// namespace if `netns`, then the tap if `tap`.
     Started {
         id: u64,
         pid: u32,
+        netns: bool,
         tap: bool,
     },
     Failed {

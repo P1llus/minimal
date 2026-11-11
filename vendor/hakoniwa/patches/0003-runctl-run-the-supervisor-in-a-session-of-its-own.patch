@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: minimal <noreply@minimal.dev>
+Date: Wed, 11 Nov 2026 16:52:58 +0100
+Subject: [PATCH] feat(runctl): run the supervisor in a session of its own
+
+Add Runctl::SupervisorNewSession. The supervisor calls setsid(2) before
+it creates the container, so no process of the container shares a
+session or a process group with the caller, and a signal the container
+sends to its own process group cannot reach the caller.
+---
+ hakoniwa/src/runc.rs             |  5 +++++
+ hakoniwa/src/runctl.rs           |  8 +++++++
+ hakoniwa/tests/container_test.rs | 36 +++++++++++++++++++++++++++++++-
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/hakoniwa/src/runc.rs b/hakoniwa/src/runc.rs
+index 52d19ac..f04c117 100644
+--- a/hakoniwa/src/runc.rs
++++ b/hakoniwa/src/runc.rs
+@@ -104,6 +104,11 @@ fn exec_imp(
+         sys::join_cgroup(dir.as_raw_fd())?;
+     }
+ 
++    // Leave the caller's session and process group.
++    if container.runctl.contains(&Runctl::SupervisorNewSession) {
++        sys::setsid()?;
++    }
++
+     // Redirect standard I/O stream.
+     if let Some(stdin) = stdin.take() {
+         sys::dup2_stdin(stdin.as_raw_fd())?;
+diff --git a/hakoniwa/src/runctl.rs b/hakoniwa/src/runctl.rs
+index 7e2c351..5e1073d 100644
+--- a/hakoniwa/src/runctl.rs
++++ b/hakoniwa/src/runctl.rs
+@@ -33,4 +33,12 @@ pub enum Runctl {
+ 
+     /// Mount root dir with read-write access.
+     RootdirRW,
++
++    /// Run the container's supervisor process in a session of its own.
++    ///
++    /// The supervisor calls `setsid(2)` before it creates the container, so
++    /// neither it nor the internal process shares a session or a process
++    /// group with the caller. A signal the container sends to its own
++    /// process group, such as `kill(0, sig)`, then cannot reach the caller.
++    SupervisorNewSession,
+ }
+diff --git a/hakoniwa/tests/container_test.rs b/hakoniwa/tests/container_test.rs
+index 95fc033..6bc7174 100644
+--- a/hakoniwa/tests/container_test.rs
++++ b/hakoniwa/tests/container_test.rs
+@@ -7,7 +7,7 @@ mod container_test {
+     use std::fs::{self, File};
+     use std::path::PathBuf;
+ 
+-    use hakoniwa::{Container, MountOptions, Namespace, Pasta, Rlimit, Runctl};
++    use hakoniwa::{Container, MountOptions, Namespace, Pasta, Rlimit, Runctl, Stdio};
+ 
+     fn current_dir() -> PathBuf {
+         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR")))
+@@ -965,6 +965,40 @@ mod container_test {
+         assert_contains!(output.status.reason, "cgroup.procs");
+     }
+ 
++    #[test]
++    fn test_runctl_supervisor_new_session() {
++        // Field 5 of /proc/<pid>/stat is the process group, field 6 the session.
++        let ids = |stat: &str| -> (String, String) {
++            let rest = stat.rsplit_once(')').unwrap().1;
++            let fields: Vec<&str> = rest.split_whitespace().collect();
++            (fields[2].to_string(), fields[3].to_string())
++        };
++        let own = ids(&fs::read_to_string("/proc/self/stat").unwrap());
++
++        let stat_of = |supervisor_new_session: bool| {
++            let mut container = Container::new();
++            container.rootfs("/").unwrap();
++            if supervisor_new_session {
++                container.runctl(Runctl::SupervisorNewSession);
++            }
++            let mut child = container
++                .command("/bin/sleep")
++                .arg("5")
++                .stdout(Stdio::MakePipe)
++                .spawn()
++                .unwrap();
++            let stat = fs::read_to_string(format!("/proc/{}/stat", child.id())).unwrap();
++            child.kill().unwrap();
++            child.wait().unwrap();
++            (ids(&stat), child.id().to_string())
++        };
++
++        let (shared, _) = stat_of(false);
++        assert_eq!(shared, own);
++        let (detached, supervisor) = stat_of(true);
++        assert_eq!(detached, (supervisor.clone(), supervisor));
++    }
++
+     #[test]
+     fn test_network_pasta() {
+         let output = Container::new()

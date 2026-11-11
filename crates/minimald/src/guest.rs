@@ -420,24 +420,13 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
 
     // cgroup2, mounted with `nsdelegate` so the cgroup namespace of a box
     // is a delegation boundary: the box cannot change the limits of its
-    // own cgroup. The daemon owns the whole hierarchy here and builds its
-    // `supervisor` and `boxes` cgroups once this mount is up.
-    //
-    // Strict, not best-effort: a guest that cannot build this tree is a
-    // broken image, not a deployment state — there is no privileged step a
-    // person could run inside the VM to fix it, and a host-address box that
-    // ran unenforced here would speak with the VM's address and no verdict at
-    // all (design §7.1). Boot still continues — the daemon keeps serving the
-    // modes that need no classification — but the failure is logged at error
-    // level with the consequence named, and `box_runtime` refuses a
-    // host-address session on it.
+    // own cgroup. The daemon takes the whole hierarchy as its cgroup root
+    // once it runs in the new root, and checks the option there
+    // (`sandbox::cgroup::Root::open`). A mount that fails here leaves the
+    // daemon with no root, and it says so then.
     let cgroup2 = format!("{NEWROOT}/sys/fs/cgroup");
     if let Err(e) = std::fs::create_dir_all(&cgroup2) {
-        tracing::error!(
-            error = %e,
-            "creating the cgroup2 mountpoint: a broken guest image; \
-             host-address boxes will be refused"
-        );
+        tracing::error!(error = %e, "creating the cgroup2 mountpoint: a broken guest image");
     }
     let cgroup2_target = CString::new(cgroup2.as_str()).expect("no NUL in the cgroup2 mountpoint");
     // SAFETY: mount(2) with valid C strings; `data` carries the `nsdelegate`
@@ -451,36 +440,11 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
             c"nsdelegate".as_ptr().cast(),
         )
     };
-    // `EBUSY` (already mounted) is success for an idempotent mount — same
-    // tolerance as `raw_mount`, which cannot carry the `data` option. But an
-    // existing mount only counts if it carries `nsdelegate`: the delegation
-    // boundary is a property of the superblock, fixed at the first mount, so
-    // what this boot inherited is what the boxes would get.
-    let failure = if mounted == 0 {
-        None
-    } else {
-        let e = std::io::Error::last_os_error();
-        (e.raw_os_error() != Some(libc::EBUSY)).then_some(e)
-    };
-    // The initramfs itself has no /proc at this point; the one just mounted
-    // under the new root shows this very mount namespace, which is the table
-    // the question is about.
-    let mountinfo =
-        std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
-    let delegated = cgroup2_mounted_with_nsdelegate(&mountinfo);
-    match (failure, delegated) {
-        (None, true) => tracing::info!(
-            mountpoint = %cgroup2,
-            "mounted cgroup2 with nsdelegate"
-        ),
-        (failure, _) => {
-            let error = failure
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "the existing cgroup2 mount carries no nsdelegate".to_string());
-            tracing::error!(
-                error = %error,
-                "mounting cgroup2 with nsdelegate failed: a broken guest image"
-            );
+    if mounted != 0 {
+        let error = std::io::Error::last_os_error();
+        // Already mounted: the options it was first mounted with stand.
+        if error.raw_os_error() != Some(libc::EBUSY) {
+            tracing::error!(%error, "mounting cgroup2 with nsdelegate: a broken guest image");
         }
     }
 
@@ -1709,26 +1673,6 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
     } else {
         tracing::info!(target, fstype, "mounted pseudo filesystem");
     }
-}
-
-/// Whether the mount table `mountinfo` holds a cgroup2 mount at
-/// `sys/fs/cgroup` with the `nsdelegate` option.
-fn cgroup2_mounted_with_nsdelegate(mountinfo: &str) -> bool {
-    mountinfo.lines().any(|line| {
-        // `<ids> <root> <mount point> <options> ... - <fstype> <source> <super options>`
-        let Some((before, after)) = line.split_once(" - ") else {
-            return false;
-        };
-        let mount_point = before.split(' ').nth(4).unwrap_or_default();
-        let mut after = after.split(' ');
-        let fstype = after.next().unwrap_or_default();
-        let super_options = after.nth(1).unwrap_or_default();
-        fstype == "cgroup2"
-            && mount_point.ends_with("sys/fs/cgroup")
-            && super_options
-                .split(',')
-                .any(|option| option == "nsdelegate")
-    })
 }
 
 #[cfg(test)]

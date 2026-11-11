@@ -15,11 +15,16 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use super::enter::{self, ShimArgs};
 use super::wire::{ContainerSpec, Enter, Run, Session};
 use super::{ENTER_MODE, ExitStatus, title::Title};
+
+/// How long a container's setup may take: its namespaces, its ID maps, its
+/// network and its mounts. Far more than a healthy host needs.
+const SETUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A container this process started.
 pub(crate) struct Container {
@@ -27,6 +32,8 @@ pub(crate) struct Container {
     pub(crate) child: hakoniwa::Child,
     /// The supervisor, pinned.
     pub(crate) supervisor: OwnedFd,
+    /// The container's network namespace, when it has one of its own.
+    pub(crate) netns: Option<OwnedFd>,
     /// The tap hakoniwa built, when the container asked for one.
     pub(crate) tap: Option<OwnedFd>,
 }
@@ -134,8 +141,17 @@ pub(crate) fn run(
     titled: bool,
 ) -> io::Result<Container> {
     let mut container = hakoniwa_container(&run.container, cgroup)?;
-    if run.session == Session::NewWithTerminal {
-        container.runctl(hakoniwa::Runctl::NewSession);
+    match run.session {
+        Session::New => {
+            container.runctl(hakoniwa::Runctl::SupervisorNewSession);
+        }
+        Session::NewWithTerminal => {
+            container.runctl(hakoniwa::Runctl::SupervisorNewSession);
+            container.runctl(hakoniwa::Runctl::NewSession);
+        }
+        // The supervisor stays in the session whose terminal the program
+        // takes the foreground of.
+        Session::Foreground => {}
     }
     let mut command = container.command(&run.program);
     command.args(&run.args);
@@ -152,13 +168,17 @@ pub(crate) fn run(
         &mut command,
         run.lo_up,
         run.gate.clone(),
-        run.session == Session::New,
+        run.session,
     );
     let [stdin, stdout, stderr] = stdio;
     command
         .stdin(hakoniwa::Stdio::from(stdin))
         .stdout(hakoniwa::Stdio::from(stdout))
         .stderr(hakoniwa::Stdio::from(stderr));
+    // The spawner serves every box from one thread, and it waits here for
+    // the container's setup. A mount whose source does not answer must not
+    // hold every other box.
+    command.setup_timeout(SETUP_LIMIT);
     let spawned = {
         // The supervisor is a fork of this process and keeps the title.
         let _title = titled.then(|| Title::set(c"minimal-box"));
@@ -172,9 +192,17 @@ pub(crate) fn run(
         .rustslirp_tapfd
         .take()
         .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
+    // The supervisor made its namespaces before the spawn returned, and it
+    // is this process's child, so its pid is its own until it is reaped.
+    let netns = if run.container.netns {
+        Some(std::fs::File::open(format!("/proc/{}/ns/net", child.id()))?.into())
+    } else {
+        None
+    };
     Ok(Container {
         child,
         supervisor,
+        netns,
         tap,
     })
 }
@@ -187,6 +215,32 @@ pub(crate) fn pinned_init(supervisor: u32) -> Option<(u32, OwnedFd)> {
     let pid = enter::init_of(supervisor).ok()?;
     let pinned = enter::pidfd_open(pid).ok()?;
     (enter::init_of(supervisor).ok()? == pid).then_some((pid, pinned))
+}
+
+/// Makes this process's group the foreground group of its terminal again,
+/// once a job that had taken the foreground is gone. Does nothing for a
+/// process with no terminal.
+pub(crate) fn retake_foreground() {
+    let Ok(terminal) = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty")
+    else {
+        return;
+    };
+    // SAFETY: plain syscalls on this thread's signal mask and the terminal.
+    unsafe {
+        // A background group that changes the foreground group is stopped
+        // with SIGTTOU unless it blocks the signal.
+        let mut ttou: libc::sigset_t = std::mem::zeroed();
+        let mut before: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut ttou);
+        libc::sigaddset(&raw mut ttou, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const ttou, &raw mut before);
+        libc::tcsetpgrp(terminal.as_raw_fd(), libc::getpgrp());
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
+    }
 }
 
 /// Whether the process a pidfd names has exited.
