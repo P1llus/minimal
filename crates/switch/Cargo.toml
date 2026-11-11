@@ -18,6 +18,10 @@ stack-peer = ["dep:smoltcp", "dep:tokio", "dep:tracing"]
 # reuse so they exercise the same delivery path against the real registry
 # and the stand-in acceptor instead of re-implementing a TCP client.
 test-util = ["stack-peer"]
+# The frame pump between a local frame carrier and gvproxy (`pump`). Both
+# daemons turn it on; a build that only needs the address plan does not pull
+# in tokio.
+pump = ["dep:tokio", "dep:libc"]
 
 [dependencies]
 # The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
@@ -28,6 +32,7 @@ smoltcp = { workspace = true, optional = true }
 # The peer's socket, channels and poll task.
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The crate's own test build turns its Box Egress Proxy feature on: the
@@ -37,7 +42,7 @@ tracing = { workspace = true, optional = true }
 # and bench targets — never another crate's build — so the in-VM
 # `minimald` build keeps linking the feature off, as the `stack-peer`
 # comment above promises.
-switch = { path = ".", features = ["test-util"] }
+switch = { path = ".", features = ["test-util", "pump"] }
 tempfile.workspace = true
 
 [lints]

@@ -17,6 +17,8 @@ pub mod bep_host;
 #[cfg(feature = "stack-peer")]
 pub use bep_host::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
 pub mod loopback;
+#[cfg(feature = "pump")]
+pub mod pump;
 pub mod refusal;
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
