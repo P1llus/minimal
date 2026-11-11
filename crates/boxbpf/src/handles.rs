@@ -593,20 +593,6 @@ impl Handles {
         self.reconfigure(live, spec)
     }
 
-    /// Replaces the host ports the box may reach on the host alias.
-    pub fn set_host_exposures(
-        &mut self,
-        live: &mut LiveBox,
-        ports: Vec<PortOf>,
-    ) -> Result<(), Error> {
-        if live.spec.deployment.host_exposures == ports {
-            return Ok(());
-        }
-        let mut spec = live.spec.clone();
-        spec.deployment.host_exposures = ports;
-        self.reconfigure(live, spec)
-    }
-
     pub fn uninstall(&mut self, live: &LiveBox) -> Result<(), Error> {
         self.remove(live.id)
     }

@@ -85,7 +85,6 @@ fn declared(rule: &Rule) -> Option<String> {
         Origin::BoxDeny => format!("deny_subnets {}", rule.target),
         Origin::BoxAllow => format!("allow_subnets {}", rule.target),
         Origin::BoxName => format!("allow_dns_hosts {}", rule.target),
-        Origin::HostExposure => format!("host exposure {}", l4()),
         Origin::Published => format!("published port {}", l4()),
         _ => return None,
     })
@@ -661,33 +660,33 @@ mod tests {
     }
 
     #[test]
-    fn the_error_tells_host_exposures_from_the_base_policy() {
-        let mut d = Deployment::new(NodeKind::Guest, Mode::HostIp);
-        d.network = Some(crate::base::VirtualNetwork {
-            subnet: p("100.64.0.0/24"),
-            gateway: "100.64.0.1".parse().unwrap(),
-            host_alias: Some("100.64.0.254".parse().unwrap()),
-        });
-        d.host_exposures = (0..40)
+    fn the_error_tells_published_ports_from_the_base_policy() {
+        let mut d = Deployment::new(NodeKind::Guest, Mode::OwnIp);
+        d.published = (0..40)
             .map(|i| crate::base::PortOf {
                 protocols: Protocols::TCP,
                 port: 5000 + i,
             })
             .collect();
         let err = compile(&base_policy(&d), &BoxPolicy::default(), Options::default()).unwrap_err();
-        let CompileError::TooManyRules { entries, base, .. } = &err else {
+        let CompileError::TooManyRules {
+            direction: Direction::Ingress,
+            entries,
+            base,
+            ..
+        } = &err
+        else {
             panic!("{err:?}");
         };
-        assert_eq!(entries.len(), 40);
-        assert!(*base >= 1, "the deny of the rest of the alias");
-        assert!(err.to_string().contains("host exposure tcp 5000"), "{err}");
+        assert_eq!((entries.len(), *base), (40, 0));
+        assert!(err.to_string().contains("published port tcp 5000"), "{err}");
     }
 
     #[test]
     fn a_guest_box_with_every_service_and_its_own_rules_fits() {
         use std::net::{Ipv4Addr, SocketAddrV4};
 
-        use crate::base::{EndpointRange, PortOf, VirtualNetwork};
+        use crate::base::{EndpointRange, VirtualNetwork};
 
         let at = |port| Endpoint {
             v4: Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 80, 1), port)),
@@ -697,23 +696,18 @@ mod tests {
         d.network = Some(VirtualNetwork {
             subnet: p("100.64.0.0/24"),
             gateway: "100.64.0.1".parse().unwrap(),
-            host_alias: Some("100.64.0.254".parse().unwrap()),
         });
+        d.host_alias = Some("100.64.0.254".parse().unwrap());
         d.services.resolver = Some(at(20480));
         d.services.credential_proxy = Some(at(20481));
         d.services.hostname_proxy = Some(at(20482));
+        d.services.host_relay = Some(at(20483));
         d.steered = vec!["api.example.com".parse().unwrap()];
         d.node_hostname_proxy = vec!["127.0.0.1:7654".parse().unwrap()];
         d.endpoint_ranges = vec![EndpointRange {
             prefix: p("127.0.80.1/32"),
             ports: PortRange::new(20480, 24575).unwrap(),
         }];
-        d.host_exposures = (0..7)
-            .map(|i| PortOf {
-                protocols: Protocols::TCP,
-                port: 5000 + i,
-            })
-            .collect();
         let to_any = |port| BoxRule {
             action: BoxAction::Allow,
             protocols: Protocols::TCP,
@@ -730,7 +724,7 @@ mod tests {
         let c = compile(&base_policy(&d), &policy, Options::default()).unwrap();
         let longest = c.nets.iter().map(|e| e.rules.len()).max().unwrap();
         assert!(longest <= 12, "{longest} rules in one entry\n{c}");
-        // On the endpoint address: its own three endpoints, the deny of
+        // On the endpoint address: its own four endpoints, the deny of
         // the other ports of the range, DNS, and the box's rules that can
         // still decide there.
         let endpoint = entry(&c, Direction::Egress, "127.0.80.1/32");
@@ -742,6 +736,7 @@ mod tests {
         assert_eq!(
             origins,
             [
+                Origin::OwnEndpoints,
                 Origin::OwnEndpoints,
                 Origin::OwnEndpoints,
                 Origin::OwnEndpoints,
@@ -859,7 +854,6 @@ mod tests {
         d.network = Some(crate::base::VirtualNetwork {
             subnet: p("100.64.0.0/24"),
             gateway: "100.64.0.1".parse().unwrap(),
-            host_alias: None,
         });
         base_policy(&d)
     }

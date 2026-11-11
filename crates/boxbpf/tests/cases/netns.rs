@@ -20,6 +20,9 @@ const PEER4: &str = "10.99.0.9";
 const BOX6: &str = "fd00:99::2";
 const BOX_LL6: &str = "fe80::99:2";
 const ENDPOINT: &str = "127.0.80.1:20480";
+const RELAY: &str = "127.0.80.1:20483";
+/// An address of the virtual network that nothing answers at.
+const HOST_ALIAS: &str = "10.99.0.254";
 /// A link-local address on the box's interface that is not the one the
 /// engine was told.
 const OTHER_LL6: &str = "fe80::99:3";
@@ -83,7 +86,6 @@ fn a_box_in_its_own_network_namespace() {
     deployment.network = Some(VirtualNetwork {
         subnet: "10.99.0.0/24".parse().expect("prefix"),
         gateway: ip(GATEWAY4),
-        host_alias: None,
     });
     deployment.transport_ipv6 = true;
     // The box's resolver endpoint is inside its own namespace, at the
@@ -93,6 +95,21 @@ fn a_box_in_its_own_network_namespace() {
         v4: Some(endpoint),
         v6: None,
     });
+    // So is its host relay, which takes what the box sends to the host
+    // alias. The daemon's endpoints of a namespace are on one block of
+    // ports, which the box must leave alone.
+    deployment.host_alias = Some(ip(HOST_ALIAS));
+    deployment.services.host_relay = Some(netpol::Endpoint {
+        v4: Some(RELAY.parse().expect("address")),
+        v6: None,
+    });
+    let block = PortRange::new(20480, 20483).expect("range");
+    deployment.endpoint_ranges = ["127.0.80.1/32", "::1/128"]
+        .map(|prefix| netpol::base::EndpointRange {
+            prefix: prefix.parse().expect("prefix"),
+            ports: block,
+        })
+        .to_vec();
     let mut live = h.install("own", deployment, policy(8, 128));
     // The addresses of the box's namespace, as the daemon adds them when
     // it gives the namespace its interface.
@@ -314,6 +331,59 @@ fn a_box_in_its_own_network_namespace() {
     assert_eq!(twin_peer, peer);
     assert_eq!(recorded(&h, here).map(|(id, ..)| id), Some(twin.id()));
     assert_eq!(recorded(&h, inside_ns).map(|(id, ..)| id), Some(live.id()));
+
+    // ---- the host alias leads to the box's relay endpoint and nowhere else
+    let mut relay = Cgroups::hold_peer_probe(box_ns, &["endpoint-tcp", "127.0.80.1", "20483"]);
+    let to_host = cg.hold_probe_in("own", box_ns, &["hold-tcp", HOST_ALIAS, "5432"]);
+    // The box sees the address it dialled, and the relay's greeting.
+    assert_eq!(
+        to_host.ready,
+        format!("ok peer={HOST_ALIAS}:5432 data=relayed")
+    );
+    let relayed: std::net::SocketAddr = relay
+        .step()
+        .strip_prefix("peer=")
+        .and_then(|p| p.parse().ok())
+        .expect("the relay accepted");
+    // The relay learns whose flow it is and which host port it was for.
+    let flow = h
+        .handles
+        .original_destination(inside_ns, relayed, Protocol::Tcp)
+        .expect("lookup")
+        .expect("a recorded flow");
+    assert_eq!(
+        (flow.box_id, flow.destination, flow.endpoint),
+        (
+            live.id(),
+            format!("{HOST_ALIAS}:5432").parse().expect("address"),
+            netpol::base::HOST_RELAY
+        )
+    );
+    drop(to_host);
+    // Only TCP is relayed.
+    assert_eq!(probe(&["udp", HOST_ALIAS, "5432"]), refused());
+    assert_eq!(probe(&["ping", HOST_ALIAS, "300"]), refused());
+
+    // ---- the box leaves the ports of the daemon's endpoints alone
+    for (kind, at, port) in [
+        ("tcp", "127.0.80.1", "20481"),
+        ("udp", "0.0.0.0", "20482"),
+        ("tcp", "::", "20480"),
+        ("udp", "::1", "20483"),
+    ] {
+        assert_eq!(
+            probe(&["bind", kind, at, port]),
+            refused(),
+            "{kind} {at}:{port}"
+        );
+    }
+    assert_eq!(
+        probe(&["bind", "tcp", "127.0.80.1", "20484"]),
+        "ok port=20484",
+        "a port beside the block"
+    );
+    // A port of the block that is none of its endpoints is closed to it.
+    assert_eq!(probe(&["tcp", "127.0.80.1", "20481", "300"]), refused());
 
     // ---- UDP: a socket's replies come back, and nothing else comes in
     let _peer_echo = Cgroups::hold_peer_probe(peer_ns, &["serve-udp", PEER4, "18090"]);

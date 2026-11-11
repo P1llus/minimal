@@ -75,6 +75,43 @@ mod guest {
         let _closed = unsafe { libc::close(sock) };
     }
 
+    /// Gives the loopback interface a second address, outside 127.0.0.0/8:
+    /// a source the engine does not let pass for being loopback.
+    fn loopback_alias(addr: Ipv4Addr) {
+        // SAFETY: socket takes no pointers.
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        // SAFETY: an all-zero ifreq is valid, and name and address are
+        // filled in below.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in request.ifr_name.iter_mut().zip(c"lo:1".to_bytes_with_nul()) {
+            *dst = libc::c_char::from_ne_bytes([*src]);
+        }
+        let sin = libc::sockaddr_in {
+            sin_family: libc::sa_family_t::try_from(libc::AF_INET).unwrap_or(2),
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: sockaddr_in and sockaddr have the same size, and every
+        // bit pattern is a valid sockaddr.
+        request.ifr_ifru.ifru_addr =
+            unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) };
+        // SAFETY: request is a valid ifreq naming an interface and an address.
+        let _set = unsafe { libc::ioctl(sock, libc::SIOCSIFADDR as libc::Ioctl, &raw mut request) };
+        // SAFETY: sock is ours and not used again.
+        let _closed = unsafe { libc::close(sock) };
+    }
+
+    /// One datagram from `from` to port 9 of the same address.
+    fn udp_from(from: Ipv4Addr) -> String {
+        match UdpSocket::bind((from, 0)).and_then(|s| s.send_to(b"x", (from, 9))) {
+            Ok(_) => "ok".to_owned(),
+            Err(e) => errno(&e),
+        }
+    }
+
     /// Runs `action` in a child that first joins the box cgroup, and returns
     /// the line it reports.
     fn in_box(name: &str, action: impl FnOnce() -> String) -> String {
@@ -157,7 +194,7 @@ mod guest {
 
     fn start() -> Result<Handles, Error> {
         let step = |what: &'static str| move |source: std::io::Error| Error::Sys { what, source };
-        for dir in ["supervisor", "boxes", "boxes/bare", "boxes/b"] {
+        for dir in ["supervisor", "boxes", "boxes/bare", "boxes/b", "boxes/own"] {
             fs::create_dir_all(format!("{CGROUP}/{dir}"))
                 .map_err(step("create the cgroup layout"))?;
         }
@@ -416,6 +453,31 @@ mod guest {
                 "port {listen_port}: in the table {listed:?}, record seen: {heard}, after release {after:?}"
             ),
         );
+
+        // A box with a source check sends from its own addresses only,
+        // and those are a set the daemon adds to while the box runs.
+        let address = Ipv4Addr::new(10, 9, 0, 1);
+        loopback_alias(address);
+        let own_ip = Spec {
+            deployment: Deployment::new(NodeKind::Guest, Mode::OwnIp),
+            policy: BoxPolicy {
+                default: Some(netpol::Verdict::Allow),
+                ..BoxPolicy::default()
+            },
+            options: Options { log_flows: false },
+        };
+        let own = handles.install(box_id("own")?, own_ip)?;
+        let before = in_box("own", || udp_from(address));
+        handles.add_own_address(own.id(), IpAddr::V4(address))?;
+        let with = in_box("own", || udp_from(address));
+        handles.remove_own_address(own.id(), IpAddr::V4(address))?;
+        let after = in_box("own", || udp_from(address));
+        report.check(
+            "own_address",
+            (before.as_str(), with.as_str(), after.as_str()) == ("err 1", "ok", "err 1"),
+            &format!("a send from {address}: {before} before it is the box's, {with} while, {after} after"),
+        );
+        handles.uninstall(&own)?;
 
         let stats = handles.stats(live.id())?.unwrap_or_default();
         report.check(

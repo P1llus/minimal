@@ -30,6 +30,8 @@ pub(crate) struct Node {
     pub(crate) kind: NodeKind,
     /// The virtual network the node itself sits on: a VM guest's.
     pub(crate) network: Option<VirtualNetwork>,
+    /// The address that stands for the host's loopback there.
+    pub(crate) host_alias: Option<IpAddr>,
     /// Where the node's hostname proxy listens for programs outside boxes.
     pub(crate) hostname_proxy: Vec<SocketAddr>,
 }
@@ -39,6 +41,7 @@ impl Node {
         Self {
             kind: NodeKind::Native,
             network: None,
+            host_alias: None,
             hostname_proxy: Vec::new(),
         }
     }
@@ -50,11 +53,11 @@ impl Node {
             .map(|prefix| VirtualNetwork {
                 subnet: prefix,
                 gateway: IpAddr::V4(subnet.gateway()),
-                host_alias: Some(IpAddr::V4(subnet.host_alias())),
             });
         Self {
             kind: NodeKind::Guest,
             network,
+            host_alias: Some(IpAddr::V4(subnet.host_alias())),
             hostname_proxy: Vec::new(),
         }
     }
@@ -160,6 +163,7 @@ pub(crate) fn deployment(
         NetworkMode::OwnIp => d.transport_enforces = true,
         _ => {
             d.network = node.network;
+            d.host_alias = node.host_alias;
             // A native box uses the host's own routes. The virtual network
             // a guest sits on carries IPv4 only.
             d.transport_ipv6 = node.kind == NodeKind::Native;

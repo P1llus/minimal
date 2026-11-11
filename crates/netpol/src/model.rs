@@ -703,8 +703,9 @@ pub enum Origin {
     NeighbourDiscovery,
     /// The transport carries no IPv6.
     NoIpv6Transport,
-    /// Ports of the host exposed on the host alias.
-    HostExposure,
+    /// The host alias: TCP goes to the box's host relay, nothing else
+    /// goes there.
+    HostAlias,
     /// Gateway and host alias of the virtual network.
     Infrastructure,
     /// A protected range: closed unless the box allows a prefix inside
@@ -746,7 +747,7 @@ impl fmt::Display for Origin {
             Self::OwnAddresses => f.write_str("the box itself"),
             Self::NeighbourDiscovery => f.write_str("IPv6 neighbour discovery"),
             Self::NoIpv6Transport => f.write_str("transport without IPv6"),
-            Self::HostExposure => f.write_str("host exposure"),
+            Self::HostAlias => f.write_str("host alias"),
             Self::Infrastructure => f.write_str("virtual network infrastructure"),
             Self::Protected => f.write_str("protected range"),
             Self::Published => f.write_str("published port"),

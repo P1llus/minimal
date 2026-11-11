@@ -66,6 +66,7 @@ const PORTS: [u16; 6] = [0, 53, 443, 450, 1023, 8080];
 
 const ENDPOINT4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 1), 5353);
 const ENDPOINT6: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5353, 0, 0);
+const RELAY4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 1), 5354);
 
 fn direction() -> impl Strategy<Value = Direction> {
     prop::sample::select(Direction::ALL.to_vec())
@@ -189,10 +190,14 @@ fn agree(c: &Compiled, flow: &Flow, name: Pinned<'_>) -> Result<(), TestCaseErro
     let want = match action {
         Action::Allow => FlowVerdict::Allow,
         Action::Deny => FlowVerdict::Deny,
-        Action::Redirect(_) => FlowVerdict::Redirect(match netpol::eval::canonical(flow.remote) {
-            IpAddr::V4(_) => SocketAddr::V4(ENDPOINT4),
-            IpAddr::V6(_) => SocketAddr::V6(ENDPOINT6),
-        }),
+        Action::Redirect(index) => {
+            let endpoint = c.endpoint(index).expect("a redirect names an endpoint");
+            match netpol::eval::canonical(flow.remote) {
+                IpAddr::V4(_) => endpoint.v4.map(SocketAddr::V4),
+                IpAddr::V6(_) => endpoint.v6.map(SocketAddr::V6),
+            }
+            .map_or(FlowVerdict::Deny, FlowVerdict::Redirect)
+        }
     };
     prop_assert_eq!(got.verdict, want, "flow {:?} name {:?}\n{}", flow, name, c);
     prop_assert_eq!(
@@ -324,14 +329,17 @@ proptest! {
             d.network = Some(VirtualNetwork {
                 subnet: "10.1.0.0/16".parse().unwrap(),
                 gateway: "10.1.0.1".parse().unwrap(),
-                host_alias: Some("10.1.0.254".parse().unwrap()),
             });
-            d.host_exposures = vec![PortOf { protocols: Protocols::TCP, port: 443 }];
+            d.host_alias = Some("10.1.0.254".parse().unwrap());
             d.published = vec![PortOf { protocols: Protocols::TCP, port: 8080 }];
         }
         if with_services {
             let e = Endpoint { v4: Some(ENDPOINT4), v6: Some(ENDPOINT6) };
-            d.services = Services { resolver: Some(e), credential_proxy: None, hostname_proxy: None };
+            d.services = Services {
+                resolver: Some(e),
+                host_relay: Some(Endpoint { v4: Some(RELAY4), v6: None }),
+                ..Services::default()
+            };
         }
         let policy = BoxPolicy {
             rules: explicit

@@ -438,6 +438,38 @@ fn endpoint_udp(at: SocketAddr) {
     }
 }
 
+/// A stream listener at `at` as an endpoint of the daemon has one: it
+/// greets every peer with `relayed` and says who it was.
+fn endpoint_tcp(at: SocketAddr) {
+    let listener = TcpListener::bind(at).expect("bind");
+    let netns = boxbpf::netns_cookie(listener.as_fd()).expect("namespace cookie");
+    say(&format!("ready netns={netns}"));
+    for mut stream in listener.incoming().flatten() {
+        let peer = stream.peer_addr().expect("peer");
+        // The client may have given up already.
+        let _sent = stream.write_all(b"relayed\n");
+        say(&format!("peer={peer}"));
+    }
+}
+
+/// A connection that stays open until the probe is dropped.
+fn hold_tcp(to: SocketAddr) {
+    match TcpStream::connect_timeout(&to, Duration::from_secs(2)) {
+        Ok(mut stream) => {
+            let mut buf = [0u8; 32];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let data = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
+            say(&format!(
+                "ready ok peer={} data={}",
+                stream.peer_addr().expect("peer"),
+                data.trim()
+            ));
+            while wait_step() {}
+        }
+        Err(e) => say(&format!("ready {}", errno(&e))),
+    }
+}
+
 fn hold_udp(to: SocketAddr, local_port: u16) {
     let mut local = unspecified(&to);
     local.set_port(local_port);
@@ -635,6 +667,8 @@ pub fn run() {
             return hold_udp(addr(ip, port), local.parse().expect("port"));
         }
         ["endpoint-udp", ip, port] => return endpoint_udp(addr(ip, port)),
+        ["endpoint-tcp", ip, port] => return endpoint_tcp(addr(ip, port)),
+        ["hold-tcp", ip, port] => return hold_tcp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
         ["udp-many", ip, first, count] => report(udp_many(

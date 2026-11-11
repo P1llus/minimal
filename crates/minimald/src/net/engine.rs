@@ -595,6 +595,7 @@ impl Engine {
             hostname_proxy: wants
                 .hostname_proxy
                 .then(|| block.endpoint(Service::HostnameProxy)),
+            host_relay: None,
         });
         let ranges = spec::endpoint_ranges(&endpoints::addresses(), endpoints::port_range());
         Spec {
