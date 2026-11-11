@@ -407,7 +407,7 @@ mod tests {
                 port: 7654,
                 local: None,
             };
-            compiled.evaluate(&flow, None).verdict
+            compiled.evaluate(&flow, |_| None).verdict
         };
         let redirected = FlowVerdict::Redirect(SocketAddr::V4(endpoint));
         // The guest's listener accepts on every address, and a box can
