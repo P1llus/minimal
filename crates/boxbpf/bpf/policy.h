@@ -223,10 +223,12 @@ static __always_inline void emit_net(const struct ev_args *a)
 static __always_inline void scan(const struct bp_rules *rs, const struct flow *f, __u8 reason,
 				 struct verdict *v)
 {
-	for (int i = 0; i < BP_RULES_MAX; i++) {
+	__u32 count = rs->count;
+
+	for (__u32 i = 0; i < BP_RULES_MAX; i++) {
 		const struct bp_rule *r = &rs->r[i];
 
-		if (!r->proto_mask || r->prio >= v->rule)
+		if (i >= count || r->prio >= v->rule)
 			return;
 		if ((r->proto_mask & f->pbit) && f->port >= r->port_lo && f->port <= r->port_hi) {
 			v->rule = r->prio;

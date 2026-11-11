@@ -21,13 +21,13 @@ use crate::{
     model::{Action, Direction, Protocols, SetId, Verdict},
 };
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Endpoint indexes of a box are below this.
 pub const ENDPOINTS_MAX: u8 = 4;
 
 /// Rules per prefix or name set after covering rules are copied in.
-pub const RULES_MAX: usize = 8;
+pub const RULES_MAX: usize = 32;
 /// `prio` of "no rule": what an event carries when a default decided.
 pub const NO_RULE: u16 = 0xffff;
 /// Bits of an LPM key before the address: box id and direction.
@@ -71,7 +71,6 @@ pub struct BoxCfg {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Rule {
     pub prio: u16,
-    /// 0 ends the list.
     pub proto_mask: u8,
     pub action: u8,
     pub port_lo: u16,
@@ -81,9 +80,22 @@ pub struct Rule {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rules {
+    /// Rules in use, from the front of `r`.
+    pub count: u16,
+    pub _pad: u16,
     pub r: [Rule; RULES_MAX],
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            _pad: 0,
+            r: [Rule::default(); RULES_MAX],
+        }
+    }
 }
 
 #[repr(C)]
@@ -456,7 +468,7 @@ fn constants(out: &mut String) {
 layouts! {
     BoxCfg = "bp_box_cfg", 36 { flags, generation, default_action, refuse_errno, addr4, addr6 }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
-    Rules = "bp_rules", 96 { r }
+    Rules = "bp_rules", 388 { count, r }
     Rule4Key = "bp_rule4_key", 20 { prefixlen, box_id, dir, addr }
     Rule6Key = "bp_rule6_key", 32 { prefixlen, box_id, dir, addr }
     PinKey = "bp_pin_key", 32 { box_id, addr, family }
@@ -550,8 +562,10 @@ const fn verdict_code(verdict: Verdict) -> u8 {
     }
 }
 
+/// The compiler never hands over more than [`RULES_MAX`] slots.
 fn rules_value(slots: &[Slot]) -> Rules {
     let mut out = Rules::default();
+    out.count = u16::try_from(slots.len().min(RULES_MAX)).unwrap_or(0);
     for (dst, slot) in out.r.iter_mut().zip(slots) {
         let (action, endpoint) = action_code(slot.action);
         *dst = Rule {
@@ -719,7 +733,7 @@ mod tests {
         assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 36,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 16"));
-        assert!(c.contains("BP_ABI_VERSION == 2"));
+        assert!(c.contains("BP_ABI_VERSION == 3"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
         assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 15);
@@ -782,7 +796,7 @@ mod tests {
             (v4.r[0].proto_mask, v4.r[0].action, v4.r[0].port_hi),
             (7, ACTION_ALLOW, u16::MAX)
         );
-        assert_eq!(v4.r[1].proto_mask, 0);
+        assert_eq!((v4.count, v4.r[1].proto_mask), (1, 0));
         assert_eq!(e.rules6.len(), 1);
         assert_eq!(e.sets.len(), 1);
         assert_eq!(e.sets.first().unwrap().0.set_id, 1);

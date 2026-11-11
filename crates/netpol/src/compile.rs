@@ -21,14 +21,22 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompileError {
     #[error(
-        "{needed} rules apply to {direction} {target}, the limit is {max}: merge rules or use fewer overlapping prefixes"
+        "{needed} rules apply to {direction} {target}, the limit is {max}. {}",
+        landed(entries, *base)
     )]
     TooManyRules {
         direction: Direction,
         target: String,
         needed: usize,
         max: usize,
+        /// The entries the user wrote that land in the list, each as the
+        /// setting it comes from.
+        entries: Vec<String>,
+        /// How many rules of the list the base policy adds.
+        base: usize,
     },
+    #[error("rule {rule} names no protocol and can match nothing: give it one or remove it")]
+    NoProtocol { rule: usize },
     #[error("the policy has {0} rules, more than the engine can number")]
     TooManyRulesTotal(usize),
     #[error("rule {rule} redirects a {direction} flow: only egress can be redirected")]
@@ -47,6 +55,38 @@ pub enum CompileError {
     DuplicateEndpoint(u8),
     #[error("endpoint index {0} is beyond what the engine holds per box")]
     EndpointIndex(u8),
+}
+
+fn landed(entries: &[String], base: usize) -> String {
+    let mut out = String::new();
+    if !entries.is_empty() {
+        out.push_str("These entries land there: ");
+        out.push_str(&entries.join("; "));
+        out.push_str(". ");
+    }
+    if base > 0 {
+        out.push_str(&format!("The base policy adds {base}. "));
+    }
+    out.push_str("Remove some of the entries or merge them.");
+    out
+}
+
+/// A rule as the setting the user wrote it in, or `None` for a rule the
+/// user has no setting for.
+fn declared(rule: &Rule) -> Option<String> {
+    use crate::model::Origin;
+
+    let l4 = || format!("{} {}", rule.protocols, rule.ports);
+    Some(match rule.origin {
+        Origin::BoxRule(i) => format!("rules[{i}] ({} {} to {})", rule.action, l4(), rule.target),
+        Origin::BoxProtocols => "allow_protocols".to_owned(),
+        Origin::BoxDeny => format!("deny_subnets {}", rule.target),
+        Origin::BoxAllow => format!("allow_subnets {}", rule.target),
+        Origin::BoxName => format!("allow_dns_hosts {}", rule.target),
+        Origin::HostExposure => format!("host exposure {}", l4()),
+        Origin::Published => format!("published port {}", l4()),
+        _ => return None,
+    })
 }
 
 /// One rule as the programs see it: `prio` is its position in the box's list.
@@ -130,35 +170,84 @@ impl Spec {
     }
 }
 
-/// Drops rules that can never be the first match in their list: an earlier
-/// rule takes every protocol and port they take.
+/// The ports one protocol has rules for so far: sorted ranges that neither
+/// overlap nor touch.
+#[derive(Default)]
+struct Taken(Vec<(u32, u32)>);
+
+impl Taken {
+    fn covers(&self, ports: PortRange) -> bool {
+        let (lo, hi) = (u32::from(ports.lo()), u32::from(ports.hi()));
+        self.0.iter().any(|(a, b)| *a <= lo && hi <= *b)
+    }
+
+    fn add(&mut self, ports: PortRange) {
+        self.0.push((u32::from(ports.lo()), u32::from(ports.hi())));
+        self.0.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.0.len());
+        for (lo, hi) in self.0.drain(..) {
+            match merged.last_mut() {
+                Some((_, end)) if lo <= *end + 1 => *end = (*end).max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        self.0 = merged;
+    }
+}
+
+/// Drops rules that can never be the first match in their list: the rules
+/// before them take every protocol and port they take, between them.
 fn prune(slots: impl Iterator<Item = Slot>) -> Vec<Slot> {
+    let mut taken: [Taken; 3] = Default::default();
     let mut kept: Vec<Slot> = Vec::new();
     for s in slots {
-        let shadowed = kept
+        let shadowed = s
+            .protocols
             .iter()
-            .any(|k| k.protocols.is_superset(s.protocols) && k.ports.covers(s.ports));
-        if !shadowed {
-            kept.push(s);
+            .all(|p| taken.get(index_of(p)).is_some_and(|t| t.covers(s.ports)));
+        if shadowed {
+            continue;
         }
+        for p in s.protocols.iter() {
+            if let Some(t) = taken.get_mut(index_of(p)) {
+                t.add(s.ports);
+            }
+        }
+        kept.push(s);
     }
     kept
+}
+
+const fn index_of(protocol: crate::model::Protocol) -> usize {
+    match protocol {
+        crate::model::Protocol::Tcp => 0,
+        crate::model::Protocol::Udp => 1,
+        crate::model::Protocol::Icmp => 2,
+    }
 }
 
 fn check_len(
     direction: Direction,
     target: &dyn fmt::Display,
-    rules: &[Slot],
+    list: &[Slot],
+    rules: &[Rule],
 ) -> Result<(), CompileError> {
-    if rules.len() > abi::RULES_MAX {
-        return Err(CompileError::TooManyRules {
-            direction,
-            target: target.to_string(),
-            needed: rules.len(),
-            max: abi::RULES_MAX,
-        });
+    if list.len() <= abi::RULES_MAX {
+        return Ok(());
     }
-    Ok(())
+    let entries: Vec<String> = list
+        .iter()
+        .filter_map(|slot| rules.get(usize::from(slot.prio)))
+        .filter_map(declared)
+        .collect();
+    Err(CompileError::TooManyRules {
+        direction,
+        target: target.to_string(),
+        needed: list.len(),
+        max: abi::RULES_MAX,
+        base: list.len() - entries.len(),
+        entries,
+    })
 }
 
 fn validate(rules: &[Rule], endpoints: &[(EndpointIndex, Endpoint)]) -> Result<(), CompileError> {
@@ -175,6 +264,9 @@ fn validate(rules: &[Rule], endpoints: &[(EndpointIndex, Endpoint)]) -> Result<(
         }
     }
     for (rule, r) in rules.iter().enumerate() {
+        if r.protocols.is_empty() {
+            return Err(CompileError::NoProtocol { rule });
+        }
         let Action::Redirect(index) = r.action else {
             continue;
         };
@@ -266,7 +358,7 @@ pub fn compile(
                         .filter(|(_, p)| p.covers(&prefix))
                         .map(|(s, _)| *s),
                 );
-                check_len(direction, &prefix, &list)?;
+                check_len(direction, &prefix, &list, &rules)?;
                 nets.push(NetEntry {
                     direction,
                     prefix,
@@ -299,7 +391,7 @@ pub fn compile(
             if list.is_empty() {
                 continue;
             }
-            check_len(direction, pattern, &list)?;
+            check_len(direction, pattern, &list, &rules)?;
             sets.push(SetEntry {
                 id: *id,
                 direction,
@@ -491,14 +583,98 @@ mod tests {
             },
             Options::default(),
         );
+        let Err(CompileError::TooManyRules {
+            direction: Direction::Egress,
+            target,
+            needed,
+            max,
+            entries,
+            base: 0,
+        }) = &err
+        else {
+            panic!("{err:?}");
+        };
         assert_eq!(
-            err,
-            Err(CompileError::TooManyRules {
-                direction: Direction::Egress,
-                target: "10.0.0.0/8".into(),
-                needed: abi::RULES_MAX + 1,
-                max: abi::RULES_MAX
+            (target.as_str(), *needed, *max),
+            ("10.0.0.0/8", abi::RULES_MAX + 1, abi::RULES_MAX)
+        );
+        assert_eq!(entries.len(), abi::RULES_MAX + 1);
+        // The message names what the user wrote, so they know what to merge.
+        let message = err.unwrap_err().to_string();
+        assert!(
+            message.contains("rules[0] (allow tcp 1000 to 10.0.0.0/8)")
+                && message.contains("rules[32]"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_error_tells_host_exposures_from_the_base_policy() {
+        let mut d = Deployment::new(NodeKind::Guest, Mode::HostIp);
+        d.network = Some(crate::base::VirtualNetwork {
+            subnet: p("100.64.0.0/24"),
+            gateway: "100.64.0.1".parse().unwrap(),
+            host_alias: Some("100.64.0.254".parse().unwrap()),
+        });
+        d.host_exposures = (0..40)
+            .map(|i| crate::base::PortOf {
+                protocols: Protocols::TCP,
+                port: 5000 + i,
             })
+            .collect();
+        let err = compile(&base_policy(&d), &BoxPolicy::default(), Options::default()).unwrap_err();
+        let CompileError::TooManyRules { entries, base, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(entries.len(), 40);
+        assert!(*base >= 1, "the deny of the rest of the alias");
+        assert!(err.to_string().contains("host exposure tcp 5000"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_without_a_protocol_is_refused() {
+        let policy = BoxPolicy {
+            rules: vec![BoxRule {
+                action: BoxAction::Allow,
+                protocols: Protocols::NONE,
+                ports: PortRange::ALL,
+                to: Target::Net(p("127.0.0.0/8")),
+            }],
+            deny: vec![p("127.0.0.0/8")],
+            ..BoxPolicy::default()
+        };
+        assert_eq!(
+            compile(&host_ip(), &policy, Options::default()),
+            Err(CompileError::NoProtocol { rule: 0 })
+        );
+    }
+
+    #[test]
+    fn rules_that_earlier_rules_cover_between_them_are_dropped() {
+        let rule = |protocols, lo, hi, action| BoxRule {
+            action,
+            protocols,
+            ports: PortRange::new(lo, hi).unwrap(),
+            to: Target::Net(p("10.0.0.0/8")),
+        };
+        let policy = BoxPolicy {
+            rules: vec![
+                rule(Protocols::TCP, 0, 1023, BoxAction::Deny),
+                rule(Protocols::TCP, 1024, u16::MAX, BoxAction::Deny),
+                rule(Protocols::UDP, 53, 53, BoxAction::Allow),
+                // TCP is taken in full by the first two together.
+                rule(Protocols::TCP, 443, 2000, BoxAction::Allow),
+                // UDP 53 is taken, the rest of UDP is not.
+                rule(Protocols::TCP_UDP, 53, 53, BoxAction::Deny),
+                rule(Protocols::TCP_UDP, 50, 60, BoxAction::Deny),
+            ],
+            ..BoxPolicy::default()
+        };
+        let c = compile(&host_ip(), &policy, Options::default()).unwrap();
+        let list = &entry(&c, Direction::Egress, "10.0.0.0/8").rules;
+        assert_eq!(
+            list.iter().map(|s| s.prio).collect::<Vec<_>>(),
+            [0, 1, 2, 5]
         );
     }
 

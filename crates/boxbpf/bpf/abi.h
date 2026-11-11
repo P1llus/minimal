@@ -14,7 +14,7 @@
 #ifndef BOXBPF_ABI_H
 #define BOXBPF_ABI_H
 
-#define BP_ABI_VERSION 2
+#define BP_ABI_VERSION 3
 
 /* Directions. They index bp_box_cfg.default_action and are part of rule keys. */
 #define BP_DIR_EGRESS  0 /* address = destination, port = destination port */
@@ -48,12 +48,12 @@ struct bp_box_cfg {
 	__u8  addr6[16];
 };
 
-#define BP_RULES_MAX 8
+#define BP_RULES_MAX 32
 #define BP_NO_RULE   0xffff
 
 struct bp_rule {
 	__u16 prio;       /* position in the box's list; the lowest match wins */
-	__u8  proto_mask; /* 0 ends the list */
+	__u8  proto_mask;
 	__u8  action;
 	__u16 port_lo;    /* TCP and UDP: port. ICMP: message type. */
 	__u16 port_hi;
@@ -67,6 +67,8 @@ struct bp_rule {
  * prefixes into each entry.
  */
 struct bp_rules {
+	__u16 count; /* rules in use, from r[0] */
+	__u16 _pad;
 	struct bp_rule r[BP_RULES_MAX];
 };
 

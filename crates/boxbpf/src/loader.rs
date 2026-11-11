@@ -434,7 +434,7 @@ fn exchange(
         what: "connect to the policy loader",
         source: e.into(),
     })?;
-    // Loading and verifying thirteen programs takes well under a second.
+    // Loading and verifying the programs takes well under a second.
     // A loader that stays silent this long is not going to answer.
     socket::setsockopt(&conn, ReceiveTimeout, &TimeVal::new(REPLY_TIMEOUT_SECS, 0)).map_err(
         |e| Error::Sys {

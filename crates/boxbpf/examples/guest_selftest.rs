@@ -214,7 +214,7 @@ mod guest {
         report.check(
             "load",
             true,
-            "13 programs passed the verifier and attached at boxes/",
+            "every program passed the verifier and attached at boxes/",
         );
         let mut events = handles.take_events();
 
@@ -314,8 +314,11 @@ mod guest {
         let mut buf = [0u8; 16];
         let origin = match resolver.recv_from(&mut buf) {
             Ok((n, peer)) => {
+                // The entry goes with the box's socket, which closes once
+                // the reply is in: ask first.
+                let origin = handles.original_destination(peer, Protocol::Udp)?;
                 let _sent = resolver.send_to(buf.get(..n).unwrap_or_default(), peer);
-                handles.original_destination(peer, Protocol::Udp)?
+                origin
             }
             Err(_) => None,
         };
