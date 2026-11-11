@@ -1982,7 +1982,7 @@ impl AskFacts {
 /// ever touches it.
 struct PendingAsk {
     facts: AskFacts,
-    reply: std::sync::mpsc::Sender<minimald_rpc::AskAdmitOutcome>,
+    reply: std::sync::mpsc::Sender<AskOutcome>,
 }
 
 /// One attached host client's subscription: the push channel its serving
@@ -2048,18 +2048,35 @@ pub(crate) enum AnswerRefusal {
     },
 }
 
+/// How a guest's ask ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskOutcome {
+    /// A person allowed it. The port is the one the ask was about.
+    Admitted {
+        ask_id: minimald_rpc::AskId,
+        port: u16,
+        proto: IpProto,
+    },
+    /// It was not allowed.
+    Refused {
+        ask_id: minimald_rpc::AskId,
+        reason: minimald_rpc::AskRefused,
+        cause: Option<minimald_rpc::AskCancelCause>,
+    },
+}
+
 /// How an outcome reads to a late answer: allowed only when admitted,
 /// denied for a no or a no-tty, and every other end as the cancellation it
 /// is — a yes the row could no longer take included, since its row went.
-fn late_end(outcome: &minimald_rpc::AskAdmitOutcome) -> minimald_rpc::AskLateEnd {
+fn late_end(outcome: &AskOutcome) -> minimald_rpc::AskLateEnd {
     use minimald_rpc::{AskCancelCause, AskLateEnd, AskRefused};
     match outcome {
-        minimald_rpc::AskAdmitOutcome::Admitted { .. } => AskLateEnd::Allowed,
-        minimald_rpc::AskAdmitOutcome::Refused {
+        AskOutcome::Admitted { .. } => AskLateEnd::Allowed,
+        AskOutcome::Refused {
             reason: AskRefused::Denied | AskRefused::NoTty,
             ..
         } => AskLateEnd::Denied,
-        minimald_rpc::AskAdmitOutcome::Refused { cause, .. } => AskLateEnd::Cancelled {
+        AskOutcome::Refused { cause, .. } => AskLateEnd::Cancelled {
             cause: cause.unwrap_or(AskCancelCause::RowWithdrawn),
         },
     }
@@ -2240,7 +2257,7 @@ impl AskBook {
     fn end(
         &mut self,
         ask_id: minimald_rpc::AskId,
-        outcome: impl FnOnce(&AskFacts) -> minimald_rpc::AskAdmitOutcome,
+        outcome: impl FnOnce(&AskFacts) -> AskOutcome,
     ) -> Option<AskEnded> {
         let pending = self.pending.remove(&ask_id)?;
         let key = pending.facts.switch_address.octets();
@@ -2326,11 +2343,8 @@ impl AskBook {
 }
 
 /// The cancelled end of `ask_id`, by `cause`.
-fn cancelled(
-    ask_id: minimald_rpc::AskId,
-    cause: minimald_rpc::AskCancelCause,
-) -> minimald_rpc::AskAdmitOutcome {
-    minimald_rpc::AskAdmitOutcome::Refused {
+fn cancelled(ask_id: minimald_rpc::AskId, cause: minimald_rpc::AskCancelCause) -> AskOutcome {
+    AskOutcome::Refused {
         ask_id,
         reason: minimald_rpc::AskRefused::Cancelled,
         cause: Some(cause),
@@ -2388,7 +2402,7 @@ pub(crate) struct AskEnded {
     /// The ended ask's host-sourced facts.
     pub(crate) facts: AskFacts,
     /// The outcome the guest's held reply was answered with.
-    pub(crate) outcome: minimald_rpc::AskAdmitOutcome,
+    pub(crate) outcome: AskOutcome,
     /// How many attached clients the ended dialog was dismissed from.
     pub(crate) dismissed: usize,
     /// The row's next queued ask, offered now that this one ended.
@@ -2417,7 +2431,7 @@ impl BoxRegistry {
         switch_addr: Ipv4Addr,
         port: u16,
         proto: IpProto,
-        reply: std::sync::mpsc::Sender<minimald_rpc::AskAdmitOutcome>,
+        reply: std::sync::mpsc::Sender<AskOutcome>,
     ) -> Result<AskRecorded, AskRecordRefusal> {
         let ask_id = mint_ask_id();
         let refuse = |facts: Option<AskFacts>, reason| AskRecordRefusal {
@@ -2484,7 +2498,7 @@ impl BoxRegistry {
     ///
     /// A yes records the ask's port in the row the table holds now, inside
     /// the grant ([`record_ask_yes`]), and answers the guest's held reply
-    /// [`minimald_rpc::AskAdmitOutcome::Admitted`]: that reply is the one
+    /// [`AskOutcome::Admitted`]: that reply is the one
     /// admit the yes is consumed by. A no and a no-tty record nothing: the
     /// ask leaves the book, and nothing is stored that could later count as
     /// a yes.
@@ -2512,23 +2526,23 @@ impl BoxRegistry {
         }
         book.end(ask_id, |facts| match answer {
             minimald_rpc::AskAnswer::Yes => match record_ask_yes(&rows, facts) {
-                Ok(()) => minimald_rpc::AskAdmitOutcome::Admitted {
+                Ok(()) => AskOutcome::Admitted {
                     ask_id,
                     port: facts.port,
                     proto: facts.proto,
                 },
-                Err(reason) => minimald_rpc::AskAdmitOutcome::Refused {
+                Err(reason) => AskOutcome::Refused {
                     ask_id,
                     reason,
                     cause: None,
                 },
             },
-            minimald_rpc::AskAnswer::No => minimald_rpc::AskAdmitOutcome::Refused {
+            minimald_rpc::AskAnswer::No => AskOutcome::Refused {
                 ask_id,
                 reason: minimald_rpc::AskRefused::Denied,
                 cause: None,
             },
-            minimald_rpc::AskAnswer::NoTty => minimald_rpc::AskAdmitOutcome::Refused {
+            minimald_rpc::AskAnswer::NoTty => AskOutcome::Refused {
                 ask_id,
                 reason: minimald_rpc::AskRefused::NoTty,
                 cause: None,

@@ -356,7 +356,6 @@ pub async fn prepare_attach(
         && crate::host_ip_box_with_vm_host_declaring(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
-            record.policy.egress.clone(),
             record.policy.credentialed_upstream.is_some(),
             crate::HostIpBoxChange::Admit,
         )
@@ -366,7 +365,6 @@ pub async fn prepare_attach(
         crate::host_ip_box_with_vm_host(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
-            None,
             crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
         )
         .await;
@@ -387,7 +385,6 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
         crate::host_ip_box_with_vm_host(
             minimal_client::box_registration::vm_host_control_sock(sock),
             id,
-            None,
             crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
         )
         .await;
@@ -569,7 +566,6 @@ pub async fn activate(
         minimal_client::box_registration::vm_host_control_sock(sock),
         id,
         request.config.network,
-        request.config.policy.egress.as_ref(),
     )
     .await;
 

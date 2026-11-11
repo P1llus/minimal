@@ -213,12 +213,10 @@ pub fn fetch_cached_in(root: &Path, workspace: &Path, lock: &GvproxyLock) -> Pat
 pub fn register_box(
     control_sock: &Path,
     name: &str,
-    egress: Option<boxes::EgressPolicy>,
 ) -> Result<(minimald_rpc::BoxAddresses, minimald_rpc::BoxId), String> {
     let request = minimald_rpc::BoxControlRequest::Register(minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),
         ingress_ports: Vec::new(),
-        egress,
         credentialed_upstream: None,
         dynamic_ingress: None,
         dynamic_allowed_range: None,

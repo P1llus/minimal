@@ -14,8 +14,8 @@ use boxes::core::ingress::{DynamicPortVerdict, IngressRules, ListenVerdict};
 use boxes::{IngressPolicy, IpProto};
 use netpol::{Protocols, base::PortOf};
 
+use super::engine::{Engine, Installed};
 use super::listens::Listeners;
-use super::publish::Admission;
 
 #[derive(Default)]
 struct Open {
@@ -25,6 +25,32 @@ struct Open {
     exposed: BTreeSet<u16>,
     /// Declared ports whose forward was taken away while the box runs.
     revoked: BTreeSet<u16>,
+}
+
+/// The engine's part of a published port.
+pub(crate) trait Admission: Send + Sync {
+    fn admit(&self, port: PortOf) -> Result<(), String>;
+    fn refuse(&self, port: PortOf) -> Result<(), String>;
+}
+
+/// The ingress entries of one box in the engine.
+pub(crate) struct EngineAdmission {
+    pub(crate) engine: &'static Engine,
+    pub(crate) of: Arc<Installed>,
+}
+
+impl Admission for EngineAdmission {
+    fn admit(&self, port: PortOf) -> Result<(), String> {
+        self.engine
+            .publish(&self.of, port)
+            .map_err(|error| error.to_string())
+    }
+
+    fn refuse(&self, port: PortOf) -> Result<(), String> {
+        self.engine
+            .unpublish(&self.of, port)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// The ingress side of one box at one address.

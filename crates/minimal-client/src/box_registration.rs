@@ -406,18 +406,6 @@ pub async fn register_box_with_vm_host(
                  marker for {name:?}; the registration did not happen"
             )
         }
-        minimald_rpc::BoxControlReply::RowStanding { switch_address, .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the row-standing \
-                 read for {switch_address}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::ProxyListening { .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the proxy-listening \
-                 read; the registration did not happen"
-            )
-        }
         minimald_rpc::BoxControlReply::ProxyPorts { .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the hostname proxy's \
@@ -436,22 +424,10 @@ pub async fn register_box_with_vm_host(
                  the registration did not happen"
             )
         }
-        minimald_rpc::BoxControlReply::Audited { .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with an audit report's \
-                 answer; the registration did not happen"
-            )
-        }
         minimald_rpc::BoxControlReply::NameHeld { name, .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the name-hold \
                  marker for {name:?}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::PortRecorded { port, .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the port \
-                 report {port}; the registration did not happen"
             )
         }
         minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
@@ -464,7 +440,6 @@ pub async fn register_box_with_vm_host(
         | minimald_rpc::BoxControlReply::PendingAskOffer(_)
         | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
         | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
-        | minimald_rpc::BoxControlReply::AskAdmit(_)
         | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with an ask \
@@ -772,7 +747,6 @@ async fn register_box_at(
                     .collect()
             })
             .unwrap_or_default(),
-        egress: policy.egress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
         // The dynamic-ingress grant (NET-045, NET-138), from the same
         // create inputs the session record holds: the stance and the range
@@ -1262,7 +1236,6 @@ mod tests {
             let request = minimald_rpc::RegisterBoxRequest {
                 name: "grant".to_string(),
                 ingress_ports: Vec::new(),
-                egress: None,
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,

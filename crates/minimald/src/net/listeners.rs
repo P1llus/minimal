@@ -121,11 +121,12 @@
 //! record in the local audit log ([`crate::audit`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(test)]
 use std::io;
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::LazyLock;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -164,810 +165,6 @@ const WITHDRAW_PASSES: usize = 3;
 /// a refusal that persists is *waited for* — one attempt every half minute,
 /// never one per poll — while never being given up on.
 const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
-
-/// The one deadline every attempt of an *admitted*-port report shares: the
-/// VM host daemon answers a report from memory, so a report that outlives
-/// this is a host that is not answering. The publish waiting on it holds
-/// the session's actor, so the bound covers the attempts as a whole — the
-/// dials, the reply waits and the backoffs between them — and each attempt
-/// gets an equal share of it ([`attempt_deadline`]), so a reply that never
-/// arrives still leaves the later attempts their turn.
-const REPORT_DEADLINE: Duration = Duration::from_secs(10);
-
-/// The one deadline every attempt of a *withdrawn*-port report shares: the
-/// withdrawal is teardown, so it is given up on sooner than a publish. A
-/// sweep that withdraws several ports runs them side by side, so the sweep
-/// as a whole is bounded by this too.
-pub(crate) const WITHDRAW_REPORT_DEADLINE: Duration = Duration::from_secs(5);
-
-/// How many attempts one *admitted*-port report makes when its reply does
-/// not arrive (T94): the host's admit is idempotent per port and protocol —
-/// a reply lost on the shuttle costs nothing but a rate-window entry — so a
-/// lost answer is retried, never re-decided, and the attempts bound how long
-/// a publish whose reply keeps getting lost holds the caller. A report the
-/// host *refused* is answered, not retried: the refusal is the grant's own
-/// decision, and the next attempt would draw the same one.
-const REPORT_ATTEMPTS: usize = 5;
-
-/// The backoff between one report's attempts: the length the marker
-/// channel's retries take — the other control path from inside a microVM
-/// to the VM host daemon — long enough for a shuttle that dropped one reply
-/// to hand back the next, short enough that a publish is not parked behind
-/// it.
-const REPORT_BACKOFF: Duration = Duration::from_millis(100);
-
-/// How many attempts one *withdrawn*-port report makes when its reply does
-/// not arrive: the withdrawal is teardown — the forward is already down, the
-/// gate already refuses the port — so it is tried, waited for, and given up
-/// on faster than a publish would be; a withdrawal the host never recorded
-/// leaves a stale row entry behind, never a live forward.
-const WITHDRAW_REPORT_ATTEMPTS: usize = 3;
-
-/// Where a runtime port report goes when the daemon runs inside a VM (T94,
-/// NET-138): the VM host daemon's report door, over the same host CID the
-/// switch's control channel rides — the two vsock paths reach one host, so
-/// they share one CID, at ports of their own. A native host's control
-/// channel is a local UDS and no VM host daemon sits behind it, so its
-/// report channel is `None` and a runtime publish there stands exactly as
-/// it always did: admitted by the switch alone, reported to nobody.
-#[derive(Debug, Clone)]
-enum BoxReportChannel {
-    /// The VM host daemon's report door at
-    /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`], over the shuttle at the
-    /// host CID the switch's control channel carries.
-    Vsock { cid: u32 },
-    /// A UDS report door — the tests' stand-in for the VM host daemon's
-    /// door, seeded per switch control socket by
-    /// [`seed_vm_report_door_for_tests`].
-    #[cfg(test)]
-    Unix(std::path::PathBuf),
-}
-
-/// The tests' stand-in report doors, keyed by the switch control socket
-/// their session's reports ride: the harness runs on a native-shaped
-/// `ControlChannel::Unix`, which carries no report channel of its own, so a
-/// test that owes a report door seeds one for its switch's control socket
-/// and every report that session makes derives to the seeded door —
-/// consulted on every call, never taken once, so the watcher's repeated
-/// polls reach the stand-in exactly the expose path's own reports do.
-#[cfg(test)]
-static VM_REPORT_SEAM: LazyLock<Mutex<HashMap<std::path::PathBuf, std::path::PathBuf>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Seed a stand-in report door for the session whose switch control socket
-/// is `control_socket` (tests only, T94): the door at `door` answers every
-/// port report that session makes, speaking the VM host daemon's own wire —
-/// one JSON request line in, one JSON reply line back.
-#[cfg(test)]
-pub(crate) fn seed_vm_report_door_for_tests(
-    control_socket: &Path,
-    door: impl Into<std::path::PathBuf>,
-) {
-    VM_REPORT_SEAM
-        .lock()
-        .expect("the vm report seam lock poisoned")
-        .insert(control_socket.to_path_buf(), door.into());
-}
-
-/// Clear the stand-in report door seeded for `control_socket`, so a session
-/// a test has finished with reports nowhere again (tests only).
-#[cfg(test)]
-pub(crate) fn clear_vm_report_door_for_tests(control_socket: &Path) {
-    VM_REPORT_SEAM
-        .lock()
-        .expect("the vm report seam lock poisoned")
-        .remove(control_socket);
-}
-
-/// The report channel a runtime port report rides for the switch at
-/// `control` (T94): the VM host daemon's door over the shuttle a VM host's
-/// control channel carries, or `None` on a native host, whose runtime
-/// publishes were admitted by the switch alone before this channel existed
-/// and still are. Derived per call, so the watcher's every poll and the
-/// expose path's every publish resolve the channel the same way.
-fn box_report_channel(control: &ControlChannel) -> Option<BoxReportChannel> {
-    // The tests' stand-in first: a native-shaped control channel with a
-    // seeded door is a test driving the report channel, and its door
-    // answers reports the way the VM host daemon's own does.
-    #[cfg(test)]
-    if let ControlChannel::Unix(sock) = control {
-        let seam = VM_REPORT_SEAM
-            .lock()
-            .expect("the vm report seam lock poisoned");
-        if let Some(door) = seam.get(sock) {
-            return Some(BoxReportChannel::Unix(door.clone()));
-        }
-    }
-    match control {
-        ControlChannel::Vsock { cid, .. } => Some(BoxReportChannel::Vsock { cid: *cid }),
-        ControlChannel::Unix(_) => None,
-    }
-}
-
-/// One report exchange over the VM host daemon's report door: one JSON
-/// request line in, one JSON reply line back — the door's own protocol, the
-/// same one `minvmd status`'s row read rides on the host's socket.
-///
-/// The write is not followed by a shutdown (G-N8): on the KVM libkrun
-/// `add_vsock_port2(listen=false)` shuttle a close started from either end
-/// drops that end's still-buffered bytes as it propagates, so this side
-/// sends its line and waits for the reply instead of half-closing after the
-/// write — the door holds its end open until *this* side closes, which the
-/// drop at the exchange's end is, after the reply is read.
-async fn report_round<S>(
-    stream: S,
-    request: &minimald_rpc::BoxControlRequest,
-) -> io::Result<minimald_rpc::BoxControlReply>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-    let mut line = serde_json_lenient::to_string(request)
-        .map_err(|error| io::Error::other(format!("the port report did not serialize: {error}")))?;
-    line.push('\n');
-    let mut stream = stream;
-    stream.write_all(line.as_bytes()).await?;
-    let mut reply = String::new();
-    tokio::io::BufReader::new(&mut stream)
-        .read_line(&mut reply)
-        .await?;
-    if reply.trim().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the VM host daemon closed the connection without answering",
-        ));
-    }
-    serde_json_lenient::from_str(reply.trim()).map_err(|error| {
-        io::Error::other(format!("the port report's reply did not parse: {error}"))
-    })
-}
-
-/// One attempt's own bound under a report's shared `deadline`: an equal
-/// share of the `total` across its `attempts`, never past the deadline. A
-/// reply that never arrives — a door that holds the connection without
-/// answering — then costs one share, not the whole budget, so the attempts
-/// after it still run.
-fn attempt_deadline(
-    deadline: tokio::time::Instant,
-    total: Duration,
-    attempts: usize,
-) -> tokio::time::Instant {
-    let share = total / u32::try_from(attempts).unwrap_or(u32::MAX).max(1);
-    deadline.min(tokio::time::Instant::now() + share)
-}
-
-/// One report's dial and exchange, timed out as a whole at `deadline`: a
-/// door that accepts and then stalls must not hang the publish or the
-/// teardown waiting on it. The connection closes from this side when the
-/// round returns — the client-side close G-N8's workaround owns.
-async fn report_exchange(
-    channel: &BoxReportChannel,
-    request: &minimald_rpc::BoxControlRequest,
-    deadline: tokio::time::Instant,
-) -> io::Result<minimald_rpc::BoxControlReply> {
-    tokio::time::timeout_at(deadline, async {
-        match channel {
-            BoxReportChannel::Vsock { cid } => {
-                let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
-                    *cid,
-                    minimald_rpc::VM_HOST_BOX_REPORT_PORT,
-                ))
-                .await?;
-                report_round(stream, request).await
-            }
-            #[cfg(test)]
-            BoxReportChannel::Unix(door) => {
-                let stream = tokio::net::UnixStream::connect(door).await?;
-                report_round(stream, request).await
-            }
-        }
-    })
-    .await
-    .map_err(|_elapsed| {
-        // The elapsed carries no cause of its own to report back: the bound
-        // itself is the failure, and the reason names it.
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the VM host daemon's answer did not arrive before its deadline",
-        )
-    })?
-}
-
-/// Whether a publish over `control` answers to a VM host daemon (T94,
-/// NET-138): the control channel is the VM's host shuttle, so the box's
-/// row and its grant are held outside the VM. A native host answers `false`
-/// and keeps every decision in this daemon, its ask dialog included.
-pub(crate) fn reports_to_vm_host(control: &ControlChannel) -> bool {
-    box_report_channel(control).is_some()
-}
-
-/// Whether the VM host daemon holds a row at `switch_address` (NET-138):
-/// the host's own table, read over the report door before this daemon
-/// relaunches a registered box whose host ended, so the box rejoins the
-/// switch only while the host's row stands for it — through its detach
-/// grace, or once its creator resumed it. `None` when the host could not be
-/// asked: a native host, which holds no rows, or a door that did not answer
-/// within [`REPORT_DEADLINE`] over its attempts. The caller reads `None` as
-/// no row, fail-closed. The host answers for `box_id` alone: a row it
-/// handed another box at the address is not this box's.
-pub(crate) async fn host_row_standing(
-    control: &ControlChannel,
-    switch_address: Ipv4Addr,
-    box_id: minimald_rpc::BoxId,
-) -> Option<bool> {
-    let channel = box_report_channel(control)?;
-    let request = minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
-        switch_address,
-        box_id: Some(box_id),
-    });
-    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-    for attempt in 1..=REPORT_ATTEMPTS {
-        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
-        match report_exchange(&channel, &request, bound).await {
-            Ok(minimald_rpc::BoxControlReply::RowStanding { row_standing, .. }) => {
-                return Some(row_standing);
-            }
-            Ok(other) => {
-                tracing::warn!(
-                    %switch_address,
-                    reply = ?other,
-                    "the VM host daemon answered the row read with another verb's reply"
-                );
-                return None;
-            }
-            Err(error) => {
-                tracing::debug!(%switch_address, attempt, %error, "the row read was not answered");
-            }
-        }
-        if attempt < REPORT_ATTEMPTS {
-            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
-                break;
-            }
-            tokio::time::sleep(REPORT_BACKOFF).await;
-        }
-    }
-    None
-}
-
-/// The id the VM host daemon mints for a box this daemon is about to
-/// create (BOX-002), asked over the report door. `switch_address` is the
-/// address the box's registration handed it, when it has one: the host
-/// answers with the id it minted for that row, so the record and the row
-/// name one id. `None` on a native host, which has no VM host, and where
-/// this daemon's own store mints the id. An error when the door refused
-/// the ask or did not answer within [`REPORT_DEADLINE`] over its attempts:
-/// the caller refuses the create, because no other source may name the
-/// box's id. A row's id goes to one create only. Each call is one create:
-/// it makes one token and sends it on every attempt, so a retry of the same
-/// create after a lost or late reply gets the same id. Another create that
-/// asks for a claimed row is refused, and that create fails closed.
-/// `host_ip_name` is the creation name of a `host_ip` box, which has no
-/// row: the host answers with the id the box's registration minted under
-/// that name (BEP-082), and a fresh id when no registration used it.
-pub(crate) async fn mint_box_id(
-    control: &ControlChannel,
-    switch_address: Option<Ipv4Addr>,
-    host_ip_name: Option<String>,
-) -> Option<io::Result<minimald_rpc::BoxId>> {
-    let channel = box_report_channel(control)?;
-    let request = minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
-        switch_address,
-        create_token: Some(uuid::Uuid::new_v4().simple().to_string()),
-        host_ip_name,
-    });
-    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-    let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
-    for attempt in 1..=REPORT_ATTEMPTS {
-        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
-        match report_exchange(&channel, &request, bound).await {
-            Ok(minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id }) => {
-                return Some(Ok(minted_box_id));
-            }
-            Ok(minimald_rpc::BoxControlReply::Error { error }) => {
-                tracing::warn!(?switch_address, %error, "the VM host daemon refused the box id mint");
-                return Some(Err(io::Error::other(error)));
-            }
-            Ok(other) => {
-                tracing::warn!(
-                    ?switch_address,
-                    reply = ?other,
-                    "the VM host daemon answered the box id mint with another verb's reply"
-                );
-                return Some(Err(io::Error::other(
-                    "the VM host daemon answered with something other than a box id",
-                )));
-            }
-            Err(error) => {
-                tracing::debug!(?switch_address, attempt, %error, "the box id mint was not answered");
-                last = error;
-            }
-        }
-        if attempt < REPORT_ATTEMPTS {
-            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
-                break;
-            }
-            tokio::time::sleep(REPORT_BACKOFF).await;
-        }
-    }
-    // No door, or a door that never answered: the bare `minvmd boot` path
-    // binds none. The caller refuses the create with this text as its
-    // reply, so it names what happened in the words the client reads.
-    tracing::warn!(?switch_address, error = %last, "the box id mint was never answered");
-    // The kind marks "no answer" for the caller, whatever the transport
-    // said. The transport's error goes to the log above, not to the client.
-    Some(Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "it did not answer in time",
-    )))
-}
-
-/// Whether the Box Egress Proxy's listener is live on the host (BEP-062):
-/// asked over the report door the way [`host_row_standing`] asks, because
-/// the proxy runs on the host and its listener state lives in the VM host
-/// daemon. `None` when the host could not be asked: a native host, which
-/// runs no proxy, or a door that did not answer within [`REPORT_DEADLINE`]
-/// over its attempts. The caller reads `None` as not live, so a steered
-/// name fails closed with SERVFAIL.
-pub(crate) async fn proxy_listening(control: &ControlChannel) -> Option<bool> {
-    let channel = box_report_channel(control)?;
-    let request = minimald_rpc::BoxControlRequest::ProxyListening;
-    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-    for attempt in 1..=REPORT_ATTEMPTS {
-        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
-        match report_exchange(&channel, &request, bound).await {
-            Ok(minimald_rpc::BoxControlReply::ProxyListening { listening }) => {
-                return Some(listening);
-            }
-            Ok(other) => {
-                tracing::warn!(
-                    reply = ?other,
-                    "the VM host daemon answered the proxy-listening read with another \
-                     verb's reply"
-                );
-                return None;
-            }
-            Err(error) => {
-                tracing::debug!(attempt, %error, "the proxy-listening read was not answered");
-            }
-        }
-        if attempt < REPORT_ATTEMPTS {
-            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
-                break;
-            }
-            tokio::time::sleep(REPORT_BACKOFF).await;
-        }
-    }
-    None
-}
-
-/// Raise one ask with the VM host daemon (NET-045): an expose decided `ask`
-/// on a VM-backed host is answered by the human attached on the host, not
-/// by a dialog this daemon renders, so the ask crosses the report door as
-/// the row key, the port and the protocol — nothing else, because the guest
-/// can raise a question but neither phrase it nor answer it — and the
-/// door's reply is the ask's end.
-///
-/// The dial is bounded by [`REPORT_DEADLINE`]; the reply is not: no timer
-/// answers an ask, so the connection is held until the host's ask ends by
-/// an answer or a cancellation. Dropping the future closes the connection,
-/// which the host takes as this ask's withdrawal.
-///
-/// # Errors
-///
-/// The door could not be dialled, closed without answering, or answered
-/// with something other than the ask's end; a native host has no door at
-/// all. Each is an ask nobody answered, and the caller fails it closed.
-pub(crate) async fn report_ask(
-    control: &ControlChannel,
-    switch_address: Ipv4Addr,
-    port: u16,
-) -> io::Result<minimald_rpc::AskAdmitOutcome> {
-    let Some(channel) = box_report_channel(control) else {
-        return Err(io::Error::other(
-            "a native host has no VM host daemon to raise an ask with",
-        ));
-    };
-    let request = minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
-        switch_address,
-        port,
-        proto: IpProto::Tcp,
-    });
-    let dial_timeout = |_elapsed| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the port prompt did not get an answer in time",
-        )
-    };
-    let reply = match &channel {
-        BoxReportChannel::Vsock { cid } => {
-            let stream = tokio::time::timeout(
-                REPORT_DEADLINE,
-                tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
-                    *cid,
-                    minimald_rpc::VM_HOST_BOX_REPORT_PORT,
-                )),
-            )
-            .await
-            .map_err(dial_timeout)??;
-            report_round(stream, &request).await?
-        }
-        #[cfg(test)]
-        BoxReportChannel::Unix(door) => {
-            let stream =
-                tokio::time::timeout(REPORT_DEADLINE, tokio::net::UnixStream::connect(door))
-                    .await
-                    .map_err(dial_timeout)??;
-            report_round(stream, &request).await?
-        }
-    };
-    match reply {
-        minimald_rpc::BoxControlReply::AskAdmit(outcome) => Ok(outcome),
-        minimald_rpc::BoxControlReply::Error { error } => Err(io::Error::other(format!(
-            "the port prompt was refused: {error}"
-        ))),
-        other => {
-            // The reply itself goes to the log, not to the person.
-            tracing::warn!(reply = ?other, "the port prompt got an unexpected reply");
-            Err(io::Error::other(
-                "the port prompt got an answer it could not read",
-            ))
-        }
-    }
-}
-
-/// Report one runtime-published port as admitted to the VM host daemon
-/// (T94, NET-138): the publish's host-side half — the grant the box's
-/// registration holds decides the report, and a report it refuses comes
-/// back as [`io::Error`] carrying the grant's own reason, so the publish
-/// that asked it unwinds on the refusal that refused it, with nothing left
-/// standing at either end.
-///
-/// A reply that never arrives is retried within [`REPORT_ATTEMPTS`], all of
-/// them under the one [`REPORT_DEADLINE`]: the host's admit is idempotent,
-/// so a lost reply costs a rate-window entry and nothing else. A transport
-/// failure that outlives the attempts is the report's own refusal shape —
-/// the publish unwinds on it the same way, fail-closed, because a publish
-/// the host never vouched for is not one to leave standing against the
-/// host's grant either. Such a failure is not proof the host never recorded
-/// the port, though — the reply may be the only thing that was lost — so
-/// before it is answered a best-effort withdrawal is reported for the same
-/// port, and a lost reply does not leave a host row naming a port the
-/// unwound publish no longer holds. A refusal needs no withdrawal: the host
-/// answered that it recorded nothing. A native host reports nowhere and
-/// publishes as it always did: [`Ok`] without a round trip.
-pub(crate) async fn report_admitted_port(
-    control: &ControlChannel,
-    switch_address: Ipv4Addr,
-    port: u16,
-    source: minimald_rpc::PortReportSource,
-) -> io::Result<()> {
-    let Some(channel) = box_report_channel(control) else {
-        // A native host has no VM host daemon to report to; the publish
-        // stands admitted by the switch alone, as it always has.
-        return Ok(());
-    };
-    let request = minimald_rpc::BoxControlRequest::AdmitPort(minimald_rpc::AdmitPortRequest {
-        switch_address,
-        port,
-        proto: IpProto::Tcp,
-        source,
-    });
-    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-    let mut unanswered = None;
-    for attempt in 1..=REPORT_ATTEMPTS {
-        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
-        match report_exchange(&channel, &request, bound).await {
-            // Answered, so decided: the recorded port is the grant's own
-            // word that the publish may stand.
-            Ok(minimald_rpc::BoxControlReply::PortRecorded { .. }) => return Ok(()),
-            Ok(minimald_rpc::BoxControlReply::Error { error }) => {
-                // The grant's refusal, not a transport failure to retry —
-                // the next attempt would draw the same refusal, and the
-                // rate window does not need it asked for again.
-                return Err(io::Error::other(format!(
-                    "the request to open the port was refused: {error}"
-                )));
-            }
-            Ok(other) => {
-                // Not the admit's own answer, so not a decision either: the
-                // host's row may or may not name the port, and the unwind
-                // below withdraws it the way a lost reply's does.
-                tracing::warn!(reply = ?other, "the request to open the port got an unexpected reply");
-                unanswered = Some(io::Error::other(
-                    "the request to open the port got an answer it could not read",
-                ));
-                break;
-            }
-            // No reply: a lost answer, retried — the host's admit is
-            // idempotent, so this attempt cost nothing the next cannot pay.
-            Err(error) => unanswered = Some(error),
-        }
-        if attempt < REPORT_ATTEMPTS {
-            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
-                break;
-            }
-            tokio::time::sleep(REPORT_BACKOFF).await;
-        }
-    }
-    let unanswered = unanswered.expect("the loop ran at least once without deciding");
-    // A deadline reads as the request's own words, not the door's.
-    let unanswered = if unanswered.kind() == io::ErrorKind::TimedOut {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the request to open the port did not get an answer in time",
-        )
-    } else {
-        unanswered
-    };
-    // Fail-closed, and clean on the host's side too: the host may have
-    // recorded the port before its reply was lost, so the unwind withdraws
-    // it there — best-effort, because the publish is failing either way and
-    // a withdrawal the door never answers leaves only a stale row entry.
-    if let Err(error) = withdraw_report(&channel, switch_address, port, source).await {
-        tracing::warn!(
-            port,
-            reason = %error,
-            "withdrawing an unconfirmed port report from the VM host daemon \
-             failed; the host's row may still name it"
-        );
-    }
-    Err(unanswered)
-}
-
-/// Report one runtime-published port as withdrawn to the VM host daemon
-/// (T94): the teardown half of the report channel, answering whether the
-/// host's row heard it. The withdrawal itself never fails the caller that
-/// owes it — the forward it reports about is already down and the gate
-/// already refuses the port; what the report carries is the *host's* row,
-/// whose runtime set must stop naming a port nothing publishes any more.
-/// Never refused by the host, so a reply that arrives ends the report
-/// whichever way it is shaped; a reply that never arrives is retried fewer
-/// times than a publish's, all under the one [`WITHDRAW_REPORT_DEADLINE`],
-/// and the [`Err`] a test or a caller reads names what the host's row still
-/// holds.
-pub(crate) async fn report_withdrawn_port(
-    control: &ControlChannel,
-    switch_address: Ipv4Addr,
-    port: u16,
-    source: minimald_rpc::PortReportSource,
-) -> io::Result<()> {
-    let Some(channel) = box_report_channel(control) else {
-        return Ok(());
-    };
-    withdraw_report(&channel, switch_address, port, source).await
-}
-
-/// [`report_withdrawn_port`] for an unwind that has no caller to hand a
-/// failure to: a publish that reported its port and then did not stand
-/// gives the port back at the host, and a withdrawal the door does not
-/// answer is said once here and left as a stale row entry, cleared with the
-/// row at the box's destroy.
-pub(crate) async fn unreport_port(
-    control: &ControlChannel,
-    switch_address: Ipv4Addr,
-    port: u16,
-    source: minimald_rpc::PortReportSource,
-) {
-    if let Err(error) = report_withdrawn_port(control, switch_address, port, source).await {
-        tracing::warn!(
-            port,
-            source = ?source,
-            reason = %error,
-            "withdrawing a port report from the VM host daemon after its publish \
-             unwound failed; the host's row may still name it"
-        );
-    }
-}
-
-/// Where one box's audit reports go (NET-046): the VM host daemon's door,
-/// and the row key the host names the box by. Registered while the box's
-/// listen watcher runs on a VM host ([`register_host_audit_route`]), so a
-/// box with no switch, or a box on a native host, has none and reports
-/// nothing.
-#[derive(Debug, Clone)]
-struct HostAuditRoute {
-    /// The box's name, as the in-VM audit record names it.
-    box_name: String,
-    /// The door the reports go to.
-    channel: BoxReportChannel,
-}
-
-/// The live audit routes, by the box's switch address: the relay's drop
-/// line knows the box by its lease, and the expose decision record by its
-/// name, so both look here.
-static HOST_AUDIT_ROUTES: std::sync::LazyLock<Mutex<HashMap<Ipv4Addr, HostAuditRoute>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// The most audit reports in flight at once. A report past it is not sent
-/// and the in-VM record stays the only one, so a box that refuses frames
-/// in a loop cannot grow the daemon's tasks. The drop line's own rate limit
-/// keeps a box far under it.
-const HOST_AUDIT_IN_FLIGHT: usize = 64;
-
-/// The audit reports in flight now ([`HOST_AUDIT_IN_FLIGHT`]).
-static HOST_AUDIT_SENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Registers where `box_name`'s audit reports go, while its watcher runs:
-/// the VM host daemon's door over `control`, keyed by the box's switch
-/// address. A native host's control channel has no door, so nothing is
-/// registered there.
-fn register_host_audit_route(box_name: &str, switch_address: Ipv4Addr, control: &ControlChannel) {
-    let channel = match control {
-        ControlChannel::Vsock { cid, .. } => BoxReportChannel::Vsock { cid: *cid },
-        ControlChannel::Unix(_) => return,
-    };
-    HOST_AUDIT_ROUTES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            switch_address,
-            HostAuditRoute {
-                box_name: box_name.to_string(),
-                channel,
-            },
-        );
-}
-
-/// Removes the audit route [`register_host_audit_route`] made for the box
-/// at `switch_address`, when it is still that box's.
-fn deregister_host_audit_route(box_name: &str, switch_address: Ipv4Addr) {
-    let mut routes = HOST_AUDIT_ROUTES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if routes
-        .get(&switch_address)
-        .is_some_and(|route| route.box_name == box_name)
-    {
-        routes.remove(&switch_address);
-    }
-}
-
-/// Seeds an audit route for `box_name` at `switch_address` whose reports go
-/// to the stand-in door at `door` (tests only): the harness runs boxes on a
-/// native-shaped switch, which registers no route of its own.
-#[cfg(test)]
-pub(crate) fn seed_host_audit_route_for_tests(
-    box_name: &str,
-    switch_address: Ipv4Addr,
-    door: impl Into<std::path::PathBuf>,
-) {
-    HOST_AUDIT_ROUTES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            switch_address,
-            HostAuditRoute {
-                box_name: box_name.to_string(),
-                channel: BoxReportChannel::Unix(door.into()),
-            },
-        );
-}
-
-/// Removes an audit route a test seeded (tests only).
-#[cfg(test)]
-pub(crate) fn clear_host_audit_route_for_tests(box_name: &str, switch_address: Ipv4Addr) {
-    deregister_host_audit_route(box_name, switch_address);
-}
-
-/// Sends one audit report to the VM host daemon in the background, once,
-/// under [`REPORT_DEADLINE`]. Best-effort: the in-VM record is already
-/// written or already failed on its own, so a host that cannot be reached
-/// costs only the host's copy. A report the host does not take says so in
-/// one debug line.
-fn send_host_audit(channel: BoxReportChannel, request: minimald_rpc::BoxControlRequest) {
-    use std::sync::atomic::Ordering;
-    if HOST_AUDIT_SENDING.fetch_add(1, Ordering::AcqRel) >= HOST_AUDIT_IN_FLIGHT {
-        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
-        tracing::debug!(
-            request = ?request,
-            "too many audit reports are in flight; the host keeps no copy of this one"
-        );
-        return;
-    }
-    // A caller off a runtime (a sync test) has nothing to send on.
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
-        return;
-    };
-    runtime.spawn(async move {
-        let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-        match report_exchange(&channel, &request, deadline).await {
-            Ok(minimald_rpc::BoxControlReply::Audited { .. }) => {}
-            Ok(other) => tracing::debug!(
-                reply = ?other,
-                "the VM host daemon did not take an audit report"
-            ),
-            Err(error) => tracing::debug!(
-                %error,
-                "an audit report did not reach the VM host daemon"
-            ),
-        }
-        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
-    });
-}
-
-/// Reports one dynamic ingress decision to the VM host daemon (NET-046), so
-/// the host keeps its own copy outside the VM. A box with an audit route is
-/// named by its switch address. A box with no route, such as a box with no
-/// switch, is named by `box_id`, and the report goes over the VM host door
-/// of its `control` channel. Nothing is sent on a native host, or when
-/// neither key is known.
-pub(crate) fn report_expose_decision(
-    box_name: &str,
-    box_id: Option<boxes::BoxId>,
-    control: Option<&ControlChannel>,
-    port: u16,
-    decision: boxes::DynamicIngress,
-    decided_by: minimald_rpc::ExposeDecidedBy,
-    outcome: minimald_rpc::ExposeDecisionOutcome,
-) {
-    let route = HOST_AUDIT_ROUTES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|(_, route)| route.box_name == box_name)
-        .map(|(switch_address, route)| (*switch_address, route.channel.clone()));
-    let (switch_address, box_id, channel) = match route {
-        Some((switch_address, channel)) => (Some(switch_address), None, channel),
-        None => {
-            let Some(box_id) = box_id else {
-                return;
-            };
-            let Some(channel) = control.and_then(box_report_channel) else {
-                return;
-            };
-            (None, Some(box_id), channel)
-        }
-    };
-    send_host_audit(
-        channel,
-        minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
-            switch_address,
-            box_id,
-            port,
-            decision,
-            decided_by,
-            outcome,
-        }),
-    );
-}
-
-/// The withdrawal's attempts over a resolved report channel, shared by
-/// [`report_withdrawn_port`] and the unwind of an admit whose reply never
-/// arrived.
-async fn withdraw_report(
-    channel: &BoxReportChannel,
-    switch_address: Ipv4Addr,
-    port: u16,
-    source: minimald_rpc::PortReportSource,
-) -> io::Result<()> {
-    let request =
-        minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
-            switch_address,
-            port,
-            proto: IpProto::Tcp,
-            source,
-        });
-    let deadline = tokio::time::Instant::now() + WITHDRAW_REPORT_DEADLINE;
-    let mut unanswered = None;
-    for attempt in 1..=WITHDRAW_REPORT_ATTEMPTS {
-        let bound = attempt_deadline(deadline, WITHDRAW_REPORT_DEADLINE, WITHDRAW_REPORT_ATTEMPTS);
-        match report_exchange(channel, &request, bound).await {
-            // Answered: the host's withdrawal is never refused, and a row
-            // that held nothing the report named is the report's goal
-            // state — both replies end it.
-            Ok(_) => return Ok(()),
-            Err(error) => unanswered = Some(error),
-        }
-        if attempt < WITHDRAW_REPORT_ATTEMPTS {
-            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
-                break;
-            }
-            tokio::time::sleep(REPORT_BACKOFF).await;
-        }
-    }
-    Err(unanswered.expect("the loop ran at least once without deciding"))
-}
 
 /// Everything a box's listener watcher needs, gathered by the launch that
 /// attached the box: its name (each publication's line names the box), its
@@ -1598,10 +795,6 @@ impl ListenWatcher {
             session = %plan.box_name,
             lease = %plan.lease,
         );
-        // The box's audit reports reach the VM host daemon while the
-        // watcher runs (NET-046), and stop when it ends.
-        register_host_audit_route(&plan.box_name, plan.lease, &plan.control);
-        let route = (plan.box_name.clone(), plan.lease);
         let task = crate::traced::spawn_detached(root, async move {
             let mut state = WatchState::new(plan, source);
             loop {
@@ -1615,7 +808,6 @@ impl ListenWatcher {
             // The stop's own work: everything the box's processes published
             // comes down here, before the stopper's teardown continues.
             state.withdraw_all().await;
-            deregister_host_audit_route(&route.0, route.1);
         });
         Self { stop, task }
     }
@@ -2194,7 +1386,6 @@ impl WatchState {
                                 crate::audit::DecisionOutcome::Published,
                                 None,
                             ),
-                            &crate::audit::HostReportKey::default(),
                         )
                         .await
                         {
@@ -2337,57 +1528,6 @@ impl WatchState {
                         Appearance::Contended
                     }
                     Ok(reservation) => {
-                        // The host-held grant's own say comes first (T94):
-                        // on a VM host the egress gate in front of the
-                        // switch admits a forward only for a port the
-                        // box's host-side row holds, and the report is what
-                        // puts a runtime port in that row — so the port is
-                        // reported before the switch is asked to bind it,
-                        // or the gate refuses the bind it has no record of.
-                        // A report the grant refuses publishes nothing:
-                        // the reservation releases itself, nothing was
-                        // bound, nothing admits at the gate, and the port
-                        // is owed again on the backoff a refused publish
-                        // earns. A native host reports nowhere and
-                        // publishes as it always did.
-                        if let Err(error) = report_admitted_port(
-                            &self.plan.control,
-                            self.plan.lease,
-                            port,
-                            minimald_rpc::PortReportSource::Listen,
-                        )
-                        .await
-                        {
-                            if refusals == 0 {
-                                // One line per streak, naming the refusal's
-                                // reason: the retries the backoff makes are
-                                // the same refusal, waited out.
-                                tracing::warn!(
-                                    session = %self.plan.box_name,
-                                    host = %self.plan.published,
-                                    port,
-                                    verdict = "permitted",
-                                    owner = %PublicationOwner::Listen.as_str(),
-                                    retry_in = ?retry_after(refusals + 1),
-                                    error = %error,
-                                    "the VM host daemon did not admit the \
-                                     listening port's report; the publish unwound"
-                                );
-                            }
-                            drop(reservation);
-                            if refusals == 0 {
-                                // The streak's one decision record (NET-046),
-                                // once the port is free again: the allow
-                                // stood, the publish did not.
-                                self.audit_listen(
-                                    port,
-                                    crate::audit::DecisionOutcome::PublishFailed,
-                                    Some(error.to_string()),
-                                )
-                                .await;
-                            }
-                            return Appearance::Owing;
-                        }
                         // The forward binds before the gate admits — the
                         // order the declaration's own apply holds
                         // (NET-121), so a port is never admitted while
@@ -2450,7 +1590,6 @@ impl WatchState {
                                         crate::audit::DecisionOutcome::Published,
                                         None,
                                     ),
-                                    &crate::audit::HostReportKey::default(),
                                 )
                                 .await
                                 {
@@ -2460,13 +1599,6 @@ impl WatchState {
                                         // revoked arm's unbind is the whole
                                         // unwind.
                                         self.unbind_revoked(port, &mapping).await;
-                                        unreport_port(
-                                            &self.plan.control,
-                                            self.plan.lease,
-                                            port,
-                                            minimald_rpc::PortReportSource::Listen,
-                                        )
-                                        .await;
                                         return Appearance::Settled;
                                     }
                                     self.forwards.insert(port, mapping);
@@ -2493,16 +1625,6 @@ impl WatchState {
                                     // was never listed.
                                     self.plan.gate.withdraw_published(port);
                                     self.unbind_revoked(port, &mapping).await;
-                                    // Unbind first, then withdraw the report:
-                                    // the host's gate retracts a runtime port
-                                    // only while the row still holds it.
-                                    unreport_port(
-                                        &self.plan.control,
-                                        self.plan.lease,
-                                        port,
-                                        minimald_rpc::PortReportSource::Listen,
-                                    )
-                                    .await;
                                     // The allow's `Published` record is
                                     // already written, but the publish never
                                     // stood: the log says so, so it never
@@ -2568,13 +1690,6 @@ impl WatchState {
                                 // retry, publishes it normally. The host's
                                 // row gives the reported port back too.
                                 drop(reservation);
-                                unreport_port(
-                                    &self.plan.control,
-                                    self.plan.lease,
-                                    port,
-                                    minimald_rpc::PortReportSource::Listen,
-                                )
-                                .await;
                                 if refusals == 0 {
                                     // The streak's one decision record
                                     // (NET-046): the allow stood and the bind
@@ -2670,7 +1785,6 @@ impl WatchState {
             &self.listen_record(port, outcome, reason),
             // A watched box reports through the route its watcher
             // registered by switch address, so it needs no box id.
-            &crate::audit::HostReportKey::default(),
         )
         .await;
     }
@@ -2851,33 +1965,6 @@ impl WatchState {
                         from = %self.plan.box_name,
                         action = "shared-address-port-hand-over",
                         "a shared-address port passes to the earliest-created box still publishing it"
-                    );
-                }
-                // The host-held grant's row comes down with it (T94): the
-                // runtime port this publication recorded at the VM host
-                // daemon stops being named by a row whose port nothing
-                // publishes any more. Best-effort, like the unexpose
-                // beside it — the forward is already down and the gate
-                // already refuses the port, so a report the door would not
-                // answer leaves a stale row entry, cleared with the row at
-                // the box's destroy, and is said once here: a native host
-                // reports nowhere and withdraws as it always did.
-                if let Err(error) = report_withdrawn_port(
-                    &self.plan.control,
-                    self.plan.lease,
-                    port,
-                    minimald_rpc::PortReportSource::Listen,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        session = %self.plan.box_name,
-                        host = %self.plan.published,
-                        port,
-                        owner = %PublicationOwner::Listen.as_str(),
-                        error = %error,
-                        "reporting the listening port's withdrawal to the VM host daemon \
-                         failed; the host's row still names it"
                     );
                 }
                 // The withdrawal came down, so the streak of its failures —
@@ -3069,6 +2156,7 @@ fn read_listening(table: &Path, v6: bool, lease: Ipv4Addr) -> io::Result<HashSet
 /// but `TCP_LISTEN` — an established or time-wait socket is a connection,
 /// not a listener — or a listener whose bind the forward's dial cannot
 /// reach, whichever table it is in.
+#[cfg(test)]
 fn listen_port(line: &str, v6: bool, lease: Ipv4Addr) -> Option<u16> {
     let mut fields = line.split_whitespace();
     // `sl:` — the table's index column, always first.
@@ -3102,6 +2190,7 @@ fn listen_port(line: &str, v6: bool, lease: Ipv4Addr) -> Option<u16> {
 /// mapped address (`::ffff:a.b.c.d`) whose v4 part is the any or the lease.
 /// A listener on any other v6 address cannot be reached at the box's IPv4
 /// lease at all.
+#[cfg(test)]
 fn binds_for_the_lease(address: &str, v6: bool, lease: Ipv4Addr) -> bool {
     if !v6 {
         return match v4_word(address) {
@@ -3128,6 +2217,7 @@ fn binds_for_the_lease(address: &str, v6: bool, lease: Ipv4Addr) -> bool {
 /// the table prints each 32-bit word little-endian — `127.0.0.1` reads
 /// `0100007F` — so the eight hex digits are byte-swapped back into network
 /// order. `None` for anything that is not exactly that.
+#[cfg(test)]
 fn v4_word(word: &str) -> Option<Ipv4Addr> {
     if word.len() != 8 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -3135,97 +2225,6 @@ fn v4_word(word: &str) -> Option<Ipv4Addr> {
     u32::from_str_radix(word, 16)
         .ok()
         .map(|word| Ipv4Addr::from(word.swap_bytes()))
-}
-
-/// Whether a process whose cgroup v2 path is `cgroup` (the path after
-/// `0::` in `/proc/<pid>/cgroup`) is in a box cgroup. The daemon's own
-/// cgroup is a sibling of the boxes, so its sockets never match.
-pub(crate) fn in_boxes_subtree(cgroup: &str) -> bool {
-    crate::box_cgroups::in_a_box(cgroup)
-}
-
-/// The TCP ports of the node's own network namespace that a process in the
-/// boxes subtree listens on, read from `proc_root` (`/proc` in the guest):
-/// the listeners of the host-address boxes, which share the node's
-/// namespace (NET-129). A listener counts only when a dial to `lease`, the
-/// node's own address, can reach it ([`binds_for_the_lease`]). A socket
-/// that `own_pid` or any process outside the boxes subtree also holds is
-/// never counted: the in-VM daemon sends no notice for a listener of its
-/// own, even one a box process inherited.
-pub(crate) fn host_address_listening_ports(
-    proc_root: &Path,
-    own_pid: u32,
-    lease: Ipv4Addr,
-) -> io::Result<BTreeSet<u16>> {
-    let mut by_inode: HashMap<u64, u16> = HashMap::new();
-    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
-        let text = match std::fs::read_to_string(proc_root.join(table)) {
-            Ok(text) => text,
-            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for line in text.lines().skip(1) {
-            let inode = line
-                .split_whitespace()
-                .nth(9)
-                .and_then(|word| word.parse().ok());
-            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
-                by_inode.insert(inode, port);
-            }
-        }
-    }
-    // Per listening socket: whether a box process holds it, and whether
-    // anything that is not a box process holds it too.
-    let mut held: HashMap<u64, (bool, bool)> = HashMap::new();
-    for entry in std::fs::read_dir(proc_root)?.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
-            continue;
-        };
-        let inodes: Vec<u64> = fds
-            .flatten()
-            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-            .filter_map(|target| {
-                target
-                    .to_str()?
-                    .strip_prefix("socket:[")?
-                    .strip_suffix(']')?
-                    .parse()
-                    .ok()
-            })
-            .filter(|inode| by_inode.contains_key(inode))
-            .collect();
-        if inodes.is_empty() {
-            continue;
-        }
-        let in_boxes = pid != own_pid
-            && std::fs::read_to_string(entry.path().join("cgroup"))
-                .ok()
-                .and_then(|text| {
-                    text.lines()
-                        .find_map(|line| line.strip_prefix("0::").map(in_boxes_subtree))
-                })
-                .unwrap_or(false);
-        for inode in inodes {
-            let holders = held.entry(inode).or_default();
-            if in_boxes {
-                holders.0 = true;
-            } else {
-                holders.1 = true;
-            }
-        }
-    }
-    Ok(held
-        .into_iter()
-        .filter(|(_, (box_holds, other_holds))| *box_holds && !*other_holds)
-        .filter_map(|(inode, _)| by_inode.get(&inode).copied())
-        .collect())
 }
 
 /// The longest wait before a refused or unanswered listen notice is sent
@@ -3322,95 +2321,46 @@ impl HostAddressListens {
     }
 }
 
-/// Sends the host-address boxes' listen notices to the VM host daemon until
-/// `stop` turns true: every [`LISTEN_POLL_INTERVAL`] it reads
-/// [`host_address_listening_ports`] under `/proc` for `lease`, the node's
-/// own address, and sends one notice per change ([`HostAddressListens`]).
-/// A read that fails is logged and retried on the next poll. A notice the
-/// host refuses or never answers is logged and sent again after its retry
-/// wait. A native host has no report door, so this returns at once.
+/// Tells the VM host which ports of the node's own address the boxes that
+/// share it listen on, and when one stops, until `stop` is set. The VM
+/// host publishes them under those boxes' names.
 pub(crate) async fn watch_host_address_listens(
-    control: ControlChannel,
+    door: Arc<dyn crate::net::door::HostDoor>,
+    source: Arc<dyn Listeners>,
     lease: Ipv4Addr,
     mut stop: watch::Receiver<bool>,
 ) {
-    if box_report_channel(&control).is_none() {
-        return;
-    }
-    let own_pid = std::process::id();
     let mut listens = HostAddressListens::default();
     while !*stop.borrow() {
-        match host_address_listening_ports(Path::new("/proc"), own_pid, lease) {
-            Ok(ports) => {
+        match source.listening() {
+            Ok(listening) => {
+                let ports: BTreeSet<u16> = super::listens::reachable_ports(&listening, lease)
+                    .into_iter()
+                    .collect();
                 for notice in listens.notices(&ports, std::time::Instant::now()) {
-                    let answer = send_listen_notice(&control, notice).await;
-                    let held = matches!(
-                        answer,
-                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. }))
-                    );
-                    match answer {
-                        Ok(Some(minimald_rpc::BoxControlReply::Error { error })) => {
-                            tracing::warn!(
-                                port = notice.port,
-                                state = ?notice.state,
-                                reason = %error,
-                                "the VM host daemon refused a host-address box's listen notice"
-                            );
-                        }
-                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. })) => {
-                            tracing::debug!(
-                                port = notice.port,
-                                state = ?notice.state,
-                                "the VM host daemon holds a host-address box's listen notice"
-                            );
-                        }
-                        Ok(other) => tracing::warn!(
-                            port = notice.port,
-                            state = ?notice.state,
-                            answer = ?other,
-                            "the VM host daemon answered a host-address box's listen notice \
-                             with an unexpected reply"
-                        ),
-                        Err(error) => tracing::warn!(
+                    let answer = door.listen_notice(notice).await;
+                    if let Err(error) = &answer {
+                        tracing::warn!(
                             port = notice.port,
                             state = ?notice.state,
                             reason = %error,
-                            "a host-address box's listen notice got no answer"
-                        ),
+                            "the VM host did not take a listen notice of the node's address"
+                        );
                     }
-                    listens.answered(notice, held, std::time::Instant::now());
+                    listens.answered(notice, answer.is_ok(), std::time::Instant::now());
                 }
             }
             Err(error) => tracing::warn!(
                 reason = %error,
-                "could not read the node's listening sockets for the host-address boxes"
+                "could not read the listening sockets of the boxes at the node's address"
             ),
         }
         tokio::select! {
-            () = tokio::time::sleep(LISTEN_POLL_INTERVAL) => {}
+            () = source.changed() => {}
+            () = tokio::time::sleep(LISTEN_REREAD) => {}
             changed = stop.changed() => if changed.is_err() { return; },
         }
     }
-}
-
-/// Sends one listen notice to the VM host daemon's report door and returns
-/// its answer. A native host has no door: `Ok(None)` without a round trip.
-///
-/// # Errors
-///
-/// The exchange's error when no answer arrived before [`REPORT_DEADLINE`].
-pub(crate) async fn send_listen_notice(
-    control: &ControlChannel,
-    notice: minimald_rpc::ListenNotice,
-) -> io::Result<Option<minimald_rpc::BoxControlReply>> {
-    let Some(channel) = box_report_channel(control) else {
-        return Ok(None);
-    };
-    let request = minimald_rpc::BoxControlRequest::ListenNotice(notice);
-    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-    report_exchange(&channel, &request, deadline)
-        .await
-        .map(Some)
 }
 
 /// The listening sockets this test process holds that a forward to `lease`
@@ -6090,454 +5040,5 @@ mod tests {
 
         watcher.stop().await;
         drop(gvproxy);
-    }
-
-    /// A report door stand-in that answers every withdrawal and either
-    /// refuses each admit (`refuse_admits`) or reads it and hangs up without
-    /// a reply — the lost reply a transport failure is. Every request it
-    /// reads is handed to the test over the returned receiver.
-    async fn admit_failing_door(
-        door: PathBuf,
-        refuse_admits: bool,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
-    ) {
-        use tokio::io::AsyncBufReadExt as _;
-        let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
-        let (seen_tx, seen) = mpsc::unbounded_channel();
-        let task = crate::traced::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (read, mut write) = stream.into_split();
-                let mut line = String::new();
-                if tokio::io::BufReader::new(read)
-                    .read_line(&mut line)
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                let request =
-                    serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim())
-                        .expect("the report door's request line parses");
-                let reply = match &request {
-                    minimald_rpc::BoxControlRequest::AdmitPort(_) if refuse_admits => {
-                        Some(minimald_rpc::BoxControlReply::Error {
-                            error: "the grant does not admit this port".to_string(),
-                        })
-                    }
-                    minimald_rpc::BoxControlRequest::AdmitPort(_) => None,
-                    _ => Some(minimald_rpc::BoxControlReply::PortRecorded {
-                        port: 3000,
-                        proto: IpProto::Tcp,
-                    }),
-                };
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the test may drop its receiver once it has its answer"
-                )]
-                let _ = seen_tx.send(request);
-                if let Some(reply) = reply {
-                    let mut reply_line =
-                        serde_json_lenient::to_string(&reply).expect("the reply serialises");
-                    reply_line.push('\n');
-                    #[expect(
-                        clippy::let_underscore_must_use,
-                        reason = "a reporter that already hung up needs no reply"
-                    )]
-                    let _ = write.write_all(reply_line.as_bytes()).await;
-                }
-            }
-        });
-        (task, seen)
-    }
-
-    /// T94: an admit whose reply never arrives fails the publish closed, and
-    /// before it answers it withdraws the same port at the host — the lost
-    /// reply may have followed a recorded port, and the unwound publish must
-    /// not leave the host's row naming it.
-    /// A door that reads each admit and then holds the connection open
-    /// without answering — the shape a lost reply takes on the KVM shuttle —
-    /// still sees every attempt: each attempt waits out its own share of the
-    /// report's deadline, not the whole of it.
-    #[tokio::test]
-    async fn held_admit_report_is_retried_within_the_deadline() {
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-        let dir = tempfile::tempdir().unwrap();
-        let control_sock = dir.path().join("control.sock");
-        let door = dir.path().join("report-door.sock");
-        let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
-        let (seen_tx, mut seen) = mpsc::unbounded_channel();
-        let task = crate::traced::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                let (read, mut write) = stream.into_split();
-                let mut reader = tokio::io::BufReader::new(read);
-                let mut line = String::new();
-                if reader.read_line(&mut line).await.is_err() {
-                    continue;
-                }
-                let request =
-                    serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim())
-                        .expect("the report door's request line parses");
-                let admit = matches!(request, minimald_rpc::BoxControlRequest::AdmitPort(_));
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the test may drop its receiver once it has its answer"
-                )]
-                let _ = seen_tx.send(request);
-                if admit {
-                    held.push((reader, write));
-                    continue;
-                }
-                let mut reply_line =
-                    serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::PortRecorded {
-                        port: 3000,
-                        proto: IpProto::Tcp,
-                    })
-                    .expect("the reply serialises");
-                reply_line.push('\n');
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the client may already have given up on the reply"
-                )]
-                let _ = write.write_all(reply_line.as_bytes()).await;
-            }
-        });
-        seed_vm_report_door_for_tests(&control_sock, &door);
-
-        let started = std::time::Instant::now();
-        let reported = report_admitted_port(
-            &ControlChannel::Unix(control_sock.clone()),
-            Ipv4Addr::new(100, 64, 128, 22),
-            3000,
-            minimald_rpc::PortReportSource::Listen,
-        )
-        .await;
-        let elapsed = started.elapsed();
-        clear_vm_report_door_for_tests(&control_sock);
-        task.abort();
-
-        assert!(
-            reported.is_err(),
-            "an admit the host never answered fails closed"
-        );
-        let mut admits = 0;
-        while let Ok(request) = seen.try_recv() {
-            if matches!(request, minimald_rpc::BoxControlRequest::AdmitPort(_)) {
-                admits += 1;
-            }
-        }
-        assert_eq!(
-            admits, REPORT_ATTEMPTS,
-            "a held reply is retried within the attempts, not spent on the first"
-        );
-        assert!(
-            elapsed < REPORT_DEADLINE + WITHDRAW_REPORT_DEADLINE,
-            "the attempts stay under the report's deadline: {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unanswered_admit_report_withdraws_before_failing() {
-        let dir = tempfile::tempdir().unwrap();
-        let control_sock = dir.path().join("control.sock");
-        let door = dir.path().join("report-door.sock");
-        let (task, mut seen) = admit_failing_door(door.clone(), false).await;
-        seed_vm_report_door_for_tests(&control_sock, &door);
-        let lease = Ipv4Addr::new(100, 64, 128, 21);
-
-        let reported = report_admitted_port(
-            &ControlChannel::Unix(control_sock.clone()),
-            lease,
-            3000,
-            minimald_rpc::PortReportSource::Listen,
-        )
-        .await;
-        clear_vm_report_door_for_tests(&control_sock);
-        task.abort();
-
-        assert!(
-            reported.is_err(),
-            "an admit the host never answered is not a publish that stands"
-        );
-        let mut requests = Vec::new();
-        while let Ok(request) = seen.try_recv() {
-            requests.push(request);
-        }
-        let (admits, rest): (Vec<_>, Vec<_>) = requests
-            .iter()
-            .partition(|request| matches!(request, minimald_rpc::BoxControlRequest::AdmitPort(_)));
-        assert_eq!(
-            admits.len(),
-            REPORT_ATTEMPTS,
-            "a lost reply is retried within the attempts: {requests:?}"
-        );
-        assert_eq!(
-            rest,
-            vec![&minimald_rpc::BoxControlRequest::WithdrawPort(
-                minimald_rpc::WithdrawPortRequest {
-                    switch_address: lease,
-                    port: 3000,
-                    proto: IpProto::Tcp,
-                    source: minimald_rpc::PortReportSource::Listen,
-                }
-            )],
-            "the unanswered admit withdraws its port once, after the admits: {requests:?}"
-        );
-        assert!(
-            matches!(
-                requests.last(),
-                Some(minimald_rpc::BoxControlRequest::WithdrawPort(_))
-            ),
-            "the withdrawal follows every admit attempt: {requests:?}"
-        );
-    }
-
-    /// T94: an admit the grant refused is the host's answer that it
-    /// recorded nothing, so the failed publish withdraws nothing.
-    #[tokio::test]
-    async fn refused_admit_report_withdraws_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let control_sock = dir.path().join("control.sock");
-        let door = dir.path().join("report-door.sock");
-        let (task, mut seen) = admit_failing_door(door.clone(), true).await;
-        seed_vm_report_door_for_tests(&control_sock, &door);
-
-        let reported = report_admitted_port(
-            &ControlChannel::Unix(control_sock.clone()),
-            Ipv4Addr::new(100, 64, 128, 22),
-            3000,
-            minimald_rpc::PortReportSource::Listen,
-        )
-        .await;
-        clear_vm_report_door_for_tests(&control_sock);
-        task.abort();
-
-        let error = reported.expect_err("a refused admit fails the publish");
-        assert!(
-            error
-                .to_string()
-                .contains("the grant does not admit this port"),
-            "the refusal carries the grant's reason: {error}"
-        );
-        let mut requests = Vec::new();
-        while let Ok(request) = seen.try_recv() {
-            requests.push(request);
-        }
-        assert_eq!(
-            requests.len(),
-            1,
-            "a refusal is answered once and withdraws nothing: {requests:?}"
-        );
-    }
-
-    /// T94: on a VM-backed host the watcher reports a listening port before
-    /// it asks the switch to bind it — the host's egress gate admits a bind
-    /// only for a port the box's row holds — so a report the grant refuses
-    /// asks the switch nothing and admits nothing at the gate.
-    #[tokio::test]
-    async fn a_refused_listen_report_asks_the_switch_nothing() {
-        let listener = listening_socket();
-        let port = port_of(&listener);
-        let dir = tempfile::tempdir().unwrap();
-        let control_sock = dir.path().join("gvproxy.sock");
-        let door = dir.path().join("report-door.sock");
-        let (door_task, mut seen) = admit_failing_door(door.clone(), true).await;
-        seed_vm_report_door_for_tests(&control_sock, &door);
-        let (watcher, gate, server, mut served) = started_watcher(&dir, &permit_policy(port));
-
-        let first = tokio::time::timeout(Duration::from_secs(10), seen.recv())
-            .await
-            .expect("the watcher reports the listening port within the bound")
-            .expect("the report door stand-in lives");
-        assert!(
-            matches!(
-                first,
-                minimald_rpc::BoxControlRequest::AdmitPort(minimald_rpc::AdmitPortRequest {
-                    port: reported,
-                    ..
-                }) if reported == port
-            ),
-            "the watcher's first word is the admit report: {first:?}"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), served.recv())
-                .await
-                .is_err(),
-            "a port the grant refused is never asked of the switch"
-        );
-        assert!(
-            !gate.admits_tcp(port),
-            "a port the grant refused admits nothing at the gate"
-        );
-
-        watcher.stop().await;
-        clear_vm_report_door_for_tests(&control_sock);
-        door_task.abort();
-        server.abort();
-        drop(listener);
-    }
-
-    /// One fake `/proc` entry: `pid` with `cgroup` and fds onto `inodes`.
-    fn fake_process(root: &Path, pid: u32, cgroup: &str, inodes: &[u64]) {
-        let entry = root.join(pid.to_string());
-        std::fs::create_dir_all(entry.join("fd")).expect("a fake fd dir");
-        std::fs::write(entry.join("cgroup"), format!("0::{cgroup}\n")).expect("a fake cgroup");
-        for (n, inode) in inodes.iter().enumerate() {
-            std::os::unix::fs::symlink(
-                format!("socket:[{inode}]"),
-                entry.join("fd").join(n.to_string()),
-            )
-            .expect("a fake socket fd");
-        }
-    }
-
-    /// NET-138: the in-VM daemon notices a listen or a close only for a
-    /// socket a process in a box cgroup holds, and never for a listener of
-    /// its own or one any process outside the boxes holds.
-    #[test]
-    fn listen_notice_only_for_box_cgroup_sockets() {
-        crate::box_cgroups::with_root_name("/minimald.slice", notices_only_for_box_cgroup_sockets);
-    }
-
-    fn notices_only_for_box_cgroup_sockets() {
-        assert!(in_boxes_subtree("/minimald.slice/boxes/web"));
-        assert!(in_boxes_subtree("/minimald.slice/boxes/db\n"));
-        assert!(!in_boxes_subtree("/minimald.slice/supervisor"));
-        assert!(!in_boxes_subtree("/minimald.slice/boxes"));
-        assert!(!in_boxes_subtree("/minimald.slice"));
-        assert!(!in_boxes_subtree("/boxes/web"));
-        assert!(!in_boxes_subtree("/other.slice/minimald.slice/boxes/web"));
-        assert!(!in_boxes_subtree("/"));
-
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("net")).expect("a fake net dir");
-        // Listeners on the any address, ports 0x1F90 (8080), 0x0BB8
-        // (3000), 0x1A0A (6666), 0x1E61 (7777) and 0x08AE (2222); one
-        // established socket on 0x2328 (9000).
-        let row = |sl: u32, port: &str, state: &str, inode: u64| {
-            format!(
-                "{sl:4}: 00000000:{port} 00000000:0000 {state} 00000000:00000000 00:00000000 \
-                 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0"
-            )
-        };
-        let table = [
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode".to_string(),
-            row(0, "1F90", "0A", 101),
-            row(1, "0BB8", "0A", 102),
-            row(2, "1A0A", "0A", 103),
-            row(3, "1E61", "0A", 104),
-            row(4, "08AE", "0A", 105),
-            row(5, "2328", "01", 106),
-        ]
-        .join("\n");
-        std::fs::write(root.join("net/tcp"), table).expect("a fake tcp table");
-        let own_pid = 10;
-        // A box process listens on 8080 and 3000, and holds the established
-        // socket too.
-        fake_process(root, 20, "/minimald.slice/boxes/web", &[101, 102, 106]);
-        // The daemon's own listener, in its own cgroup.
-        fake_process(root, own_pid, "/minimald.slice/supervisor", &[105]);
-        // A box process inherited the daemon's 6666 listener: still the
-        // daemon's own.
-        fake_process(root, 21, "/minimald.slice/boxes/db", &[103]);
-        fake_process(root, own_pid + 1, "/minimald.slice/supervisor", &[103]);
-        // A process outside the minimald tree listens on 7777.
-        fake_process(root, 30, "/init.scope", &[104]);
-
-        let lease = Ipv4Addr::new(192, 168, 127, 2);
-        let ports =
-            host_address_listening_ports(root, own_pid, lease).expect("the fake proc reads");
-        assert_eq!(ports, BTreeSet::from([3000, 8080]));
-
-        let mut listens = HostAddressListens::default();
-        let at = std::time::Instant::now();
-        let notices = listens.notices(&ports, at);
-        assert_eq!(
-            notices,
-            vec![
-                minimald_rpc::ListenNotice {
-                    port: 3000,
-                    state: minimald_rpc::ListenState::Listening
-                },
-                minimald_rpc::ListenNotice {
-                    port: 8080,
-                    state: minimald_rpc::ListenState::Listening
-                },
-            ]
-        );
-        // Only a holding answer commits a port. The host held 3000 and
-        // refused 8080, so 8080 stays owed after its wait.
-        listens.answered(notices[0], true, at);
-        listens.answered(notices[1], false, at);
-        assert!(
-            listens.notices(&ports, at).is_empty(),
-            "a held port owes nothing, and a refused one waits"
-        );
-        assert_eq!(
-            listens.notices(&ports, at + LISTEN_POLL_INTERVAL),
-            vec![notices[1]],
-            "a refused notice is sent again after its wait"
-        );
-        listens.answered(notices[1], true, at + LISTEN_POLL_INTERVAL);
-        assert!(
-            listens
-                .notices(&ports, at + LISTEN_NOTICE_RETRY_MAX)
-                .is_empty(),
-            "an unchanged read owes nothing"
-        );
-        let stop_3000 = minimald_rpc::ListenNotice {
-            port: 3000,
-            state: minimald_rpc::ListenState::Stopped,
-        };
-        assert_eq!(
-            listens.notices(&BTreeSet::from([8080]), at),
-            vec![stop_3000]
-        );
-        // A stopped notice that got no answer stays owed too.
-        listens.answered(stop_3000, false, at);
-        assert!(listens.notices(&BTreeSet::from([8080]), at).is_empty());
-        assert_eq!(
-            listens.notices(&BTreeSet::from([8080]), at + LISTEN_POLL_INTERVAL),
-            vec![stop_3000]
-        );
-        listens.answered(stop_3000, true, at + LISTEN_POLL_INTERVAL);
-        assert!(
-            listens
-                .notices(&BTreeSet::from([8080]), at + LISTEN_NOTICE_RETRY_MAX)
-                .is_empty()
-        );
-        // A port the host refused and that then closes owes a stopped
-        // notice, so the host forgets what it recorded for it, such as a
-        // collision. 8080 is refused again here, then its listener closes.
-        let stop_8080 = minimald_rpc::ListenNotice {
-            port: 8080,
-            state: minimald_rpc::ListenState::Stopped,
-        };
-        let mut refused = HostAddressListens::default();
-        refused.answered(notices[1], false, at);
-        let later = at + LISTEN_NOTICE_RETRY_MAX;
-        assert_eq!(
-            refused.notices(&BTreeSet::new(), later),
-            vec![stop_8080],
-            "a refused port that closes owes a stopped notice"
-        );
-        refused.answered(stop_8080, true, later);
-        assert!(
-            refused.notices(&BTreeSet::new(), later).is_empty(),
-            "a held stopped notice clears the refused port"
-        );
-        // The wire line is the fixed notice: a port and a state alone.
-        let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlRequest::ListenNotice(
-            notices[0],
-        ))
-        .expect("the notice serializes");
-        assert_eq!(
-            line,
-            r#"{"verb":"listen_notice","port":3000,"state":"listening"}"#
-        );
-        assert!(line.len() <= minimald_rpc::ListenNotice::MAX_LINE_BYTES);
     }
 }

@@ -374,12 +374,60 @@ impl Drop for Namespace {
     }
 }
 
+/// The listening sockets of every box in the node's own namespace.
+struct NodeListeners {
+    engine: &'static Engine,
+    table: boxbpf::Listens,
+    netns: u64,
+}
+
+impl super::listens::Listeners for NodeListeners {
+    fn listening(&self) -> std::io::Result<Vec<super::listens::Listener>> {
+        let Some(attached) = self.engine.attached_state() else {
+            return Ok(Vec::new());
+        };
+        let sharing: Vec<BoxId> = attached
+            .boxes
+            .read()
+            .expect("engine lock")
+            .values()
+            .filter(|of| !of.own_namespace)
+            .map(|of| of.id)
+            .collect();
+        let mut all = Vec::new();
+        for id in sharing {
+            let listening = self
+                .table
+                .listening(id, self.netns)
+                .map_err(std::io::Error::other)?;
+            all.extend(
+                listening
+                    .into_iter()
+                    .map(|socket| super::listens::Listener {
+                        address: socket.address,
+                        port: socket.port,
+                    }),
+            );
+        }
+        Ok(all)
+    }
+
+    fn changed(&self) -> futures::future::BoxFuture<'_, ()> {
+        match self.engine.attached_state() {
+            Some(attached) => Box::pin(async move { attached.listen_wake.notified().await }),
+            None => Box::pin(std::future::pending()),
+        }
+    }
+}
+
 struct Attached {
     handles: Mutex<Handles>,
     flows: Flows,
     node: RwLock<Node>,
     boxes: RwLock<HashMap<BoxId, Arc<Installed>>>,
     by_session: RwLock<HashMap<SessionId, BoxId>>,
+    /// Notified when a socket of any box starts or stops listening.
+    listen_wake: Arc<tokio::sync::Notify>,
     allocator: Allocator,
     events: mpsc::Sender<events::Write>,
     /// Taken by [`Engine::start_tasks`].
@@ -402,6 +450,7 @@ impl Attached {
             node: RwLock::new(node),
             boxes: RwLock::default(),
             by_session: RwLock::default(),
+            listen_wake: Arc::default(),
             allocator: Allocator::new(),
             events,
             pending: Mutex::new(Some((source, receiver))),
@@ -681,6 +730,9 @@ impl Engine {
                     // The table is what counts. This only says to read it.
                     if let Some(of) = self.by_cgroup(BoxId(event.box_id)) {
                         of.listen_wake.notify_one();
+                    }
+                    if let Some(attached) = self.attached_state() {
+                        attached.listen_wake.notify_one();
                     }
                     continue;
                 }
@@ -1197,6 +1249,29 @@ impl Engine {
     pub(crate) fn set_node_switch(&self, subnet: switch::SwitchSubnet) {
         if let Some(attached) = self.attached_state() {
             attached.node.write().expect("engine lock").switch = Some(subnet);
+        }
+    }
+
+    /// The listening sockets of the boxes that share the node's network
+    /// namespace, as the engine records them. `None` without an engine.
+    pub(crate) fn node_listeners(&'static self) -> Option<Arc<dyn super::listens::Listeners>> {
+        let attached = self.attached_state()?;
+        let table = attached
+            .handles
+            .lock()
+            .expect("engine lock")
+            .listens()
+            .map_err(std::io::Error::other);
+        match table.and_then(|table| Ok((table, boxbpf::current_netns_cookie()?))) {
+            Ok((table, netns)) => Some(Arc::new(NodeListeners {
+                engine: self,
+                table,
+                netns,
+            })),
+            Err(error) => {
+                tracing::warn!(%error, "the engine's table of listening sockets cannot be read");
+                None
+            }
         }
     }
 

@@ -1343,14 +1343,12 @@ impl BoxLauncher for SandboxLauncher {
                     "built the box's listen plan"
                 );
                 let switch = net_switch.lock().await;
-                let control = match switch.transport() {
-                    crate::net::SwitchTransport::LocalSpawn => {
-                        crate::net::policy::ControlChannel::Unix(switch.control_socket())
-                    }
-                    crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                        crate::net::policy::ControlChannel::Vsock { cid, port }
-                    }
-                };
+                let control = crate::net::policy::ControlChannel::of(
+                    &switch,
+                    own_address
+                        .as_ref()
+                        .map(crate::net::provider::OwnAddressReporter::session_id),
+                );
                 Some(crate::net::listeners::ListenPlan::new(
                     session_label,
                     lease,

@@ -49,8 +49,6 @@ impl BoxMessage {
             #[cfg(test)]
             Self::PeekComposition { .. } => "PeekComposition",
             #[cfg(test)]
-            Self::PeekIngressCells(_) => "PeekIngressCells",
-            #[cfg(test)]
             Self::CheckPackagesAtFinalize(..) => "CheckPackagesAtFinalize",
             #[cfg(test)]
             Self::ForgetComposedGraphNames(_) => "ForgetComposedGraphNames",

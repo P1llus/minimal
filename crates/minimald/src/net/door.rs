@@ -15,8 +15,8 @@ use boxes::BoxId;
 use futures::future::BoxFuture;
 use minimald_rpc::{
     BoxStandingRequest, EndBoxRequest, ForwardState, GuestDoorReply, GuestDoorRequest,
-    PublishOrigin, PublishPortRequest, PublishRefusal, StreamOpen, StreamRefusal, StreamReply,
-    UnpublishPortRequest, VM_HOST_BOX_REPORT_PORT, VM_HOST_STREAM_PORT,
+    ListenNotice, MintBoxIdRequest, PublishOrigin, PublishPortRequest, PublishRefusal, StreamOpen,
+    StreamRefusal, StreamReply, UnpublishPortRequest, VM_HOST_BOX_REPORT_PORT, VM_HOST_STREAM_PORT,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -69,7 +69,7 @@ impl Connect for VmHost {
 
 /// Why a request on the guest door got no result.
 #[derive(Debug)]
-pub(crate) enum DoorError {
+pub enum DoorError {
     /// The VM host was not reached, or its answer was not one the door
     /// gives to this request.
     Unreachable(io::Error),
@@ -99,21 +99,21 @@ impl From<io::Error> for DoorError {
 
 /// A forward the VM host made for a box's port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Forwarded {
+pub struct Forwarded {
     /// Where the host listens.
-    pub(crate) listener: SocketAddrV4,
+    pub listener: SocketAddrV4,
     /// Whether the listener is bound, or waits for another box to end.
-    pub(crate) state: ForwardState,
+    pub state: ForwardState,
 }
 
 /// What the VM host did when it was told that a box has ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoxEnded {
+pub struct BoxEnded {
     /// False when the host held no row for the box.
-    pub(crate) ended: bool,
-    pub(crate) forwards_unbound: u32,
+    pub ended: bool,
+    pub forwards_unbound: u32,
     /// Forwards the host has not unbound yet and keeps trying to.
-    pub(crate) still_bound: u32,
+    pub still_bound: u32,
 }
 
 /// The guest door of the VM host daemon.
@@ -253,6 +253,26 @@ impl<C: Connect> GuestDoor<C> {
         }
     }
 
+    /// Asks the VM host for the id of a box this daemon is about to
+    /// create. A request with the token of an earlier one gets the same id.
+    pub(crate) async fn mint_box_id(&self, request: MintBoxIdRequest) -> Result<BoxId, DoorError> {
+        let request = GuestDoorRequest::MintBoxId(request);
+        match self.ask(&request, Some(ANSWER_LIMIT)).await? {
+            GuestDoorReply::BoxIdMinted { minted_box_id } => Ok(minted_box_id),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Tells the VM host that a port of the node's own address started or
+    /// stopped listening.
+    pub(crate) async fn listen_notice(&self, notice: ListenNotice) -> Result<(), DoorError> {
+        let request = GuestDoorRequest::ListenNotice(notice);
+        match self.ask(&request, Some(ANSWER_LIMIT)).await? {
+            GuestDoorReply::ListenRecorded { port } if port == notice.port => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Whether the VM host holds a row for the box.
     pub(crate) async fn box_standing(&self, box_id: BoxId) -> Result<bool, DoorError> {
         let request = GuestDoorRequest::BoxStanding(BoxStandingRequest { box_id });
@@ -264,6 +284,48 @@ impl<C: Connect> GuestDoor<C> {
             other => Err(unexpected(&other)),
         }
     }
+}
+
+/// The guest door as the code that publishes sees it, so a test can stand
+/// in for the VM host.
+pub trait HostDoor: Send + Sync + std::fmt::Debug {
+    fn publish(&self, request: PublishPortRequest) -> BoxFuture<'_, Result<Forwarded, DoorError>>;
+    fn unpublish(&self, request: UnpublishPortRequest) -> BoxFuture<'_, Result<u32, DoorError>>;
+    fn end_box(&self, box_id: BoxId) -> BoxFuture<'_, BoxEnded>;
+    fn box_standing(&self, box_id: BoxId) -> BoxFuture<'_, Result<bool, DoorError>>;
+    fn mint_box_id(&self, request: MintBoxIdRequest) -> BoxFuture<'_, Result<BoxId, DoorError>>;
+    fn listen_notice(&self, notice: ListenNotice) -> BoxFuture<'_, Result<(), DoorError>>;
+}
+
+impl<C: Connect + std::fmt::Debug> HostDoor for GuestDoor<C> {
+    fn publish(&self, request: PublishPortRequest) -> BoxFuture<'_, Result<Forwarded, DoorError>> {
+        Box::pin(Self::publish(self, request))
+    }
+
+    fn unpublish(&self, request: UnpublishPortRequest) -> BoxFuture<'_, Result<u32, DoorError>> {
+        Box::pin(Self::unpublish(self, request))
+    }
+
+    fn end_box(&self, box_id: BoxId) -> BoxFuture<'_, BoxEnded> {
+        Box::pin(Self::end_box(self, box_id))
+    }
+
+    fn box_standing(&self, box_id: BoxId) -> BoxFuture<'_, Result<bool, DoorError>> {
+        Box::pin(Self::box_standing(self, box_id))
+    }
+
+    fn mint_box_id(&self, request: MintBoxIdRequest) -> BoxFuture<'_, Result<BoxId, DoorError>> {
+        Box::pin(Self::mint_box_id(self, request))
+    }
+
+    fn listen_notice(&self, notice: ListenNotice) -> BoxFuture<'_, Result<(), DoorError>> {
+        Box::pin(Self::listen_notice(self, notice))
+    }
+}
+
+/// The guest door of the VM host this daemon runs under.
+pub(crate) fn of_this_guest() -> Arc<dyn HostDoor> {
+    Arc::new(GuestDoor::new(Arc::new(VmHost::of_this_guest())))
 }
 
 /// Why the stream door opened no stream.

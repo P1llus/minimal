@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 use crate::net::attach::Link;
 use crate::net::engine::{Engine, Installed, Namespace};
 use crate::net::ingress_gate::{self, IngressGate};
+use crate::net::ingress_gate::{Admission, EngineAdmission};
 use crate::net::policy::{ControlChannel, PortForwarder};
-use crate::net::publish::{Admission, EngineAdmission};
 use crate::net::{PtaskLease, SwitchClient};
 
 /// The box a namespace belongs to, as the engine knows it.
@@ -118,6 +118,7 @@ impl OwnIpAttach {
         // A declared port bound for this spawn after its attach, at a
         // shared-address port's hand-over (NET-129), is released with the
         // ones the attach bound.
+        let ends_box = runtime_ingress.is_some();
         if let Some(runtime_ingress) = &runtime_ingress {
             exposed.extend(runtime_ingress.detach_handed());
         }
@@ -146,6 +147,30 @@ impl OwnIpAttach {
         drop(link);
         if let Err(e) = switch.lock().await.detach(lease).await {
             tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
+        }
+        // A task's namespace is not its box's: the box's own launch ends it.
+        if ends_box
+            && let ControlChannel::VmHost {
+                door,
+                box_id: Some(box_id),
+            } = control
+        {
+            // The VM host unbinds the box's forwards on this message only,
+            // so it is told until it answers, whatever becomes of this
+            // launch.
+            crate::traced::spawn_detached(
+                tracing::info_span!(parent: None, "net.end_box", %box_id),
+                async move {
+                    let ended = door.end_box(box_id).await;
+                    tracing::info!(
+                        %box_id,
+                        ended = ended.ended,
+                        forwards_unbound = ended.forwards_unbound,
+                        still_bound = ended.still_bound,
+                        "told the VM host that the box's network is gone"
+                    );
+                },
+            );
         }
     }
 }
@@ -427,7 +452,7 @@ mod tests {
     use crate::net::SwitchTransport;
     use crate::net::attach::Link;
     use crate::net::dns;
-    use crate::net::policy::{ControlChannel, register_dns_name};
+    use crate::net::policy::ControlChannel;
 
     /// A lease at `ip` for an attach whose switch never handed it: epoch 0,
     /// which no allocator hands, so its teardown releases nothing.
@@ -442,187 +467,6 @@ mod tests {
     /// The fake gvproxy's answer for a request it serves happily.
     fn ok() -> (u16, String) {
         (200, String::new())
-    }
-
-    /// Reads one control request off `sock` — its head up to the
-    /// end-of-head marker, then exactly its `Content-Length` body — and
-    /// returns the body bytes. The mirror of `policy::post_json`'s
-    /// keep-alive framing: never read to EOF, which would block on the
-    /// connection the client holds open until it has drained the response.
-    async fn read_request_body(sock: &mut UnixStream) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(512);
-        let mut scratch = [0u8; 512];
-        let head_end = loop {
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) {
-                break i;
-            }
-            let n = sock
-                .read(&mut scratch)
-                .await
-                .expect("the fake gvproxy must receive the control request");
-            assert!(n > 0, "the control client closed before sending its head");
-            buf.extend_from_slice(&scratch[..n]);
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-        let len: usize = head
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())?
-            })
-            .unwrap_or(0);
-        while buf.len() < head_end + len {
-            let n = sock
-                .read(&mut scratch)
-                .await
-                .expect("the fake gvproxy must receive the request body");
-            assert!(n > 0, "the control client closed mid-body");
-            buf.extend_from_slice(&scratch[..n]);
-        }
-        buf[head_end..head_end + len].to_vec()
-    }
-
-    /// Serves a gvproxy-shaped control channel at `path`, answering every
-    /// request with an empty 200 and handing the first `requests` request
-    /// bodies to the returned receiver — the fake forwarder the publishes
-    /// below are driven against, standing in for the one host gvproxy two
-    /// VM daemons on one machine share.
-    fn spawn_control_channel_capturing(path: PathBuf, requests: usize) -> mpsc::Receiver<Vec<u8>> {
-        let listener = UnixListener::bind(&path).unwrap();
-        let (tx, rx) = mpsc::channel(requests);
-        crate::traced::spawn(async move {
-            for _ in 0..requests {
-                let (mut sock, _) = listener
-                    .accept()
-                    .await
-                    .expect("the fake gvproxy must accept every publish");
-                let body = read_request_body(&mut sock).await;
-                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await
-                    .expect("the fake gvproxy must answer 200");
-                tx.send(body)
-                    .await
-                    .expect("the test is still collecting the publish bodies");
-                // `sock` drops here, held open past its response the way the
-                // real forwarder holds the keep-alive exchange; the client
-                // reads its Content-Length and closes first.
-            }
-        });
-        rx
-    }
-
-    /// NET-027's DNS-publish half, observed at the wire a shared gvproxy
-    /// sees: two daemons on one machine — here the shape whose control
-    /// channel is the one host gvproxy both attach to — each publish their
-    /// own `web` box's names exactly the way `finish_own_ip_attach` does
-    /// (`host_ids_for` per daemon: its own id, then the promised `local`),
-    /// both into the *same* zone. What the two daemons put there:
-    ///
-    /// - the instance-scoped records are distinct names, so both daemons'
-    ///   boxes stay resolvable beside each other — the disjoint half of
-    ///   NET-027, the reason the instance label exists;
-    /// - the shared two-label `web` row and the deprecated `web.local` row
-    ///   are the *same names* published twice at different leases — one
-    ///   row each in the one zone, which gvproxy's newest-wins merge (the
-    ///   `DnsZone` doc) resolves whichever daemon registered last. That
-    ///   is the ambiguity across daemons NET-010's host-global allocation
-    ///   is the layer that arbitrates; pinned here as observable fact
-    ///   rather than left unexercised by a test that never looks at the
-    ///   publish path.
-    #[tokio::test]
-    async fn instance_zone_records_stay_distinct_in_one_shared_zone() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sock_path = dir.path().join("gvproxy.sock");
-        let mut bodies_rx = spawn_control_channel_capturing(sock_path.clone(), 4);
-        let control = ControlChannel::Unix(sock_path);
-
-        // Two daemons, two instance ids, each with a `web` box at its own
-        // lease — the collision case a shared two-label name space has.
-        let id_a = "aaaa1";
-        let id_b = "bbbb2";
-        let lease_a = Ipv4Addr::new(100, 64, 1, 5);
-        let lease_b = Ipv4Addr::new(100, 64, 2, 5);
-        for (id, lease) in [(id_a, lease_a), (id_b, lease_b)] {
-            for host_id in dns::host_ids_for(id) {
-                register_dns_name(&control, &host_id, "web", lease)
-                    .await
-                    .expect("the fake gvproxy control channel must accept the publish");
-            }
-        }
-
-        let mut bodies = Vec::with_capacity(4);
-        while let Some(body) = bodies_rx.recv().await {
-            bodies.push(String::from_utf8(body).expect("the zone body is ASCII JSON"));
-        }
-
-        // Two publishes per daemon: its own zone, then `local`, each carrying
-        // every record at that daemon's own lease.
-        let publishes_of = |ip: &str| -> Vec<&String> {
-            bodies
-                .iter()
-                .filter(|body| body.contains(&format!("\"ip\":\"{ip}\"")))
-                .collect()
-        };
-        let publishes_a = publishes_of(&lease_a.to_string());
-        let publishes_b = publishes_of(&lease_b.to_string());
-        assert_eq!(
-            publishes_a.len(),
-            2,
-            "daemon A publishes its own zone and the `local` zone, got: {bodies:?}"
-        );
-        assert_eq!(
-            publishes_b.len(),
-            2,
-            "daemon B publishes its own zone and the `local` zone, got: {bodies:?}"
-        );
-
-        // The instance-scoped records are distinct names — the half of
-        // NET-027 two daemons can rely on: each daemon's zone holds its own
-        // `<name>.<id>` row beside the other daemon's, not over it.
-        let own_a = format!("\"name\":\"web.{id_a}\"");
-        let own_b = format!("\"name\":\"web.{id_b}\"");
-        assert_ne!(own_a, own_b, "two daemon instances mint two host labels");
-        assert!(
-            publishes_a.iter().any(|body| body.contains(&own_a)),
-            "daemon A must publish its instance-scoped record, got: {bodies:?}"
-        );
-        assert!(
-            publishes_b.iter().any(|body| body.contains(&own_b)),
-            "daemon B must publish its instance-scoped record, got: {bodies:?}"
-        );
-
-        // The shared forms are the same row published twice at different
-        // leases — what a shared gvproxy's newest-wins merge resolves
-        // last-writer-wins, the boundary the instance-scoped record draws
-        // and NET-010's allocation arbitrates.
-        for body in &publishes_a {
-            assert!(
-                body.contains(&format!("\"name\":\"web\",\"ip\":\"{}\"", lease_a)),
-                "daemon A's publish carries the shared two-label row at its \
-                 own lease, got: {body}"
-            );
-        }
-        for body in &publishes_b {
-            assert!(
-                body.contains(&format!("\"name\":\"web\",\"ip\":\"{}\"", lease_b)),
-                "daemon B's publish carries the shared two-label row at its \
-                 own lease, got: {body}"
-            );
-        }
-        assert!(
-            publishes_a
-                .iter()
-                .any(|body| body.contains("\"name\":\"web.local\"")),
-            "daemon A publishes the deprecated `local` row, got: {bodies:?}"
-        );
-        assert!(
-            publishes_b
-                .iter()
-                .any(|body| body.contains("\"name\":\"web.local\"")),
-            "daemon B publishes the deprecated `local` row too — the same \
-             shared name both daemons publish, got: {bodies:?}"
-        );
     }
 
     /// A switch whose attach/detach are pure bookkeeping: `HostShuttle`
@@ -1529,155 +1373,6 @@ mod tests {
             vec![format!("{SHARED}:9090")],
             "teardown unbinds only what the attach bound: {unbound:?}"
         );
-        fake.abort();
-    }
-
-    /// NET-129 across a respawn: a shared-address port the box took over
-    /// while it ran is bound for the spawn that was running then. That
-    /// spawn's teardown unbinds it beside the forwards its attach bound, and
-    /// the box's next attach, which now holds the port of record, binds it
-    /// itself and succeeds.
-    #[tokio::test]
-    async fn a_port_taken_over_while_running_comes_down_with_its_spawn_and_binds_at_the_next_attach()
-     {
-        const FIRST_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
-        const SECOND_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
-        const SHARED: Ipv4Addr = Ipv4Addr::LOCALHOST;
-        let dir = tempfile::TempDir::new().unwrap();
-        let scenario = attach_scenario(&dir, "gvproxy.sock");
-        let (events_tx, mut events_rx) = mpsc::channel(64);
-        let (handed_tx, _handed_rx) = mpsc::channel(4);
-        let fake = spawn_control_channel_deciding(
-            scenario.control_path.clone(),
-            |_, _| ok(),
-            events_tx,
-            handed_tx,
-        );
-        let switch = vm_host_switch();
-        let policy = declared_two_ports();
-        let control = ControlChannel::Unix(scenario.control_path.clone());
-        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
-            .expect("a valid id");
-        {
-            let mut reg = scenario.registry.write().expect("registry lock");
-            reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
-            reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
-            reg.publish_own_address(
-                boxes::SessionId::nil(),
-                "web",
-                SHARED,
-                BTreeSet::from([8080, 9090]),
-            );
-            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
-        }
-        // The session actor's cell, shared with every spawn's guard through
-        // the reporter, as the launcher wires it.
-        let runtime = crate::net::provider::RuntimeIngress::default();
-        let reporter = scenario
-            .reporter
-            .clone()
-            .with_runtime_ingress(runtime.clone());
-
-        // First spawn: the box yields 8080, so its attach binds 9090 alone.
-        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
-            &switch,
-            no_link(),
-            control.clone(),
-            lease_at(FIRST_LEASE),
-            crate::net::gvproxy_network::AttachInputs {
-                session_name: "web",
-                policy: Some(&policy),
-                own_address: Some(&reporter),
-                engine_box: None,
-                spawned: &sandbox::Spawned::new(),
-            },
-        )
-        .await
-        .expect("the first spawn attaches");
-        let events = seen_so_far(&mut events_rx);
-        assert_eq!(
-            locals_of(&events, "/services/forwarder/expose"),
-            vec![format!("{SHARED}:9090")],
-            "the yielded port is not asked for at the attach: {events:?}"
-        );
-
-        // The holder is destroyed and the box takes the port over while it
-        // runs: its forward is bound and tracked with the running spawn.
-        let (_, hand_overs) = scenario
-            .registry
-            .write()
-            .expect("registry lock")
-            .unpublish_own_address(holder);
-        assert_eq!(hand_overs.len(), 1, "the box is handed the port");
-        let handed = boxes::PortMapping {
-            external_port: 8080,
-            internal_port: 80,
-            proto: boxes::IpProto::Tcp,
-        };
-        let bind =
-            crate::net::policy::bind_handed_port(&control, SHARED, FIRST_LEASE, &handed, None)
-                .await
-                .expect("the hand-over's bind stands");
-        let crate::net::policy::HandedBind::Bound(forwarder) = bind else {
-            panic!("a native host's switch bound the forward");
-        };
-        let exposed = collect_until(&mut events_rx, "/services/forwarder/expose", 1).await;
-        assert!(
-            exposed
-                .iter()
-                .any(|(_, body)| body.contains(&format!("\"remote\":\"{FIRST_LEASE}:80\""))),
-            "the hand-over's forward delivers to the running spawn's lease: {exposed:?}"
-        );
-        assert!(runtime.record_handed(forwarder).is_ok());
-        assert!(runtime.holds_handed(SHARED, &handed));
-
-        // The spawn ends: its teardown unbinds the handed-over forward with
-        // the one its attach bound.
-        Box::new(guard).teardown().await;
-        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
-        let mut locals = locals_of(&unbound, "/services/forwarder/unexpose");
-        locals.sort();
-        assert_eq!(
-            locals,
-            vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
-            "the spawn's teardown unbinds both forwards: {unbound:?}"
-        );
-        assert!(!runtime.holds_handed(SHARED, &handed));
-        assert!(runtime.is_detached());
-
-        // The next spawn holds the port of record: its attach binds both
-        // ports itself, toward its own lease.
-        let second_tap = no_link();
-        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
-            &switch,
-            second_tap,
-            control.clone(),
-            lease_at(SECOND_LEASE),
-            crate::net::gvproxy_network::AttachInputs {
-                session_name: "web",
-                policy: Some(&policy),
-                own_address: Some(&reporter),
-                engine_box: None,
-                spawned: &sandbox::Spawned::new(),
-            },
-        )
-        .await
-        .expect("the box's next attach succeeds");
-        let reattached = seen_so_far(&mut events_rx);
-        let mut locals = locals_of(&reattached, "/services/forwarder/expose");
-        locals.sort();
-        assert_eq!(
-            locals,
-            vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
-            "the next attach binds the port the box holds now: {reattached:?}"
-        );
-        assert!(
-            reattached
-                .iter()
-                .any(|(_, body)| body.contains(&format!("\"remote\":\"{SECOND_LEASE}:80\""))),
-            "toward the new spawn's lease: {reattached:?}"
-        );
-        Box::new(guard).teardown().await;
         fake.abort();
     }
 

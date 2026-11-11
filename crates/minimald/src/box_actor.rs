@@ -566,17 +566,6 @@ enum BoxMessage {
     /// deterministically here — without disturbing the lifecycle.
     #[cfg(test)]
     PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
-    /// Test-only inspection: clones of the box's shared runtime ingress cell
-    /// and publication set, the two a spawn's end reaches without going
-    /// through this actor — so a test can end the spawn while the actor is
-    /// mid-turn, the way the spawn's guard does in production.
-    #[cfg(test)]
-    PeekIngressCells(
-        oneshot::Sender<(
-            crate::net::provider::RuntimeIngress,
-            crate::net::listeners::BoxPublications,
-        )>,
-    ),
     /// Test-only: turn on the finalize package check that test builds leave
     /// off (see [`BoxActor::check_packages_at_finalize`]), bounded by the
     /// carried deadline — [`PACKAGE_CHECK_DEADLINE`] for the production
@@ -2824,14 +2813,6 @@ impl BoxActor {
                         .map(|ask| (ask.id, ask.port))
                         .collect(),
                 );
-            }
-            #[cfg(test)]
-            BoxMessage::PeekIngressCells(r) => {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the asker may already be gone; there is nothing to answer then"
-                )]
-                let _ = r.send((self.live_ingress.clone(), self.publications.clone()));
             }
             #[cfg(test)]
             BoxMessage::CheckPackagesAtFinalize(deadline, r) => {

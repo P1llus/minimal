@@ -1718,8 +1718,6 @@ async fn start_host_proxies(
                 crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
             ),
         },
-        in_microvm,
-        HostExpose::Shuttle,
         RetryBackoff::production(),
     ));
 
@@ -1783,11 +1781,14 @@ async fn start_host_address_listen_watcher(state: &ServerStateHandle) {
         shutdown.cancelled().await;
         let _ = stop_tx.send(true);
     });
+    // Without an engine no box that shares the node's address runs with a
+    // policy, and nothing records what listens.
+    let Some(listening) = crate::net::engine::Engine::current().node_listeners() else {
+        return;
+    };
     crate::traced::spawn(crate::net::listeners::watch_host_address_listens(
-        crate::net::policy::ControlChannel::Vsock {
-            cid: crate::net::VSOCK_HOST_CID,
-            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-        },
+        crate::net::door::of_this_guest(),
+        listening,
         crate::net::DEFAULT_SUBNET.daemon_ip(),
         stop,
     ));
@@ -1925,36 +1926,6 @@ impl ProxyPort {
     fn reselects_when_busy(self) -> bool {
         matches!(self, Self::DefaultThenSelect { .. })
     }
-
-    /// Whether a refused host-loopback publish may take a host port of its
-    /// own rather than keep proposing the bound one: any port the *guest*
-    /// chose — the OS-selected one, or the documented default nobody
-    /// pinned — is the daemon's to relocate on the host side; a port the
-    /// operator pinned keeps proposing it (the publish retry is the
-    /// remedy, and the report says so). Either way the walk moves the
-    /// publication, never the bind: the listener keeps the port its own
-    /// boxes reach it on.
-    ///
-    /// On a VM boot this is false by construction: minvmd hands each VM
-    /// its own distinct node ports on the boot line
-    /// ([`crate::guest::handed_proxy_port`], and the answerer's beside it),
-    /// the daemon binds them as [`ProxyPort::Pinned`], and each VM's
-    /// publication lands on the host at exactly the number it was handed —
-    /// no two VMs contend for one host port, so the walk never runs on the
-    /// VM path. What the walk covers is boots with no handed port — an
-    /// older minvmd, a native run, a host that handed `0` — where two
-    /// daemons can meet on the one documented default: the first holds it
-    /// on the host loopback and the second's publication lands on the next
-    /// rung beside it, so both VMs on one host publish (NET-059).
-    ///
-    /// "Refused" means the host port was actually taken
-    /// ([`HostPublishFailure::port_taken`]) — a transient failure keeps the
-    /// port and retries, so a daemon that boots before its host gvproxy does
-    /// not move off its default.
-    #[must_use]
-    fn reselects_when_publish_refused(self) -> bool {
-        !matches!(self, Self::Pinned(port) if port != 0)
-    }
 }
 
 /// Which host-side proxy a startup retry drives. The one left differs only in
@@ -2048,13 +2019,7 @@ impl HostProxyStartup {
     /// `source` is who chose the port — the flag, the documented default,
     /// or the OS — which is what the line and the reader of two daemons'
     /// logs want to know (see [`PortSource`]).
-    async fn record_serving(
-        &self,
-        state: &ServerStateHandle,
-        bound_port: u16,
-        source: PortSource,
-        reported_port: u16,
-    ) {
+    async fn record_serving(&self, state: &ServerStateHandle, bound_port: u16, source: PortSource) {
         match self {
             Self::Egress { .. } => {
                 tracing::info!(
@@ -2065,7 +2030,7 @@ impl HostProxyStartup {
                     "hostname proxy is serving on its {} port",
                     source.as_str()
                 );
-                state.set_hostname_proxy_port(reported_port).await;
+                state.set_hostname_proxy_port(bound_port).await;
             }
         }
     }
@@ -2094,8 +2059,6 @@ pub async fn retry_hostname_proxy_until_serving(
             bind_base: addr.ip(),
             port: ProxyPort::Pinned(addr.port()),
         },
-        false,
-        HostExpose::Shuttle,
         retry,
     )
     .await;
@@ -2127,177 +2090,9 @@ pub async fn retry_zone_answerer_until_serving(
         answerer,
         addr.ip(),
         ProxyPort::Pinned(addr.port()),
-        false,
-        HostExpose::Shuttle,
         retry,
     )
     .await;
-}
-
-/// How far apart the host-side ports a VM's proxy publication proposes are.
-/// The bound port is proposed first — a lone VM publishes on the documented
-/// default the host's recipes assume — and each further VM on the host takes
-/// the next rung up, a stride apart, so the rungs stay in the range a reader
-/// of two daemons' logs recognises while it is the forwarder's refusal, not
-/// the stride, that actually keeps two publications distinct: a rung the
-/// host already holds is skipped exactly like the held default.
-#[cfg(target_os = "linux")]
-pub(crate) const HOST_PUBLISH_PORT_STRIDE: u32 = 1_000;
-
-/// The next host-side port the publication may propose after `port` was
-/// refused as taken: one stride further up, or `None` when the walk has no
-/// rung left under [`u16::MAX`] — the caller then keeps the port it has and
-/// lets the retry backoff answer for the failure instead.
-#[cfg(target_os = "linux")]
-#[must_use]
-pub(crate) fn next_host_publish_port(port: u16) -> Option<u16> {
-    u32::from(port)
-        .checked_add(HOST_PUBLISH_PORT_STRIDE)
-        .and_then(|next| u16::try_from(next).ok())
-}
-
-/// The vsock port the guest dials to hand the VM host daemon a report: the
-/// boot-marker channel the `READY` and `MOUNT_FAILED` beacons already travel
-/// — `guest.rs`'s private `BOOT_MARKER_PORT`, pinned here beside its twin
-/// because the channel is the host's to own and the guest's to dial. The
-/// hostname proxy's host-publish outcome rides it (T93): the VM host holds
-/// the port's reservation, so the redraw-or-fail decision is the host's —
-/// but only once it hears the publish failed, which is what this report
-/// is.
-#[cfg(target_os = "linux")]
-const VM_HOST_MARKER_PORT: u32 = 7350;
-
-/// The lines of one publish report: the verb, the port, and — when the boot
-/// line handed one — the boot's publish generation, echoed so the VM host
-/// can tell this boot's report from a killed boot's (T93). Without a
-/// generation the report is the two lines an older host parses.
-#[cfg(target_os = "linux")]
-fn publish_report(verb: &str, port: u16, generation: Option<u64>) -> String {
-    match generation {
-        Some(generation) => format!("{verb}\n{port}\n{generation}\n"),
-        None => format!("{verb}\n{port}\n"),
-    }
-}
-
-/// Writes the `PROXY_SERVING\n<port>\n[<generation>\n]` report to the given
-/// async writer. Factored out of [`report_proxy_serving`] so tests can
-/// exercise the format with an in-memory writer, the twin of guest.rs's
-/// `write_ready_beacon`.
-#[cfg(target_os = "linux")]
-async fn write_proxy_serving_report<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    port: u16,
-    generation: Option<u64>,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-
-    writer
-        .write_all(publish_report("PROXY_SERVING", port, generation).as_bytes())
-        .await
-}
-
-/// Writes the `PROXY_PORT_HELD\n<port>\n[<generation>\n]` report — the
-/// terminal address-in-use failure, naming the host port the host already
-/// held — to the given async writer, factored out for tests like
-/// [`write_proxy_serving_report`].
-#[cfg(target_os = "linux")]
-async fn write_proxy_port_held_report<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    port: u16,
-    generation: Option<u64>,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-
-    writer
-        .write_all(publish_report("PROXY_PORT_HELD", port, generation).as_bytes())
-        .await
-}
-
-/// Hands one publish-outcome report to the VM host daemon over the
-/// boot-marker channel: dials the host (CID 2) on [`VM_HOST_MARKER_PORT`],
-/// writes the payload, and closes. Best-effort on purpose — the host bounds
-/// its own watch and falls back to its own probes when no report arrives,
-/// so a report that cannot be sent never stalls the boot — mirroring
-/// guest.rs's `emit_marker`, with the same short dial retries for a vsock
-/// device that can lag the boot.
-#[cfg(target_os = "linux")]
-async fn report_publish_outcome(payload: &[u8], label: &str) {
-    use tokio::io::AsyncWriteExt;
-    use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
-
-    const MAX_ATTEMPTS: u32 = 5;
-    const BACKOFF: Duration = Duration::from_millis(100);
-
-    let addr = VsockAddr::new(VMADDR_CID_HOST, VM_HOST_MARKER_PORT);
-    for attempt in 1..=MAX_ATTEMPTS {
-        match VsockStream::connect(addr).await {
-            Ok(mut stream) => {
-                if let Err(error) = stream.write_all(payload).await {
-                    tracing::warn!(
-                        attempt,
-                        error = %error,
-                        report = label,
-                        "the publish-outcome report could not be written"
-                    );
-                    return;
-                }
-                // Fully qualified: `VsockStream` also carries an inherent
-                // sync `shutdown(&self, std::net::Shutdown)`, and the trait's
-                // is the half-close the marker channel's reader expects.
-                if let Err(error) = tokio::io::AsyncWriteExt::shutdown(&mut stream).await {
-                    tracing::warn!(
-                        attempt,
-                        error = %error,
-                        report = label,
-                        "the publish-outcome report could not be closed"
-                    );
-                    return;
-                }
-                tracing::info!(
-                    attempt,
-                    report = label,
-                    "handed the hostname proxy's publish outcome to the VM host daemon"
-                );
-                return;
-            }
-            Err(error) => {
-                tracing::debug!(
-                    attempt,
-                    error = %error,
-                    "the boot-marker channel is not up yet; retrying"
-                );
-                tokio::time::sleep(BACKOFF).await;
-            }
-        }
-    }
-    tracing::warn!(
-        report = label,
-        "the publish-outcome report could not be sent: the boot-marker channel never came up"
-    );
-}
-
-/// Reports the hostname proxy's publication landing on `port`: one report
-/// of the port the publication took ends the VM host's publish watch
-/// without waiting out its bound.
-#[cfg(target_os = "linux")]
-async fn report_proxy_serving(port: u16) {
-    let mut payload = Vec::new();
-    let generation = crate::guest::handed_publish_generation();
-    let _ = write_proxy_serving_report(&mut payload, port, generation).await;
-    report_publish_outcome(&payload, "PROXY_SERVING").await;
-}
-
-/// Reports the hostname proxy's publication refused for address-in-use on
-/// `port` — the terminal publish failure (T93): the VM host holds the
-/// reservation, so the redraw-or-fail decision is the host's, and this
-/// report is how it hears the failure instead of watching a retry it cannot
-/// see.
-#[cfg(target_os = "linux")]
-async fn report_proxy_port_held(port: u16) {
-    let mut payload = Vec::new();
-    let generation = crate::guest::handed_publish_generation();
-    let _ = write_proxy_port_held_report(&mut payload, port, generation).await;
-    report_publish_outcome(&payload, "PROXY_PORT_HELD").await;
 }
 
 /// Drives one host-side proxy to serving, retrying with backoff (NET-021).
@@ -2338,8 +2133,6 @@ async fn report_proxy_port_held(port: u16) {
 pub(crate) async fn drive_proxy_until_serving(
     state: ServerStateHandle,
     proxy: HostProxyStartup,
-    publish_on_host: bool,
-    expose: HostExpose,
     retry: RetryBackoff,
 ) {
     let component = proxy.component();
@@ -2348,237 +2141,96 @@ pub(crate) async fn drive_proxy_until_serving(
     // binds can move under the two fallbacks below; the base never does.
     let choice = proxy.port_choice();
     let mut addr = SocketAddr::new(bind_base, choice.first_port());
-    // The port the bind currently asks for: 0 means "OS, pick a free one"
-    // (NET-025). The port the proxy *ended up* on can only be read off the
-    // bound listener, because the chosen one lives there and nowhere else.
-    let mut bound_port = addr.port();
+    // The port the proxy ends up on is read off the bound listener: a
+    // port the OS picked lives there and nowhere else.
+    let bound_port;
     let mut source = PortSource::of(choice);
-    // The host-side port the publication proposes: the port the listener
-    // actually landed on first — a lone VM publishes on the documented
-    // default the host's recipes assume — and, once the host refuses that
-    // one, whatever rung of its own the walk has stepped to. Reset to the
-    // bound port whenever the walk gives up on a pass (see the publish
-    // arm), so the next pass re-proposes the default before its rungs.
-    let mut host_port = bound_port;
-    // The port the publication was accepted on, once it was: the port a
-    // client can reach, which is what the RPC discovery field carries.
-    let mut published_port: Option<u16> = None;
 
-    let mut bound = false;
     let mut attempt: u32 = 0;
     let mut failed_before = false;
     loop {
-        if !bound {
-            // A box that dials this listener is sent to its own endpoint,
-            // and that redirect names the address the listener has. It is
-            // written for every running box before the listener accepts,
-            // so no box reaches it as if it were a host program.
-            let redirect_boxes = |bound: std::net::SocketAddr| {
-                crate::net::engine::Engine::current().set_node_hostname_proxy(vec![bound]);
-            };
-            match crate::net::proxy::bind_listener_after(addr, redirect_boxes).await {
-                Ok(listener) => {
-                    // Auto-selected ports are only discoverable here, off the
-                    // bound socket — and the publish below needs the real one:
-                    // forwarding port 0 forwards nothing.
-                    match listener.local_addr() {
-                        Ok(local) => {
-                            bound_port = local.port();
-                            // The publication proposes the port the listener
-                            // actually landed on, so a relocated bind (a busy
-                            // default, NET-025) publishes what it bound.
-                            host_port = bound_port;
-                            // The serve task runs for the daemon's lifetime;
-                            // its handle is dropped on purpose — nothing ever
-                            // aborts it, because nothing ever rebinds.
-                            drop(proxy.spawn_serve(&state, listener).await);
-                            // No host exposure reaches the proxy itself.
-                            #[cfg(target_os = "linux")]
-                            crate::net::relay::OwnListeners::daemon().hold(bound_port);
-                            bound = true;
-                            if !publish_on_host {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            let report = format!(
-                                "the proxy's listener bound but would not report its address: \
-                                 {error}"
-                            );
-                            let next_retry = retry.delay(attempt);
-                            tracing::warn!(
-                                component,
-                                %addr,
-                                status = "unavailable",
-                                reason = %report,
-                                next_retry = ?next_retry,
-                                "host-side proxy could not bind its listener; retrying with backoff"
-                            );
-                            proxy.record_unavailable(&state, report).await;
-                            failed_before = true;
-                            attempt += 1;
-                            tokio::time::sleep(next_retry).await;
-                            continue;
-                        }
+        // A box that dials this listener is sent to its own endpoint,
+        // and that redirect names the address the listener has. It is
+        // written for every running box before the listener accepts,
+        // so no box reaches it as if it were a host program.
+        let redirect_boxes = |bound: std::net::SocketAddr| {
+            crate::net::engine::Engine::current().set_node_hostname_proxy(vec![bound]);
+        };
+        match crate::net::proxy::bind_listener_after(addr, redirect_boxes).await {
+            Ok(listener) => {
+                match listener.local_addr() {
+                    Ok(local) => {
+                        bound_port = local.port();
+                        // The publication proposes the port the listener
+                        // actually landed on, so a relocated bind (a busy
+                        // default, NET-025) publishes what it bound.
+                        // The serve task runs for the daemon's lifetime;
+                        // its handle is dropped on purpose — nothing ever
+                        // aborts it, because nothing ever rebinds.
+                        drop(proxy.spawn_serve(&state, listener).await);
+                        // No host exposure reaches the proxy itself.
+                        #[cfg(target_os = "linux")]
+                        crate::net::relay::OwnListeners::daemon().hold(bound_port);
+                        break;
                     }
-                }
-                Err(failure) => {
-                    // Nobody pinned a port and the address is *busy*: fall
-                    // back to asking the OS for a free one (NET-025) rather
-                    // than retrying a port some other process owns — the one
-                    // bind failure that relocates. Any other failure (an
-                    // address that cannot be assigned, a permission the
-                    // daemon lacks) keeps its address and retries (NET-021):
-                    // it is not another daemon holding the port, and moving
-                    // the listener would hide the report. The relocation
-                    // is a warning, not an unavailability — the proxy is
-                    // about to come up, one port over.
-                    if choice.reselects_when_busy() && failure.is_addr_in_use() && addr.port() != 0
-                    {
+                    Err(error) => {
+                        let report = format!(
+                            "the proxy's listener bound but would not report its address: \
+                                 {error}"
+                        );
+                        let next_retry = retry.delay(attempt);
                         tracing::warn!(
                             component,
                             %addr,
-                            "the default hostname-proxy port is busy; selecting a free one"
+                            status = "unavailable",
+                            reason = %report,
+                            next_retry = ?next_retry,
+                            "host-side proxy could not bind its listener; retrying with backoff"
                         );
-                        addr = SocketAddr::new(bind_base, 0);
-                        source = PortSource::Selected;
+                        proxy.record_unavailable(&state, report).await;
+                        failed_before = true;
+                        attempt += 1;
+                        tokio::time::sleep(next_retry).await;
                         continue;
                     }
-                    let report = failure.reported();
-                    let next_retry = retry.delay(attempt);
+                }
+            }
+            Err(failure) => {
+                // Nobody pinned a port and the address is *busy*: fall
+                // back to asking the OS for a free one (NET-025) rather
+                // than retrying a port some other process owns — the one
+                // bind failure that relocates. Any other failure (an
+                // address that cannot be assigned, a permission the
+                // daemon lacks) keeps its address and retries (NET-021):
+                // it is not another daemon holding the port, and moving
+                // the listener would hide the report. The relocation
+                // is a warning, not an unavailability — the proxy is
+                // about to come up, one port over.
+                if choice.reselects_when_busy() && failure.is_addr_in_use() && addr.port() != 0 {
                     tracing::warn!(
                         component,
                         %addr,
-                        status = "unavailable",
-                        reason = %report,
-                        next_retry = ?next_retry,
-                        "host-side proxy could not bind its listener; retrying with backoff"
+                        "the default hostname-proxy port is busy; selecting a free one"
                     );
-                    proxy.record_unavailable(&state, report).await;
-                    failed_before = true;
-                    attempt += 1;
-                    tokio::time::sleep(next_retry).await;
+                    addr = SocketAddr::new(bind_base, 0);
+                    source = PortSource::Selected;
                     continue;
                 }
-            }
-        }
-        // Bound and serving. Only the host-loopback publish can still be
-        // pending: a bind success with no publish gate broke out above.
-        if !publish_on_host {
-            break;
-        }
-        match expose
-            .publish(
-                crate::net::DEFAULT_SUBNET.daemon_ip(),
-                bound_port,
-                host_port,
-                "tcp",
-            )
-            .await
-        {
-            None => {
-                // The bundle's answer to "where on the host is this VM's
-                // proxy published" — the diagnostics question two VMs on one
-                // host exist to ask — naming the host port beside the guest
-                // port the serving line below reports.
-                tracing::info!(
-                    component,
-                    host_port,
-                    guest_port = bound_port,
-                    status = "published",
-                    "hostname proxy is published on the host loopback"
-                );
-                published_port = Some(host_port);
-                // The VM host daemon's watch for exactly this moment (T93):
-                // one report of the port the publication landed on ends it
-                // without waiting out the bound. This arm only runs on the
-                // in-VM publish path — a native daemon has no host daemon to
-                // tell. Sent in the background: the report's vsock dial can
-                // take seconds per try, and the drive must record serving
-                // without waiting on it.
-                crate::traced::spawn(report_proxy_serving(host_port));
-                break;
-            }
-            Some(failure) => {
-                // The host already holds this port: publish on a host port
-                // of this VM's own — the next rung up — instead of moving the
-                // listener. The bind is the surface this VM's own boxes reach
-                // on its loopback, at the documented port every recipe
-                // assumes; the publication is the host's surface, and it is
-                // the one two VMs contend for (NET-059). A pinned port has
-                // no rung to walk to: the operator named it, and the retry
-                // with the report is the remedy. A *transient* failure — the
-                // shuttle not up yet at boot, a stalled exchange — keeps the
-                // port it was proposing and retries with the existing
-                // backoff, so a daemon that starts before its host gvproxy
-                // does not move off its default (NET-021, NET-025).
-                let walk = if failure.port_taken && choice.reselects_when_publish_refused() {
-                    next_host_publish_port(host_port)
-                } else {
-                    None
-                };
+                let report = failure.reported();
                 let next_retry = retry.delay(attempt);
-                if let Some(next) = walk {
-                    tracing::warn!(
-                        component,
-                        host_port,
-                        guest_port = bound_port,
-                        status = "relocated",
-                        "the host already holds this port; publishing on a port of its own"
-                    );
-                    host_port = next;
-                    continue;
-                }
-                // The one publish failure that is terminal rather than
-                // retried: inside a microVM, a host port the host already
-                // holds on the port the boot line handed this daemon — a
-                // handed port has no rung of its own — is the VM host's to
-                // answer for, not this daemon's to out-wait. The VM host
-                // holds the reservation and owns the retry (a redraw hands
-                // a fresh port, or the start fails naming this one), and
-                // the report is how it hears the failure. The VM host
-                // daemon then starts the VM with its proxy down and retries
-                // the port itself. `publish_on_host` is the in-VM flag, so
-                // the report has a listener exactly when it is sent; a
-                // native daemon never reaches this arm at all.
-                if publish_on_host && failure.port_taken && !choice.reselects_when_publish_refused()
-                {
-                    tracing::warn!(
-                        component,
-                        host_port,
-                        guest_port = bound_port,
-                        status = "port held",
-                        %failure.report,
-                        "the host holds the hostname proxy's port; reporting the terminal publish failure to the VM host daemon"
-                    );
-                    // The VM host daemon records the cause, naming the
-                    // holder it can see, and its held-port watcher owns the
-                    // retry (NET-021). The guest records none, so its note
-                    // never stands in for that cause. Reported in the
-                    // background: the drive ends here and never waits on the
-                    // report's vsock dial, which can take seconds per try.
-                    crate::traced::spawn(report_proxy_port_held(host_port));
-                    return;
-                }
-                // No rung left to walk to, a pinned port, or a transient
-                // failure: keep the listener where it is, report the failure
-                // on the state note `min ls` warns from, and let the backoff
-                // answer for the retry — the walk starts over from the
-                // bound port on the next pass.
                 tracing::warn!(
                     component,
-                    host_port,
-                    guest_port = bound_port,
+                    %addr,
                     status = "unavailable",
-                    %failure.report,
+                    reason = %report,
                     next_retry = ?next_retry,
-                    "hostname proxy could not publish on the host loopback; retrying with backoff"
+                    "host-side proxy could not bind its listener; retrying with backoff"
                 );
-                proxy.record_unavailable(&state, failure.report).await;
-                host_port = bound_port;
+                proxy.record_unavailable(&state, report).await;
                 failed_before = true;
                 attempt += 1;
                 tokio::time::sleep(next_retry).await;
+                continue;
             }
         }
     }
@@ -2595,10 +2247,7 @@ pub(crate) async fn drive_proxy_until_serving(
     // The port the RPC discovery field carries is the port a client can
     // reach: the bound one, or — on a VM whose publication had to take a
     // host port of its own — the published one.
-    let reported_port = published_port.unwrap_or(bound_port);
-    proxy
-        .record_serving(&state, bound_port, source, reported_port)
-        .await;
+    proxy.record_serving(&state, bound_port, source).await;
 }
 
 /// Drives the box-zone answerer to serving, the same two gates, the same
@@ -2652,115 +2301,62 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     answerer: crate::net::answerer::ZoneAnswerer<T>,
     bind_base: IpAddr,
     port: ProxyPort,
-    publish_on_host: bool,
-    expose: HostExpose,
     retry: RetryBackoff,
 ) {
     const COMPONENT: &str = "zone-answerer";
 
     let mut addr = SocketAddr::new(bind_base, port.first_port());
     let mut source = PortSource::of(port);
-    // The port the socket actually landed on — read off the bound socket, the
-    // only place a chosen one lives — which the publish and the state's
-    // discovery field both need: forwarding port 0 forwards nothing.
-    let mut bound_port = addr.port();
-    // The host-side port the publication proposes: the port the socket
-    // actually landed on first — a lone VM publishes on the documented
-    // default the host's recipes assume — and, once the host refuses that
-    // one, whatever rung of its own the walk has stepped to. Reset to the
-    // bound port whenever the walk gives up on a pass (see the publish arm),
-    // so the next pass re-proposes the default before its rungs.
-    let mut host_port = bound_port;
-    // The port the publication was accepted on, once it was: the port the
-    // host's resolver reaches, which is what the RPC discovery field carries.
-    let mut published_port: Option<u16> = None;
-    let mut bound = false;
+    // The port the socket lands on is read off the bound socket.
+    let bound_port;
 
     let mut attempt: u32 = 0;
     let mut failed_before = false;
     loop {
-        if !bound {
-            match crate::net::answerer::bind_answerer(addr).await {
-                Ok(socket) => match socket.local_addr() {
-                    Ok(local) => {
-                        // Serving from the moment the socket is bound, like
-                        // the proxies: the publish can still retry behind it.
-                        // The serve loop takes a clone; the registry inside is
-                        // the daemon's one either way. The bound port — the
-                        // only place a selected one lives — is what the
-                        // publish below and the state's discovery field need.
-                        bound_port = local.port();
-                        // The publication proposes the port the socket
-                        // actually landed on, so a relocated bind (a busy
-                        // default, NET-025) publishes what it bound.
-                        host_port = bound_port;
-                        let bound_addr = SocketAddr::new(bind_base, bound_port);
-                        tracing::info!(
-                            component = COMPONENT,
-                            %bound_addr,
-                            port = bound_port,
-                            status = "listening",
-                            "box-zone answerer is serving"
-                        );
-                        let serve_answerer = answerer.clone();
-                        // The serve task runs for the daemon's lifetime; its
-                        // handle is dropped on purpose — nothing ever aborts
-                        // it, because nothing ever rebinds: the walk below
-                        // moves the *publication*, never the socket.
-                        drop(crate::traced::spawn(async move {
-                            if let Err(error) =
-                                crate::net::answerer::serve(socket, serve_answerer).await
-                            {
-                                tracing::error!(
-                                    component = COMPONENT,
-                                    %error,
-                                    "box-zone answerer receive loop exited"
-                                );
-                            }
-                        }));
-                        bound = true;
-                        if !publish_on_host {
-                            break;
+        match crate::net::answerer::bind_answerer(addr).await {
+            Ok(socket) => match socket.local_addr() {
+                Ok(local) => {
+                    // Serving from the moment the socket is bound, like
+                    // the proxies: the publish can still retry behind it.
+                    // The serve loop takes a clone; the registry inside is
+                    // the daemon's one either way. The bound port — the
+                    // only place a selected one lives — is what the
+                    // publish below and the state's discovery field need.
+                    bound_port = local.port();
+                    // The publication proposes the port the socket
+                    // actually landed on, so a relocated bind (a busy
+                    // default, NET-025) publishes what it bound.
+                    let bound_addr = SocketAddr::new(bind_base, bound_port);
+                    tracing::info!(
+                        component = COMPONENT,
+                        %bound_addr,
+                        port = bound_port,
+                        status = "listening",
+                        "box-zone answerer is serving"
+                    );
+                    let serve_answerer = answerer.clone();
+                    // The serve task runs for the daemon's lifetime; its
+                    // handle is dropped on purpose — nothing ever aborts
+                    // it, because nothing ever rebinds: the walk below
+                    // moves the *publication*, never the socket.
+                    drop(crate::traced::spawn(async move {
+                        if let Err(error) =
+                            crate::net::answerer::serve(socket, serve_answerer).await
+                        {
+                            tracing::error!(
+                                component = COMPONENT,
+                                %error,
+                                "box-zone answerer receive loop exited"
+                            );
                         }
-                    }
-                    Err(error) => {
-                        let report = format!(
-                            "the answerer's socket bound but would not report its address: \
+                    }));
+                    break;
+                }
+                Err(error) => {
+                    let report = format!(
+                        "the answerer's socket bound but would not report its address: \
                              {error}"
-                        );
-                        let next_retry = retry.delay(attempt);
-                        tracing::warn!(
-                            component = COMPONENT,
-                            %addr,
-                            status = "unavailable",
-                            reason = %report,
-                            next_retry = ?next_retry,
-                            "box-zone answerer could not bind its socket; retrying with backoff"
-                        );
-                        failed_before = true;
-                        attempt += 1;
-                        tokio::time::sleep(next_retry).await;
-                        continue;
-                    }
-                },
-                Err(failure) => {
-                    // Nobody pinned a port and the address is *busy*: fall
-                    // back to asking the OS for a free one (NET-025), the
-                    // same relocation the routing proxies take — and the
-                    // same rule that only a busy address relocates; every
-                    // other bind failure keeps its address and retries
-                    // (NET-021).
-                    if port.reselects_when_busy() && failure.is_addr_in_use() && addr.port() != 0 {
-                        tracing::warn!(
-                            component = COMPONENT,
-                            %addr,
-                            "the default zone-answerer port is busy; selecting a free one"
-                        );
-                        addr = SocketAddr::new(bind_base, 0);
-                        source = PortSource::Selected;
-                        continue;
-                    }
-                    let report = failure.reported();
+                    );
                     let next_retry = retry.delay(attempt);
                     tracing::warn!(
                         component = COMPONENT,
@@ -2775,83 +2371,38 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
                     tokio::time::sleep(next_retry).await;
                     continue;
                 }
-            }
-        }
-        // Bound and serving; only the host-loopback publish can still be
-        // pending (a bind success with no publish gate broke out above).
-        match expose
-            .publish(
-                crate::net::DEFAULT_SUBNET.daemon_ip(),
-                bound_port,
-                host_port,
-                "udp",
-            )
-            .await
-        {
-            None => {
-                // The bundle's answer to "where on the host is this VM's
-                // answerer published" — the same diagnostics question two VMs
-                // on one host ask of the proxy — naming the host port beside
-                // the guest port the serving line below reports.
-                tracing::info!(
-                    component = COMPONENT,
-                    host_port,
-                    guest_port = bound_port,
-                    status = "published",
-                    "box-zone answerer is published on the host loopback"
-                );
-                published_port = Some(host_port);
-                break;
-            }
-            Some(failure) => {
-                // The host already holds this port: publish on a host port of
-                // this VM's own — the next rung up — instead of moving the
-                // socket. The bind is the surface this VM's own boxes query
-                // on its loopback, at the documented port the host's resolver
-                // recipes assume; the publication is the host's surface, and
-                // it is the one two VMs contend for (NET-059): each VM's
-                // answerer serves its zone on a host port of its own, the
-                // same walk the routing proxies take. A pinned port has no
-                // rung to walk to: the operator named it, and the retry with
-                // the report is the remedy. A *transient* failure — the
-                // shuttle not up yet at boot, a stalled exchange — keeps the
-                // port it was proposing and retries with the existing
-                // backoff, so a daemon that starts before its host gvproxy
-                // does not move off its default (NET-021, NET-025).
-                let walk = if failure.port_taken && port.reselects_when_publish_refused() {
-                    next_host_publish_port(host_port)
-                } else {
-                    None
-                };
-                let next_retry = retry.delay(attempt);
-                if let Some(next) = walk {
+            },
+            Err(failure) => {
+                // Nobody pinned a port and the address is *busy*: fall
+                // back to asking the OS for a free one (NET-025), the
+                // same relocation the routing proxies take — and the
+                // same rule that only a busy address relocates; every
+                // other bind failure keeps its address and retries
+                // (NET-021).
+                if port.reselects_when_busy() && failure.is_addr_in_use() && addr.port() != 0 {
                     tracing::warn!(
                         component = COMPONENT,
-                        host_port,
-                        guest_port = bound_port,
-                        status = "relocated",
-                        "the host already holds this port; publishing on a port of its own"
+                        %addr,
+                        "the default zone-answerer port is busy; selecting a free one"
                     );
-                    host_port = next;
+                    addr = SocketAddr::new(bind_base, 0);
+                    source = PortSource::Selected;
                     continue;
                 }
-                // No rung left to walk to, a pinned port, or a transient
-                // failure: keep the socket where it is, report the failure in
-                // the log the host's resolver config is read from, and let the
-                // backoff answer for the retry — the walk starts over from
-                // the bound port on the next pass.
+                let report = failure.reported();
+                let next_retry = retry.delay(attempt);
                 tracing::warn!(
                     component = COMPONENT,
                     %addr,
                     status = "unavailable",
-                    %failure.report,
+                    reason = %report,
                     next_retry = ?next_retry,
-                    "box-zone answerer could not publish on the host loopback; retrying with backoff"
+                    "box-zone answerer could not bind its socket; retrying with backoff"
                 );
-                host_port = bound_port;
                 failed_before = true;
                 attempt += 1;
                 tokio::time::sleep(next_retry).await;
+                continue;
             }
         }
     }
@@ -2872,10 +2423,7 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
         "box-zone answerer is serving on its {} port",
         source.as_str()
     );
-    // The port the RPC discovery field carries is the port the host's
-    // resolver reaches: the bound one, or — on a VM whose publication had to
-    // take a host port of its own (NET-059) — the published one.
-    let reached_port = published_port.unwrap_or(bound_port);
+    let reached_port = bound_port;
     state.set_zone_answerer_port(reached_port).await;
     // NET-018's observability line, at the moment its fact can first be
     // true: the answerer's bind is the daemon's half of the native
@@ -2887,194 +2435,6 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     // host port of its own does not have its log point the host at a port
     // the host never sees.
     crate::rpc::log_live_name_surface(&state, reached_port).await;
-}
-
-/// Upper bound on one host-loopback publish attempt in
-/// [`expose_proxy_on_host`]. Deliberately far below `post_json`'s gvproxy
-/// control timeout: the startup retry's failed attempts must not each cost the
-/// full 5 s before the next try — when the forwarder control path is not
-/// reachable over the shuttle in every deployment, a retry every 5 s would
-/// spend nearly all its time waiting instead of checking. A reachable
-/// forwarder answers in well under this bound.
-#[cfg(target_os = "linux")]
-const HOST_EXPOSE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// A host-loopback publish that did not happen: the reason-and-remedy report
-/// (which the startup retry logs with its next delay and records on the state
-/// note a client prints), plus whether the host-side port was actually
-/// refused — the only publish failure a guest-chosen port's publication
-/// walks from.
-///
-/// Every other cause is *transient* — the shuttle not reachable, the host
-/// forwarder not up yet at boot, an exchange that stalls past its bound — and
-/// keeps the port it has: the retry comes on the same backoff (NET-021), so a
-/// daemon that starts before its host gvproxy does not drift off the default
-/// port nobody configured (NET-025) and stay there until it restarts.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-pub(crate) struct HostPublishFailure {
-    /// The reason and the remedy as one text.
-    report: String,
-    /// Whether the forwarder was reached and refused to take the host-side
-    /// port — on this endpoint, a host port some other process already
-    /// holds — versus a failure that never got an answer from the forwarder.
-    port_taken: bool,
-}
-
-/// Publishes a guest-side listener bound on `daemon_ip:port` — a routing
-/// proxy, or the box-zone answerer (`protocol` says which transport) — onto
-/// the macOS host's loopback (`127.0.0.1:host_port`) via the host gvproxy
-/// forwarder, reached over the vsock shuttle (DM1). Best-effort in that it
-/// never fails the daemon, since the host gvproxy may be absent; capped at
-/// [`HOST_EXPOSE_PUBLISH_TIMEOUT`] per attempt so a stalled forwarder cannot
-/// stretch the retry cadence.
-///
-/// `host_port` is the host-side port the publication proposes — the bound
-/// port's own number while nobody else on the host holds it, and the rung a
-/// refused publication walked to when someone does (NET-059).
-///
-/// Returns `Some(failure)` when the publish did not happen — its `report` is
-/// the reason and remedy as one text, and its `port_taken` says whether the
-/// host port is actually unusable (a taken one is the guest-chosen port's
-/// cue to walk; a transient one keeps the port and retries) — and `None`
-/// once published.
-#[cfg(target_os = "linux")]
-async fn expose_proxy_on_host(
-    daemon_ip: std::net::Ipv4Addr,
-    port: u16,
-    host_port: u16,
-    protocol: &'static str,
-) -> Option<HostPublishFailure> {
-    publish_listener_on_control(
-        &crate::net::policy::ControlChannel::Vsock {
-            cid: crate::net::VSOCK_HOST_CID,
-            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-        },
-        daemon_ip,
-        port,
-        host_port,
-        protocol,
-    )
-    .await
-}
-
-/// [`expose_proxy_on_host`]'s publish, over whichever control channel the
-/// forwarder is reached on: the vsock shuttle from inside a microVM, a unix
-/// control socket on a native host — and, in a test, a stand-in for either.
-/// The control channel is the only thing the
-/// caller picks; the request shape, the bound, the report, and the
-/// taken-versus-transient classification are the same on every channel.
-#[cfg(target_os = "linux")]
-async fn publish_listener_on_control(
-    control: &crate::net::policy::ControlChannel,
-    daemon_ip: std::net::Ipv4Addr,
-    port: u16,
-    host_port: u16,
-    protocol: &'static str,
-) -> Option<HostPublishFailure> {
-    use crate::net::policy::{ExposeRequest, post_json};
-
-    let request = ExposeRequest {
-        local: format!("127.0.0.1:{host_port}"),
-        remote: format!("{daemon_ip}:{port}"),
-        protocol: protocol.to_string(),
-    };
-    match tokio::time::timeout(
-        HOST_EXPOSE_PUBLISH_TIMEOUT,
-        post_json(control, "/services/forwarder/expose", &request),
-    )
-    .await
-    {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => {
-            // The forwarder answered and refused: it could not take the
-            // host-side port (`post_json` folds an HTTP error status into one
-            // io::Error whose text names it), which on this endpoint is a
-            // host port some other process holds. Everything else reaching
-            // this arm — a refused or unreachable shuttle, a socket error —
-            // never got an answer at all, so the port may still be free.
-            let port_taken = error.to_string().contains("returned HTTP");
-            Some(HostPublishFailure {
-                report: format!(
-                    "the daemon could not publish port {host_port} on the host loopback via \
-                     the gvproxy forwarder: {error}. Remedy: check that the host \
-                     gvproxy (minvmd) is running and reachable over the shuttle"
-                ),
-                port_taken,
-            })
-        }
-        Err(_) => Some(HostPublishFailure {
-            report: format!(
-                "publishing port {host_port} on the host loopback did not complete within \
-                 {HOST_EXPOSE_PUBLISH_TIMEOUT:?}. Remedy: check that the host \
-                 gvproxy (minvmd) is running and reachable over the shuttle"
-            ),
-            // A stalled exchange says nothing about the port; it is the
-            // transient case by construction.
-            port_taken: false,
-        }),
-    }
-}
-
-/// The host-loopback publish a startup driver gates its bound listener
-/// behind. Production publishes through the gvproxy forwarder over the
-/// vsock shuttle ([`HostExpose::Shuttle`]); a test stands an answer in
-/// ([`HostExpose::Fixed`], [`HostExpose::HeldPorts`]) so each half of the
-/// publish's failure space — a host port actually taken, which walks to a
-/// port of its own, and a transient failure, which must not — can be
-/// driven deterministically, no host gvproxy required.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-pub(crate) enum HostExpose {
-    /// The daemon's publish: gvproxy's forwarder over the vsock shuttle.
-    Shuttle,
-    /// A test's stand-in that answers `answer` for every attempt.
-    #[cfg(test)]
-    Fixed(Option<HostPublishFailure>),
-    /// A test's stand-in forwarder that behaves like the real one on the one
-    /// axis a port walk depends on: every host port it accepts is held from
-    /// then on, and a later proposal of a held port is refused as taken — so
-    /// two daemons publishing through one ledger cannot land on one host
-    /// port, the contention two VMs put on a host's loopback (NET-059).
-    #[cfg(test)]
-    HeldPorts(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>),
-}
-
-#[cfg(target_os = "linux")]
-impl HostExpose {
-    /// Runs one publish attempt for a listener bound on `daemon_ip:port`,
-    /// proposing `host_port` as the host-side port the forwarder takes —
-    /// the bound port's own number until a refusal walks the host side off
-    /// it.
-    async fn publish(
-        &self,
-        daemon_ip: std::net::Ipv4Addr,
-        port: u16,
-        host_port: u16,
-        protocol: &'static str,
-    ) -> Option<HostPublishFailure> {
-        match self {
-            Self::Shuttle => expose_proxy_on_host(daemon_ip, port, host_port, protocol).await,
-            #[cfg(test)]
-            Self::Fixed(answer) => answer.clone(),
-            #[cfg(test)]
-            Self::HeldPorts(held) => {
-                let mut held = held.lock().expect("the test's ledger is never poisoned");
-                if held.insert(host_port) {
-                    None
-                } else {
-                    Some(HostPublishFailure {
-                        report: format!(
-                            "the gvproxy forwarder could not take 127.0.0.1:{host_port} on \
-                             the host: the port is held by another publication. Remedy: \
-                             let the publication take a port of its own"
-                        ),
-                        port_taken: true,
-                    })
-                }
-            }
-        }
-    }
 }
 
 /// A [`Config`] rooted at `dir` (state and cache both), with an ephemeral host

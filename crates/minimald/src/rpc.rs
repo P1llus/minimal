@@ -513,26 +513,7 @@ async fn serve_create_session(
                         fresh_instance,
                         "session created"
                     );
-                    // NET-123: the session-start loopback probe, before any
-                    // of this session's names publish. Its interim flag on
-                    // the reply is what tells the client to surface the
-                    // naming advisory again (NET-122). On a VM-backed daemon
-                    // the guest's own `lo` always carries the range, so the
-                    // forwarder walks the host's loopback instead, and the
-                    // flag is the host's verdict. NET-018 reads the
-                    // answerer's half straight off the state, not off this
-                    // probe.
-                    #[cfg(target_os = "linux")]
-                    let walked = mngr
-                        .session_start_range_walk()
-                        .await
-                        .map(|answer| session_start_range_walk_line(&id, &answer));
-                    #[cfg(not(target_os = "linux"))]
-                    let walked: Option<bool> = None;
-                    let interim_loopback = match walked {
-                        Some(interim) => interim,
-                        None => session_start_loopback_probe(&id).await.interim(),
-                    };
+                    let interim_loopback = session_start_loopback_probe(&id).await.interim();
                     let hostname_proxy_port = s.hostname_proxy_port().await;
                     let zone_answerer_port = s.zone_answerer_port().await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
@@ -694,40 +675,6 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
         "session-start loopback probe picked the publish surface"
     );
     probe
-}
-
-/// The session-start line of a VM-backed daemon (NET-123): the same record
-/// [`session_start_loopback_probe`] writes, over the forwarder's walk of the
-/// host's loopback, with whether this start walked and how many boxes the
-/// landing moved off the `127.0.0.1` interim. Returns the reply's interim
-/// flag.
-#[cfg(target_os = "linux")]
-fn session_start_range_walk_line(
-    session_id: &SessionId,
-    answer: &crate::box_manager::RangeWalkAnswer,
-) -> bool {
-    let probe = &answer.probe;
-    // A walk that got no answer over a present verdict keeps that verdict,
-    // so the box publishes in the range and the surface is the range's.
-    let interim = probe.interim() && !answer.kept_present;
-    let surface = if answer.kept_present {
-        "reserved-range"
-    } else {
-        probe.surface()
-    };
-    tracing::info!(
-        session_id = %session_id,
-        via = "forwarder",
-        walked = answer.walked,
-        moved_off_interim = answer.moved,
-        verdict_kept = answer.kept_present,
-        probe = %probe.summary(),
-        surface = %surface,
-        first_failure = ?probe.first_failure,
-        interim_loopback = interim,
-        "session-start loopback probe picked the publish surface"
-    );
-    interim
 }
 
 /// How long [`log_live_name_surface`] lets the proxy's driver finish
@@ -998,20 +945,11 @@ async fn serve_answerer_control(
                 | BoxControlRequest::ReleaseBoxName(_)
                 | BoxControlRequest::AdmitHostIpBox(_)
                 | BoxControlRequest::RetireHostIpBox(_)
-                | BoxControlRequest::AdmitPort(_)
-                | BoxControlRequest::WithdrawPort(_)
                 | BoxControlRequest::ReadRow(_)
-                | BoxControlRequest::AdmitAsk(_)
                 | BoxControlRequest::RecordAskAnswer(_)
                 | BoxControlRequest::SubscribeAsks(_)
                 | BoxControlRequest::ResumeBox(_)
-                | BoxControlRequest::RowStanding(_)
-                | BoxControlRequest::ProxyListening
-                | BoxControlRequest::ProxyPorts
-                | BoxControlRequest::MintBoxId(_)
-                | BoxControlRequest::ReportExposeDecision(_)
-                | BoxControlRequest::ReportRefusedEgress(_)
-                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
+                | BoxControlRequest::ProxyPorts => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),

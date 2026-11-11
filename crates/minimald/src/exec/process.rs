@@ -217,18 +217,11 @@ pub(crate) async fn ensure_task_rows_stand(
     record: &boxes::Record,
     switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
 ) -> io::Result<()> {
-    let Some(addresses) = record.box_addresses else {
+    if record.box_addresses.is_none() {
         return Ok(());
-    };
-    let standing = match record.box_id {
-        Some(box_id) => {
-            let control = crate::box_actor::switch_control_of(switch).await;
-            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
-                .await
-                == Some(true)
-        }
-        None => false,
-    };
+    }
+    let control = crate::box_actor::switch_control_of(switch, record.box_id).await;
+    let standing = control.box_standing().await == Some(true);
     if standing {
         Ok(())
     } else {

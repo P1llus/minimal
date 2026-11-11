@@ -736,11 +736,6 @@ pub struct RegisterBoxRequest {
     /// reaches ports without re-parsing declarations.
     #[serde(default)]
     pub ingress_ports: Vec<u16>,
-    /// The box's egress policy, as the client expanded it. Absent means the
-    /// allow-all default — the same meaning the create request's policy
-    /// carries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress: Option<EgressPolicy>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
     /// from the session's policy: `Some` marks the Box Egress Proxy's
     /// listener as the box's infrastructure — the one destination its
@@ -938,29 +933,8 @@ pub struct ResumeBoxRequest {
     pub box_id: Option<BoxId>,
 }
 
-/// The in-VM daemon's read of whether the host still holds a row at its
-/// box's switch address ([`BoxControlRequest::RowStanding`], NET-138):
-/// asked before the daemon relaunches a box's host after the host it ran
-/// ended, so the box rejoins the switch only while the host's row stands
-/// for it. A read, never a report: the answer is the host's own table,
-/// and the request changes nothing in it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RowStandingRequest {
-    /// The switch address the host-side registration handed the box.
-    pub switch_address: std::net::Ipv4Addr,
-    /// The box id the same registration handed back: the row is answered
-    /// as standing only when it is this box's own row. `None`, from a
-    /// record that carries no id, is never answered as standing.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "boxes::box_id_hex::option"
-    )]
-    pub box_id: Option<BoxId>,
-}
-
 /// The in-VM daemon's ask for the id of a box it is about to create
-/// ([`BoxControlRequest::MintBoxId`], BOX-002). The VM host daemon mints
+/// ([`GuestDoorRequest::MintBoxId`], BOX-002). The VM host daemon mints
 /// every box id on an un-enrolled host and hands it to the in-VM daemon,
 /// so the in-VM daemon never mints one and never takes one from its
 /// client. Answered with [`BoxControlReply::BoxIdMinted`].
@@ -1021,11 +995,6 @@ pub struct HoldBoxNameRequest {
 pub struct HostIpBoxRequest {
     /// The session the box runs as.
     pub session_id: boxes::SessionId,
-    /// The box's egress policy, as the session's create declared it.
-    /// Absent is the egress default's to fill, the same meaning the create
-    /// request's policy carries. The host fills it under its own phase.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress: Option<EgressPolicy>,
     /// Whether the box declares a credentialed upstream (BEP-083): `true`
     /// opens the cohort's lane to the Box Egress Proxy's listener while the
     /// box is resident. `false`, the default and what a client that
@@ -1065,76 +1034,6 @@ pub enum HostIpBoxEnd {
     Destroyed,
 }
 
-/// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
-/// NET-138): the fixed fact the host's log line and audit copy name, so a
-/// tail can tell an expose decision from an answered ask from a listen
-/// without parsing the daemon's own logs.
-///
-/// Reported, never trusted: the host records the port only inside the grant
-/// the host-side registration holds ([`RegisterBoxRequest`]), whatever this
-/// says — the source is a label on the report, not a permission.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PortReportSource {
-    /// An `expose` decided allow under a `dynamic_ingress = allow` stance.
-    Expose,
-    /// The attached human answered yes to an ask (NET-045).
-    Ask,
-    /// A listen-publish the box's own watcher made (the permitted-listener
-    /// half of the dynamic stance).
-    Listen,
-}
-
-/// The in-VM daemon's report that one of its boxes published a port at
-/// runtime (NET-138): the fixed, size-bounded message — the row key, the
-/// port, the protocol, and the reporting source, nothing else — the guest
-/// sends the VM host daemon before the publish is reported to the caller.
-///
-/// The row key is the box's **switch address**, the address the host-side
-/// registration handed back: it is the one fact the guest cannot invent a
-/// row with, because no row exists at an address the host did not allocate,
-/// so a report keyed anywhere else is refused as no row's. The port is
-/// checked against the grant the row holds — the box's
-/// `dynamic_ingress` stance and its allowed range, both carried at
-/// registration — and a refusal answers [`BoxControlReply::Error`] naming
-/// why, so the guest's publish unwinds with no partial mapping.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdmitPortRequest {
-    /// The switch address of the row the port belongs to — the row's own
-    /// key, the address the registration handed back.
-    pub switch_address: std::net::Ipv4Addr,
-    /// The runtime-published port the box is admitting.
-    pub port: u16,
-    /// The protocol the port was published under.
-    pub proto: IpProto,
-    /// Which side of the in-VM daemon reported it
-    /// ([`PortReportSource`]): the label the host's log and audit lines
-    /// carry.
-    pub source: PortReportSource,
-}
-
-/// The in-VM daemon's report that one of its boxes stopped publishing a
-/// runtime-admitted port: the withdrawal half of [`AdmitPortRequest`], the
-/// same row key and port, sent when the mapping closes — an unexpose, a
-/// listener's end, or the box's own stop.
-///
-/// A withdrawal is never refused by the cap or the rate the admit path
-/// answers to: removing a fact the row holds is always the row's goal
-/// state, so the host answers [`BoxControlReply::PortRecorded`] whether the
-/// port was held or not.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WithdrawPortRequest {
-    /// The switch address of the row the port belongs to.
-    pub switch_address: std::net::Ipv4Addr,
-    /// The runtime-published port the box withdrew.
-    pub port: u16,
-    /// The protocol the port was published under.
-    pub proto: IpProto,
-    /// Which side of the in-VM daemon reported it
-    /// ([`PortReportSource`]).
-    pub source: PortReportSource,
-}
-
 /// Whether the listener a [`ListenNotice`] names opened or closed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1168,94 +1067,6 @@ impl ListenNotice {
     /// line before the mirror sees it. The line is parsed first, so before
     /// the parse only the box control channel's own line bound applies.
     pub const MAX_LINE_BYTES: usize = 96;
-}
-
-/// Who decided a dynamic ingress request, as the in-VM daemon's expose
-/// decision report names it ([`ExposeDecisionReport`]): the same three
-/// deciders, in the same kebab-case spelling, as the in-VM daemon's own
-/// audit record.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ExposeDecidedBy {
-    /// The box's own `dynamic_ingress` declaration.
-    BoxPolicy,
-    /// The attached human, answering an `ask` (NET-045).
-    AttachedHuman,
-    /// The in-VM daemon, failing an `ask` closed with nobody attached.
-    Daemon,
-}
-
-/// What became of a dynamic ingress request, as the expose decision report
-/// names it ([`ExposeDecisionReport`]).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ExposeDecisionOutcome {
-    /// The port was published.
-    Published,
-    /// The request was refused.
-    Refused,
-    /// The publish could not be made.
-    PublishFailed,
-}
-
-/// The in-VM daemon's report of one dynamic ingress decision (NET-046): the
-/// host keeps a copy of each decision in its own audit log, outside the VM,
-/// so the record survives a box that erases the in-VM log.
-///
-/// Fixed and size-bounded like the port reports: the row key, the port, and
-/// three closed enums. The box is named by the host from the row at
-/// `switch_address`, never by a string the guest sends. A box with no
-/// switch has no row key, so its report carries its box id instead, and
-/// the host names the box from what it holds under that id. A report keyed
-/// at no box the host holds is refused and leaves no record.
-///
-/// Both keys are serde-defaulted, so an older guest's report, which always
-/// carries a switch address and never a box id, still reads.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExposeDecisionReport {
-    /// The switch address of the row the decision is about. `None` for a
-    /// box with no switch, which [`Self::box_id`] names instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub switch_address: Option<std::net::Ipv4Addr>,
-    /// The box the decision is about, by its id. The host reads it only
-    /// when the report carries no switch address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub box_id: Option<BoxId>,
-    /// The port the box asked to publish.
-    pub port: u16,
-    /// The decision the box's `dynamic_ingress` setting made.
-    pub decision: DynamicIngress,
-    /// Who decided it.
-    pub decided_by: ExposeDecidedBy,
-    /// What became of the request.
-    pub outcome: ExposeDecisionOutcome,
-}
-
-/// The longest `proto` or `rule` text a [`RefusedEgressReport`] carries.
-/// The host clamps a longer one, so a report cannot grow the host's log.
-pub const REFUSED_EGRESS_TEXT_MAX: usize = 64;
-
-/// The in-VM daemon's report of one refused own-address egress flow: the
-/// relay dropped a box's frame against its egress rules and said so in its
-/// rate-limited drop line, and the same event is reported to the host,
-/// which appends it to its own audit log outside the VM.
-///
-/// Sent at most once per drop line, so under the same rate limit as that
-/// line and never once per frame. The host caps the records it writes per
-/// box again on its side, whatever the guest sends.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RefusedEgressReport {
-    /// The switch address of the row of the box whose frame was dropped.
-    pub switch_address: std::net::Ipv4Addr,
-    /// The destination the dropped frame was sent to, when it had an IPv4
-    /// destination to read.
-    pub destination: Option<std::net::SocketAddrV4>,
-    /// The frame's protocol as the drop line names it (`tcp`, `udp`,
-    /// `icmp`, `ipv6`, ...), at most [`REFUSED_EGRESS_TEXT_MAX`] bytes.
-    pub proto: String,
-    /// The rule that dropped it, as the drop line names it, at most
-    /// [`REFUSED_EGRESS_TEXT_MAX`] bytes.
-    pub rule: String,
 }
 
 /// The read-only row verb's key: the box's name, the identity a row is
@@ -1294,8 +1105,6 @@ pub struct BoxRow {
     pub box_id: BoxId,
     /// The box's address on the switch: the row's key.
     pub switch_address: std::net::Ipv4Addr,
-    /// The row's derived egress allow-list, as CIDR strings.
-    pub egress_allow_list: Vec<String>,
     /// The external ports the box's ingress declaration admitted, in the
     /// order the registration carried them.
     pub declared_ports: Vec<u16>,
@@ -1395,29 +1204,6 @@ pub enum AskAnswer {
     NoTty,
 }
 
-/// The in-VM daemon's report that one of its boxes' exposes was decided
-/// `ask` (NET-045): the row key, the port and the protocol — nothing
-/// else, the same fixed, size-bounded shape [`AdmitPortRequest`] carries,
-/// and for the same reason: the guest can raise a question but never
-/// answer one, and a name or a prompt string it might have sent is not
-/// something a dialog could trust.
-///
-/// The VM host daemon mints the ask's [`AskId`], offers it to every host
-/// client attached to the row, and holds this request's reply until a
-/// recorded answer resolves it — there is no deadline on either side, so
-/// an ask ends only by an answer or a cancellation, never by a timer
-/// expiring a publish the human never saw.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdmitAskRequest {
-    /// The switch address of the row the ask belongs to — the row's own
-    /// key, the address the registration handed back.
-    pub switch_address: std::net::Ipv4Addr,
-    /// The port the exposure asks to publish.
-    pub port: u16,
-    /// The protocol the port would publish under.
-    pub proto: IpProto,
-}
-
 /// A host client's recorded answer for one pending ask (NET-045): the
 /// offer's [`AskId`] and the answer. Served on the host's control socket
 /// only — the guest door refuses it, because a guest can raise a question
@@ -1497,39 +1283,6 @@ pub enum AskRefused {
     /// guest's connection ended, the last attached client detached, or
     /// the daemon stopped.
     Cancelled,
-}
-
-/// The VM host daemon's answer to the in-VM daemon's ask admit (NET-045):
-/// the outcome of the ask the offered dialog decided, tagged `ask` so the
-/// untagged reply cannot mistake it for any older shape. [`Admitted`]
-/// alone records the port in the row — the one reply a publish may go
-/// ahead on; [`Refused`] names which end the ask met
-/// ([`AskRefused`]), and the guest's publish unwinds with no partial
-/// mapping either way.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "ask", rename_all = "snake_case")]
-pub enum AskAdmitOutcome {
-    /// The attached human answered yes: the port is recorded in the row
-    /// under the ask's id, and this admit — this one — may publish.
-    Admitted {
-        /// The ask that was answered.
-        ask_id: AskId,
-        /// The port the host now holds as runtime-admitted.
-        port: u16,
-        /// The protocol the port was recorded under.
-        proto: IpProto,
-    },
-    /// The ask will not publish: the typed end it met.
-    Refused {
-        /// The ask that met this end.
-        ask_id: AskId,
-        /// Which end the ask met.
-        reason: AskRefused,
-        /// What cancelled the ask, for a [`AskRefused::Cancelled`] end;
-        /// absent for every other end.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<AskCancelCause>,
-    },
 }
 
 /// What cancelled a pending ask (NET-045): the four ends an ask meets with
@@ -1746,6 +1499,11 @@ pub enum GuestDoorRequest {
     EndBox(EndBoxRequest),
     /// Does the host hold a row for the box?
     BoxStanding(BoxStandingRequest),
+    /// The id of the box the guest daemon is about to create.
+    MintBoxId(MintBoxIdRequest),
+    /// A process in a `host_ip` box started or stopped listening on a
+    /// port of the guest node.
+    ListenNotice(ListenNotice),
 }
 
 /// One reply line on the guest door.
@@ -1792,6 +1550,13 @@ pub enum GuestDoorReply {
         box_id: BoxId,
         standing: bool,
     },
+    /// The answer to [`GuestDoorRequest::MintBoxId`].
+    BoxIdMinted {
+        #[serde(with = "boxes::box_id_hex")]
+        minted_box_id: BoxId,
+    },
+    /// The answer to [`GuestDoorRequest::ListenNotice`] the host took.
+    ListenRecorded { port: u16 },
     /// The request could not be served.
     Error { error: String },
 }
@@ -1920,22 +1685,6 @@ pub enum BoxControlRequest {
     /// session: the box stopped or was destroyed. Answered with
     /// [`BoxControlReply::HostIpBox`].
     RetireHostIpBox(RetireHostIpBoxRequest),
-    /// The in-VM daemon's report that one of its boxes published a port at
-    /// runtime (NET-138), carried on the daemon's own control channel: the
-    /// host records it in the row only within the grant the host-side
-    /// registration holds, and answers the refusal so the guest's publish
-    /// unwinds.
-    AdmitPort(AdmitPortRequest),
-    /// The in-VM daemon's report that one of its boxes stopped publishing a
-    /// runtime-admitted port: the withdrawal half of the admit report,
-    /// accepted whatever the row's cap or rate says.
-    WithdrawPort(WithdrawPortRequest),
-    /// The in-VM daemon's report that an expose was decided `ask`
-    /// (NET-045): carried on the daemon's own control channel like the
-    /// port reports, answered when a host client the daemon offered the
-    /// ask to records an answer — with no deadline on the reply, because
-    /// no timer ever answers an ask.
-    AdmitAsk(AdmitAskRequest),
     /// A host client's recorded answer for one pending ask (NET-045):
     /// served on the host's control socket only — the guest door refuses
     /// it, because a guest can raise a question but never answer one —
@@ -1969,43 +1718,10 @@ pub enum BoxControlRequest {
     /// NET-138): served on the host's control socket only, answered with
     /// [`BoxControlReply::Registered`].
     ResumeBox(ResumeBoxRequest),
-    /// The in-VM daemon's read of whether its box's row stands
-    /// ([`RowStandingRequest`]): carried on the daemon's own control
-    /// channel, answered with [`BoxControlReply::RowStanding`].
-    RowStanding(RowStandingRequest),
-    /// The in-VM daemon's read of whether the Box Egress Proxy's listener is
-    /// live on the host (BEP-062): carried on the daemon's own control
-    /// channel, answered with [`BoxControlReply::ProxyListening`]. A read,
-    /// never a report: the proxy runs on the host, outside the VM, so the
-    /// guest can only ask. The DNS gate of a `dns` or `both` box answers a
-    /// steered name with the proxy's address only while the answer is
-    /// `true`, and SERVFAIL otherwise.
-    ProxyListening,
     /// Read every host port this VM's hostname proxy serves on (NET-150,
     /// NET-154): served on the VM host's control socket only, answered with
     /// [`BoxControlReply::ProxyPorts`]. A read: no state changes.
     ProxyPorts,
-    /// The in-VM daemon's ask for the id of a box it is about to create
-    /// ([`MintBoxIdRequest`], BOX-002): carried on the daemon's own control
-    /// channel, answered with [`BoxControlReply::BoxIdMinted`].
-    MintBoxId(MintBoxIdRequest),
-    /// The in-VM daemon's report of one dynamic ingress decision
-    /// ([`ExposeDecisionReport`], NET-046): carried on the daemon's own
-    /// control channel, appended to the host's audit log, and answered with
-    /// [`BoxControlReply::Audited`].
-    ReportExposeDecision(ExposeDecisionReport),
-    /// The in-VM daemon's report of one refused own-address egress flow
-    /// ([`RefusedEgressReport`]): carried on the daemon's own control
-    /// channel, appended to the host's audit log under a per-box cap, and
-    /// answered with [`BoxControlReply::Audited`].
-    ReportRefusedEgress(RefusedEgressReport),
-    /// The in-VM daemon's notice that a host-address box's listener opened
-    /// or closed ([`ListenNotice`], NET-138): carried on the daemon's own
-    /// control channel. The VM host daemon mirrors the bind at the node's
-    /// own address and answers [`BoxControlReply::PortRecorded`] when the
-    /// mirror holds the notice, or [`BoxControlReply::Error`] naming why
-    /// it does not.
-    ListenNotice(ListenNotice),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -2218,16 +1934,11 @@ impl<'de> Deserialize<'de> for AnswererStatusReply {
 /// [`AsksSubscribed`](Self::AsksSubscribed) its `subscribed`,
 /// [`PendingAskOffer`](Self::PendingAskOffer) its `ask_id`,
 /// [`PendingAskDismissed`](Self::PendingAskDismissed) its `dismissed`,
-/// [`AskAnswerRecorded`](Self::AskAnswerRecorded) its `recorded`,
-/// [`AskAdmit`](Self::AskAdmit) its `ask` tag — but two of them also carry
-/// a port and a protocol, so a `PortRecorded` document is a strict subset
-/// of their fields: they are placed before it rather than after, so an
-/// offered ask cannot decode as a recorded port. The older newer shapes
-/// stay disjoint the same way — [`Row`](Self::Row) its
-/// `egress_allow_list`, [`NoRow`](Self::NoRow) its `no_row`,
-/// [`PortRecorded`](Self::PortRecorded) its `proto`,
-/// [`NameHeld`](Self::NameHeld) its `held` — so no document of
-/// one can decode as another's, and the order among them is free.
+/// [`AskAnswerRecorded`](Self::AskAnswerRecorded) its `recorded`. The
+/// other shapes stay disjoint the same way: [`Row`](Self::Row) by its
+/// `declared_ports`, [`NoRow`](Self::NoRow) by its `no_row`,
+/// [`NameHeld`](Self::NameHeld) by its `held`. No document of one can
+/// decode as another's, and the order among them is free.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BoxControlReply {
@@ -2258,13 +1969,10 @@ pub enum BoxControlReply {
         #[serde(with = "boxes::box_id_hex")]
         box_id: BoxId,
     },
-    /// A pending ask, pushed to a subscribed client's connection
-    /// (NET-045): the ask's id, the row, the port and the protocol — the
-    /// host row's own fields, never a guest-supplied string, because the
-    /// dialog the client renders is built from these alone. Carries an
-    /// `ask_id` no other reply shape has, and is placed before
-    /// [`PortRecorded`](Self::PortRecorded), whose port and protocol are
-    /// a subset of its fields.
+    /// A pending ask, pushed to a subscribed client's connection: the
+    /// ask's id, the row, the port and the protocol. These are the host
+    /// row's own fields, never a string from the guest, because the dialog
+    /// the client renders is built from these alone.
     PendingAskOffer(PendingAskOffer),
     /// A pending ask taken away from a subscribed client: another client
     /// recorded the first answer, the ask was cancelled, or the client's
@@ -2289,9 +1997,6 @@ pub enum BoxControlReply {
         /// discriminates this from every other shape.
         recorded: bool,
     },
-    /// The ask admit's answer ([`AskAdmitOutcome`]): the ask's end, as a
-    /// `ask`-tagged document no older reply shape can decode as.
-    AskAdmit(AskAdmitOutcome),
     /// The registration succeeded: the allocated addresses and the box id
     /// the published row holds ([`RegisteredBox`]) — the reply the register
     /// verb answers with. The withdrawal never answers this: it has no id
@@ -2357,16 +2062,6 @@ pub enum BoxControlReply {
         /// discriminates this from a live row's answer.
         no_row: bool,
     },
-    /// A port report was recorded: the port and protocol the host now holds
-    /// — the one reply both report verbs answer with, the withdrawal
-    /// included, because a withdrawal's goal state holds even when the
-    /// port was never admitted.
-    PortRecorded {
-        /// The port the report named.
-        port: u16,
-        /// The protocol the report named.
-        proto: IpProto,
-    },
     /// A release or release-cancel was answered: `acted` says whether the
     /// daemon did anything (false: it hosted no interim, or had no release
     /// pending), and `detail` is the sentence it logged.
@@ -2375,23 +2070,6 @@ pub enum BoxControlReply {
         acted: bool,
         /// What the daemon did, as its log line said it.
         detail: String,
-    },
-    /// The row-standing read's answer: whether the host holds a row at the
-    /// switch address asked about. `row_standing` is required — the marker
-    /// that keeps this document from decoding as any other reply.
-    RowStanding {
-        /// The switch address that was asked about.
-        switch_address: std::net::Ipv4Addr,
-        /// Whether a row stands at it.
-        row_standing: bool,
-    },
-    /// The proxy-listening read's answer: whether the Box Egress Proxy's
-    /// listener is live on the host. `false` when the host runs no proxy.
-    /// `listening` is required — the marker that keeps this document from
-    /// decoding as any other reply.
-    ProxyListening {
-        /// Whether the proxy's listener is live.
-        listening: bool,
     },
     /// The proxy-ports read's answer (NET-154): every host port the VM's
     /// hostname proxy serves on, the preferred port first. One port while
@@ -2402,14 +2080,6 @@ pub enum BoxControlReply {
     ProxyPorts {
         /// The host ports, the preferred first.
         proxy_ports: Vec<u16>,
-    },
-    /// An audit report's answer: whether the host wrote a record for it.
-    /// `false` when the host's per-box cap suppressed the record, which the
-    /// host counts in its log instead. `audited` is required — the marker
-    /// that keeps this document from decoding as any other reply.
-    Audited {
-        /// Whether a record was written.
-        audited: bool,
     },
     /// The mint verb's answer (BOX-002): the id the VM host daemon minted
     /// for the box the in-VM daemon is about to create. It is also the
@@ -4533,19 +4203,18 @@ mod box_listing_tests {
 mod mint_box_id_tests {
     use super::*;
 
-    /// BOX-002: the mint verb and its answer survive the wire, the answer
-    /// decodes as itself among the untagged replies, and an ask with no
+    /// The mint verb and its answer survive the wire, and an ask with no
     /// switch address spells none.
     #[test]
     fn mint_box_id_request_and_reply_round_trip() {
         for request in [
-            BoxControlRequest::MintBoxId(MintBoxIdRequest::default()),
-            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+            GuestDoorRequest::MintBoxId(MintBoxIdRequest::default()),
+            GuestDoorRequest::MintBoxId(MintBoxIdRequest {
                 switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
                 create_token: Some("create-1".to_string()),
                 host_ip_name: None,
             }),
-            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+            GuestDoorRequest::MintBoxId(MintBoxIdRequest {
                 switch_address: None,
                 create_token: Some("create-2".to_string()),
                 host_ip_name: Some("agent".to_string()),
@@ -4553,10 +4222,10 @@ mod mint_box_id_tests {
         ] {
             let line = serde_json_lenient::to_string(&request).unwrap();
             assert!(line.contains(r#""verb":"mint_box_id""#), "{line}");
-            let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+            let back: GuestDoorRequest = serde_json_lenient::from_str(&line).unwrap();
             assert_eq!(back, request);
         }
-        let bare = serde_json_lenient::to_string(&BoxControlRequest::MintBoxId(
+        let bare = serde_json_lenient::to_string(&GuestDoorRequest::MintBoxId(
             MintBoxIdRequest::default(),
         ))
         .unwrap();
@@ -4564,18 +4233,18 @@ mod mint_box_id_tests {
         assert!(!bare.contains("create_token"), "{bare}");
         assert!(!bare.contains("host_ip_name"), "{bare}");
         // An older in-VM daemon's ask carries no name, and decodes as none.
-        let older: BoxControlRequest =
+        let older: GuestDoorRequest =
             serde_json_lenient::from_str(r#"{"verb":"mint_box_id","create_token":"c"}"#).unwrap();
-        let BoxControlRequest::MintBoxId(older) = older else {
+        let GuestDoorRequest::MintBoxId(older) = older else {
             panic!("decoded as another verb: {older:?}");
         };
         assert_eq!(older.host_ip_name, None);
 
-        let reply = BoxControlReply::BoxIdMinted {
+        let reply = GuestDoorReply::BoxIdMinted {
             minted_box_id: BoxId::mint(),
         };
         let line = serde_json_lenient::to_string(&reply).unwrap();
-        let back: BoxControlReply = serde_json_lenient::from_str(&line).unwrap();
+        let back: GuestDoorReply = serde_json_lenient::from_str(&line).unwrap();
         assert_eq!(back, reply);
     }
 }

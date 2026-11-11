@@ -1,20 +1,11 @@
 use super::*;
 
-/// The control channel `switch`'s switch is reached on: its control
-/// socket for a switch this daemon spawned, the host shuttle's vsock port
-/// for the VM host's.
+/// What holds the forwards of the box `box_id` on the node of `switch`.
 pub(crate) async fn switch_control_of(
     switch: &Mutex<crate::net::SwitchClient>,
+    box_id: Option<boxes::BoxId>,
 ) -> crate::net::policy::ControlChannel {
-    let switch = switch.lock().await;
-    match switch.transport() {
-        crate::net::SwitchTransport::LocalSpawn => {
-            crate::net::policy::ControlChannel::Unix(switch.control_socket())
-        }
-        crate::net::SwitchTransport::HostShuttle { cid, port } => {
-            crate::net::policy::ControlChannel::Vsock { cid, port }
-        }
-    }
+    crate::net::policy::ControlChannel::of(&*switch.lock().await, box_id)
 }
 
 /// The rows `min session policy` lists as a box's live ingress (NET-044), by
@@ -49,10 +40,13 @@ pub(crate) struct AskId(u64);
 /// How a routed ask ended (NET-045): the continuation's input, the same
 /// for an ask this daemon's binding rendered and one the VM host daemon
 /// asked the human attached on the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum AskEnd {
     /// The attached human answered.
     Answered(box_runtime::AskAnswer),
+    /// The human attached on the VM host said yes, and the VM host opened
+    /// this forward with the answer.
+    HostPublished(crate::net::policy::PortForwarder),
     /// Nobody answered: on a native host no binding, or a dialog that ended
     /// without a pick; on a VM-backed host no client attached when the ask
     /// arrived. The typed nobody-is-attached refusal.
@@ -66,7 +60,8 @@ pub(crate) enum AskEnd {
     /// who is attached: its row's ask queue was full, or the row's grant
     /// did not admit the ask.
     HostRefused(minimald_rpc::AskRefused),
-    /// The VM host daemon could not be asked or did not answer the ask.
+    /// The VM host daemon could not be asked, did not answer, or refused
+    /// the publish for a reason that is not about the ask.
     HostUnreachable(String),
 }
 
@@ -78,29 +73,29 @@ impl From<Option<box_runtime::AskAnswer>> for AskEnd {
 }
 
 impl AskEnd {
-    /// The end the VM host daemon's reply names: the human's yes or no as
-    /// the human's answer, the ends nobody answered as unanswered, and the
-    /// host's own refusals as such.
-    fn from_host(outcome: minimald_rpc::AskAdmitOutcome) -> Self {
-        use minimald_rpc::AskRefused;
-        match outcome {
-            minimald_rpc::AskAdmitOutcome::Admitted { .. } => {
-                Self::Answered(box_runtime::AskAnswer::Allowed)
-            }
-            minimald_rpc::AskAdmitOutcome::Refused { reason, cause, .. } => match reason {
+    /// The end of a publish the VM host asked its attached human about.
+    fn from_host(published: std::io::Result<crate::net::policy::PortForwarder>) -> Self {
+        use minimald_rpc::{AskRefused, PublishRefusal};
+        let error = match published {
+            Ok(forwarder) => return Self::HostPublished(forwarder),
+            Err(error) => error,
+        };
+        match crate::net::policy::host_refusal(&error) {
+            Some(PublishRefusal::Ask { refused, cause }) => match refused {
                 AskRefused::Denied => Self::Answered(box_runtime::AskAnswer::Refused),
                 AskRefused::NoClient => Self::Unanswered,
                 AskRefused::NoTty => Self::HostNoTty,
-                // A cancellation always names its cause; one that does not
-                // is a daemon that predates causes, said as its own stop.
+                // A cancellation names its cause. One without is read as
+                // the VM host stopping.
                 AskRefused::Cancelled => Self::HostCancelled(
                     cause.unwrap_or(minimald_rpc::AskCancelCause::MinvmdStopping),
                 ),
                 AskRefused::QueueFull
                 | AskRefused::NoRow
                 | AskRefused::StanceNotAsk
-                | AskRefused::OutsideGrant => Self::HostRefused(reason),
+                | AskRefused::OutsideGrant => Self::HostRefused(refused),
             },
+            _ => Self::HostUnreachable(error.to_string()),
         }
     }
 }
@@ -229,8 +224,7 @@ impl BoxActor {
             // Where the port answers: the name always; the host's loopback
             // only natively, since on a VM-backed host the loopback the box
             // shares is the guest's (NET-129).
-            let host_loopback =
-                !crate::net::listeners::reports_to_vm_host(&self.switch_control().await);
+            let host_loopback = !self.switch_control().await.host_unbinds_declared_forwards();
             let refusal = crate::net::policy::ExposeRefusal::NeedsNoExposing {
                 port,
                 host_loopback,
@@ -273,14 +267,7 @@ impl BoxActor {
                 // `allow`, so an `Ok` here is one; every other refusal was
                 // made with the switch asked nothing (NET-047).
                 let outcome = match decided {
-                    Ok(_) => {
-                        self.publish_exposed_port(
-                            &record,
-                            port,
-                            minimald_rpc::PortReportSource::Expose,
-                        )
-                        .await
-                    }
+                    Ok(_) => self.publish_exposed_port(&record, port, None).await,
                     Err(refusal) => Err(ExposeFailure::Refused(refusal)),
                 };
                 self.answer_expose(
@@ -358,8 +345,15 @@ impl BoxActor {
         // the switch address the host handed the box; a box the host never
         // handed one holds no row there to ask about.
         let control = self.switch_control().await;
-        let host_switch_address = if crate::net::listeners::reports_to_vm_host(&control) {
-            let Some(addresses) = record.box_addresses else {
+        // In a VM the VM host asks whoever is attached on the host, as part
+        // of the publish itself. The forward comes back with the yes.
+        let host_publish = if control.host_unbinds_declared_forwards() {
+            let published = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned")
+                .published_own_address(record.id);
+            let (Some(addresses), Some(published)) = (record.box_addresses, published) else {
                 self.answer_expose(
                     &box_name,
                     port,
@@ -373,33 +367,27 @@ impl BoxActor {
                 .await;
                 return;
             };
-            Some(addresses.switch_address)
+            Some((published, addresses.switch_address))
         } else {
             None
         };
-        // Minted before the park, not derived from the port: two asks can
-        // share a port, and the continuation below keys on this so each
-        // answer reaches the ask it answers however their answers arrive.
         let id = AskId(self.next_ask_id);
         self.next_ask_id += 1;
         let weak = self.weak_self.clone();
-        let host_ask = match host_switch_address {
-            Some(switch_address) => {
+        let host_ask = match host_publish {
+            Some((published, switch_address)) => {
                 let task = crate::traced::spawn(async move {
-                    let end =
-                        match crate::net::listeners::report_ask(&control, switch_address, port)
-                            .await
-                        {
-                            Ok(outcome) => AskEnd::from_host(outcome),
-                            Err(error) => {
-                                tracing::warn!(
-                                    port,
-                                    reason = %error,
-                                    "the VM host daemon did not answer the ask; it fails closed"
-                                );
-                                AskEnd::HostUnreachable(error.to_string())
-                            }
-                        };
+                    let end = AskEnd::from_host(
+                        crate::net::policy::expose_dynamic(
+                            &control,
+                            published,
+                            switch_address,
+                            port,
+                            boxes::IpProto::Tcp,
+                            None,
+                        )
+                        .await,
+                    );
                     if let Some(handle) = weak.upgrade() {
                         handle.ask_answered(id, port, end).await;
                     }
@@ -464,42 +452,12 @@ impl BoxActor {
             // allowed ask can end refused, with the switch asked only now
             // (NET-047).
             AskEnd::Answered(box_runtime::AskAnswer::Allowed) => {
-                let published = self
-                    .publish_exposed_port(
-                        &ask.record,
-                        ask.port,
-                        minimald_rpc::PortReportSource::Ask,
-                    )
-                    .await;
-                // A VM host recorded the yes in the row before the publish
-                // ran, so a publish refused before its bind gives the port
-                // back there, leaving no partial mapping — unless the port
-                // stands published already, by either surface, whose
-                // admission the row's entry is.
-                if ask.host_ask.is_some()
-                    && let Err(crate::net::policy::ExposeFailure::Refused(refusal)) = &published
-                    && !matches!(
-                        refusal,
-                        crate::net::policy::ExposeRefusal::AlreadyPublished { .. }
-                            | crate::net::policy::ExposeRefusal::ListenPublished { .. }
-                    )
-                    && let Some(addresses) = ask.record.box_addresses
-                {
-                    let control = self.switch_control().await;
-                    crate::net::listeners::unreport_port(
-                        &control,
-                        addresses.switch_address,
-                        ask.port,
-                        minimald_rpc::PortReportSource::Ask,
-                    )
-                    .await;
-                }
-                published
+                self.publish_exposed_port(&ask.record, ask.port, None).await
             }
-            // The human said deny — or keyed a cancel (Ctrl-C, `q`, Escape),
-            // which means the same thing: the box's own deny answer, now in
-            // the human's hand. An input EOF is not this — a client that
-            // went away did not answer — so it lands on the `None` below.
+            AskEnd::HostPublished(forwarder) => {
+                self.publish_exposed_port(&ask.record, ask.port, Some(forwarder.clone()))
+                    .await
+            }
             AskEnd::Answered(box_runtime::AskAnswer::Refused) => {
                 Err(crate::net::policy::ExposeFailure::Refused(
                     crate::net::policy::ExposeRefusal::DeniedByHuman,
@@ -548,7 +506,9 @@ impl BoxActor {
             }),
         };
         let decided_by = match &answer {
-            AskEnd::Answered(_) => crate::audit::DecidedBy::AttachedHuman,
+            AskEnd::Answered(_) | AskEnd::HostPublished(_) => {
+                crate::audit::DecidedBy::AttachedHuman
+            }
             AskEnd::Unanswered
             | AskEnd::HostNoTty
             | AskEnd::HostCancelled(_)
@@ -615,35 +575,6 @@ impl BoxActor {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf();
-        // How the VM host names this box when its copy of the record
-        // arrives (NET-046). A box with a switch address reports only by the
-        // route its listen watcher registered. A box with no switch address
-        // has no such route, so its report carries the box id and goes over
-        // this box's control channel. When the box record cannot be read,
-        // the switch address this box reported decides, so a box with no
-        // switch still reports by id.
-        let no_switch = match self.record.record().await {
-            Ok(record) => record.box_addresses.is_none(),
-            Err(error) => {
-                let no_switch = self.reported_switch_address.is_none();
-                tracing::debug!(
-                    name = %box_name,
-                    port,
-                    %error,
-                    no_switch,
-                    "the box record could not be read; the reported switch address decides the host report key"
-                );
-                no_switch
-            }
-        };
-        let host_key = if no_switch {
-            crate::audit::HostReportKey {
-                box_id: Some(*self.record.id()),
-                control: Some(self.switch_control().await),
-            }
-        } else {
-            crate::audit::HostReportKey::default()
-        };
         // An allow that stands is recorded before anything else is said
         // about it, and only a recorded one is answered as published
         // (NET-046): an allow whose record cannot be written is withdrawn and
@@ -660,7 +591,7 @@ impl BoxActor {
                     outcome: crate::audit::DecisionOutcome::Published,
                     reason: None,
                 };
-                match crate::audit::try_append(&state_dir, &record, &host_key).await {
+                match crate::audit::try_append(&state_dir, &record).await {
                     Ok(()) => {
                         // The record is written, so the box's relay gate
                         // admits the port now, before the caller hears the
@@ -841,7 +772,6 @@ impl BoxActor {
                     outcome: audited,
                     reason,
                 },
-                &host_key,
             )
             .await;
         }
@@ -891,14 +821,6 @@ impl BoxActor {
             "the dynamic ingress allow could not be audited; the publish is \
              withdrawn and the request refused"
         );
-        // The surface the publish reported under: an answered ask was
-        // recorded at the host as one (NET-045), every other allow is the
-        // box's own expose.
-        let source = if decision == boxes::DynamicIngress::Ask {
-            minimald_rpc::PortReportSource::Ask
-        } else {
-            minimald_rpc::PortReportSource::Expose
-        };
         let control = self.switch_control().await;
         let live = self.live_ingress.take(port);
         // The gate refuses the port before the forward comes down (NET-044),
@@ -963,9 +885,6 @@ impl BoxActor {
         if unbound {
             self.publications
                 .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
-            if let Some(switch_address) = self.reported_switch_address {
-                crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
-            }
         }
         crate::net::policy::ExposeFailure::Publish {
             port,
@@ -997,7 +916,7 @@ impl BoxActor {
         &mut self,
         record: &Record,
         port: u16,
-        source: minimald_rpc::PortReportSource,
+        opened: Option<crate::net::policy::PortForwarder>,
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
         use crate::net::policy::{ExposeFailure, ExposeRefusal, expose_dynamic};
 
@@ -1119,67 +1038,28 @@ impl BoxActor {
                 }));
             }
         };
-        // The VM host daemon's grant decides the publish before the switch
-        // is asked to bind it (T94, NET-138): on a VM-backed host the egress
-        // gate in front of the switch admits a forward only for a port the
-        // box's host-side row holds, and the report is what puts a runtime
-        // port in that row — so a bind asked first is refused at the gate
-        // with no reply at all. A report the grant refuses — or a door that
-        // never answers it, fail-closed, because a publish the host never
-        // vouched for is not one to stand against its grant either —
-        // publishes nothing: the reservation releases itself, the switch was
-        // asked nothing, and the caller hears the publish failed, carrying
-        // the reason it failed. A reply lost after the host recorded the port
-        // is withdrawn again by the report itself before it answers,
-        // best-effort. A native host has no report channel and reports
-        // nothing: its publish stands, admitted by the switch alone, exactly
-        // as it always did. Every end below that leaves the port unpublished
-        // withdraws the report again once the forward is down — the gate
-        // applies a runtime port's retraction only while the row holds it.
-        //
-        // An answered ask is the exception: on a VM-backed host the human's
-        // yes was recorded in the row by the VM host daemon, and the ask's
-        // own reply was the one admit it is consumed by (NET-045), so it is
-        // not reported again — a guest's own admit report under `ask` is
-        // refused by the grant. Its unwinds below still withdraw the port.
-        let host_recorded = source == minimald_rpc::PortReportSource::Ask;
-        if !host_recorded
-            && let Err(report) =
-                crate::net::listeners::report_admitted_port(&control, switch_address, port, source)
-                    .await
-        {
-            tracing::warn!(
-                session_id = %record.id,
-                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
-                port,
-                source = ?source,
-                reason = %report,
-                "the VM host daemon did not admit the port report; the \
-                 publish unwound"
-            );
-            return Err(ExposeFailure::Publish {
-                port,
-                source: report,
-            });
-        }
         self.reported_switch_address = Some(switch_address);
-        let forwarder = match expose_dynamic(
-            &control,
-            loopback_address,
-            switch_address,
-            port,
-            boxes::IpProto::Tcp,
-            None,
-        )
-        .await
-        {
+        let forwarder = match opened {
+            Some(forwarder) => Ok(forwarder),
+            None => {
+                expose_dynamic(
+                    &control,
+                    loopback_address,
+                    switch_address,
+                    port,
+                    boxes::IpProto::Tcp,
+                    None,
+                )
+                .await
+            }
+        };
+        let forwarder = match forwarder {
             Ok(forwarder) => forwarder,
             // The reservation releases itself on the guard's drop here,
             // so a publish that failed leaves the port free and the set
             // empty of it: nothing was published, and the watcher's next
             // observation of the port publishes it normally (NET-047).
             Err(source_error) => {
-                crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
                 return Err(ExposeFailure::Publish {
                     port,
                     source: source_error,
@@ -1214,7 +1094,6 @@ impl BoxActor {
             // still holds the port, so a withdrawal that ran first would leave
             // the forward bound and unretractable.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
-            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
         }
         // The bind stood, so the reservation commits as this surface's own
@@ -1233,7 +1112,6 @@ impl BoxActor {
             // still holds the port, so a withdrawal that ran first would leave
             // the forward bound and unretractable.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
-            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
         if let Err(stale) = self
@@ -1256,7 +1134,6 @@ impl BoxActor {
             // names a forward that is gone, and the withdrawal report clears
             // it — best-effort, like the unexpose beside it, because there
             // is no caller left to propagate a failure to.
-            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
         // The publish stands, but the box's relay gate does not admit the
@@ -1304,8 +1181,6 @@ impl BoxActor {
     /// attach bound, and the port is recorded as one this box bound.
     #[cfg(target_os = "linux")]
     pub(super) async fn bind_handed_port(&mut self, address: std::net::Ipv4Addr, port: u16) {
-        use crate::net::policy::HandedBind;
-
         if !self.has_live_host() || self.live_ingress.is_detached() {
             return;
         }
@@ -1353,9 +1228,8 @@ impl BoxActor {
                 gate.as_ref(),
             )
             .await;
-            let (forwarder, held_by_host) = match bind {
-                Ok(HandedBind::Bound(forwarder)) => (forwarder, false),
-                Ok(HandedBind::HeldByHost(forwarder)) => (forwarder, true),
+            let forwarder = match bind {
+                Ok(forwarder) => forwarder,
                 Err(error) => {
                     tracing::warn!(
                         session_id = %record.id,
@@ -1381,7 +1255,6 @@ impl BoxActor {
                 session_id = %record.id,
                 session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 %local,
-                held_by_host,
                 action = "shared-address-port-hand-over",
                 "bound the shared-address port this box took over while it runs"
             );
@@ -1584,11 +1457,10 @@ impl BoxActor {
         }
     }
 
-    /// The switch's control channel, read off the daemon's shared switch under
-    /// a lock held only for the two sync reads — never across the publish it
-    /// feeds.
+    /// What holds this box's forwards. In a VM the box's id is the one the
+    /// VM host minted for it.
     pub(super) async fn switch_control(&self) -> crate::net::policy::ControlChannel {
-        switch_control_of(&self.net_switch).await
+        switch_control_of(&self.net_switch, Some(*self.record.id())).await
     }
 
     /// The live dynamic-ingress mappings — the rows `min session policy`

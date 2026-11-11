@@ -1537,74 +1537,6 @@ fn withdraw_box_id_is_optional_on_the_wire() {
     assert_eq!(decoded, with_id);
 }
 
-#[test]
-fn box_control_admit_and_withdraw_round_trip() {
-    let admit = BoxControlRequest::AdmitPort(AdmitPortRequest {
-        switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
-        port: 8080,
-        proto: IpProto::Tcp,
-        source: PortReportSource::Ask,
-    });
-    let wire = serde_json_lenient::to_string(&admit).expect("serialize");
-    assert!(
-        wire.contains(r#""verb":"admit_port""#),
-        "the tagged line names its verb: {wire}"
-    );
-    assert_eq!(round_trip(&admit), admit);
-
-    let withdraw = BoxControlRequest::WithdrawPort(WithdrawPortRequest {
-        switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
-        port: 8080,
-        proto: IpProto::Udp,
-        source: PortReportSource::Listen,
-    });
-    let wire = serde_json_lenient::to_string(&withdraw).expect("serialize");
-    assert!(
-        wire.contains(r#""verb":"withdraw_port""#),
-        "the tagged line names its verb: {wire}"
-    );
-    assert_eq!(round_trip(&withdraw), withdraw);
-    assert!(
-        wire.contains(r#""source":"listen""#) && wire.contains(r#""proto":"udp""#),
-        "the source and the protocol cross in their wire spellings: {wire}"
-    );
-
-    // The reply a recorded report answers with round-trips, and a
-    // document of no other variant's shape decodes as it — the
-    // untagged discrimination, checked from the other side.
-    let recorded = BoxControlReply::PortRecorded {
-        port: 8080,
-        proto: IpProto::Tcp,
-    };
-    assert_eq!(round_trip(&recorded), recorded);
-    let decoded: BoxControlReply = serde_json_lenient::from_str(r#"{"port":8080,"proto":"tcp"}"#)
-        .expect("a recorded report's reply decodes");
-    assert_eq!(decoded, recorded);
-
-    // The refusal a grant-refused report answers with still decodes as
-    // the error it is — the shape the guest unwinds its publish by.
-    let refused: BoxControlReply = serde_json_lenient::from_str(
-        r#"{"error":"the reported port is outside the box's allowed range"}"#,
-    )
-    .expect("a refusal decodes");
-    assert_eq!(
-        refused,
-        BoxControlReply::Error {
-            error: "the reported port is outside the box's allowed range".to_string()
-        }
-    );
-
-    // The report port is the wire contract between the two ends that
-    // depend on this crate — the in-VM daemon that dials it and the VM
-    // host daemon that bridges it — pinned beside the guest's boot
-    // marker, one port per purpose, and clear of the timekeep bridge's
-    // own number, which runs the opposite direction.
-    assert_eq!(
-        VM_HOST_BOX_REPORT_PORT, 7352,
-        "the report port is wire contract; changing it breaks both ends"
-    );
-}
-
 /// The ask verbs' offer half (NET-045) round-trips: the guest's ask
 /// admit carries only the row key, the port and the protocol — no name
 /// or free text a guest could smuggle a prompt with — the subscription
@@ -1619,28 +1551,6 @@ fn box_control_pending_ask_offer_round_trip() {
         0x01, 0x95, 0x65, 0x5f, 0x7f, 0x1e, 0x7a, 0xbc, 0x9d, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e,
         0x7f,
     ]);
-
-    // The guest's ask admit: the row key, the port, the protocol, and
-    // nothing else — the one fixed shape a guest may raise a question
-    // in.
-    let admit_ask = BoxControlRequest::AdmitAsk(AdmitAskRequest {
-        switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
-        port: 8080,
-        proto: IpProto::Tcp,
-    });
-    let wire = serde_json_lenient::to_string(&admit_ask).expect("serialize");
-    assert!(
-        wire.contains(r#""verb":"admit_ask""#)
-            && wire.contains(r#""port":8080"#)
-            && wire.contains(r#""proto":"tcp""#),
-        "the tagged line names its verb and the port and protocol it asks for: {wire}"
-    );
-    assert!(
-        !wire.contains("name") && !wire.contains("source") && !wire.contains("answer"),
-        "the ask admit carries no name, no source and no answer — the guest can raise a \
-         question but neither phrase it nor answer it: {wire}"
-    );
-    assert_eq!(round_trip(&admit_ask), admit_ask);
 
     // The subscription: keyed by the row's box id, never a name.
     let subscribe = BoxControlRequest::SubscribeAsks(SubscribeAsksRequest { box_id });
@@ -1770,61 +1680,6 @@ fn box_control_record_ask_answer_round_trip() {
         recorded
     );
 
-    // The admit's answer: admitted names the port the host now holds
-    // and the ask it was admitted under; refused names the typed end
-    // the ask met. Both are `ask`-tagged documents, and the older
-    // recorded-port reply — a strict subset of admitted's fields —
-    // decodes as the port record it is, not as an ask.
-    let admitted = BoxControlReply::AskAdmit(AskAdmitOutcome::Admitted {
-        ask_id,
-        port: 8080,
-        proto: IpProto::Tcp,
-    });
-    let wire = serde_json_lenient::to_string(&admitted).expect("serialize");
-    assert!(
-        wire.contains(r#""ask":"admitted""#)
-            && wire.contains(r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#)
-            && wire.contains(r#""port":8080"#),
-        "the admitted answer spells its tag, its ask and its port: {wire}"
-    );
-    assert_eq!(round_trip(&admitted), admitted);
-    assert_eq!(
-        serde_json_lenient::from_str::<BoxControlReply>(&wire)
-            .expect("the admitted answer decodes as its own reply"),
-        admitted,
-        "the admitted answer is placed before the recorded-port reply its \
-         fields are a superset of"
-    );
-
-    for (reason, spelling) in [
-        (AskRefused::Denied, r#""reason":"denied""#),
-        (AskRefused::NoClient, r#""reason":"no_client""#),
-        (AskRefused::QueueFull, r#""reason":"queue_full""#),
-        (AskRefused::OutsideGrant, r#""reason":"outside_grant""#),
-        (AskRefused::NoTty, r#""reason":"no_tty""#),
-        (AskRefused::Cancelled, r#""reason":"cancelled""#),
-        (AskRefused::NoRow, r#""reason":"no_row""#),
-        (AskRefused::StanceNotAsk, r#""reason":"stance_not_ask""#),
-    ] {
-        let cause = (reason == AskRefused::Cancelled).then_some(AskCancelCause::LastDetach);
-        let refused = BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
-            ask_id,
-            reason,
-            cause,
-        });
-        let wire = serde_json_lenient::to_string(&refused).expect("serialize");
-        assert!(
-            wire.contains(r#""ask":"refused""#) && wire.contains(spelling),
-            "the refused answer spells its tag and its typed end: {wire}"
-        );
-        assert_eq!(
-            wire.contains(r#""cause":"last-detach""#),
-            cause.is_some(),
-            "only a cancellation carries its cause: {wire}"
-        );
-        assert_eq!(round_trip(&refused), refused);
-    }
-
     // A late answer for an ended ask is answered with how it ended, a
     // shape no other reply decodes as.
     for (end, spelling) in [
@@ -1853,19 +1708,6 @@ fn box_control_record_ask_answer_round_trip() {
             late
         );
     }
-
-    // The older recorded-port reply still decodes as the port record
-    // it is — no ask-shaped variant claims a document with no ask in
-    // it.
-    let decoded: BoxControlReply = serde_json_lenient::from_str(r#"{"port":8080,"proto":"tcp"}"#)
-        .expect("a recorded report's reply still decodes");
-    assert_eq!(
-        decoded,
-        BoxControlReply::PortRecorded {
-            port: 8080,
-            proto: IpProto::Tcp
-        }
-    );
 }
 
 /// The read-only row verb round-trips under its key, and its two
@@ -1891,7 +1733,6 @@ fn box_control_read_row_round_trip() {
             0x6e, 0x7f,
         ]),
         switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
-        egress_allow_list: vec!["10.0.0.0/8".to_string()],
         declared_ports: vec![8080, 9090],
         runtime_ports: vec![3000],
     });
@@ -1899,7 +1740,6 @@ fn box_control_read_row_round_trip() {
     for field in [
         r#""switch_address":"100.64.127.255""#,
         r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#,
-        r#""egress_allow_list":["10.0.0.0/8"]"#,
         r#""declared_ports":[8080,9090]"#,
         r#""runtime_ports":[3000]"#,
     ] {
@@ -2285,7 +2125,6 @@ fn host_ip_box_request_carries_the_lane_declaration() {
     let session_id = boxes::SessionId::mint();
     let declaring = BoxControlRequest::AdmitHostIpBox(HostIpBoxRequest {
         session_id,
-        egress: None,
         credentialed_upstream: true,
     });
     let line = serde_json_lenient::to_string(&declaring).unwrap();
@@ -2297,7 +2136,6 @@ fn host_ip_box_request_carries_the_lane_declaration() {
     // host reads is the line it always read.
     let silent = HostIpBoxRequest {
         session_id,
-        egress: None,
         credentialed_upstream: false,
     };
     let line = serde_json_lenient::to_string(&silent).unwrap();
@@ -2431,8 +2269,27 @@ fn guest_door_requests_round_trip() {
         }),
         GuestDoorRequest::EndBox(EndBoxRequest { box_id }),
         GuestDoorRequest::BoxStanding(BoxStandingRequest { box_id }),
+        GuestDoorRequest::ListenNotice(ListenNotice {
+            port: 3000,
+            state: ListenState::Listening,
+        }),
     ] {
         assert_eq!(round_trip(&request), request);
+    }
+    // A notice that names anything but a port and a state is refused.
+    assert!(
+        serde_json_lenient::from_str::<GuestDoorRequest>(
+            r#"{"verb":"listen_notice","port":3000,"state":"listening","address":"127.0.0.1"}"#
+        )
+        .is_err()
+    );
+    // The guest's verbs are not verbs of the host's socket.
+    for line in [
+        r#"{"verb":"listen_notice","port":3000,"state":"listening"}"#,
+        r#"{"verb":"mint_box_id"}"#,
+    ] {
+        assert!(serde_json_lenient::from_str::<GuestDoorRequest>(line).is_ok());
+        assert!(serde_json_lenient::from_str::<BoxControlRequest>(line).is_err());
     }
 }
 
@@ -2462,6 +2319,10 @@ fn guest_door_replies_round_trip() {
             box_id,
             standing: true,
         },
+        GuestDoorReply::BoxIdMinted {
+            minted_box_id: box_id,
+        },
+        GuestDoorReply::ListenRecorded { port: 3000 },
         GuestDoorReply::Error {
             error: "no".to_string(),
         },

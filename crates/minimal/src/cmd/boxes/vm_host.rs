@@ -345,7 +345,6 @@ pub(crate) async fn retire_stopped_box_with_vm_host(
     host_ip_box_with_vm_host(
         control_sock,
         id,
-        None,
         HostIpBoxChange::Retire(HostIpBoxEnd::Stopped),
     )
     .await;
@@ -504,7 +503,6 @@ pub(crate) async fn rehold_held_name_before_attach(
         && host_ip_box_with_vm_host_declaring(
             control_sock_beside(sock),
             id,
-            record.policy.egress.clone(),
             record.policy.credentialed_upstream.is_some(),
             HostIpBoxChange::Admit,
         )
@@ -612,20 +610,18 @@ pub(crate) async fn withdraw_box_row_with_vm_host(
     }
 }
 
-/// Admits ([`HostIpBoxChange::Admit`]) or retires a `host_ip` box's egress
-/// policy on the VM host daemon (NET-085), off the async worker and bounded by
-/// [`BOX_CONTROL_TIMEOUT`]. The host gate decides a frame a `host_ip` box
-/// sends by the policies admitted there, so a box is admitted before it
-/// runs anything and retired once it is gone. Returns whether the VM host
-/// daemon answered: `false` for no VM host daemon to ask, a refusal, or no
-/// answer (each warned on).
+/// Admits ([`HostIpBoxChange::Admit`]) or retires a `host_ip` box as a
+/// resident on the VM host daemon, off the async worker and bounded by
+/// [`BOX_CONTROL_TIMEOUT`]. A box is admitted before it runs anything and
+/// retired once it is gone. Returns whether the VM host daemon answered:
+/// `false` for no VM host daemon to ask, a refusal, or no answer (each
+/// warned on).
 pub(crate) async fn host_ip_box_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
-    egress: Option<boxes::EgressPolicy>,
     change: HostIpBoxChange,
 ) -> bool {
-    host_ip_box_with_vm_host_declaring(control_sock, id, egress, false, change).await
+    host_ip_box_with_vm_host_declaring(control_sock, id, false, change).await
 }
 
 /// [`host_ip_box_with_vm_host`] for a box that says whether it declares a
@@ -634,7 +630,6 @@ pub(crate) async fn host_ip_box_with_vm_host(
 pub(crate) async fn host_ip_box_with_vm_host_declaring(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
-    egress: Option<boxes::EgressPolicy>,
     credentialed_upstream: bool,
     change: HostIpBoxChange,
 ) -> bool {
@@ -642,13 +637,7 @@ pub(crate) async fn host_ip_box_with_vm_host_declaring(
         return false;
     };
     let exchange = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::host_ip_box_at(
-            &sock_path,
-            id,
-            egress.as_ref(),
-            credentialed_upstream,
-            change,
-        )
+        minimal_client::attach::host_ip_box_at(&sock_path, id, credentialed_upstream, change)
     });
     match tokio::time::timeout(BOX_CONTROL_TIMEOUT, exchange).await {
         Ok(Ok(answered)) => answered,
@@ -678,7 +667,7 @@ pub(crate) struct HostIpResidency {
 }
 
 impl HostIpResidency {
-    /// Admits the box's `egress` for session `id` on the VM host daemon
+    /// Admits the box of session `id` as a resident on the VM host daemon
     /// whose control socket is `control_sock`, when the box is a `host_ip`
     /// box. `control_sock` is `None` on a host that is not VM-backed. The
     /// guard is `None` there, for another network mode, and when the admit
@@ -687,9 +676,8 @@ impl HostIpResidency {
         control_sock: Option<std::path::PathBuf>,
         id: boxes::SessionId,
         network: boxes::NetworkMode,
-        egress: Option<&boxes::EgressPolicy>,
     ) -> Option<Self> {
-        Self::admit_declaring(control_sock, id, network, egress, false).await
+        Self::admit_declaring(control_sock, id, network, false).await
     }
 
     /// [`Self::admit`] for a box that says whether it declares a
@@ -700,7 +688,6 @@ impl HostIpResidency {
         control_sock: Option<std::path::PathBuf>,
         id: boxes::SessionId,
         network: boxes::NetworkMode,
-        egress: Option<&boxes::EgressPolicy>,
         credentialed_upstream: bool,
     ) -> Option<Self> {
         if network != boxes::NetworkMode::HostNet {
@@ -710,7 +697,6 @@ impl HostIpResidency {
         host_ip_box_with_vm_host_declaring(
             Some(control_sock.clone()),
             id,
-            egress.cloned(),
             credentialed_upstream,
             HostIpBoxChange::Admit,
         )
@@ -823,7 +809,6 @@ fn retire_host_ip_box_retrying(
                 let _ = answer_tx.send(minimal_client::attach::host_ip_box_at(
                     &sock,
                     id,
-                    None,
                     false,
                     HostIpBoxChange::Retire(end),
                 ));
@@ -1102,7 +1087,7 @@ mod tests {
 
     /// T66: an own-address box on a VM-backed host registers with the VM
     /// host daemon over its control socket — the request carries the box's
-    /// name, its expanded ingress ports, and its egress policy; the reply
+    /// name and its expanded ingress ports; the reply
     /// hands back the two addresses the create request then carries — and
     /// the decision about whether to register at all is the activation's:
     /// only a minvmd-backed host with an own-address box registers, and a
@@ -1189,7 +1174,6 @@ mod tests {
                 "the activation holds its registration as a lease"
             );
             assert_eq!(request.ingress_ports, vec![8080, 5432]);
-            assert_eq!(request.egress.as_ref(), policy.egress.as_ref());
             assert!(
                 !seen[0].contains("box_id"),
                 "the client never presents a box id; the host mints it: {}",
@@ -1243,7 +1227,6 @@ mod tests {
             minimald_rpc::RegisterBoxRequest {
                 name: "db".to_string(),
                 ingress_ports: Vec::new(),
-                egress: None,
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
@@ -2761,9 +2744,9 @@ mod tests {
             matches!(
                 residency.as_slice(),
                 [minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit)]
-                    if admit.session_id == id && admit.egress == record.policy.egress
+                    if admit.session_id == id
             ),
-            "one admit for the resumed box, with its own rules: {residency:?}"
+            "one admit for the resumed box: {residency:?}"
         );
     }
 

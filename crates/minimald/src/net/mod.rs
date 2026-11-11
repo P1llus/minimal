@@ -36,23 +36,13 @@ pub(crate) mod gvproxy_network;
 pub(crate) mod provider;
 
 pub(crate) mod attach;
-#[allow(
-    dead_code,
-    reason = "no caller until the guest speaks to the VM host through it"
-)]
 pub(crate) mod door;
 // Whether a box's network policy can be enforced on this host.
 pub(crate) mod endpoints;
 pub(crate) mod engine;
 pub mod ingress_gate;
-#[allow(
-    dead_code,
-    reason = "its watch loop has no caller until publishing moves onto it"
-)]
 pub(crate) mod listens;
 pub(crate) mod nl;
-#[allow(dead_code, reason = "no caller until publishing moves onto it")]
-pub(crate) mod publish;
 pub(crate) mod relay;
 pub(crate) mod resolver;
 pub(crate) mod spec;

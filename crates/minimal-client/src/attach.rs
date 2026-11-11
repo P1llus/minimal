@@ -692,34 +692,26 @@ pub fn hold_box_name_beside(
 /// What [`host_ip_box_at`] asks of the VM host daemon for a `host_ip` box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostIpBoxChange {
-    /// Admit the box's egress policy: the box is resident.
+    /// Admit the box: it is resident.
     Admit,
-    /// Retire the box's egress policy, and say how the box ended.
+    /// Retire the box, and say how it ended.
     Retire(minimald_rpc::HostIpBoxEnd),
 }
 
-/// Admits ([`HostIpBoxChange::Admit`]) or retires a `host_ip` box's egress policy at the
-/// VM host daemon whose control socket is `control_sock` (NET-085). A
-/// `host_ip` box leaves the VM from the node's own address, and the host
-/// gate decides its frames by the policies admitted here: a box whose
-/// policy is not admitted reaches nothing outside the VM. Keyed by the
-/// session `session_id`, so an unnamed box and a task box admit the same
-/// way. `credentialed_upstream` says whether the box declares a
-/// credentialed upstream (BEP-083): the host gate opens the cohort's lane
-/// to the Box Egress Proxy's listener while one resident box declares one.
-/// A retire ignores it. A retire carries how the box ended
-/// ([`HostIpBoxChange::Retire`]): only a destroyed box has its id revoked
-/// (BEP-043).
+/// Admits ([`HostIpBoxChange::Admit`]) or retires a `host_ip` box as a
+/// resident of the VM, at the VM host daemon whose control socket is
+/// `control_sock`. Keyed by the session `session_id`, so an unnamed box and
+/// a task box admit the same way. `credentialed_upstream` says whether the
+/// box declares a credentialed upstream: the host then lets its streams
+/// through to the credential proxy. A retire ignores it. A retire carries
+/// how the box ended ([`HostIpBoxChange::Retire`]): only a destroyed box
+/// has its id revoked.
 ///
-/// Blocking: an admit returns only once the VM host daemon answered, so a
-/// caller that admits before it starts the box's first process knows the
-/// gate holds the box's rules by then. Best-effort: a failed exchange warns
-/// and returns `false`. A daemon that predates the verbs refuses them, and
-/// its gate predates the decision too.
+/// Blocking: an admit returns only once the VM host daemon answered.
+/// Best-effort: a failed exchange warns and returns `false`.
 pub fn host_ip_box_at(
     control_sock: &Path,
     session_id: boxes::SessionId,
-    egress: Option<&boxes::EgressPolicy>,
     credentialed_upstream: bool,
     change: HostIpBoxChange,
 ) -> bool {
@@ -727,7 +719,6 @@ pub fn host_ip_box_at(
         HostIpBoxChange::Admit => (
             minimald_rpc::BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
                 session_id,
-                egress: egress.cloned(),
                 credentialed_upstream,
             }),
             "admit",
@@ -1765,7 +1756,7 @@ mod tests {
         };
         let session = boxes::SessionId::mint();
         assert!(
-            host_ip_box_at(&sock, session, None, true, HostIpBoxChange::Admit),
+            host_ip_box_at(&sock, session, true, HostIpBoxChange::Admit),
             "the VM host daemon answered the admit"
         );
         assert!(

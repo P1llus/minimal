@@ -89,7 +89,6 @@ impl Vm {
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             name: name.to_string(),
             ingress_ports: ports.to_vec(),
-            egress: None,
             credentialed_upstream: credentialed.then(boxes::CredentialedUpstream::default),
             dynamic_ingress: None,
             dynamic_allowed_range: None,

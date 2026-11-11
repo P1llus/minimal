@@ -505,25 +505,6 @@ impl BoxHandle {
         recv.await.unwrap_or_default()
     }
 
-    /// Test-only: clones of the box's shared runtime ingress cell and
-    /// publication set (see [`BoxMessage::PeekIngressCells`]). `None` once
-    /// the actor is gone.
-    #[cfg(test)]
-    pub(crate) async fn ingress_cells(
-        &self,
-    ) -> Option<(
-        crate::net::provider::RuntimeIngress,
-        crate::net::listeners::BoxPublications,
-    )> {
-        let (send, recv) = oneshot::channel();
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "the actor may already be gone; the recv below reports that"
-        )]
-        let _ = self.0.send(BoxMessage::PeekIngressCells(send)).await;
-        recv.await.ok()
-    }
-
     /// The live dynamic-ingress mappings this box published at runtime
     /// (NET-044) — the rows `min session policy` lists. Empty for a box that
     /// published none. A dead actor maps to `NotConnected`.

@@ -3663,7 +3663,6 @@ pub(crate) async fn activate_box(
         control_sock.clone(),
         id,
         request.config.network,
-        request.config.policy.egress.as_ref(),
         request.config.policy.credentialed_upstream.is_some(),
     )
     .await;

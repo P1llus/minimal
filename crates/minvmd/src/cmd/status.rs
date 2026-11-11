@@ -157,10 +157,9 @@ fn row_read_text(read: &RowRead, json: bool) -> Result<String> {
             .context("serialising the no-row marker")?)
         }
         RowRead::Row(row) => Ok(format!(
-            "box {} switch {} allow [{}] declared [{}] runtime [{}]",
+            "box {} switch {} declared [{}] runtime [{}]",
             row.name,
             row.switch_address,
-            row.egress_allow_list.join(","),
             ports_text(&row.declared_ports),
             ports_text(&row.runtime_ports),
         )),
@@ -490,7 +489,6 @@ mod tests {
                 0x6e, 0x7f,
             ]),
             switch_address: "100.64.0.9".parse().unwrap(),
-            egress_allow_list: vec!["10.0.0.0/8".to_string()],
             declared_ports: vec![8080],
             runtime_ports: vec![3000, 3001],
         }
@@ -509,7 +507,7 @@ mod tests {
         let row = RowRead::Row(live_row());
         assert_eq!(
             row_read_text(&row, false).unwrap(),
-            "box web switch 100.64.0.9 allow [10.0.0.0/8] declared [8080] runtime [3000,3001]",
+            "box web switch 100.64.0.9 declared [8080] runtime [3000,3001]",
             "the human line carries every fact the row read answers with"
         );
         let json: minimald_rpc::BoxRow =

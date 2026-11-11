@@ -6349,7 +6349,7 @@ exit $rc
         // The hand vouched for, so the registry publishes it: both publishes
         // below bind at the box's own address.
         let manager = server.state.sessions_manager().await;
-        manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+        manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
         let web = crate::box_actor::tests::finalize_declared_dynamic_ingress_session(
             &mut client,
             "web",
@@ -6670,7 +6670,7 @@ exit $rc
         // The hand vouched for, so the registry publishes it: the allowed
         // publish below binds at the box's own address.
         let manager = server.state.sessions_manager().await;
-        manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+        manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
         let web = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",

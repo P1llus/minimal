@@ -355,6 +355,11 @@ impl OwnAddressReporter {
     /// The registry this reporter reports to, for the listen watcher's
     /// dynamic-port records and releases (NET-129): a watcher holding this
     /// handle needs no other path to the registry.
+    /// The box this reporter speaks for.
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
     pub(crate) fn registry(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.registry)
     }
@@ -717,13 +722,14 @@ impl OwnIpNetwork {
                 }
                 (None, None) => s.attach().await.map_err(NetworkError::new)?,
             };
-            let control = match s.transport() {
-                crate::net::SwitchTransport::LocalSpawn => ControlChannel::Unix(s.control_socket()),
-                crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                    ControlChannel::Vsock { cid, port }
-                }
-            };
-            (attach.lease, control, subnet)
+            // A box's id is its session's, and a task's box is its
+            // session's box.
+            let box_id = self
+                .own_address
+                .as_ref()
+                .map(OwnAddressReporter::session_id)
+                .or_else(|| self.engine_box.as_ref().map(|judged| judged.of.session()));
+            (attach.lease, ControlChannel::of(&s, box_id), subnet)
         };
 
         *self.reserved.lock().unwrap() = Some(Reserved {
@@ -754,7 +760,7 @@ impl OwnIpNetwork {
             ControlChannel::Unix(gvproxy) => {
                 Box::new(crate::net::attach::tap::TapUplink::new(gvproxy.clone()))
             }
-            ControlChannel::Vsock { .. } => Box::new(crate::net::attach::veth::VethUplink),
+            ControlChannel::VmHost { .. } => Box::new(crate::net::attach::veth::VethUplink),
         };
         let link = uplink
             .connect(&spawned, place)

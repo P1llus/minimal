@@ -1572,7 +1572,6 @@ pub(crate) async fn run_entry(
         ),
         id,
         request.config.network,
-        request.config.policy.egress.as_ref(),
     )
     .await;
     // The daemon named the box `<task>-<n>`. A box whose name cannot be read

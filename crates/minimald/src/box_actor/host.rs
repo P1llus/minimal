@@ -552,74 +552,8 @@ impl BoxActor {
             // publish; the record's handed address only when no publish of
             // this surface was admitted (a listen-published port's watcher
             // withdraws its own).
-            let switch_address = match self.reported_switch_address {
-                Some(address) => Some(address),
-                None => self.record.record().await.ok().and_then(|record| {
-                    record
-                        .box_addresses
-                        .map(|addresses| addresses.switch_address)
-                }),
-            };
-            if switch_address.is_none()
-                && matches!(control, crate::net::policy::ControlChannel::Vsock { .. })
-            {
-                tracing::warn!(
-                    session_id = %self.record.id(),
-                    ports = forwarders.len(),
-                    "no switch address to withdraw a stopped box's runtime ports from the \
-                     VM host daemon; the host's row keeps them until the box is destroyed \
-                     (see gominimal/inbox#914)"
-                );
-            }
-            // The withdrawals run side by side under one shared bound: the
-            // guest report door serves one connection at a time, so a door
-            // that accepts and never answers would otherwise hold each
-            // withdrawal's own deadline in turn. Past the bound the rest are
-            // abandoned, best-effort like every withdrawal here.
-            if let Some(switch_address) = switch_address {
-                let withdrawals = forwarders.iter().map(|forwarder| {
-                    let control = &control;
-                    async move {
-                        let port = forwarder.internal_port();
-                        if let Err(error) = crate::net::listeners::report_withdrawn_port(
-                            control,
-                            switch_address,
-                            port,
-                            minimald_rpc::PortReportSource::Expose,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                port,
-                                reason = %error,
-                                "reporting a stopped box's port withdrawal to the \
-                                 VM host daemon failed; the host's row still names it"
-                            );
-                        }
-                    }
-                });
-                if tokio::time::timeout(
-                    crate::net::listeners::WITHDRAW_REPORT_DEADLINE,
-                    futures::future::join_all(withdrawals),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!(
-                        ports = forwarders.len(),
-                        "the stopped box's port withdrawals did not finish inside \
-                         their shared deadline; the host's row may still name some"
-                    );
-                }
-            }
         }
 
-        // Runtime port-publish asks still waiting on a human (NET-045) fail
-        // closed with the typed nobody-is-attached refusal: a session that is
-        // going away has no attached human to answer them, and no caller can
-        // be left parked on a reply that will never come. The decision is
-        // audited like every other (NET-046) — and a late answer from the
-        // task the ask routed through finds no ask left to answer.
         for ask in std::mem::take(&mut self.pending_asks) {
             if let Some(host_ask) = &ask.host_ask {
                 host_ask.abort();
@@ -1075,12 +1009,10 @@ impl BoxActor {
     /// another box handed its address, so it reads as no row without
     /// asking: fail-closed. A host that cannot be asked reads as no row.
     pub(super) async fn host_row_stands(&mut self, record: &Record) -> bool {
-        let (Some(addresses), Some(box_id)) = (record.box_addresses, record.box_id) else {
+        if record.box_addresses.is_none() {
             return false;
-        };
-        let control = self.switch_control().await;
-        crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id).await
-            == Some(true)
+        }
+        self.switch_control().await.box_standing().await == Some(true)
     }
 
     /// The spec stored beside this box's record, read by the first launch
