@@ -5934,6 +5934,33 @@ mod tests {
         );
     }
 
+    /// Requests apply in the order they took their tickets, even when the
+    /// later one's thread is ready first.
+    #[test]
+    fn a_later_ticket_applies_after_the_earlier_one() {
+        let order = Arc::new(ApplyOrder::default());
+        let earlier = order.take();
+        let later = order.take();
+        let (applied, applied_rx) = std::sync::mpsc::channel();
+        let late = applied.clone();
+        let waiting = std::thread::spawn(move || {
+            later.wait_turn();
+            let _ = late.send("later");
+        });
+        assert!(
+            applied_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the later ticket waits while the earlier one has not applied"
+        );
+        earlier.wait_turn();
+        let _ = applied.send("earlier");
+        drop(earlier);
+        waiting.join().unwrap();
+        assert_eq!(
+            applied_rx.try_iter().collect::<Vec<_>>(),
+            ["earlier", "later"]
+        );
+    }
+
     /// A ticket whose thread panics before its turn still hands the turn
     /// on through its drop: the tickets behind it apply, and the door's
     /// order never wedges.

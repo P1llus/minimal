@@ -544,8 +544,6 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use minimald_rpc::ProxyDownCause;
-
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::resolve_boot_images;
     use crate::lifecycle::{Action, Lifecycle, next_state};
@@ -1008,68 +1006,20 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         .context("binding the stream door")?
     };
 
-    // The node's hostname proxy is published by this process, before the VM
-    // boots: a forward from the host's loopback at the node's port to the
-    // same port at the guest node. A port another program took since the
-    // draw is drawn again, without a boot. A pinned port that is held, or a
-    // draw that ran out of tries, leaves the proxy down, and the watcher
-    // below publishes the port once it is free.
-    let mut proxy_down_at_start = false;
-    if let Some((_, publisher)) = &network {
-        let node = boxes.subnet().daemon_ip();
-        let mut tries = 0usize;
-        loop {
-            tries += 1;
-            let listener =
-                std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, node_port.port);
-            match publisher.bind_node(listener, node, node_port.port) {
-                Ok(()) => {
-                    proxy_publish.set_serving(node_port.port);
-                    break;
-                }
-                Err(crate::net::publish::NodeBindError::Occupied)
-                    if !node_port.configured && tries < crate::control::PUBLISH_TRIES =>
-                {
-                    tracing::warn!(
-                        port = node_port.port,
-                        "the hostname proxy's port was taken since it was drawn; drawing another"
-                    );
-                    // The reservation is released first: a second take in
-                    // this process would contend with it.
-                    drop(node_port);
-                    node_port = assign_node_proxy_port(&ports_dir)
-                        .context("redrawing the node's proxy port")?;
-                    boxes
-                        .try_register_node_namespace(node_port.port)
-                        .context("publishing the node namespace's row after a redraw")?;
-                }
-                Err(error) => {
-                    let holder = port_holder(node_port.port).map(|(_, holder)| holder);
-                    tracing::warn!(
-                        port = node_port.port,
-                        holder = holder.as_deref().unwrap_or("unnamed"),
-                        %error,
-                        tries,
-                        "the VM starts with the hostname proxy down; retrying its port while the VM runs"
-                    );
-                    proxy_publish.set_down(
-                        node_port.port,
-                        ProxyDownCause::PortHeldAfterStart { holder },
-                    );
-                    // The watcher's check takes the reservation again when
-                    // the port frees.
-                    node_port.reservation = None;
-                    proxy_down_at_start = true;
-                    break;
-                }
-            }
+    let proxy_down_at_start = match &network {
+        Some((_, publisher)) => {
+            publish_node_proxy(publisher, &boxes, &proxy_publish, &mut node_port, || {
+                assign_node_proxy_port(&ports_dir)
+            })?
         }
-    } else {
-        tracing::warn!(
-            port = node_port.port,
-            "no virtual network: the hostname proxy is not published"
-        );
-    }
+        None => {
+            tracing::warn!(
+                port = node_port.port,
+                "no virtual network: the hostname proxy is not published"
+            );
+            false
+        }
+    };
 
     // R2.5: record whether the data volume image pre-exists this boot, before
     // the VMM child provisions it — a later boot failure is fatal for a
@@ -2637,6 +2587,68 @@ fn fallback_port(
 /// cause (#1790): under the in-force gate a box with no host row reaches
 /// nothing, so there is no interim a boot without its doors could degrade
 /// to.
+/// Publishes the node's hostname proxy before the VM boots: a forward from
+/// the host's loopback at the node's port to the same port at the guest
+/// node. A port another program took since the draw is drawn again with
+/// `redraw`, without a boot. A pinned port that is held, or a draw that ran
+/// out of tries, leaves the proxy down: the answer is `true` then, and the
+/// caller's watcher publishes the port once it is free.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn publish_node_proxy(
+    publisher: &crate::net::publish::Publisher,
+    boxes: &crate::box_registry::BoxRegistry,
+    proxy_publish: &crate::control::ProxyPublishStatus,
+    node_port: &mut NodePortAssignment,
+    redraw: impl Fn() -> Result<NodePortAssignment>,
+) -> Result<bool> {
+    use anyhow::Context as _;
+    let node = boxes.subnet().daemon_ip();
+    let mut tries = 0usize;
+    loop {
+        tries += 1;
+        let listener = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, node_port.port);
+        match publisher.bind_node(listener, node, node_port.port) {
+            Ok(()) => {
+                proxy_publish.set_serving(node_port.port);
+                return Ok(false);
+            }
+            Err(crate::net::publish::NodeBindError::Occupied)
+                if !node_port.configured && tries < crate::control::PUBLISH_TRIES =>
+            {
+                tracing::warn!(
+                    port = node_port.port,
+                    "the hostname proxy's port was taken since it was drawn; drawing another"
+                );
+                // The reservation is released first: a second take in this
+                // process would contend with it.
+                node_port.reservation = None;
+                *node_port = redraw().context("redrawing the node's proxy port")?;
+                boxes
+                    .try_register_node_namespace(node_port.port)
+                    .context("publishing the node namespace's row after a redraw")?;
+            }
+            Err(error) => {
+                let holder = port_holder(node_port.port).map(|(_, holder)| holder);
+                tracing::warn!(
+                    port = node_port.port,
+                    holder = holder.as_deref().unwrap_or("unnamed"),
+                    %error,
+                    tries,
+                    "the VM starts with the hostname proxy down; retrying its port while the VM runs"
+                );
+                proxy_publish.set_down(
+                    node_port.port,
+                    minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder },
+                );
+                // The watcher's check takes the reservation again when the
+                // port frees.
+                node_port.reservation = None;
+                return Ok(true);
+            }
+        }
+    }
+}
+
 #[cfg_attr(
     not(minvmd_libkrun),
     allow(
@@ -4025,5 +4037,195 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// A supervisor's publisher over a stand-in for gvproxy.
+    fn publisher_bed() -> (
+        crate::net::gvproxy_api::testing::FakeSwitch,
+        crate::box_registry::BoxRegistry,
+        crate::net::publish::Publisher,
+    ) {
+        let fake = crate::net::gvproxy_api::testing::FakeSwitch::start();
+        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let publisher = crate::net::publish::Publisher::start(
+            crate::net::gvproxy_api::SwitchApi::new(fake.sock.clone()),
+            boxes.clone(),
+            None,
+        );
+        (fake, boxes, publisher)
+    }
+
+    /// A drawn proxy port whose number nothing on this host holds.
+    fn drawn_node_port(ports: &std::path::Path) -> super::NodePortAssignment {
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .unwrap()
+            .port();
+        super::assign_node_port(ports, free, false).unwrap()
+    }
+
+    fn no_redraw() -> anyhow::Result<super::NodePortAssignment> {
+        panic!("the port is not drawn again")
+    }
+
+    #[test]
+    fn the_hostname_proxy_is_published_before_boot_at_the_drawn_port() {
+        let (fake, boxes, publisher) = publisher_bed();
+        let ports = tempfile::tempdir().unwrap();
+        let status = crate::control::ProxyPublishStatus::new();
+        let mut node_port = drawn_node_port(ports.path());
+        let port = node_port.port;
+        let down =
+            super::publish_node_proxy(&publisher, &boxes, &status, &mut node_port, no_redraw)
+                .unwrap();
+        assert!(!down);
+        assert_eq!(status.serving_ports(), vec![port]);
+        let node = boxes.subnet().daemon_ip();
+        assert_eq!(
+            fake.dials(&format!("127.0.0.1:{port}"), "tcp"),
+            Some(format!("{node}:{port}"))
+        );
+    }
+
+    #[test]
+    fn a_proxy_port_taken_since_its_draw_is_drawn_again_without_a_boot() {
+        let (fake, boxes, publisher) = publisher_bed();
+        let ports = tempfile::tempdir().unwrap();
+        let status = crate::control::ProxyPublishStatus::new();
+        let mut node_port = drawn_node_port(ports.path());
+        let taken = node_port.port;
+        boxes.try_register_node_namespace(taken).unwrap();
+        // Another program takes the port between the draw and the publish.
+        let _holder = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+        fake.occupy(&format!("127.0.0.1:{taken}"));
+
+        let down = super::publish_node_proxy(&publisher, &boxes, &status, &mut node_port, || {
+            super::assign_node_port(ports.path(), taken, false)
+        })
+        .unwrap();
+        assert!(!down);
+        let port = node_port.port;
+        assert_ne!(port, taken);
+        assert_eq!(status.serving_ports(), vec![port]);
+        assert_eq!(fake.dials(&format!("127.0.0.1:{taken}"), "tcp"), None);
+        assert!(fake.dials(&format!("127.0.0.1:{port}"), "tcp").is_some());
+    }
+
+    #[test]
+    fn a_pinned_proxy_port_that_is_held_starts_the_vm_with_the_proxy_down() {
+        let (fake, boxes, publisher) = publisher_bed();
+        let ports = tempfile::tempdir().unwrap();
+        let status = crate::control::ProxyPublishStatus::new();
+        let mut node_port = drawn_node_port(ports.path());
+        node_port.configured = true;
+        let pinned = node_port.port;
+        fake.occupy(&format!("127.0.0.1:{pinned}"));
+
+        let down =
+            super::publish_node_proxy(&publisher, &boxes, &status, &mut node_port, no_redraw)
+                .unwrap();
+        assert!(down, "the boot goes on with the proxy down");
+        assert_eq!(node_port.port, pinned, "a pinned port is never moved");
+        assert!(node_port.reservation.is_none());
+        assert!(status.serving_ports().is_empty());
+        assert!(matches!(
+            status.down(),
+            Some((port, minimald_rpc::ProxyDownCause::PortHeldAfterStart { .. })) if port == pinned
+        ));
+        assert!(fake.forwards().is_empty());
+    }
+
+    #[test]
+    fn the_mirror_binder_forwards_to_the_same_port_at_the_node() {
+        use crate::box_registry::{MirrorBindError, MirrorBinder as _, MirrorUnbind};
+        let (fake, boxes, publisher) = publisher_bed();
+        let node = boxes.subnet().daemon_ip();
+        let binder = super::SwitchMirrorBinder { publisher, node };
+        let address = std::net::Ipv4Addr::new(127, 0, 64, 9);
+
+        binder.bind(address, 3000).unwrap();
+        assert_eq!(
+            fake.dials("127.0.64.9:3000", "tcp"),
+            Some(format!("{node}:3000"))
+        );
+        fake.occupy("127.0.64.9:3001");
+        assert!(matches!(
+            binder.bind(address, 3001),
+            Err(MirrorBindError::Occupied)
+        ));
+        assert!(matches!(
+            binder.unbind(address, 3000),
+            MirrorUnbind::Undone { .. }
+        ));
+        assert_eq!(fake.dials("127.0.64.9:3000", "tcp"), None);
+    }
+
+    #[test]
+    fn the_supervisors_registry_reports_to_the_credential_proxy_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("boxes.json");
+        let registry =
+            super::supervisor_registry(crate::bep_attach::Attachments::new(), file.clone());
+        assert_eq!(
+            registry.proxy_control().map(std::path::Path::to_path_buf),
+            crate::box_registry::home_proxy_control(),
+            "a destroyed box's revocation goes to the proxy under the home directory"
+        );
+        registry
+            .register_client_box(crate::box_registry::ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .unwrap();
+        assert!(
+            file.exists(),
+            "a registration is written to the registry file"
+        );
+    }
+
+    #[test]
+    fn a_door_that_cannot_bind_is_a_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let answerer = crate::net::answerer::AnswererStatus::allocating_for_tests("doors");
+        let status = crate::control::ProxyPublishStatus::new();
+        let bind = |control: &std::path::Path| {
+            super::bind_box_doors(control, &boxes, &answerer, &status, None)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        // The host's control socket: its directory is a file.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let error = bind(&file.join("control.sock")).unwrap_err();
+        assert!(
+            error.contains("binding the box-registration control socket"),
+            "{error}"
+        );
+
+        // The guest door: something that is no socket stands at its path.
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(host.join(crate::control::GUEST_CONTROL_SOCK_FILE).join("x"))
+            .unwrap();
+        let error = bind(&host.join("control.sock")).unwrap_err();
+        assert!(error.contains("binding the guest report door"), "{error}");
+
+        // The stream door, the same way.
+        let stream = host.join(crate::net::GUEST_STREAM_SOCK_FILE);
+        std::fs::create_dir_all(stream.join("x")).unwrap();
+        let door = crate::net::stream_door::spawn(
+            stream,
+            crate::net::stream_door::Config {
+                boxes: boxes.clone(),
+                exposures: crate::net::host_exposures::HostExposures::fixed(Vec::new()),
+                own_listeners: std::sync::Arc::new(Vec::new),
+                proxy: None,
+            },
+        );
+        assert!(door.is_err(), "{door:?}");
     }
 }

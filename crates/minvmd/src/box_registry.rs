@@ -11371,4 +11371,156 @@ mod tests {
         ));
         assert!(!registry.holds_host_ip_boxes());
     }
+
+    /// Boxes come and go for as long as the daemon lives, and neither the
+    /// addresses nor the ids run out. A box the guest never started returns
+    /// its address at once. A started box's address comes back after the
+    /// quarantine.
+    #[test]
+    fn create_and_destroy_cycles_never_run_out_of_addresses_or_ids() {
+        let registry = BoxRegistry::new(carved());
+        let mut ids = std::collections::HashSet::new();
+        // Never started: three times the run's addresses, with no time
+        // passing.
+        for cycle in 0..CARVED_RUN * 3 {
+            let row = register_carved(&registry, &format!("idle{cycle}"))
+                .unwrap_or_else(|error| panic!("cycle {cycle}: {error}"));
+            assert!(!row.was_used());
+            assert!(ids.insert(row.box_id()), "cycle {cycle} repeats an id");
+            destroy(&registry, &row);
+        }
+        assert_eq!(registry.live_switch_addrs(), 0);
+        // Started: the whole run at once, four times over.
+        for round in 0..4 {
+            let rows = fill_carved_run(&registry);
+            for row in &rows {
+                assert!(ids.insert(row.box_id()), "round {round} repeats an id");
+            }
+            assert!(matches!(
+                register_carved(&registry, "one-more"),
+                Err(AllocationError::SwitchExhausted(_))
+            ));
+            for row in &rows {
+                destroy(&registry, row);
+            }
+            assert_eq!(registry.live_switch_addrs(), 0);
+            assert!(
+                matches!(
+                    register_carved(&registry, "too-early"),
+                    Err(AllocationError::SwitchExhausted(_))
+                ),
+                "round {round}: a started box's address waits out the quarantine"
+            );
+            registry.advance_clock(SWITCH_REUSE_QUARANTINE);
+        }
+    }
+
+    #[test]
+    fn concurrent_registrations_get_distinct_ids_and_addresses() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (first, last) = box_loopback_run(registry.loopback_slice.unwrap());
+        let (rows, host_ip_ids) = std::thread::scope(|scope| {
+            let rows: Vec<_> = (first..=last)
+                .take(24)
+                .map(|loopback| {
+                    let registry = registry.clone();
+                    scope.spawn(move || {
+                        registry
+                            .register_client_box_at_with_task_slots(
+                                client_spec(&format!("box{loopback}")),
+                                Ipv4Addr::from(loopback),
+                                2,
+                            )
+                            .expect("the plan holds every box")
+                    })
+                })
+                .collect();
+            let host_ip: Vec<_> = (0..16)
+                .map(|n| {
+                    let registry = registry.clone();
+                    scope.spawn(move || {
+                        registry
+                            .register_host_ip_box(&format!("hostip{n}"))
+                            .unwrap()
+                    })
+                })
+                .collect();
+            (
+                rows.into_iter()
+                    .map(|row| row.join().unwrap())
+                    .collect::<Vec<_>>(),
+                host_ip
+                    .into_iter()
+                    .map(|id| id.join().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let mut ids = std::collections::HashSet::new();
+        let mut switch = std::collections::HashSet::new();
+        let mut loopback = std::collections::HashSet::new();
+        assert!(
+            rows.len() >= 8,
+            "the loopback run holds {} boxes",
+            rows.len()
+        );
+        for row in &rows {
+            assert!(ids.insert(row.box_id()));
+            assert!(switch.insert(row.switch_addr()));
+            assert!(loopback.insert(row.loopback_addr()));
+            assert_eq!(row.task_addrs().len(), 2);
+            for task in row.task_addrs() {
+                assert!(switch.insert(*task), "a task address is handed twice");
+            }
+        }
+        for id in host_ip_ids {
+            assert!(ids.insert(id), "a host_ip box shares an id");
+        }
+    }
+
+    #[test]
+    fn task_rows_follow_their_box_through_withdraw_resume_and_destroy() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 2)
+            .unwrap();
+        let tasks = task_rows_of(&registry, &web);
+        assert_eq!(tasks.len(), 2);
+        for task in &tasks {
+            assert_eq!(task.task_row_of(), Some(web.switch_addr()));
+        }
+
+        // The guest reports the box ended: the task rows go with its row.
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(task_rows_of(&registry, &web).is_empty());
+
+        // The creator resumes it: the task rows are back at their addresses.
+        let resumed = resume(&registry, &web).unwrap();
+        let again = task_rows_of(&registry, &resumed);
+        assert_eq!(again.len(), 2);
+        for task in &again {
+            assert_eq!(task.task_row_of(), Some(web.switch_addr()));
+        }
+
+        // The creator destroys it: the rows and all three addresses go.
+        destroy(&registry, &resumed);
+        assert!(task_rows_of(&registry, &web).is_empty());
+        assert_eq!(registry.live_switch_addrs(), 0);
+    }
+
+    #[test]
+    fn a_refused_registration_keeps_no_address() {
+        let registry = BoxRegistry::new(carved());
+        register_carved(&registry, "web").unwrap();
+        for _ in 0..CARVED_RUN {
+            assert!(
+                register_carved(&registry, "web").is_err(),
+                "the name is a live box's"
+            );
+        }
+        assert_eq!(registry.live_switch_addrs(), 1);
+        // Every other address of the run is still there to hand.
+        for n in 1..CARVED_RUN {
+            register_carved(&registry, &format!("box{n}")).unwrap();
+        }
+    }
 }
