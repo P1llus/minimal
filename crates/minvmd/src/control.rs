@@ -417,36 +417,36 @@ pub fn spawn(
         })
 }
 
-/// Bind the in-VM daemon's report door (T94, NET-138) at
-/// [`GUEST_CONTROL_SOCK_FILE`] beside `control_sock_path` and serve the
-/// port-report verbs on it against `boxes` on a dedicated thread, answering
-/// the door's bound path so the caller hands the VMM child the same socket
-/// it registered the vsock port at [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`]
-/// for — the bridge's two halves, one step.
+/// Binds the guest door at [`GUEST_CONTROL_SOCK_FILE`] beside
+/// `control_sock_path` and serves it on its own thread, with a publisher
+/// that reaches gvproxy's forwarder API at `switch_sock`. Returns the door's
+/// path, which the VMM child maps the guest's vsock port
+/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] to.
 ///
-/// The door is the port reports' alone: the admit-port and withdraw-port
-/// verbs answer on it and nothing else does, so the grant a row's
-/// registration holds — never the peer, whose uid the socket posture
-/// already gates — decides what a report records. Its accept loop runs on
-/// its own thread beside the host socket's, each connection on a thread of
-/// its own, and it never
-/// closes a connection first: after its reply is written it waits for the
-/// reporter's close, because the KVM shuttle drops a server-initiated
-/// close's still-buffered reply bytes on the way to the guest (G-N8).
+/// What a publish binds is decided by the box's registration, never by the
+/// peer. The door does not close a connection first: libkrun drops the
+/// bytes it has not read yet when the host side closes.
 ///
-/// The bind runs the control socket's own posture — path-length check,
-/// 0700 parent dir, ownership verified, stale socket removed, 0600 on the
-/// socket — and happens on the calling thread, so a bind failure surfaces
-/// to the supervisor's startup handling rather than inside a thread the
-/// supervisor cannot reach. One info line at the bind says the door stands
-/// behind its bridge: the observability half of the report channel.
+/// The bind happens on the calling thread, so a failure is a startup error.
 pub fn spawn_guest_reports_door(
     control_sock_path: &Path,
     boxes: BoxRegistry,
     answerer: AnswererStatus,
     proxy_publish: ProxyPublishStatus,
+    switch_sock: &Path,
 ) -> std::io::Result<PathBuf> {
-    spawn_guest_door(control_sock_path, boxes, answerer, proxy_publish, None)
+    let publisher = Publisher::start(
+        crate::net::gvproxy_api::SwitchApi::new(switch_sock.to_path_buf()),
+        boxes.clone(),
+        None,
+    );
+    spawn_guest_door(
+        control_sock_path,
+        boxes,
+        answerer,
+        proxy_publish,
+        Some(publisher),
+    )
 }
 
 /// [`spawn_guest_reports_door`] with the publisher the door's publish verbs
@@ -6811,8 +6811,14 @@ mod tests {
         assert_eq!(read_mirror_collisions(&sock_path).await, Some(Vec::new()));
 
         // The guest door does not answer the verb.
-        let guest = spawn_guest_reports_door(&sock_path, boxes.clone(), answerer, proxy_publish)
-            .expect("the guest door binds");
+        let guest = spawn_guest_reports_door(
+            &sock_path,
+            boxes.clone(),
+            answerer,
+            proxy_publish,
+            &sock_path.with_file_name("no-switch.sock"),
+        )
+        .expect("the guest door binds");
         assert_eq!(read_mirror_collisions(&guest).await, None);
     }
 

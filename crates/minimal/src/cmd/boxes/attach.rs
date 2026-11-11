@@ -1611,11 +1611,14 @@ mod tests {
                 minvmd::control::ProxyPublishStatus::default(),
             )
             .expect("the control server binds its socket");
+            let switch = host_dir.join("switch.sock");
+            accept_every_forward(&switch);
             let guest = minvmd::control::spawn_guest_reports_door(
                 &control,
                 registry.clone(),
                 answerer,
                 minvmd::control::ProxyPublishStatus::default(),
+                &switch,
             )
             .expect("the guest door binds its socket");
             let global = GlobalArgs {
@@ -1657,19 +1660,22 @@ mod tests {
             .expect("an own-address box on a VM-backed host registers")
         }
 
-        /// The guest's ask for `port`, its reply read on a thread.
+        /// The guest's publish of `port` under the box's `ask` stance, its
+        /// reply read on a thread.
         fn guest_ask(
             &self,
             web: &RegisteredWithVmHost,
             port: u16,
-        ) -> std::sync::mpsc::Receiver<minimald_rpc::BoxControlReply> {
+        ) -> std::sync::mpsc::Receiver<minimald_rpc::GuestDoorReply> {
             use std::io::{BufRead as _, Write as _};
             let mut stream = std::os::unix::net::UnixStream::connect(&self.guest).unwrap();
             let mut line = serde_json_lenient::to_string(
-                &minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
-                    switch_address: web.addresses.switch_address,
-                    port,
+                &minimald_rpc::GuestDoorRequest::PublishPort(minimald_rpc::PublishPortRequest {
+                    box_id: web.box_id.expect("the registration names the box"),
+                    external: port,
+                    internal: port,
                     proto: boxes::IpProto::Tcp,
+                    origin: minimald_rpc::PublishOrigin::Expose,
                 }),
             )
             .unwrap();
@@ -1685,6 +1691,41 @@ mod tests {
             });
             rx
         }
+    }
+
+    /// Stands in for gvproxy's forwarder API at `sock`: every request is
+    /// answered with success.
+    fn accept_every_forward(sock: &std::path::Path) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the switch");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                // One request per connection: read the head and the body it
+                // announces, then answer.
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Content-Length: "))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
     }
 
     /// The relay as the ask loop sees it: every suspend and resume, in
@@ -1789,17 +1830,17 @@ mod tests {
             minimal_client::ask_dialog::ask_dialog_lead_in(&offer),
             "web asks to publish port 3000/tcp."
         );
-        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
-            reply.recv_timeout(ASK_WAIT).unwrap()
-        else {
-            panic!("the guest's ask is answered with its end");
-        };
+        let outcome = reply.recv_timeout(ASK_WAIT).unwrap();
         assert!(
             matches!(
                 outcome,
-                minimald_rpc::AskAdmitOutcome::Admitted { port: 3000, .. }
+                minimald_rpc::GuestDoorReply::Published {
+                    internal: 3000,
+                    state: minimald_rpc::ForwardState::Bound,
+                    ..
+                }
             ),
-            "the recorded yes admits the ask: {outcome:?}"
+            "the recorded yes publishes the port: {outcome:?}"
         );
         assert_eq!(events.recv_timeout(ASK_WAIT).unwrap(), "suspend");
         assert_eq!(events.recv_timeout(ASK_WAIT).unwrap(), "resume");
@@ -1853,18 +1894,20 @@ mod tests {
         first_offers_rx
             .recv_timeout(ASK_WAIT)
             .expect("the first dialog is shown");
-        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
-            reply.recv_timeout(ASK_WAIT).unwrap()
-        else {
-            panic!("the guest's ask is answered with its end");
-        };
-        assert!(matches!(
-            outcome,
-            minimald_rpc::AskAdmitOutcome::Refused {
-                reason: minimald_rpc::AskRefused::Denied,
-                ..
-            }
-        ));
+        let outcome = reply.recv_timeout(ASK_WAIT).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                minimald_rpc::GuestDoorReply::PublishRefused {
+                    refusal: minimald_rpc::PublishRefusal::Ask {
+                        refused: minimald_rpc::AskRefused::Denied,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
         first_done.send(()).unwrap();
         assert_eq!(events_rx.recv_timeout(ASK_WAIT).unwrap(), "suspend");
         assert_eq!(
@@ -1925,17 +1968,17 @@ mod tests {
             });
         });
         let reply = stand.guest_ask(&web, 3000);
-        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
-            reply.recv_timeout(ASK_WAIT).unwrap()
-        else {
-            panic!("the guest's ask is answered with its end");
-        };
+        let outcome = reply.recv_timeout(ASK_WAIT).unwrap();
         assert!(
             matches!(
                 outcome,
-                minimald_rpc::AskAdmitOutcome::Admitted { port: 3000, .. }
+                minimald_rpc::GuestDoorReply::Published {
+                    internal: 3000,
+                    state: minimald_rpc::ForwardState::Bound,
+                    ..
+                }
             ),
-            "the first attach's yes admits the ask: {outcome:?}"
+            "the first attach's yes publishes the port: {outcome:?}"
         );
         ends_rx
             .recv_timeout(ASK_WAIT)
@@ -1984,22 +2027,19 @@ mod tests {
         });
         let reply = stand.guest_ask(&web, 3000);
         offers.recv_timeout(ASK_WAIT).expect("the dialog is shown");
-        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
-            reply.recv_timeout(ASK_WAIT).unwrap()
-        else {
-            panic!("the guest's ask is answered with its end");
-        };
-        assert_eq!(
-            outcome,
-            minimald_rpc::AskAdmitOutcome::Refused {
-                ask_id: match outcome {
-                    minimald_rpc::AskAdmitOutcome::Refused { ask_id, .. }
-                    | minimald_rpc::AskAdmitOutcome::Admitted { ask_id, .. } => ask_id,
-                },
-                reason: minimald_rpc::AskRefused::Denied,
-                cause: None,
-            },
-            "Ctrl-C records a no"
+        let outcome = reply.recv_timeout(ASK_WAIT).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                minimald_rpc::GuestDoorReply::PublishRefused {
+                    refusal: minimald_rpc::PublishRefusal::Ask {
+                        refused: minimald_rpc::AskRefused::Denied,
+                        cause: None,
+                    },
+                    ..
+                }
+            ),
+            "Ctrl-C records a no: {outcome:?}"
         );
         assert_eq!(events.recv_timeout(ASK_WAIT).unwrap(), "suspend");
         assert_eq!(

@@ -7312,14 +7312,13 @@ fn stopped_vm_with_boxes(state: &std::path::Path, vm: &str, boxes: &[(&str, boxe
                 "switch_address": format!("100.64.0.{}", index + 9),
                 "loopback_address": format!("127.0.64.{}", index + 2),
                 "ingress_ports": [],
-                "standing": true,
             })
         })
         .collect();
     std::fs::write(
         dir.join(minvmd::box_registry::REGISTRY_FILE),
         serde_json_lenient::to_vec(&serde_json_lenient::json!({
-            "version": 1,
+            "version": 2,
             "boxes": records,
         }))
         .expect("the records serialize"),
