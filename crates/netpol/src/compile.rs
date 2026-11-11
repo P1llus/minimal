@@ -147,7 +147,7 @@ pub struct Options {
 }
 
 /// What the daemon keeps per box: enough to compile again when a published
-/// port or a host exposure changes.
+/// port changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub deployment: Deployment,

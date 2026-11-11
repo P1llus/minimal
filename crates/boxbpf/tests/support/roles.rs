@@ -126,7 +126,7 @@ fn loader() {
             "rule_entries" => options.sizes.rule_entries = value,
             "flows_per_box" => options.sizes.flows_per_box = value,
             "listens_per_box" => options.sizes.listens_per_box = value,
-            other => panic!("unknown size {other}"),
+            other => eprintln!("loader helper: no size named {other}"),
         }
     }
     loop {

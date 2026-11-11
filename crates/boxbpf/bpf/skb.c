@@ -353,7 +353,8 @@ int bp_egress(struct __sk_buff *skb)
 	if (st && p.pbit && st->ok_pbit == p.pbit && st->ok_family == p.family &&
 	    addr_eq(st->ok_addr, p.daddr) && st->ok_generation == cfg->generation &&
 	    (p.later_frag || st->ok_port == f.port)) {
-		/* The entry may have been evicted since the first packet. */
+		/* Another socket with the same local end may have taken the
+		 * entry and gone since the first packet. */
 		if (st->flags & ST_FLOW)
 			record_flow(skb, box, cfg, &p, st);
 		goto pass;
