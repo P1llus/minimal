@@ -220,6 +220,25 @@ unsafe extern "C" {
         direct_io: bool,
         sync_mode: u32,
     ) -> i32;
+
+    /// Add a virtio-net device on a unix stream socket, where a 4-byte
+    /// big-endian length precedes each frame. Exactly one of `c_path` and
+    /// `fd` (-1 for none).
+    pub fn krun_add_net_unixstream(
+        ctx_id: u32,
+        c_path: *const c_char,
+        fd: c_int,
+        c_mac: *const u8,
+        features: u32,
+        flags: u32,
+    ) -> i32;
+
+    /// Turn off the vsock device libkrun adds by itself, and with it the
+    /// socket passthrough that device carries.
+    pub fn krun_disable_implicit_vsock(ctx_id: u32) -> i32;
+
+    /// Add a vsock device with exactly the given passthrough flags.
+    pub fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32;
 }
 
 /// Translate a libkrun return code into a `Result`.

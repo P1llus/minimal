@@ -1203,6 +1203,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut child;
     let mut child_pid;
+    let mut uplink: Option<crate::net::uplink::Uplink> = None;
     // How many times this start has asked the guest to publish the hostname
     // proxy (T93): the first boot plus every redraw an address-in-use
     // publish forced. The bound is [`crate::control::PUBLISH_TRIES`], and it
@@ -1247,6 +1248,18 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         crate::state::forward_identity(&mut cmd);
         crate::telemetry::forward_trace(&mut cmd);
         alive_lock.inherit_into(&mut cmd);
+        // The VM's network device. Its backend socket is made per boot: the
+        // child inherits one end and the pump below takes the other. No
+        // gvproxy means no device, and the VM boots without a network.
+        let uplink_ends = match (&_gvproxy, &reclaim_switch_sock) {
+            (Some(_), Some(_)) => {
+                let ends = crate::net::uplink::prepare()
+                    .context("creating the VM's uplink socket pair")?;
+                ends.inherit_into(&mut cmd);
+                Some(ends)
+            }
+            _ => None,
+        };
         // The guest report door's path travels the same way the marker
         // socket's does: the child is the process that owns the libkrun
         // context, so it is the one that registers the door's vsock port at
@@ -1303,6 +1316,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
             child_pid = child.id();
             tracing::info!(pid = child_pid, "VMM child spawned");
+            if let (Some(ends), Some(switch_sock)) = (uplink_ends, &reclaim_switch_sock) {
+                // A boot that was redrawn left its pump at end of file.
+                if let Some(old) = uplink.take() {
+                    crate::net::uplink::Uplink::finish(old);
+                }
+                uplink = Some(
+                    ends.start(switch_sock.clone())
+                        .context("starting the VM's uplink pump")?,
+                );
+            }
             state_dir
                 .write_state(&State {
                     lifecycle: Lifecycle::Starting,
@@ -1655,6 +1678,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
+    // The child held the last copy of the VM end, so the pump is at end of
+    // file now.
+    if let Some(uplink) = uplink.take() {
+        uplink.finish();
+    }
     // The VM is gone, so the guest telemetry door's connection ends: let
     // the door hand the guest's last records (its shutdown) to the host's
     // endpoint before this process exits, bounded (TEL-034). The spool

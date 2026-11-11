@@ -94,6 +94,7 @@ pub(crate) mod gvproxy_api;
 pub(crate) mod proxy_reclaim;
 mod shuttle;
 mod stale_gvproxy;
+pub(crate) mod uplink;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 #[cfg_attr(not(minvmd_libkrun), allow(unused_imports))]
 pub(crate) use stale_gvproxy::reap_stale_gvproxy;

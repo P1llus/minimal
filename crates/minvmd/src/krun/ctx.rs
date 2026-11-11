@@ -289,6 +289,43 @@ impl Context {
         Ok(())
     }
 
+    /// Replaces libkrun's implicit vsock device with one that has no socket
+    /// passthrough. Must be called before any vsock port is mapped.
+    pub fn vsock_without_socket_passthrough(&mut self) -> Result<(), VmError> {
+        // SAFETY: plain value arguments; `ctx_id` is owned by `self`.
+        let ret = unsafe { raw::krun_disable_implicit_vsock(self.ctx_id) };
+        raw::check_backend("krun_disable_implicit_vsock", ret)?;
+        // SAFETY: as above.
+        let ret = unsafe { raw::krun_add_vsock(self.ctx_id, 0) };
+        raw::check_backend("krun_add_vsock", ret)?;
+        Ok(())
+    }
+
+    /// Adds a virtio-net device whose backend is the stream socket `fd`,
+    /// with `mac` as the address the guest sees.
+    pub fn add_net_unixstream_fd(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        mac: [u8; 6],
+        features: u32,
+    ) -> Result<(), VmError> {
+        // SAFETY: `mac` lives on this frame for the call and libkrun copies
+        // it. The path is null because the backend is `fd`. `ctx_id` is
+        // owned by `self`.
+        let ret = unsafe {
+            raw::krun_add_net_unixstream(
+                self.ctx_id,
+                std::ptr::null(),
+                fd,
+                mac.as_ptr(),
+                features,
+                0,
+            )
+        };
+        raw::check_backend("krun_add_net_unixstream", ret)?;
+        Ok(())
+    }
+
     /// Redirect implicit-console output to a host file.
     pub fn set_console_output(&mut self, path: impl AsRef<Path>) -> Result<(), VmError> {
         let cstr = cstring_from_path(path.as_ref(), "console_output")?;

@@ -5,6 +5,8 @@
 //! the calls carry no token. gvproxy's copy of the API inside the virtual
 //! network is closed by the token minvmd starts it with.
 
+#![cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+
 use std::io::{self, Read as _, Write as _};
 use std::net::SocketAddrV4;
 use std::os::unix::net::UnixStream;
