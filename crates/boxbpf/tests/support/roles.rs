@@ -12,7 +12,7 @@ use std::{
 use boxbpf::loader::{ServeOptions, serve};
 use nix::sys::socket::{self, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 
-use super::{LO_ADDRS, ROLE, RULE_ENTRIES, SOCKET, probe};
+use super::{LO_ADDRS, ROLE, SIZES, SOCKET, probe};
 
 /// Runs the role this process was started for, if any.
 pub fn run() {
@@ -117,11 +117,17 @@ fn loader() {
         handover_base: Some(handover),
         ..ServeOptions::default()
     };
-    if let Some(entries) = std::env::var(RULE_ENTRIES)
-        .ok()
-        .and_then(|n| n.parse().ok())
-    {
-        options.sizes.rule_entries = entries;
+    for pair in std::env::var(SIZES).unwrap_or_default().split(',') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let value = value.parse().expect("a size is a number");
+        match name {
+            "rule_entries" => options.sizes.rule_entries = value,
+            "flows_per_box" => options.sizes.flows_per_box = value,
+            "listens_per_box" => options.sizes.listens_per_box = value,
+            other => eprintln!("loader helper: no size named {other}"),
+        }
     }
     loop {
         let conn = socket::accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC).expect("accept");

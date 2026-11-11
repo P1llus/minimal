@@ -301,6 +301,22 @@ fn flood(to: SocketAddr, count: usize) -> std::io::Result<String> {
     Ok(refused.to_string())
 }
 
+/// One socket that writes to `count` ports of one address, then counts the
+/// answers it gets.
+fn udp_many(ip: IpAddr, first: u16, count: u16) -> std::io::Result<String> {
+    let sock = UdpSocket::bind(unspecified(&SocketAddr::new(ip, 0)))?;
+    for port in first..first + count {
+        sock.send_to(b"ping", SocketAddr::new(ip, port))?;
+    }
+    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut buf = [0u8; 64];
+    let mut answered = std::collections::BTreeSet::new();
+    while let Ok((_, from)) = sock.recv_from(&mut buf) {
+        answered.insert(from.port());
+    }
+    Ok(format!("answers={}", answered.len()))
+}
+
 /// Hands sockets to whoever holds the other end of `channel`.
 pub fn send_sockets(channel: BorrowedFd<'_>, socks: &[OwnedFd]) -> std::io::Result<()> {
     let raw: Vec<_> = socks.iter().map(AsRawFd::as_raw_fd).collect();
@@ -405,8 +421,59 @@ fn dns(server: SocketAddr, over_tcp: bool) -> std::io::Result<String> {
     ))
 }
 
-fn hold_udp(to: SocketAddr) {
-    let sock = UdpSocket::bind(unspecified(&to)).and_then(|s| s.connect(to).map(|()| s));
+/// A datagram socket at `at` as an endpoint of the daemon has one: it says
+/// which network namespace it is in, then at each step who wrote to it.
+fn endpoint_udp(at: SocketAddr) {
+    let sock = UdpSocket::bind(at).expect("bind");
+    let netns = boxbpf::netns_cookie(sock.as_fd()).expect("namespace cookie");
+    sock.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    say(&format!("ready netns={netns}"));
+    let mut buf = [0u8; 64];
+    while wait_step() {
+        say(&report(
+            sock.recv_from(&mut buf)
+                .map(|(_, peer)| format!("peer={peer}")),
+        ));
+    }
+}
+
+/// A stream listener at `at` as an endpoint of the daemon has one: it
+/// greets every peer with `relayed` and says who it was.
+fn endpoint_tcp(at: SocketAddr) {
+    let listener = TcpListener::bind(at).expect("bind");
+    let netns = boxbpf::netns_cookie(listener.as_fd()).expect("namespace cookie");
+    say(&format!("ready netns={netns}"));
+    for mut stream in listener.incoming().flatten() {
+        let peer = stream.peer_addr().expect("peer");
+        // The client may have given up already.
+        let _sent = stream.write_all(b"relayed\n");
+        say(&format!("peer={peer}"));
+    }
+}
+
+/// A connection that stays open until the probe is dropped.
+fn hold_tcp(to: SocketAddr) {
+    match TcpStream::connect_timeout(&to, Duration::from_secs(2)) {
+        Ok(mut stream) => {
+            let mut buf = [0u8; 32];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let data = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
+            say(&format!(
+                "ready ok peer={} data={}",
+                stream.peer_addr().expect("peer"),
+                data.trim()
+            ));
+            while wait_step() {}
+        }
+        Err(e) => say(&format!("ready {}", errno(&e))),
+    }
+}
+
+fn hold_udp(to: SocketAddr, local_port: u16) {
+    let mut local = unspecified(&to);
+    local.set_port(local_port);
+    let sock = UdpSocket::bind(local).and_then(|s| s.connect(to).map(|()| s));
     let Ok(sock) = sock else {
         say("ready err setup");
         return;
@@ -422,7 +489,10 @@ fn hold_udp(to: SocketAddr) {
 
 fn serve_tcp(at: SocketAddr) {
     let listener = TcpListener::bind(at).expect("bind");
-    say("ready");
+    say(&format!(
+        "ready port={}",
+        listener.local_addr().expect("address").port()
+    ));
     for mut stream in listener.incoming().flatten() {
         // The client may have given up already.
         let _sent = stream.write_all(b"hello\n");
@@ -592,9 +662,20 @@ pub fn run() {
         }
         ["bind", kind, ip, port] => report(bind(kind, addr(ip, port))),
         ["dns", ip, rest @ ..] => report(dns(addr(ip, "53"), rest.first() == Some(&"tcp"))),
-        ["hold-udp", ip, port] => return hold_udp(addr(ip, port)),
+        ["hold-udp", ip, port] => return hold_udp(addr(ip, port), 0),
+        ["hold-udp", ip, port, local] => {
+            return hold_udp(addr(ip, port), local.parse().expect("port"));
+        }
+        ["endpoint-udp", ip, port] => return endpoint_udp(addr(ip, port)),
+        ["endpoint-tcp", ip, port] => return endpoint_tcp(addr(ip, port)),
+        ["hold-tcp", ip, port] => return hold_tcp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
+        ["udp-many", ip, first, count] => report(udp_many(
+            ip.parse().expect("address"),
+            first.parse().expect("port"),
+            count.parse().expect("count"),
+        )),
         ["flood", ip, port, count] => report(flood(addr(ip, port), count.parse().expect("count"))),
         ["make-sockets", kind, count] => report(make_sockets(kind, count.parse().expect("count"))),
         ["use-socket", kind, ip, port] => report(use_socket(kind, addr(ip, port))),

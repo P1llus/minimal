@@ -4,7 +4,10 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::abi::{self, EVENT_NET, Hook, NO_RULE, Reason};
+use crate::{
+    abi::{self, EVENT_LISTEN, EVENT_NET, Hook, NO_RULE, Reason},
+    model::Family,
+};
 
 /// What the engine did with the flow an event reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,9 +45,28 @@ pub struct NetEvent {
     pub cookie: u64,
 }
 
+/// A TCP socket of a box started to listen, or a listener is gone. It says
+/// when to read the engine's table of listeners, which is the truth: this
+/// record may be lost, and a box at its event rate gets none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenEvent {
+    /// Cgroup id of the box.
+    pub box_id: u64,
+    /// Boot-time clock, nanoseconds.
+    pub time_ns: u64,
+    /// Cookie of the network namespace the socket is in.
+    pub netns: u64,
+    pub port: u16,
+    /// Of the socket. An IPv6 socket may listen for IPv4 too.
+    pub family: Family,
+    /// False when the listener is gone.
+    pub open: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Net(NetEvent),
+    Listen(ListenEvent),
     /// A kind this reader does not know, or a network record with a code it
     /// does not know. The header is still usable.
     Unknown {
@@ -99,6 +121,24 @@ pub fn decode(record: &[u8]) -> Option<Event> {
         box_id,
         time_ns,
     };
+    if kind == EVENT_LISTEN {
+        let netns = c.u64()?;
+        let port = c.u16()?;
+        let family = match c.u8()? {
+            4 => Family::V4,
+            6 => Family::V6,
+            _ => return Some(unknown),
+        };
+        let open = c.u8()? != 0;
+        return Some(Event::Listen(ListenEvent {
+            box_id,
+            time_ns,
+            netns,
+            port,
+            family,
+            open,
+        }));
+    }
     if kind != EVENT_NET {
         return Some(unknown);
     }
@@ -222,6 +262,33 @@ mod tests {
                 time_ns: 1_000
             })
         );
+    }
+
+    #[test]
+    fn a_listen_record_decodes() {
+        let mut r = Vec::new();
+        r.extend(EVENT_LISTEN.to_ne_bytes());
+        r.extend(40u16.to_ne_bytes());
+        r.extend(0u32.to_ne_bytes());
+        r.extend(1_000u64.to_ne_bytes());
+        r.extend(42u64.to_ne_bytes());
+        r.extend(7u64.to_ne_bytes());
+        r.extend(8080u16.to_ne_bytes());
+        r.extend([6, 1]);
+        r.extend(0u32.to_ne_bytes());
+        assert_eq!(r.len(), size_of::<abi::EvListen>());
+        assert_eq!(
+            decode(&r),
+            Some(Event::Listen(ListenEvent {
+                box_id: 42,
+                time_ns: 1_000,
+                netns: 7,
+                port: 8080,
+                family: Family::V6,
+                open: true,
+            }))
+        );
+        assert_eq!(decode(&r[..30]), None);
     }
 
     #[test]

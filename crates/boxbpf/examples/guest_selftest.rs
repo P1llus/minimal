@@ -33,7 +33,8 @@ mod guest {
     };
 
     const CGROUP: &str = "/sys/fs/cgroup";
-    const REFUSED: u16 = 113;
+    /// What a refused system call returns: `EPERM`.
+    const REFUSED: i32 = 1;
     const RESOLVER4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 1), 15353);
     const RESOLVER6: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 15353, 0, 0);
 
@@ -72,6 +73,43 @@ mod guest {
             unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as libc::Ioctl, &raw mut request) };
         // SAFETY: sock is ours and not used again.
         let _closed = unsafe { libc::close(sock) };
+    }
+
+    /// Gives the loopback interface a second address, outside 127.0.0.0/8:
+    /// a source the engine does not let pass for being loopback.
+    fn loopback_alias(addr: Ipv4Addr) {
+        // SAFETY: socket takes no pointers.
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        // SAFETY: an all-zero ifreq is valid, and name and address are
+        // filled in below.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in request.ifr_name.iter_mut().zip(c"lo:1".to_bytes_with_nul()) {
+            *dst = libc::c_char::from_ne_bytes([*src]);
+        }
+        let sin = libc::sockaddr_in {
+            sin_family: libc::sa_family_t::try_from(libc::AF_INET).unwrap_or(2),
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: sockaddr_in and sockaddr have the same size, and every
+        // bit pattern is a valid sockaddr.
+        request.ifr_ifru.ifru_addr =
+            unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) };
+        // SAFETY: request is a valid ifreq naming an interface and an address.
+        let _set = unsafe { libc::ioctl(sock, libc::SIOCSIFADDR as libc::Ioctl, &raw mut request) };
+        // SAFETY: sock is ours and not used again.
+        let _closed = unsafe { libc::close(sock) };
+    }
+
+    /// One datagram from `from` to port 9 of the same address.
+    fn udp_from(from: Ipv4Addr) -> String {
+        match UdpSocket::bind((from, 0)).and_then(|s| s.send_to(b"x", (from, 9))) {
+            Ok(_) => "ok".to_owned(),
+            Err(e) => errno(&e),
+        }
     }
 
     /// Runs `action` in a child that first joins the box cgroup, and returns
@@ -156,7 +194,7 @@ mod guest {
 
     fn start() -> Result<Handles, Error> {
         let step = |what: &'static str| move |source: std::io::Error| Error::Sys { what, source };
-        for dir in ["supervisor", "boxes", "boxes/bare", "boxes/b"] {
+        for dir in ["supervisor", "boxes", "boxes/bare", "boxes/b", "boxes/own"] {
             fs::create_dir_all(format!("{CGROUP}/{dir}"))
                 .map_err(step("create the cgroup layout"))?;
         }
@@ -191,10 +229,7 @@ mod guest {
                 allow: prefixes(&["127.1.0.0/16"]),
                 ..BoxPolicy::default()
             },
-            options: Options {
-                refuse_errno: REFUSED,
-                log_flows: false,
-            },
+            options: Options { log_flows: false },
         }
     }
 
@@ -246,6 +281,10 @@ mod guest {
             source,
         })?;
         let _timeout = resolver.set_read_timeout(Some(Duration::from_secs(2)));
+        let netns = boxbpf::netns_cookie(resolver.as_fd()).map_err(|source| Error::Sys {
+            what: "read the namespace cookie",
+            source,
+        })?;
 
         let out = in_box("bare", || tcp((Ipv4Addr::LOCALHOST, port).into()));
         report.check(
@@ -287,7 +326,7 @@ mod guest {
                         local: None,
                     };
                     let expect_deny =
-                        live.compiled().evaluate(&flow, None).verdict == FlowVerdict::Deny;
+                        live.compiled().evaluate(&flow, |_| None).verdict == FlowVerdict::Deny;
                     total += 1;
                     denied += usize::from(out == refused);
                     if (out == refused) != expect_deny {
@@ -334,7 +373,7 @@ mod guest {
             Ok((n, peer)) => {
                 // The entry goes with the box's socket, which closes once
                 // the reply is in: ask first.
-                let origin = handles.original_destination(peer, Protocol::Udp)?;
+                let origin = handles.original_destination(netns, peer, Protocol::Udp)?;
                 let _sent = resolver.send_to(buf.get(..n).unwrap_or_default(), peer);
                 origin
             }
@@ -355,8 +394,8 @@ mod guest {
 
         let mut refusals = 0;
         if let Some(source) = events.as_mut() {
-            while source.try_next().is_some() {
-                refusals += 1;
+            while let Some(event) = source.try_next() {
+                refusals += usize::from(matches!(event, netpol::event::Event::Net(_)));
             }
         }
         report.check(
@@ -364,6 +403,82 @@ mod guest {
             refusals > denied,
             &format!("{refusals} refusal events for {denied} refused flows and one socket"),
         );
+        // A box socket that listens is in the table until it is released,
+        // and a record says when to read the table.
+        let (Ok((port_read, port_write)), Ok((stop_read, stop_write))) =
+            (nix::unistd::pipe(), nix::unistd::pipe())
+        else {
+            return Ok(());
+        };
+        // SAFETY: one thread, and the child only uses sockets and the pipes.
+        let listener = unsafe { nix::unistd::fork() };
+        if let Ok(nix::unistd::ForkResult::Child) = listener {
+            drop((port_read, stop_write));
+            let joined = fs::write(format!("{CGROUP}/boxes/b/cgroup.procs"), "0");
+            let bound = joined.and_then(|()| TcpListener::bind("[::]:0"));
+            let said = bound
+                .as_ref()
+                .map_or(0, |l| l.local_addr().map_or(0, |a| a.port()));
+            let _sent = fs::File::from(port_write).write_all(said.to_string().as_bytes());
+            let mut wait = String::new();
+            let _closed = fs::File::from(stop_read).read_to_string(&mut wait);
+            std::process::exit(0);
+        }
+        drop((port_write, stop_read));
+        let mut said = String::new();
+        let _read = fs::File::from(port_read).read_to_string(&mut said);
+        let listen_port: u16 = said.parse().unwrap_or(0);
+        let listed = handles.listening(live.id(), netns)?;
+        let mut heard = false;
+        if let Some(source) = events.as_mut() {
+            while let Some(event) = source.try_next() {
+                if let netpol::event::Event::Listen(e) = event {
+                    heard |= e.box_id == live.id().0 && e.port == listen_port && e.open;
+                }
+            }
+        }
+        drop(stop_write);
+        if let Ok(nix::unistd::ForkResult::Parent { child }) = listener {
+            let _reaped = nix::sys::wait::waitpid(child, None);
+        }
+        let after = handles.listening(live.id(), netns)?;
+        report.check(
+            "listen",
+            listen_port != 0
+                && listed.len() == 1
+                && listed.iter().all(|l| l.port == listen_port)
+                && heard
+                && after.is_empty(),
+            &format!(
+                "port {listen_port}: in the table {listed:?}, record seen: {heard}, after release {after:?}"
+            ),
+        );
+
+        // A box with a source check sends from its own addresses only,
+        // and those are a set the daemon adds to while the box runs.
+        let address = Ipv4Addr::new(10, 9, 0, 1);
+        loopback_alias(address);
+        let own_ip = Spec {
+            deployment: Deployment::new(NodeKind::Guest, Mode::OwnIp),
+            policy: BoxPolicy {
+                default: Some(netpol::Verdict::Allow),
+                ..BoxPolicy::default()
+            },
+            options: Options { log_flows: false },
+        };
+        let own = handles.install(box_id("own")?, own_ip)?;
+        let before = in_box("own", || udp_from(address));
+        handles.add_own_address(own.id(), IpAddr::V4(address))?;
+        let with = in_box("own", || udp_from(address));
+        handles.remove_own_address(own.id(), IpAddr::V4(address))?;
+        let after = in_box("own", || udp_from(address));
+        report.check(
+            "own_address",
+            (before.as_str(), with.as_str(), after.as_str()) == ("err 1", "ok", "err 1"),
+            &format!("a send from {address}: {before} before it is the box's, {with} while, {after} after"),
+        );
+        handles.uninstall(&own)?;
+
         let stats = handles.stats(live.id())?.unwrap_or_default();
         report.check(
             "stats",

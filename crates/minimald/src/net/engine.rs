@@ -271,6 +271,8 @@ pub(crate) trait BoxProxy: Send + Sync {
 /// own.
 pub(crate) struct Peers {
     flows: Flows,
+    /// The network namespace the endpoint is in: the daemon's own.
+    netns: u64,
 }
 
 impl Peers {
@@ -284,7 +286,7 @@ impl Peers {
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Option<OriginalDestination> {
-        match self.flows.original_destination(peer, protocol) {
+        match self.flows.original_destination(self.netns, peer, protocol) {
             Ok(Some(flow)) if flow.box_id == of.id && flow.endpoint == service.index() => {
                 Some(flow)
             }
@@ -599,7 +601,8 @@ impl Engine {
         let mut unknown_box: u64 = 0;
         loop {
             let event = match reader.next().await {
-                Ok(event) => event,
+                Ok(netpol::event::Event::Net(event)) => event,
+                Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(%error, "reading the policy engine's events stopped");
                     return;
@@ -728,6 +731,7 @@ impl Engine {
             hostname_proxy: wants
                 .hostname_proxy
                 .then(|| block.endpoint(Service::HostnameProxy)),
+            host_relay: None,
         });
         let ranges = spec::endpoint_ranges(&endpoints::addresses(), endpoints::port_range());
         Spec {
@@ -837,8 +841,16 @@ impl Engine {
         let _in_runtime = serving.runtime.enter();
         let mut tasks = Vec::new();
         let peers = || -> Option<Peers> {
-            match attached.flows.try_clone() {
-                Ok(flows) => Some(Peers { flows }),
+            let made = attached.flows.try_clone().and_then(|flows| {
+                let netns =
+                    boxbpf::current_netns_cookie().map_err(|source| boxbpf::Error::Sys {
+                        what: "read the network namespace cookie",
+                        source,
+                    })?;
+                Ok(Peers { flows, netns })
+            });
+            match made {
+                Ok(peers) => Some(peers),
                 Err(error) => {
                     tracing::error!(%error, "an endpoint cannot ask the engine for its peers");
                     None
@@ -1137,7 +1149,7 @@ impl Engine {
                     .expect("engine lock")
                     .pinned_set(of.id, flow.remote)
             });
-        compiled.evaluate(flow, pinned)
+        compiled.evaluate(flow, |_| pinned)
     }
 
     /// Makes the box's entry match `facts`, when a launch finds the entry

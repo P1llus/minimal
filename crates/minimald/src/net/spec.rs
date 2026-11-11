@@ -12,11 +12,8 @@ use netpol::{
     compile::Options,
 };
 
-/// A refused system call returns `EPERM`, and allowed flows are not logged.
-pub(crate) const OPTIONS: Options = Options {
-    refuse_errno: 0,
-    log_flows: false,
-};
+/// Allowed flows are not logged.
+pub(crate) const OPTIONS: Options = Options { log_flows: false };
 
 /// An entry of a box's egress section that is not what its list holds.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -33,6 +30,8 @@ pub(crate) struct Node {
     pub(crate) kind: NodeKind,
     /// The virtual network the node itself sits on: a VM guest's.
     pub(crate) network: Option<VirtualNetwork>,
+    /// The address that stands for the host's loopback there.
+    pub(crate) host_alias: Option<IpAddr>,
     /// Where the node's hostname proxy listens for programs outside boxes.
     pub(crate) hostname_proxy: Vec<SocketAddr>,
 }
@@ -42,6 +41,7 @@ impl Node {
         Self {
             kind: NodeKind::Native,
             network: None,
+            host_alias: None,
             hostname_proxy: Vec::new(),
         }
     }
@@ -53,11 +53,11 @@ impl Node {
             .map(|prefix| VirtualNetwork {
                 subnet: prefix,
                 gateway: IpAddr::V4(subnet.gateway()),
-                host_alias: Some(IpAddr::V4(subnet.host_alias())),
             });
         Self {
             kind: NodeKind::Guest,
             network,
+            host_alias: Some(IpAddr::V4(subnet.host_alias())),
             hostname_proxy: Vec::new(),
         }
     }
@@ -163,6 +163,7 @@ pub(crate) fn deployment(
         NetworkMode::OwnIp => d.transport_enforces = true,
         _ => {
             d.network = node.network;
+            d.host_alias = node.host_alias;
             // A native box uses the host's own routes. The virtual network
             // a guest sits on carries IPv4 only.
             d.transport_ipv6 = node.kind == NodeKind::Native;
@@ -373,7 +374,10 @@ mod tests {
             port: 443,
             local: None,
         };
-        assert_eq!(compiled.evaluate(&flow, None).verdict, FlowVerdict::Allow);
+        assert_eq!(
+            compiled.evaluate(&flow, |_| None).verdict,
+            FlowVerdict::Allow
+        );
     }
 
     #[test]
@@ -441,10 +445,10 @@ mod tests {
             local: None,
         };
         assert!(matches!(
-            compiled.evaluate(&to(53, Protocol::Udp), None).verdict,
+            compiled.evaluate(&to(53, Protocol::Udp), |_| None).verdict,
             FlowVerdict::Redirect(_)
         ));
-        let api = compiled.evaluate(&to(80, Protocol::Tcp), None);
+        let api = compiled.evaluate(&to(80, Protocol::Tcp), |_| None);
         assert_eq!(api.verdict, FlowVerdict::Deny);
         let rule = &compiled.rules[usize::from(api.rule.expect("a rule decided"))];
         assert_eq!(

@@ -49,23 +49,11 @@ impl Mode {
     }
 }
 
-/// The addresses of the box itself. Empty for `host_ip` and `none`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoxAddrs {
-    pub v4: Option<Ipv4Addr>,
-    pub v6: Option<Ipv6Addr>,
-    /// The link-local address of the box's interface. The kernel sends
-    /// neighbour discovery from it, so the source check must know it.
-    pub link_local6: Option<Ipv6Addr>,
-}
-
 /// The virtual network a box, or the node of a `host_ip` box, sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualNetwork {
     pub subnet: Prefix,
     pub gateway: IpAddr,
-    /// The address that stands for the host's loopback, where there is one.
-    pub host_alias: Option<IpAddr>,
 }
 
 /// A port with the transport protocols it is open for.
@@ -85,6 +73,9 @@ pub struct Services {
     pub credential_proxy: Option<Endpoint>,
     /// Where the box's requests to the node's hostname proxy end up.
     pub hostname_proxy: Option<Endpoint>,
+    /// TCP to the host alias is redirected here. The relay behind it dials
+    /// the host port if the user has exposed it.
+    pub host_relay: Option<Endpoint>,
 }
 
 /// Where the daemon's endpoints for all boxes live, when boxes could reach
@@ -100,12 +91,13 @@ pub struct EndpointRange {
 pub struct Deployment {
     pub node: NodeKind,
     pub mode: Mode,
-    pub addrs: BoxAddrs,
     pub network: Option<VirtualNetwork>,
     /// Whether the transport under the box carries IPv6 at all.
     pub transport_ipv6: bool,
-    /// Host ports the box may reach on the host alias.
-    pub host_exposures: Vec<PortOf>,
+    /// The address that stands for the host's loopback. It is never
+    /// routed: a box reaches the host through its host relay endpoint, or
+    /// not at all. A box that is on no virtual network has one too.
+    pub host_alias: Option<IpAddr>,
     /// Ports of the box that accept inbound flows.
     pub published: Vec<PortOf>,
     pub services: Services,
@@ -128,19 +120,15 @@ impl Deployment {
         Self {
             node,
             mode,
-            addrs: BoxAddrs {
-                v4: None,
-                v6: None,
-                link_local6: None,
-            },
             network: None,
             transport_ipv6: false,
-            host_exposures: Vec::new(),
+            host_alias: None,
             published: Vec::new(),
             services: Services {
                 resolver: None,
                 credential_proxy: None,
                 hostname_proxy: None,
+                host_relay: None,
             },
             endpoint_ranges: Vec::new(),
             steered: Vec::new(),
@@ -160,9 +148,9 @@ pub struct BasePolicy {
     pub protected: Vec<Prefix>,
     pub defaults: Defaults,
     pub endpoints: Vec<(EndpointIndex, Endpoint)>,
-    /// Packets must leave from the box's own addresses.
+    /// Packets must leave from the box's own addresses: the set the daemon
+    /// keeps for the box.
     pub source_check: bool,
-    pub addrs: BoxAddrs,
 }
 
 impl BasePolicy {
@@ -181,11 +169,6 @@ impl BasePolicy {
             },
             endpoints: Vec::new(),
             source_check: false,
-            addrs: BoxAddrs {
-                v4: None,
-                v6: None,
-                link_local6: None,
-            },
         }
     }
 }
@@ -237,6 +220,7 @@ fn own_endpoints(s: &Services, out: &mut Vec<Rule>) {
         (s.resolver, Protocols::TCP_UDP),
         (s.credential_proxy, Protocols::TCP),
         (s.hostname_proxy, Protocols::TCP),
+        (s.host_relay, Protocols::TCP),
     ];
     for (endpoint, protocols) in entries {
         let Some(e) = endpoint else { continue };
@@ -366,16 +350,17 @@ fn steering(proxy: Option<Endpoint>, names: &[NamePattern], out: &mut Vec<Rule>)
 
 /// A box with its own namespace may always talk to itself: its loopback
 /// and its own addresses, both ways.
-fn own_addresses(addrs: &BoxAddrs, out: &mut Vec<Rule>) {
-    let own = [addrs.v4.map(IpAddr::V4), addrs.v6.map(IpAddr::V6)]
-        .into_iter()
-        .flatten()
-        .map(Prefix::host);
-    for prefix in [LOOPBACK4, LOOPBACK6].into_iter().chain(own) {
+fn own_addresses(out: &mut Vec<Rule>) {
+    let itself = [
+        Target::Net(LOOPBACK4),
+        Target::Net(LOOPBACK6),
+        Target::OwnAddresses,
+    ];
+    for target in itself {
         for direction in [Direction::Egress, Direction::Ingress] {
             out.push(Rule::new(
                 direction,
-                Target::Net(prefix),
+                target.clone(),
                 Action::Allow,
                 Origin::OwnAddresses,
             ));
@@ -422,20 +407,29 @@ fn no_ipv6_transport(out: &mut Vec<Rule>) {
     }
 }
 
-/// The host alias is open on the exposed ports only, and the gateway not at
-/// all. DNS to the gateway is redirected before this is reached.
-fn infrastructure(net: &VirtualNetwork, exposures: &[PortOf], out: &mut Vec<Rule>) {
-    if let Some(alias) = net.host_alias {
-        let alias = Target::Net(Prefix::host(alias));
-        for e in exposures {
-            out.push(
-                egress(alias.clone(), Action::Allow, Origin::HostExposure)
-                    .protocols(e.protocols)
-                    .ports(PortRange::one(e.port)),
-            );
-        }
-        out.push(egress(alias, Action::Deny, Origin::Infrastructure));
+/// TCP to the host alias goes to the box's host relay, which knows what the
+/// user has exposed and dials it. Nothing else goes to the alias, and
+/// without a relay nothing at all. DNS to it is redirected before this is
+/// reached.
+fn host_alias(alias: Option<IpAddr>, relay: Option<Endpoint>, out: &mut Vec<Rule>) {
+    let Some(alias) = alias else { return };
+    let target = Target::Net(Prefix::host(alias));
+    // A redirect cannot change the family of a flow.
+    if relay.is_some_and(|e| e.has(crate::model::Family::of(&alias))) {
+        out.push(
+            egress(
+                target.clone(),
+                Action::Redirect(HOST_RELAY),
+                Origin::HostAlias,
+            )
+            .protocols(Protocols::TCP),
+        );
     }
+    out.push(egress(target, Action::Deny, Origin::HostAlias));
+}
+
+/// No box talks to the gateway of its virtual network.
+fn infrastructure(net: &VirtualNetwork, out: &mut Vec<Rule>) {
     out.push(egress(
         Target::Net(Prefix::host(net.gateway)),
         Action::Deny,
@@ -508,7 +502,7 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
     );
     steering(d.services.credential_proxy, &d.steered, &mut before);
     if d.mode.own_namespace() {
-        own_addresses(&d.addrs, &mut before);
+        own_addresses(&mut before);
     }
     if d.mode == Mode::OwnIp && d.transport_ipv6 {
         neighbour_discovery(&mut before);
@@ -516,8 +510,11 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
     if d.mode != Mode::None && !d.transport_ipv6 {
         no_ipv6_transport(&mut before);
     }
+    if d.mode != Mode::None {
+        host_alias(d.host_alias, d.services.host_relay, &mut before);
+    }
     if let Some(net) = &d.network {
-        infrastructure(net, &d.host_exposures, &mut before);
+        infrastructure(net, &mut before);
     }
     published(&d.published, &mut before);
 
@@ -525,6 +522,7 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
         (RESOLVER, d.services.resolver),
         (CREDENTIAL_PROXY, d.services.credential_proxy),
         (HOSTNAME_PROXY, d.services.hostname_proxy),
+        (HOST_RELAY, d.services.host_relay),
     ]
     .into_iter()
     .filter_map(|(index, endpoint)| endpoint.map(|e| (index, e)))
@@ -536,7 +534,6 @@ pub fn base_policy(d: &Deployment) -> BasePolicy {
         defaults: defaults(d.mode),
         endpoints,
         source_check: d.mode == Mode::OwnIp,
-        addrs: d.addrs,
     }
 }
 
@@ -584,16 +581,11 @@ mod tests {
 
     fn own_ip() -> Deployment {
         let mut d = Deployment::new(NodeKind::Guest, Mode::OwnIp);
-        d.addrs.v4 = Some(Ipv4Addr::new(192, 168, 127, 5));
         d.network = Some(VirtualNetwork {
             subnet: "192.168.127.0/24".parse().unwrap(),
             gateway: "192.168.127.1".parse().unwrap(),
-            host_alias: Some("192.168.127.254".parse().unwrap()),
         });
-        d.host_exposures = vec![PortOf {
-            protocols: Protocols::TCP,
-            port: 5432,
-        }];
+        d.host_alias = Some("192.168.127.254".parse().unwrap());
         d.published = vec![PortOf {
             protocols: Protocols::TCP,
             port: 8080,
@@ -631,7 +623,7 @@ mod tests {
         let first = |o: Origin| origins.iter().position(|x| *x == o).unwrap();
         assert!(first(Origin::OwnEndpoints) < first(Origin::Resolver));
         assert!(first(Origin::Resolver) < first(Origin::Infrastructure));
-        assert!(first(Origin::HostExposure) < first(Origin::Infrastructure));
+        assert!(first(Origin::Resolver) < first(Origin::HostAlias));
         assert!(first(Origin::OwnAddresses) < first(Origin::NoIpv6Transport));
         assert!(origins.contains(&Origin::Published));
         assert_eq!(
@@ -698,31 +690,53 @@ mod tests {
 
     #[test]
     fn a_box_cannot_bind_a_port_the_daemon_s_endpoints_are_drawn_from() {
-        let mut d = Deployment::new(NodeKind::Native, Mode::HostIp);
-        let ports = PortRange::new(20480, 24575).unwrap();
-        d.endpoint_ranges = vec![EndpointRange {
-            prefix: Prefix::host("127.0.80.1".parse().unwrap()),
-            ports,
-        }];
-        let base = base_policy(&d);
-        let binds: Vec<&Rule> = base
-            .before
-            .iter()
-            .filter(|r| r.direction == Direction::Bind)
-            .collect();
-        assert_eq!(binds.len(), 1);
-        let rule = binds.first().unwrap();
-        assert_eq!(
-            (rule.action, rule.origin, &rule.target, rule.ports),
-            (Action::Deny, Origin::OtherEndpoints, &Target::Any, ports)
-        );
+        // On the node's network the endpoints of all boxes share an
+        // address and a port range. In a namespace of the box's own they
+        // are one block on its loopback. Either way the box must not take
+        // a port before the daemon binds it.
+        let shared = PortRange::new(20480, 24575).unwrap();
+        let block = PortRange::new(20480, 20483).unwrap();
+        for (node, mode, ports) in [
+            (NodeKind::Native, Mode::HostIp, shared),
+            (NodeKind::Native, Mode::OwnIp, block),
+            (NodeKind::Guest, Mode::OwnIp, block),
+        ] {
+            let mut d = Deployment::new(node, mode);
+            d.endpoint_ranges = ["127.0.80.1/32", "::1/128"]
+                .map(|prefix| EndpointRange {
+                    prefix: prefix.parse().unwrap(),
+                    ports,
+                })
+                .to_vec();
+            let base = base_policy(&d);
+            let binds: Vec<&Rule> = base
+                .before
+                .iter()
+                .filter(|r| r.direction == Direction::Bind)
+                .collect();
+            // A wildcard bind takes the port on every address, so the
+            // deny is for any address, once per range.
+            assert_eq!(binds.len(), 2, "{node:?} {mode:?}");
+            for rule in binds {
+                assert_eq!(
+                    (rule.action, rule.origin, &rule.target, rule.ports),
+                    (Action::Deny, Origin::OtherEndpoints, &Target::Any, ports)
+                );
+                assert_eq!(rule.protocols, Protocols::TCP_UDP);
+            }
+            // Before the rule that lets a box with its own namespace use
+            // its loopback, where it has one.
+            let first = |o: Origin| base.before.iter().position(|r| r.origin == o);
+            if let Some(own) = first(Origin::OwnAddresses) {
+                assert!(first(Origin::OtherEndpoints).unwrap() < own);
+            }
+        }
     }
 
     #[test]
     fn ipv6_transport_adds_neighbour_discovery_and_drops_the_ipv6_limit() {
         let mut d = own_ip();
         d.transport_ipv6 = true;
-        d.addrs.v6 = Some("fd00::5".parse().unwrap());
         d.services.resolver = Some(Endpoint {
             v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
             v6: Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0)),
@@ -782,6 +796,59 @@ mod tests {
         assert!(text.contains("(DNS to the box resolver)"));
         assert!(text.contains("protected ranges, after the box's rules:"));
         assert!(text.contains("  192.168.127.0/24\n"));
+    }
+
+    #[test]
+    fn the_host_alias_leads_to_the_host_relay_or_nowhere() {
+        let alias: IpAddr = "100.64.255.254".parse().unwrap();
+        let rules = |d: &Deployment| -> Vec<(Action, Protocols)> {
+            base_policy(d)
+                .before
+                .iter()
+                .filter(|r| r.origin == Origin::HostAlias)
+                .map(|r| {
+                    assert_eq!(r.target, Target::Net(Prefix::host(alias)));
+                    assert_eq!(r.ports, PortRange::ALL);
+                    (r.action, r.protocols)
+                })
+                .collect()
+        };
+        // A box on the host's own network has the alias too, and no
+        // virtual network.
+        let mut d = Deployment::new(NodeKind::Native, Mode::HostIp);
+        d.host_alias = Some(alias);
+        assert_eq!(rules(&d), [(Action::Deny, Protocols::ALL)]);
+        assert!(base_policy(&d).protected.is_empty());
+
+        let relay = Endpoint {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 80, 1), 20483)),
+            v6: None,
+        };
+        d.services.host_relay = Some(relay);
+        assert_eq!(
+            rules(&d),
+            [
+                (Action::Redirect(HOST_RELAY), Protocols::TCP),
+                (Action::Deny, Protocols::ALL)
+            ]
+        );
+        let base = base_policy(&d);
+        assert!(base.endpoints.contains(&(HOST_RELAY, relay)));
+        // The box may dial its relay endpoint itself, as any of its own.
+        assert!(base.before.iter().any(|r| r.origin == Origin::OwnEndpoints
+            && r.target == Target::Net(Prefix::host("127.0.80.1".parse().unwrap()))
+            && r.ports == PortRange::one(20483)
+            && r.protocols == Protocols::TCP));
+
+        // A relay with no address of the alias's family cannot take it.
+        d.services.host_relay = Some(Endpoint {
+            v4: None,
+            v6: Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 20483, 0, 0)),
+        });
+        assert_eq!(rules(&d), [(Action::Deny, Protocols::ALL)]);
+        // A box with no network has no host to reach.
+        d.mode = Mode::None;
+        assert!(rules(&d).is_empty());
     }
 
     #[test]

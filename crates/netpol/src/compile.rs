@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     abi,
-    base::{BasePolicy, BoxAddrs, Deployment, base_policy},
+    base::{BasePolicy, Deployment, base_policy},
     model::{
         Action, Defaults, Direction, Endpoint, EndpointIndex, Family, NamePattern, PortRange,
         Prefix, Protocols, Rule, SetId, Target, Verdict,
@@ -85,7 +85,6 @@ fn declared(rule: &Rule) -> Option<String> {
         Origin::BoxDeny => format!("deny_subnets {}", rule.target),
         Origin::BoxAllow => format!("allow_subnets {}", rule.target),
         Origin::BoxName => format!("allow_dns_hosts {}", rule.target),
-        Origin::HostExposure => format!("host exposure {}", l4()),
         Origin::Published => format!("published port {}", l4()),
         _ => return None,
     })
@@ -122,9 +121,6 @@ pub struct BoxConfig {
     pub defaults: Defaults,
     pub source_check: bool,
     pub log_flows: bool,
-    /// The errno a refused system call returns. 0 means `EPERM`.
-    pub refuse_errno: u16,
-    pub addrs: BoxAddrs,
 }
 
 /// Everything the engine holds for one box, as plain data.
@@ -146,13 +142,12 @@ pub struct Compiled {
 /// Settings of the compile that are neither deployment nor policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Options {
-    pub refuse_errno: u16,
     /// Report allowed connects and sends as events too.
     pub log_flows: bool,
 }
 
 /// What the daemon keeps per box: enough to compile again when a published
-/// port or a host exposure changes.
+/// port changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub deployment: Deployment,
@@ -293,7 +288,7 @@ fn validate(rules: &[Rule], endpoints: &[(EndpointIndex, Endpoint)]) -> Result<(
             Target::Any => &[Family::V4, Family::V6],
             Target::Net(p) if p.family() == Family::V4 => &[Family::V4],
             Target::Net(_) => &[Family::V6],
-            Target::Names(_) => &[],
+            Target::Names(_) | Target::OwnAddresses => &[],
         };
         if let Some(family) = needed.iter().copied().find(|f| !endpoint.has(*f)) {
             return Err(CompileError::EndpointFamily {
@@ -377,7 +372,7 @@ pub fn compile(
                 .filter_map(|(slot, r)| match &r.target {
                     Target::Any => Some((*slot, Prefix::all(family), *r)),
                     Target::Net(p) if p.family() == family => Some((*slot, *p, *r)),
-                    Target::Net(_) | Target::Names(_) => None,
+                    Target::Net(_) | Target::Names(_) | Target::OwnAddresses => None,
                 })
                 .collect();
             let prefixes: BTreeSet<Prefix> = scoped.iter().map(|(_, p, _)| *p).collect();
@@ -422,22 +417,32 @@ pub fn compile(
         }
         names.push((n.clone(), id));
     }
+    // The sets: one per name pattern, and the box's own addresses.
+    let own = (None, SetId::OWN);
+    let by_name = names.iter().map(|(pattern, id)| (Some(pattern), *id));
     let mut sets = Vec::new();
-    for (pattern, id) in &names {
+    for (pattern, id) in std::iter::once(own).chain(by_name) {
         for direction in Direction::ALL {
             let list = prune(
                 numbered
                     .iter()
                     .filter(|(_, r)| r.direction == direction)
-                    .filter(|(_, r)| matches!(&r.target, Target::Names(n) if n.covers(pattern)))
+                    .filter(|(_, r)| match (&r.target, pattern) {
+                        (Target::Names(n), Some(pattern)) => n.covers(pattern),
+                        (Target::OwnAddresses, None) => true,
+                        _ => false,
+                    })
                     .map(|(s, _)| *s),
             );
             if list.is_empty() {
                 continue;
             }
-            check_len(direction, pattern, &list, &rules)?;
+            match pattern {
+                Some(pattern) => check_len(direction, pattern, &list, &rules)?,
+                None => check_len(direction, &Target::OwnAddresses, &list, &rules)?,
+            }
             sets.push(SetEntry {
-                id: *id,
+                id,
                 direction,
                 rules: list,
             });
@@ -453,8 +458,6 @@ pub fn compile(
             },
             source_check: base.source_check,
             log_flows: options.log_flows,
-            refuse_errno: options.refuse_errno,
-            addrs: base.addrs,
         },
         rules,
         protected,
@@ -657,33 +660,33 @@ mod tests {
     }
 
     #[test]
-    fn the_error_tells_host_exposures_from_the_base_policy() {
-        let mut d = Deployment::new(NodeKind::Guest, Mode::HostIp);
-        d.network = Some(crate::base::VirtualNetwork {
-            subnet: p("100.64.0.0/24"),
-            gateway: "100.64.0.1".parse().unwrap(),
-            host_alias: Some("100.64.0.254".parse().unwrap()),
-        });
-        d.host_exposures = (0..40)
+    fn the_error_tells_published_ports_from_the_base_policy() {
+        let mut d = Deployment::new(NodeKind::Guest, Mode::OwnIp);
+        d.published = (0..40)
             .map(|i| crate::base::PortOf {
                 protocols: Protocols::TCP,
                 port: 5000 + i,
             })
             .collect();
         let err = compile(&base_policy(&d), &BoxPolicy::default(), Options::default()).unwrap_err();
-        let CompileError::TooManyRules { entries, base, .. } = &err else {
+        let CompileError::TooManyRules {
+            direction: Direction::Ingress,
+            entries,
+            base,
+            ..
+        } = &err
+        else {
             panic!("{err:?}");
         };
-        assert_eq!(entries.len(), 40);
-        assert!(*base >= 1, "the deny of the rest of the alias");
-        assert!(err.to_string().contains("host exposure tcp 5000"), "{err}");
+        assert_eq!((entries.len(), *base), (40, 0));
+        assert!(err.to_string().contains("published port tcp 5000"), "{err}");
     }
 
     #[test]
     fn a_guest_box_with_every_service_and_its_own_rules_fits() {
         use std::net::{Ipv4Addr, SocketAddrV4};
 
-        use crate::base::{EndpointRange, PortOf, VirtualNetwork};
+        use crate::base::{EndpointRange, VirtualNetwork};
 
         let at = |port| Endpoint {
             v4: Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 80, 1), port)),
@@ -693,23 +696,18 @@ mod tests {
         d.network = Some(VirtualNetwork {
             subnet: p("100.64.0.0/24"),
             gateway: "100.64.0.1".parse().unwrap(),
-            host_alias: Some("100.64.0.254".parse().unwrap()),
         });
+        d.host_alias = Some("100.64.0.254".parse().unwrap());
         d.services.resolver = Some(at(20480));
         d.services.credential_proxy = Some(at(20481));
         d.services.hostname_proxy = Some(at(20482));
+        d.services.host_relay = Some(at(20483));
         d.steered = vec!["api.example.com".parse().unwrap()];
         d.node_hostname_proxy = vec!["127.0.0.1:7654".parse().unwrap()];
         d.endpoint_ranges = vec![EndpointRange {
             prefix: p("127.0.80.1/32"),
             ports: PortRange::new(20480, 24575).unwrap(),
         }];
-        d.host_exposures = (0..7)
-            .map(|i| PortOf {
-                protocols: Protocols::TCP,
-                port: 5000 + i,
-            })
-            .collect();
         let to_any = |port| BoxRule {
             action: BoxAction::Allow,
             protocols: Protocols::TCP,
@@ -726,7 +724,7 @@ mod tests {
         let c = compile(&base_policy(&d), &policy, Options::default()).unwrap();
         let longest = c.nets.iter().map(|e| e.rules.len()).max().unwrap();
         assert!(longest <= 12, "{longest} rules in one entry\n{c}");
-        // On the endpoint address: its own three endpoints, the deny of
+        // On the endpoint address: its own four endpoints, the deny of
         // the other ports of the range, DNS, and the box's rules that can
         // still decide there.
         let endpoint = entry(&c, Direction::Egress, "127.0.80.1/32");
@@ -738,6 +736,7 @@ mod tests {
         assert_eq!(
             origins,
             [
+                Origin::OwnEndpoints,
                 Origin::OwnEndpoints,
                 Origin::OwnEndpoints,
                 Origin::OwnEndpoints,
@@ -855,7 +854,6 @@ mod tests {
         d.network = Some(crate::base::VirtualNetwork {
             subnet: p("100.64.0.0/24"),
             gateway: "100.64.0.1".parse().unwrap(),
-            host_alias: None,
         });
         base_policy(&d)
     }
@@ -868,7 +866,7 @@ mod tests {
             port: 443,
             local: None,
         };
-        c.evaluate(&flow, pinned).verdict
+        c.evaluate(&flow, |_| pinned).verdict
     }
 
     #[test]
@@ -906,7 +904,7 @@ mod tests {
                 port: 443,
                 local: None,
             },
-            None,
+            |_| None,
         );
         let by = &c.rules[usize::from(d.rule.unwrap())];
         assert_eq!(
@@ -1010,22 +1008,17 @@ mod tests {
         let spec = Spec {
             deployment: Deployment::new(NodeKind::Guest, Mode::OwnIp),
             policy: BoxPolicy::default(),
-            options: Options {
-                refuse_errno: 111,
-                log_flows: true,
-            },
+            options: Options { log_flows: true },
         };
         let c = spec.compile().unwrap();
         assert_eq!(c.config.defaults.egress, Verdict::Deny);
         assert!(c.config.source_check && c.config.log_flows);
-        assert_eq!(c.config.refuse_errno, 111);
         assert!(c.to_string().contains("(the box itself)"));
     }
 
     #[test]
     fn a_box_whose_transport_enforces_gets_an_entry_that_refuses_nothing() {
         let mut deployment = Deployment::new(NodeKind::Native, Mode::OwnIp);
-        deployment.addrs.v4 = Some("100.64.7.2".parse().unwrap());
         deployment.transport_enforces = true;
         let spec = Spec {
             deployment,

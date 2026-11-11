@@ -6,7 +6,7 @@ use std::{
 };
 
 use aya::maps::{MapData, RingBuf};
-use netpol::event::{self, Event, NetEvent};
+use netpol::event::{self, Event};
 use tokio::io::{Interest, unix::AsyncFd};
 
 /// The ring buffer of one engine. Reads never block.
@@ -20,14 +20,15 @@ impl Source {
         Self { ring, skipped: 0 }
     }
 
-    /// The next network event, if one is waiting. Records of a kind this
-    /// reader does not know are stepped over by their own size and counted.
-    pub fn try_next(&mut self) -> Option<NetEvent> {
+    /// The next event, if one is waiting. Records of a kind this reader
+    /// does not know are stepped over by their own size and counted, so
+    /// this never returns [`Event::Unknown`].
+    pub fn try_next(&mut self) -> Option<Event> {
         loop {
             let decoded = event::decode(&self.ring.next()?);
             match decoded {
-                Some(Event::Net(e)) => return Some(e),
                 Some(Event::Unknown { .. }) | None => self.skipped += 1,
+                Some(known) => return Some(known),
             }
         }
     }
@@ -59,8 +60,8 @@ impl Reader {
         Ok(Self { fd })
     }
 
-    /// The next network event. Waits until the kernel has written one.
-    pub async fn next(&mut self) -> io::Result<NetEvent> {
+    /// The next event. Waits until the kernel has written one.
+    pub async fn next(&mut self) -> io::Result<Event> {
         loop {
             if let Some(e) = self.fd.get_mut().try_next() {
                 return Ok(e);

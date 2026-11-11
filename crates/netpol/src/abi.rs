@@ -21,7 +21,7 @@ use crate::{
     model::{Action, Direction, Protocols, SetId, Verdict},
 };
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Endpoint indexes of a box are below this.
 pub const ENDPOINTS_MAX: u8 = 4;
@@ -42,6 +42,7 @@ pub const ACTION_ALLOW: u8 = 1;
 pub const ACTION_REDIRECT: u8 = 2;
 
 pub const EVENT_NET: u16 = 1;
+pub const EVENT_LISTEN: u16 = 2;
 
 /// A struct that is plain bytes: `repr(C)`, no padding, every bit pattern
 /// valid.
@@ -62,14 +63,7 @@ pub struct BoxCfg {
     pub generation: u32,
     /// Indexed by [`Direction::code`].
     pub default_action: [u8; 3],
-    pub _pad: u8,
-    pub refuse_errno: u16,
-    pub _pad2: u16,
-    /// All zero: the box has no address of that kind.
-    pub addr4: [u8; 4],
-    pub addr6: [u8; 16],
-    /// The box's link-local address.
-    pub ll6: [u8; 16],
+    pub _pad: [u8; 5],
 }
 
 #[repr(C)]
@@ -206,15 +200,30 @@ impl Stats {
     }
 }
 
-/// The box's end of a redirected flow, as the endpoint sees its peer.
+/// The box's end of a flow to one of its endpoints, as the endpoint sees
+/// its peer, in the network namespace both are in.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FlowKey {
+    /// The cookie of the network namespace: what `SO_NETNS_COOKIE` gives
+    /// for a socket there.
+    pub netns: u64,
     pub saddr: [u8; 16],
     pub sport: u16,
     /// One protocol bit.
     pub proto: u8,
     pub family: u8,
+    pub _pad: [u8; 4],
+}
+
+/// What a box holds of the maps the programs fill.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Usage {
+    /// Sockets with an entry in the flows map.
+    pub flows: u32,
+    /// Listening sockets with an entry in the listens map.
+    pub listens: u32,
 }
 
 #[repr(C)]
@@ -226,6 +235,28 @@ pub struct FlowVal {
     pub orig_family: u8,
     pub endpoint: u8,
     pub _pad: u32,
+}
+
+/// One listening TCP socket of a box.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ListenKey {
+    pub box_id: u64,
+    /// Cookie of the socket's network namespace.
+    pub netns: u64,
+    /// Socket cookie.
+    pub cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Listen {
+    /// The address the socket is bound to. All zero: any.
+    pub addr: [u8; 16],
+    pub port: u16,
+    /// 4 or 6, of the socket.
+    pub family: u8,
+    pub _pad: [u8; 5],
 }
 
 /// Starts every record of the event ring buffer. A reader skips a kind it
@@ -266,6 +297,20 @@ pub struct EvNet {
     pub daddr: [u8; 16],
     pub _pad: u32,
     pub cookie: u64,
+}
+
+/// The listen record, [`EVENT_LISTEN`]: the listens map changed for the
+/// box.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct EvListen {
+    pub hdr: EvHdr,
+    pub netns: u64,
+    pub port: u16,
+    pub family: u8,
+    /// 1: a socket started to listen. 0: a listener is gone.
+    pub open: u8,
+    pub _pad: u32,
 }
 
 /// Which program reported an event.
@@ -361,10 +406,12 @@ pub enum Reason {
     /// socket that never binds, and no rule is asked. The programs report
     /// no event for it: this is the evaluator's reason.
     EphemeralPort,
+    /// The box has as many flows to its endpoints open as it may have.
+    FlowLimit,
 }
 
 impl Reason {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::NoConfig,
         Self::Rule,
         Self::SetRule,
@@ -376,6 +423,7 @@ impl Reason {
         Self::NoEndpoint,
         Self::NoMemory,
         Self::EphemeralPort,
+        Self::FlowLimit,
     ];
 
     #[must_use]
@@ -392,6 +440,7 @@ impl Reason {
             Self::NoEndpoint => 9,
             Self::NoMemory => 10,
             Self::EphemeralPort => 11,
+            Self::FlowLimit => 12,
         }
     }
 
@@ -413,6 +462,7 @@ impl Reason {
             Self::NoEndpoint => "BP_R_NO_ENDPOINT",
             Self::NoMemory => "BP_R_NO_MEMORY",
             Self::EphemeralPort => "BP_R_EPHEMERAL_PORT",
+            Self::FlowLimit => "BP_R_FLOW_LIMIT",
         }
     }
 }
@@ -455,7 +505,7 @@ fn line(out: &mut String, condition: &str) {
 }
 
 fn constants(out: &mut String) {
-    let pairs: [(&str, u64); 15] = [
+    let pairs: [(&str, u64); 17] = [
         ("BP_ABI_VERSION", u64::from(VERSION)),
         ("BP_ENDPOINTS_MAX", u64::from(ENDPOINTS_MAX)),
         ("BP_RULES_MAX", RULES_MAX as u64),
@@ -467,7 +517,9 @@ fn constants(out: &mut String) {
         ("BP_DENY", u64::from(ACTION_DENY)),
         ("BP_ALLOW", u64::from(ACTION_ALLOW)),
         ("BP_REDIRECT", u64::from(ACTION_REDIRECT)),
+        ("BP_SET_OWN", SetId::OWN.0),
         ("BP_EV_NET", u64::from(EVENT_NET)),
+        ("BP_EV_LISTEN", u64::from(EVENT_LISTEN)),
         ("BP_P_TCP", u64::from(Protocols::TCP.bits())),
         ("BP_P_UDP", u64::from(Protocols::UDP.bits())),
         ("BP_P_ICMP", u64::from(Protocols::ICMP.bits())),
@@ -491,7 +543,7 @@ fn constants(out: &mut String) {
 }
 
 layouts! {
-    BoxCfg = "bp_box_cfg", 52 { flags, generation, default_action, refuse_errno, addr4, addr6, ll6 }
+    BoxCfg = "bp_box_cfg", 16 { flags, generation, default_action }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
     Rules = "bp_rules", 388 { count, r }
     Rule4Key = "bp_rule4_key", 24 { prefixlen, box_id, generation, dir, addr }
@@ -504,7 +556,11 @@ layouts! {
     Stats = "bp_stats", 72 {
         tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost, ev_limited
     }
-    FlowKey = "bp_flow_key", 20 { saddr, sport, proto, family }
+    FlowKey = "bp_flow_key", 32 { netns, saddr, sport, proto, family }
+    Usage = "bp_usage", 8 { flows, listens }
+    ListenKey = "bp_listen_key", 24 { box_id, netns, cookie }
+    Listen = "bp_listen", 24 { addr, port, family }
+    EvListen = "bp_ev_listen", 40 { hdr, netns, port, family, open }
     FlowVal = "bp_flow_val", 32 { box_id, orig_addr, orig_port, orig_family, endpoint }
     EvHdr = "bp_ev_hdr", 24 { kind, size, cpu, ts_ns, box_id }
     EvNet = "bp_ev_net", 88 {
@@ -675,12 +731,7 @@ pub fn box_cfg(compiled: &Compiled, generation: u32) -> BoxCfg {
             verdict_code(c.defaults.ingress),
             verdict_code(c.defaults.bind),
         ],
-        _pad: 0,
-        refuse_errno: c.refuse_errno,
-        _pad2: 0,
-        addr4: c.addrs.v4.map_or([0; 4], |a| a.octets()),
-        addr6: c.addrs.v6.map_or([0; 16], |a| a.octets()),
-        ll6: c.addrs.link_local6.map_or([0; 16], |a| a.octets()),
+        _pad: [0; 5],
     }
 }
 
@@ -773,6 +824,16 @@ pub fn pin_key(box_id: u64, addr: IpAddr) -> PinKey {
     }
 }
 
+/// The value that makes an address one of the box's own. It never expires:
+/// the daemon takes it out when the address is no longer the box's.
+#[must_use]
+pub const fn own_address_val() -> PinVal {
+    PinVal {
+        expiry_ns: u64::MAX,
+        set_id: SetId::OWN.0,
+    }
+}
+
 #[must_use]
 pub const fn pin_val(set: SetId, expiry_ns: u64) -> PinVal {
     PinVal {
@@ -781,16 +842,23 @@ pub const fn pin_val(set: SetId, expiry_ns: u64) -> PinVal {
     }
 }
 
-/// The key under which the egress hook recorded a redirected flow, from
-/// the peer address the endpoint's socket reports.
+/// The key under which the egress hook recorded a flow to an endpoint,
+/// from the endpoint's network namespace and the peer address its socket
+/// reports.
 #[must_use]
-pub fn flow_key(peer: std::net::SocketAddr, protocol: crate::model::Protocol) -> FlowKey {
+pub fn flow_key(
+    netns: u64,
+    peer: std::net::SocketAddr,
+    protocol: crate::model::Protocol,
+) -> FlowKey {
     let (saddr, family) = addr16(crate::eval::canonical(peer.ip()));
     FlowKey {
+        netns,
         saddr,
         sport: peer.port(),
         proto: Protocols::from(protocol).bits(),
         family,
+        _pad: [0; 4],
     }
 }
 
@@ -806,13 +874,13 @@ mod tests {
     #[test]
     fn asserts_cover_every_struct_and_constant() {
         let c = c_static_asserts();
-        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 52,"));
+        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 16,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
-        assert!(c.contains("BP_ABI_VERSION == 3"));
+        assert!(c.contains("BP_ABI_VERSION == 4"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
-        assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 15);
+        assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 19);
     }
 
     #[test]

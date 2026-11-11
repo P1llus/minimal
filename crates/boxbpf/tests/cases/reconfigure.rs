@@ -122,11 +122,32 @@ fn pins_follow_their_names_through_a_change_of_policy() {
         };
         let verdict = live
             .compiled()
-            .evaluate(&flow, h.handles.pinned_set(id, addr))
+            .evaluate(&flow, |addr| h.handles.pinned_set(id, addr))
             .verdict;
         assert_eq!(verdict == FlowVerdict::Deny, denied, "{addr}");
     }
     assert_eq!(h.handles.usage(id).expect("usage").pins, 2);
+
+    // An address of the box itself is its own whatever names resolve to
+    // it, through a pin and through a change of policy.
+    let itself = IpAddr::V4(h.v4(5, 9));
+    h.handles.add_own_address(id, itself).expect("own address");
+    h.handles
+        .pin(id, itself, "kept.test", Duration::from_millis(1))
+        .expect("a name that resolves to the box itself");
+    assert_eq!(h.handles.pinned_set(id, itself), Some(netpol::SetId::OWN));
+    assert_eq!(h.handles.usage(id).expect("usage").pins, 2);
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(h.handles.sweep_pins().expect("sweep"), 0);
+    let again = live.spec().clone();
+    h.handles
+        .reconfigure(&mut live, again)
+        .expect("reconfigure");
+    assert_eq!(h.handles.pinned_set(id, itself), Some(netpol::SetId::OWN));
+    h.handles
+        .remove_own_address(id, itself)
+        .expect("remove the address");
+    assert_eq!(h.handles.pinned_set(id, itself), None);
 }
 
 fn prefixes(h: &Harness, group: u8, count: u8) -> Vec<Prefix> {
@@ -248,6 +269,7 @@ fn a_reconfigure_that_fails_leaves_the_old_policy_and_nothing_else() {
     // Rule maps with room for 64 prefixes per family, for all boxes.
     let Some(mut h) = Harness::start_sized(
         "cases::reconfigure::a_reconfigure_that_fails_leaves_the_old_policy_and_nothing_else",
+        "rule_entries",
         64,
     ) else {
         return;
@@ -308,4 +330,75 @@ fn a_reconfigure_that_fails_leaves_the_old_policy_and_nothing_else() {
     assert!(reach(&h, 4, 29).ends_with("data=hello"));
     assert_eq!(reach(&h, 3, 0), refused());
     assert_eq!(h.handles.usage(y.id()).expect("usage").rule_entries, 30);
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_box_has_room_for_so_many_flows_to_its_endpoints() {
+    use netpol::abi::{Hook, Reason};
+
+    // An engine that lets a box have three.
+    let Some(mut h) = Harness::start_sized(
+        "cases::reconfigure::a_box_has_room_for_so_many_flows_to_its_endpoints",
+        "flows_per_box",
+        3,
+    ) else {
+        return;
+    };
+    let mut events = h.handles.take_events().expect("event source");
+    let endpoint = |host: u8| {
+        let sock = std::net::UdpSocket::bind((h.v4(6, host), 0)).expect("bind an endpoint");
+        let std::net::SocketAddr::V4(at) = sock.local_addr().expect("address") else {
+            panic!("an IPv4 socket");
+        };
+        (sock, at)
+    };
+    let with_resolver = |at| {
+        let mut d = host_ip();
+        d.services.resolver = Some(netpol::Endpoint {
+            v4: Some(at),
+            v6: None,
+        });
+        d
+    };
+    let ((_full_sock, full_at), (_free_sock, free_at)) = (endpoint(1), endpoint(2));
+    let full = h.install("full", with_resolver(full_at), BoxPolicy::default());
+    let free = h.install("free", with_resolver(free_at), BoxPolicy::default());
+    let hold = |h: &Harness, name: &str, at: std::net::SocketAddrV4| {
+        h.hold_probe(
+            name,
+            &["hold-udp", &at.ip().to_string(), &at.port().to_string()],
+        )
+    };
+    let flows = |h: &Harness, id| h.handles.usage(id).expect("usage").flows;
+
+    let mut clients: Vec<_> = (0..3).map(|_| hold(&h, "full", full_at)).collect();
+    assert!(clients.iter().all(|c| c.ready == "ok"));
+    assert_eq!(flows(&h, full.id()), 3);
+    // The fourth socket's datagram is dropped: the endpoint could not tell
+    // whose it is. The refusal says why.
+    let fourth = hold(&h, "full", full_at);
+    assert_eq!(fourth.ready, "err 1");
+    let seen = Harness::drain(&mut events);
+    assert!(
+        seen.iter().any(|e| e.box_id == full.id().0
+            && e.hook == Hook::Egress
+            && e.reason == Reason::FlowLimit
+            && e.dst == IpAddr::V4(*full_at.ip())),
+        "{seen:?}"
+    );
+    assert_eq!(flows(&h, full.id()), 3);
+    // Another box has its own room.
+    let other = hold(&h, "free", free_at);
+    assert_eq!(other.ready, "ok");
+    assert_eq!(flows(&h, free.id()), 1);
+    // A socket that keeps its entry keeps working, and one that closes
+    // gives its room to the next.
+    assert_eq!(clients.first_mut().expect("a client").step(), "ok");
+    drop(fourth);
+    drop(clients.pop());
+    crate::support::wait_for("the closed socket's entry to go", || {
+        flows(&h, full.id()) == 2
+    });
+    assert_eq!(hold(&h, "full", full_at).ready, "ok");
 }

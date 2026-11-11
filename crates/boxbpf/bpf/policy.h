@@ -64,12 +64,32 @@ struct {
 	__type(value, struct bp_stats);
 } stats SEC(".maps");
 
+/* Bounded per box by flows_per_box, so no box can fill it for the others. */
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
 	__type(key, struct bp_flow_key);
 	__type(value, struct bp_flow_val);
 } flows SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct bp_usage);
+} box_use SEC(".maps");
+
+/* Bounded per box by listens_per_box. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct bp_listen_key);
+	__type(value, struct bp_listen);
+} listens SEC(".maps");
+
+/* Set at load. */
+const volatile __u32 flows_per_box = 1024;
+const volatile __u32 listens_per_box = 256;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -79,6 +99,7 @@ struct {
 /* Per-socket state. Not part of the ABI: userspace never reads it. */
 #define ST_REWRITTEN 1
 #define ST_FLOW      2 /* flow_key names an entry of the flows map */
+#define ST_LISTEN    4 /* the socket has an entry in the listens map */
 
 struct sk_state {
 	/* A destination the connect/sendmsg hook rewrote. recvmsg and
@@ -101,6 +122,10 @@ struct sk_state {
 	__u32 ok_generation;
 	/* The entry this socket has in the flows map, removed with the socket. */
 	struct bp_flow_key flow_key;
+	/* What its entry in the listens map said, for the record of its end. */
+	__u16 listen_port;
+	__u8  listen_family;
+	__u8  _pad2[5];
 };
 
 struct {
@@ -121,7 +146,7 @@ struct {
  * at the same time loses the reply exemption for the oldest, and their
  * replies are judged by the rules alone.
  */
-#define UDP_PEERS 16 /* a power of two */
+#define UDP_PEERS 64 /* a power of two */
 
 struct udp_peer {
 	__u32 addr[4];
@@ -287,6 +312,38 @@ static __always_inline void emit_net(const struct ev_args *a)
 	bpf_ringbuf_submit(e, 0);
 }
 
+static __always_inline void emit_listen(__u64 box, __u64 netns, __u16 port, __u8 family, __u8 open)
+{
+	__u64 now = bpf_ktime_get_boot_ns();
+	struct bp_ev_listen *e;
+	struct bp_stats *s;
+
+	if (!ev_admit(box, now)) {
+		s = stats_of(box);
+		if (s)
+			s->ev_limited++;
+		return;
+	}
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e) {
+		s = stats_of(box);
+		if (s)
+			s->ev_lost++;
+		return;
+	}
+	e->hdr.kind = BP_EV_LISTEN;
+	e->hdr.size = sizeof(*e);
+	e->hdr.cpu = bpf_get_smp_processor_id();
+	e->hdr.ts_ns = now;
+	e->hdr.box_id = box;
+	e->netns = netns;
+	e->port = port;
+	e->family = family;
+	e->open = open;
+	e->_pad = 0;
+	bpf_ringbuf_submit(e, 0);
+}
+
 /* The first rule of a sorted list that matches, if it beats what we have. */
 static __always_inline void scan(const struct bp_rules *rs, const struct flow *f, __u8 reason,
 				 struct verdict *v)
@@ -413,7 +470,8 @@ static __always_inline void peer_admit(void *sk, const __u32 *addr, __u16 port, 
 	if (!us)
 		return;
 	if (us->generation != generation) {
-		__builtin_memset(us->peer, 0, sizeof(us->peer));
+		for (__u32 i = 0; i < UDP_PEERS; i++)
+			us->peer[i].dirs = 0;
 		us->next = 0;
 		us->generation = generation;
 	}

@@ -7,7 +7,7 @@ use std::process::Command;
 use netpol::{
     Direction, Flow, FlowVerdict, PortRange, Protocol, Protocols, Target,
     abi::{Hook, Reason},
-    base::{BoxAddrs, Deployment, Mode, NodeKind, PortOf, VirtualNetwork},
+    base::{Deployment, Mode, NodeKind, PortOf, VirtualNetwork},
     policy::{BoxAction, BoxPolicy, BoxRule},
 };
 
@@ -19,6 +19,10 @@ const GATEWAY4: &str = "10.99.0.1";
 const PEER4: &str = "10.99.0.9";
 const BOX6: &str = "fd00:99::2";
 const BOX_LL6: &str = "fe80::99:2";
+const ENDPOINT: &str = "127.0.80.1:20480";
+const RELAY: &str = "127.0.80.1:20483";
+/// An address of the virtual network that nothing answers at.
+const HOST_ALIAS: &str = "10.99.0.254";
 /// A link-local address on the box's interface that is not the one the
 /// engine was told.
 const OTHER_LL6: &str = "fe80::99:3";
@@ -79,18 +83,41 @@ fn a_box_in_its_own_network_namespace() {
     let mut events = h.handles.take_events().expect("event source");
 
     let mut deployment = Deployment::new(NodeKind::Guest, Mode::OwnIp);
-    deployment.addrs = BoxAddrs {
-        v4: Some(BOX4.parse().expect("address")),
-        v6: Some(BOX6.parse().expect("address")),
-        link_local6: Some(BOX_LL6.parse().expect("address")),
-    };
     deployment.network = Some(VirtualNetwork {
         subnet: "10.99.0.0/24".parse().expect("prefix"),
         gateway: ip(GATEWAY4),
-        host_alias: None,
     });
     deployment.transport_ipv6 = true;
+    // The box's resolver endpoint is inside its own namespace, at the
+    // address every namespace has.
+    let endpoint: std::net::SocketAddrV4 = ENDPOINT.parse().expect("address");
+    deployment.services.resolver = Some(netpol::Endpoint {
+        v4: Some(endpoint),
+        v6: None,
+    });
+    // So is its host relay, which takes what the box sends to the host
+    // alias. The daemon's endpoints of a namespace are on one block of
+    // ports, which the box must leave alone.
+    deployment.host_alias = Some(ip(HOST_ALIAS));
+    deployment.services.host_relay = Some(netpol::Endpoint {
+        v4: Some(RELAY.parse().expect("address")),
+        v6: None,
+    });
+    let block = PortRange::new(20480, 20483).expect("range");
+    deployment.endpoint_ranges = ["127.0.80.1/32", "::1/128"]
+        .map(|prefix| netpol::base::EndpointRange {
+            prefix: prefix.parse().expect("prefix"),
+            ports: block,
+        })
+        .to_vec();
     let mut live = h.install("own", deployment, policy(8, 128));
+    // The addresses of the box's namespace, as the daemon adds them when
+    // it gives the namespace its interface.
+    for own in [BOX4, BOX6, BOX_LL6] {
+        h.handles
+            .add_own_address(live.id(), ip(own))
+            .expect("own address");
+    }
 
     // The peer's namespaces belong to a process outside any box. The box's
     // network namespace is created by a process inside the box cgroup, as
@@ -243,6 +270,121 @@ fn a_box_in_its_own_network_namespace() {
     );
     assert_eq!(probe(&["tcp", PEER6, "18081", "500"]), refused());
 
+    // ---- an endpoint in the box's namespace knows its peers by namespace
+    let mut inside = Cgroups::hold_peer_probe(box_ns, &["endpoint-udp", "127.0.80.1", "20480"]);
+    let inside_ns: u64 = inside
+        .ready
+        .strip_prefix("netns=")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no namespace cookie: {}", inside.ready));
+    let here = boxbpf::current_netns_cookie().expect("namespace cookie");
+    assert_ne!(inside_ns, here);
+    let _client = cg.hold_probe_in("own", box_ns, &["hold-udp", "127.0.80.1", "20480", "40123"]);
+    let peer: std::net::SocketAddr = inside
+        .step()
+        .strip_prefix("ok peer=")
+        .and_then(|p| p.parse().ok())
+        .expect("the endpoint got the box's datagram");
+    assert_eq!(peer, "127.0.0.1:40123".parse().expect("address"));
+    let recorded = |h: &Harness, netns| {
+        h.handles
+            .original_destination(netns, peer, Protocol::Udp)
+            .expect("lookup")
+            .map(|flow| (flow.box_id, flow.destination, flow.endpoint))
+    };
+    assert_eq!(
+        recorded(&h, inside_ns),
+        Some((
+            live.id(),
+            ENDPOINT.parse().expect("address"),
+            netpol::base::RESOLVER
+        ))
+    );
+    assert_eq!(
+        recorded(&h, here),
+        None,
+        "the same peer address in another namespace"
+    );
+    // A box on the node's network with the same client address and port.
+    // Each endpoint finds its own box behind `127.0.0.1:40123`.
+    let outside = std::net::UdpSocket::bind((h.v4(6, 1), 0)).expect("bind an endpoint");
+    let std::net::SocketAddr::V4(outside_at) = outside.local_addr().expect("address") else {
+        panic!("an IPv4 socket");
+    };
+    let mut twin = crate::support::host_ip();
+    twin.services.resolver = Some(netpol::Endpoint {
+        v4: Some(outside_at),
+        v6: None,
+    });
+    let twin = h.install("twin", twin, BoxPolicy::default());
+    let _twin_client = h.hold_probe(
+        "twin",
+        &[
+            "hold-udp",
+            &outside_at.ip().to_string(),
+            &outside_at.port().to_string(),
+            "40123",
+        ],
+    );
+    let mut buf = [0u8; 8];
+    let (_, twin_peer) = outside.recv_from(&mut buf).expect("the twin's datagram");
+    assert_eq!(twin_peer, peer);
+    assert_eq!(recorded(&h, here).map(|(id, ..)| id), Some(twin.id()));
+    assert_eq!(recorded(&h, inside_ns).map(|(id, ..)| id), Some(live.id()));
+
+    // ---- the host alias leads to the box's relay endpoint and nowhere else
+    let mut relay = Cgroups::hold_peer_probe(box_ns, &["endpoint-tcp", "127.0.80.1", "20483"]);
+    let to_host = cg.hold_probe_in("own", box_ns, &["hold-tcp", HOST_ALIAS, "5432"]);
+    // The box sees the address it dialled, and the relay's greeting.
+    assert_eq!(
+        to_host.ready,
+        format!("ok peer={HOST_ALIAS}:5432 data=relayed")
+    );
+    let relayed: std::net::SocketAddr = relay
+        .step()
+        .strip_prefix("peer=")
+        .and_then(|p| p.parse().ok())
+        .expect("the relay accepted");
+    // The relay learns whose flow it is and which host port it was for.
+    let flow = h
+        .handles
+        .original_destination(inside_ns, relayed, Protocol::Tcp)
+        .expect("lookup")
+        .expect("a recorded flow");
+    assert_eq!(
+        (flow.box_id, flow.destination, flow.endpoint),
+        (
+            live.id(),
+            format!("{HOST_ALIAS}:5432").parse().expect("address"),
+            netpol::base::HOST_RELAY
+        )
+    );
+    drop(to_host);
+    // Only TCP is relayed.
+    assert_eq!(probe(&["udp", HOST_ALIAS, "5432"]), refused());
+    assert_eq!(probe(&["ping", HOST_ALIAS, "300"]), refused());
+
+    // ---- the box leaves the ports of the daemon's endpoints alone
+    for (kind, at, port) in [
+        ("tcp", "127.0.80.1", "20481"),
+        ("udp", "0.0.0.0", "20482"),
+        ("tcp", "::", "20480"),
+        ("udp", "::1", "20483"),
+    ] {
+        assert_eq!(
+            probe(&["bind", kind, at, port]),
+            refused(),
+            "{kind} {at}:{port}"
+        );
+    }
+    assert_eq!(
+        probe(&["bind", "tcp", "127.0.80.1", "20484"]),
+        "ok port=20484",
+        "a port beside the block"
+    );
+    // A port of the block that is none of its endpoints is closed to it.
+    assert_eq!(probe(&["tcp", "127.0.80.1", "20481", "300"]), refused());
+
     // ---- UDP: a socket's replies come back, and nothing else comes in
     let _peer_echo = Cgroups::hold_peer_probe(peer_ns, &["serve-udp", PEER4, "18090"]);
     assert_eq!(
@@ -301,6 +443,33 @@ fn a_box_in_its_own_network_namespace() {
             && e.src == ip(BOX4_OTHER)),
         "{seen:?}"
     );
+    // The box talks to its own address and not to the other one on its
+    // interface, which is just an address of the virtual network.
+    let refused_by_peer = format!("err {}", libc::ECONNREFUSED);
+    assert_eq!(probe(&["tcp", BOX4, "9", "500"]), refused_by_peer);
+    assert_eq!(probe(&["tcp", BOX4_OTHER, "9", "500"]), refused());
+    // A second address of the box, as a task run in a namespace of its
+    // own gets one: a source and "itself" from the one write on, and
+    // neither once it is taken away. The policy is not compiled again.
+    let generation = live.compiled().clone();
+    h.handles
+        .add_own_address(live.id(), ip(BOX4_OTHER))
+        .expect("a second address");
+    assert_eq!(
+        probe(&["tcp-from", BOX4_OTHER, PEER4, "18080", "700"]),
+        "ok connected"
+    );
+    assert_eq!(probe(&["tcp", BOX4_OTHER, "9", "500"]), refused_by_peer);
+    h.handles
+        .remove_own_address(live.id(), ip(BOX4_OTHER))
+        .expect("remove the address");
+    assert_eq!(
+        probe(&["tcp-from", BOX4_OTHER, PEER4, "18080", "700"]),
+        "err timeout"
+    );
+    assert_eq!(probe(&["tcp", BOX4_OTHER, "9", "500"]), refused());
+    assert!(std::sync::Arc::ptr_eq(&generation, live.compiled()));
+    let _drops = Harness::drain(&mut events);
 
     // A box can give itself any link-local address. Only the one the
     // engine knows as the box's is a source.
@@ -333,6 +502,16 @@ fn a_box_in_its_own_network_namespace() {
 
     // ---- ingress: new inbound flows only on published ports
     let _box_server = cg.hold_probe_in("own", box_ns, &["serve-tcp", "::", "18300"]);
+    // The listener is known by the namespace it is in.
+    let listeners = |netns| h.handles.listening(live.id(), netns).expect("listeners");
+    assert_eq!(
+        listeners(inside_ns),
+        [boxbpf::Listening {
+            address: ip("::"),
+            port: 18300
+        }]
+    );
+    assert!(listeners(here).is_empty());
     let inbound = |addr: &str| Cgroups::peer_probe(peer_ns, &["tcp", addr, "18300", "700"]);
     let published = PortOf {
         protocols: Protocols::TCP,
@@ -347,7 +526,7 @@ fn a_box_in_its_own_network_namespace() {
     };
     assert_eq!(inbound(BOX4), "err timeout");
     assert_eq!(
-        live.compiled().evaluate(&ingress, None).verdict,
+        live.compiled().evaluate(&ingress, |_| None).verdict,
         FlowVerdict::Deny
     );
     let seen = Harness::drain(&mut events);
@@ -372,7 +551,7 @@ fn a_box_in_its_own_network_namespace() {
         inbound(BOX6)
     );
     assert_eq!(
-        live.compiled().evaluate(&ingress, None).verdict,
+        live.compiled().evaluate(&ingress, |_| None).verdict,
         FlowVerdict::Allow
     );
 

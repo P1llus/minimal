@@ -8,7 +8,7 @@
 //! it per box and never read a policy back from the kernel.
 
 use std::{
-    collections::HashMap as StdHashMap,
+    collections::{BTreeSet, HashMap as StdHashMap},
     io,
     net::{IpAddr, SocketAddr},
     os::fd::{BorrowedFd, OwnedFd},
@@ -28,7 +28,7 @@ use crate::{Error, engine::MAPS, events, sys};
 
 /// Lets a `netpol::abi` struct be a map key or value.
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Raw<T>(T);
 
 // SAFETY: `Plain` promises repr(C) without padding and that every bit
@@ -75,6 +75,11 @@ pub struct Usage {
     pub pins: usize,
     /// Pins refused so far because the box was at its limit.
     pub pins_refused: u64,
+    /// Sockets of the box with a flow to one of its endpoints, as the
+    /// programs count them.
+    pub flows: u32,
+    /// Listening sockets of the box the programs know.
+    pub listens: u32,
 }
 
 /// What this process wrote for one box.
@@ -88,6 +93,9 @@ struct Held {
     /// set an address is pinned to, what to delete, and when.
     pins: PinTable,
     pins_refused: u64,
+    /// The box's own addresses. They are in the kernel's pin map too, in
+    /// the set [`SetId::OWN`].
+    own: BTreeSet<IpAddr>,
 }
 
 /// A box whose policy is in the maps, with what is needed to change it.
@@ -145,7 +153,7 @@ impl Flows {
         })?;
         let data = MapData::from_fd(fd).map_err(Error::map("flows"))?;
         Ok(Self {
-            map: HashMap::try_from(Map::LruHashMap(data)).map_err(Error::map("flows"))?,
+            map: HashMap::try_from(Map::HashMap(data)).map_err(Error::map("flows"))?,
             fd: kept,
         })
     }
@@ -160,25 +168,99 @@ impl Flows {
     }
 
     /// Which box is behind `peer`, the remote end of a flow that reached
-    /// an endpoint, and where that flow was first headed. The egress hook
-    /// records every flow of a box to one of its own endpoints with the
-    /// first packet, so the entry is there by the time the endpoint sees
-    /// that packet, and removes it with the box's socket. `None` means the
-    /// peer is no box socket: a process outside every box.
+    /// an endpoint in the network namespace `netns`, and where that flow
+    /// was first headed. `netns` is the endpoint's own namespace cookie
+    /// ([`crate::netns_cookie`] of its socket): a peer address means
+    /// nothing without it, since every namespace has the same loopback.
+    ///
+    /// The egress hook records every flow of a box to one of its own
+    /// endpoints with the first packet, so the entry is there by the time
+    /// the endpoint sees that packet, and removes it with the box's
+    /// socket. `None` means the peer is no box socket: a process outside
+    /// every box.
     pub fn original_destination(
         &self,
+        netns: u64,
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Result<Option<OriginalDestination>, Error> {
         // A v4-mapped peer is an IPv4 flow, and recorded as one.
         let peer = SocketAddr::new(netpol::eval::canonical(peer.ip()), peer.port());
-        let key = Raw(abi::flow_key(peer, protocol));
+        let key = Raw(abi::flow_key(netns, peer, protocol));
         let found = absent_ok(self.map.get(&key, 0)).map_err(Error::map("flows"))?;
         Ok(found.map(|Raw(v)| OriginalDestination {
             box_id: BoxId(v.box_id),
             destination: SocketAddr::new(abi::addr_of(&v.orig_addr, v.orig_family), v.orig_port),
             endpoint: EndpointIndex(v.endpoint),
         }))
+    }
+}
+
+/// A TCP socket of a box that listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Listening {
+    /// The address the socket is bound to. Unspecified: every address of
+    /// the family, and for an IPv6 socket usually IPv4 as well.
+    pub address: IpAddr,
+    pub port: u16,
+}
+
+/// The table of listening sockets alone, for a task that watches a box's
+/// ports and must not wait for the writers' lock.
+pub struct Listens {
+    map: HashMap<MapData, Raw<abi::ListenKey>, Raw<abi::Listen>>,
+    /// A second descriptor of the map, to make further handles from.
+    fd: OwnedFd,
+}
+
+impl Listens {
+    fn from_fd(fd: OwnedFd) -> Result<Self, Error> {
+        let kept = fd.try_clone().map_err(|source| Error::Sys {
+            what: "duplicate the listens map",
+            source,
+        })?;
+        let data = MapData::from_fd(fd).map_err(Error::map("listens"))?;
+        Ok(Self {
+            map: HashMap::try_from(Map::HashMap(data)).map_err(Error::map("listens"))?,
+            fd: kept,
+        })
+    }
+
+    /// Another handle on the same map.
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        let fd = self.fd.try_clone().map_err(|source| Error::Sys {
+            what: "duplicate the listens map",
+            source,
+        })?;
+        Self::from_fd(fd)
+    }
+
+    /// The TCP sockets of the box that listen now in the network namespace
+    /// `netns`, sorted. The programs add a socket when it starts to listen
+    /// and take it out when it is released. A [`netpol::event::ListenEvent`]
+    /// says when this changed. The table is what counts: read it after an
+    /// event, and now and then without one.
+    ///
+    /// This walks the table of all boxes.
+    pub fn listening(&self, id: BoxId, netns: u64) -> Result<Vec<Listening>, Error> {
+        let mut out = Vec::new();
+        for entry in self.map.iter() {
+            let (Raw(key), Raw(listen)) = match entry {
+                Ok(entry) => entry,
+                // An entry that went while we walked.
+                Err(MapError::KeyNotFound) => continue,
+                Err(error) => return Err(Error::map("listens")(error)),
+            };
+            if key.box_id == id.0 && key.netns == netns {
+                out.push(Listening {
+                    address: abi::addr_of(&listen.addr, listen.family),
+                    port: listen.port,
+                });
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 }
 
@@ -190,7 +272,9 @@ pub struct Handles {
     set_rules: HashMap<MapData, Raw<abi::SetKey>, Raw<abi::Rules>>,
     endpoints: HashMap<MapData, Raw<abi::EndpointKey>, Raw<abi::Endpoint>>,
     stats: PerCpuHashMap<MapData, u64, Raw<abi::Stats>>,
+    box_use: HashMap<MapData, u64, Raw<abi::Usage>>,
     flows: Flows,
+    listens: Listens,
     events: Option<RingBuf<MapData>>,
     boxes: StdHashMap<u64, Held>,
     /// Entries of replaced or abandoned generations that a delete failed
@@ -240,7 +324,10 @@ impl Handles {
                 .map_err(Error::map("endpoints"))?,
             stats: PerCpuHashMap::try_from(Map::PerCpuHashMap(next("stats")?))
                 .map_err(Error::map("stats"))?,
+            box_use: HashMap::try_from(Map::HashMap(next("box_use")?))
+                .map_err(Error::map("box_use"))?,
             flows: Flows::from_fd(next_fd(count)?)?,
+            listens: Listens::from_fd(next_fd(count)?)?,
             events: Some(
                 RingBuf::try_from(Map::RingBuf(next("events")?)).map_err(Error::map("events"))?,
             ),
@@ -331,7 +418,12 @@ impl Handles {
         }
     }
 
+    /// The entries a box has from its first policy to its removal: its
+    /// counters, and the count of what the programs record for it.
     fn zero_stats(&mut self, id: BoxId) -> Result<(), Error> {
+        self.box_use
+            .insert(&id.0, &Raw(abi::Usage::default()), 0)
+            .map_err(Error::map("box_use"))?;
         let cpus = aya::util::nr_cpus().map_err(|(_, e)| Error::Sys {
             what: "count CPUs",
             source: e,
@@ -421,6 +513,7 @@ impl Handles {
             if current.is_none() {
                 // Nothing reads the counters of a box that never started.
                 let _absent = self.stats.remove(&id.0);
+                let _absent = self.box_use.remove(&id.0);
             }
             return Err(error);
         }
@@ -440,6 +533,7 @@ impl Handles {
                         keys,
                         pins: PinTable::new(),
                         pins_refused: 0,
+                        own: BTreeSet::new(),
                     },
                 );
             }
@@ -453,12 +547,13 @@ impl Handles {
         absent_ok(self.box_cfg.remove(&id.0)).map_err(Error::map("box_cfg"))?;
         if let Some(held) = self.boxes.remove(&id.0) {
             self.discard(held.keys);
-            for addr in held.pins.addresses() {
+            for addr in held.pins.addresses().chain(held.own.iter().copied()) {
                 absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
                     .map_err(Error::map("pins"))?;
             }
         }
         absent_ok(self.stats.remove(&id.0)).map_err(Error::map("stats"))?;
+        absent_ok(self.box_use.remove(&id.0)).map_err(Error::map("box_use"))?;
         Ok(())
     }
 
@@ -498,22 +593,46 @@ impl Handles {
         self.reconfigure(live, spec)
     }
 
-    /// Replaces the host ports the box may reach on the host alias.
-    pub fn set_host_exposures(
-        &mut self,
-        live: &mut LiveBox,
-        ports: Vec<PortOf>,
-    ) -> Result<(), Error> {
-        if live.spec.deployment.host_exposures == ports {
-            return Ok(());
-        }
-        let mut spec = live.spec.clone();
-        spec.deployment.host_exposures = ports;
-        self.reconfigure(live, spec)
-    }
-
     pub fn uninstall(&mut self, live: &LiveBox) -> Result<(), Error> {
         self.remove(live.id)
+    }
+
+    /// Makes `addr` one of the box's own addresses: a source its packets
+    /// may have, and an address the rules for [`netpol::Target::OwnAddresses`]
+    /// apply to. It takes effect with the one map write, with no change of
+    /// the box's policy. A box has one for each of its network namespaces:
+    /// call this when a namespace gets its address, before anything runs
+    /// in it, and [`Self::remove_own_address`] when the namespace is gone.
+    ///
+    /// An address has one place in the engine's table. If it was pinned
+    /// for a name, it is the box's own from now on.
+    pub fn add_own_address(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
+        let addr = netpol::eval::canonical(addr);
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Err(Error::UnknownBox);
+        };
+        self.pins
+            .insert(
+                &Raw(abi::pin_key(id.0, addr)),
+                &Raw(abi::own_address_val()),
+                0,
+            )
+            .map_err(Error::map("pins"))?;
+        held.pins.remove(addr);
+        held.own.insert(addr);
+        Ok(())
+    }
+
+    pub fn remove_own_address(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
+        let addr = netpol::eval::canonical(addr);
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Ok(());
+        };
+        if held.own.remove(&addr) {
+            absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
+                .map_err(Error::map("pins"))?;
+        }
+        Ok(())
     }
 
     /// Pins an address the resolver answered for `name` to the set of that
@@ -525,6 +644,9 @@ impl Handles {
     ///
     /// A box at its pin limit gets [`Error::PinLimit`], and the refusal is
     /// counted in [`Self::usage`].
+    ///
+    /// One of the box's own addresses stays its own: a name that resolves
+    /// to the box itself needs no pin, since a box may always reach itself.
     pub fn pin(&mut self, id: BoxId, addr: IpAddr, name: &str, ttl: Duration) -> Result<(), Error> {
         let limit = self.limits.pins;
         let now = sys::boot_time_ns();
@@ -534,6 +656,9 @@ impl Handles {
         let Some(set) = held.compiled.set_for_name(name) else {
             return Err(Error::NameWithoutRule(name.to_owned()));
         };
+        if held.own.contains(&netpol::eval::canonical(addr)) {
+            return Ok(());
+        }
         if held.pins.len() >= limit && !held.pins.contains(addr) {
             // Pins that have run out give their room back first.
             for dead in held.pins.take_expired(now) {
@@ -558,19 +683,27 @@ impl Handles {
     }
 
     pub fn unpin(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
-        absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr)))).map_err(Error::map("pins"))?;
-        if let Some(held) = self.boxes.get_mut(&id.0) {
-            held.pins.remove(addr);
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Ok(());
+        };
+        if held.own.contains(&netpol::eval::canonical(addr)) {
+            return Ok(());
         }
+        absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr)))).map_err(Error::map("pins"))?;
+        held.pins.remove(addr);
         Ok(())
     }
 
-    /// The set an address is pinned to right now, for the evaluator.
+    /// The set an address is in right now: the set of the name it is
+    /// pinned for, or [`SetId::OWN`] for one of the box's own addresses.
+    /// This is the table the evaluator asks.
     #[must_use]
     pub fn pinned_set(&self, id: BoxId, addr: IpAddr) -> Option<SetId> {
-        self.boxes
-            .get(&id.0)
-            .and_then(|held| held.pins.live(addr, sys::boot_time_ns()))
+        let held = self.boxes.get(&id.0)?;
+        if held.own.contains(&netpol::eval::canonical(addr)) {
+            return Some(SetId::OWN);
+        }
+        held.pins.live(addr, sys::boot_time_ns())
     }
 
     /// Deletes pins whose time has passed. The programs already ignore
@@ -592,10 +725,13 @@ impl Handles {
     /// What the box holds of the shared maps. `None` for an unknown box.
     #[must_use]
     pub fn usage(&self, id: BoxId) -> Option<Usage> {
+        let Raw(counted) = self.box_use.get(&id.0, 0).unwrap_or_default();
         self.boxes.get(&id.0).map(|held| Usage {
             rule_entries: held.keys.rules4.len() + held.keys.rules6.len() + held.keys.sets.len(),
             pins: held.pins.len(),
             pins_refused: held.pins_refused,
+            flows: counted.flows,
+            listens: counted.listens,
         })
     }
 
@@ -615,14 +751,25 @@ impl Handles {
     /// See [`Flows::original_destination`].
     pub fn original_destination(
         &self,
+        netns: u64,
         peer: SocketAddr,
         protocol: Protocol,
     ) -> Result<Option<OriginalDestination>, Error> {
-        self.flows.original_destination(peer, protocol)
+        self.flows.original_destination(netns, peer, protocol)
     }
 
     /// A handle on the flows map for an endpoint task.
     pub fn flows(&self) -> Result<Flows, Error> {
         self.flows.try_clone()
+    }
+
+    /// See [`Listens::listening`].
+    pub fn listening(&self, id: BoxId, netns: u64) -> Result<Vec<Listening>, Error> {
+        self.listens.listening(id, netns)
+    }
+
+    /// A handle on the table of listening sockets for a watcher task.
+    pub fn listens(&self) -> Result<Listens, Error> {
+        self.listens.try_clone()
     }
 }

@@ -7,12 +7,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 
 use netpol::{
     Action, Compiled, Defaults, Direction, Endpoint, EndpointIndex, Flow, FlowVerdict, NamePattern,
-    Origin, PortRange, Prefix, Protocol, Protocols, Rule, Target, Verdict,
+    Origin, Pinned, PortRange, Prefix, Protocol, Protocols, Rule, SetId, Target, Verdict,
     abi::RULES_MAX,
-    base::{
-        BasePolicy, BoxAddrs, Deployment, Mode, NodeKind, PortOf, Services, VirtualNetwork,
-        base_policy,
-    },
+    base::{BasePolicy, Deployment, Mode, NodeKind, PortOf, Services, VirtualNetwork, base_policy},
     compile::{CompileError, Options, compile},
     evaluate_ordered,
     policy::{BoxAction, BoxPolicy, BoxRule},
@@ -69,6 +66,7 @@ const PORTS: [u16; 6] = [0, 53, 443, 450, 1023, 8080];
 
 const ENDPOINT4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 1), 5353);
 const ENDPOINT6: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5353, 0, 0);
+const RELAY4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 1), 5354);
 
 fn direction() -> impl Strategy<Value = Direction> {
     prop::sample::select(Direction::ALL.to_vec())
@@ -93,6 +91,7 @@ fn target() -> impl Strategy<Value = Target> {
         1 => Just(Target::Any),
         5 => prop::sample::select(PREFIXES.to_vec()).prop_map(|p| Target::Net(p.parse().expect("prefix"))),
         3 => prop::sample::select(PATTERNS.to_vec()).prop_map(|p| Target::Names(p.parse().expect("pattern"))),
+        1 => Just(Target::OwnAddresses),
     ]
 }
 
@@ -147,13 +146,23 @@ fn verdict() -> impl Strategy<Value = Verdict> {
     prop::sample::select(vec![Verdict::Allow, Verdict::Deny])
 }
 
-fn flow() -> impl Strategy<Value = (Flow, Option<&'static str>)> {
+/// What the remote address of a flow is pinned as: nothing, a name, or one
+/// of the box's own addresses.
+fn pinned() -> impl Strategy<Value = Pinned<'static>> {
+    prop_oneof![
+        3 => Just(Pinned::No),
+        4 => prop::sample::select(NAMES.to_vec()).prop_map(Pinned::Name),
+        2 => Just(Pinned::Own),
+    ]
+}
+
+fn flow() -> impl Strategy<Value = (Flow, Pinned<'static>)> {
     (
         direction(),
         prop::sample::select(Protocol::ALL.to_vec()),
         prop::sample::select(ADDRS.to_vec()),
         prop::sample::select(PORTS.to_vec()),
-        prop::option::of(prop::sample::select(NAMES.to_vec())),
+        pinned(),
     )
         .prop_map(|(direction, protocol, remote, port, name)| {
             (
@@ -170,17 +179,25 @@ fn flow() -> impl Strategy<Value = (Flow, Option<&'static str>)> {
 }
 
 /// Checks one flow against both evaluators.
-fn agree(c: &Compiled, flow: &Flow, name: Option<&str>) -> Result<(), TestCaseError> {
-    let pinned = name.and_then(|n| c.set_for_name(n));
-    let got = c.evaluate(flow, pinned);
+fn agree(c: &Compiled, flow: &Flow, name: Pinned<'_>) -> Result<(), TestCaseError> {
+    let set = match name {
+        Pinned::No => None,
+        Pinned::Name(n) => c.set_for_name(n),
+        Pinned::Own => Some(SetId::OWN),
+    };
+    let got = c.evaluate(flow, |_| set);
     let (index, action) = evaluate_ordered(&c.rules, &c.protected, &c.config.defaults, flow, name);
     let want = match action {
         Action::Allow => FlowVerdict::Allow,
         Action::Deny => FlowVerdict::Deny,
-        Action::Redirect(_) => FlowVerdict::Redirect(match netpol::eval::canonical(flow.remote) {
-            IpAddr::V4(_) => SocketAddr::V4(ENDPOINT4),
-            IpAddr::V6(_) => SocketAddr::V6(ENDPOINT6),
-        }),
+        Action::Redirect(index) => {
+            let endpoint = c.endpoint(index).expect("a redirect names an endpoint");
+            match netpol::eval::canonical(flow.remote) {
+                IpAddr::V4(_) => endpoint.v4.map(SocketAddr::V4),
+                IpAddr::V6(_) => endpoint.v6.map(SocketAddr::V6),
+            }
+            .map_or(FlowVerdict::Deny, FlowVerdict::Redirect)
+        }
     };
     prop_assert_eq!(got.verdict, want, "flow {:?} name {:?}\n{}", flow, name, c);
     prop_assert_eq!(
@@ -217,7 +234,6 @@ fn bare(
             },
         )],
         source_check: false,
-        addrs: BoxAddrs::default(),
     }
 }
 
@@ -263,7 +279,7 @@ proptest! {
                 let covers = match &rule.target {
                     Target::Any => true,
                     Target::Net(p) => p.covers(&entry.prefix),
-                    Target::Names(_) => false,
+                    Target::Names(_) | Target::OwnAddresses => false,
                 };
                 prop_assert!(covers, "{:?} does not cover {}", rule.target, entry.prefix);
             }
@@ -310,18 +326,20 @@ proptest! {
         let mut d = Deployment::new(NodeKind::Guest, mode);
         d.transport_ipv6 = transport_ipv6;
         if mode == Mode::OwnIp {
-            d.addrs = BoxAddrs { v4: Some(Ipv4Addr::new(10, 1, 2, 3)), ..BoxAddrs::default() };
             d.network = Some(VirtualNetwork {
                 subnet: "10.1.0.0/16".parse().unwrap(),
                 gateway: "10.1.0.1".parse().unwrap(),
-                host_alias: Some("10.1.0.254".parse().unwrap()),
             });
-            d.host_exposures = vec![PortOf { protocols: Protocols::TCP, port: 443 }];
+            d.host_alias = Some("10.1.0.254".parse().unwrap());
             d.published = vec![PortOf { protocols: Protocols::TCP, port: 8080 }];
         }
         if with_services {
             let e = Endpoint { v4: Some(ENDPOINT4), v6: Some(ENDPOINT6) };
-            d.services = Services { resolver: Some(e), credential_proxy: None, hostname_proxy: None };
+            d.services = Services {
+                resolver: Some(e),
+                host_relay: Some(Endpoint { v4: Some(RELAY4), v6: None }),
+                ..Services::default()
+            };
         }
         let policy = BoxPolicy {
             rules: explicit

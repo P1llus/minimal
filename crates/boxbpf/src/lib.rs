@@ -31,6 +31,8 @@ pub use engine::{Engine, MapSizes, loader_id, object_id};
 #[cfg(target_os = "linux")]
 pub use error::Error;
 #[cfg(target_os = "linux")]
-pub use handles::{BoxId, Flows, Handles, Limits, LiveBox, OriginalDestination, Usage};
+pub use handles::{
+    BoxId, Flows, Handles, Limits, Listening, Listens, LiveBox, OriginalDestination, Usage,
+};
 #[cfg(target_os = "linux")]
-pub use sys::{boot_time_ns, cgroup_id};
+pub use sys::{boot_time_ns, cgroup_id, current_netns_cookie, netns_cookie};

@@ -14,7 +14,7 @@
 #ifndef BOXBPF_ABI_H
 #define BOXBPF_ABI_H
 
-#define BP_ABI_VERSION 3
+#define BP_ABI_VERSION 4
 
 /* Directions. They index bp_box_cfg.default_action and are part of rule keys. */
 #define BP_DIR_EGRESS  0 /* address = destination, port = destination port */
@@ -32,7 +32,7 @@
 #define BP_REDIRECT 2 /* egress only: rewrite the destination to an endpoint */
 
 /* bp_box_cfg.flags */
-#define BP_F_CHECK_SRC (1u << 0) /* egress source must be addr4 or addr6 */
+#define BP_F_CHECK_SRC (1u << 0) /* egress source must be one of the box's own addresses */
 #define BP_F_LOG_FLOWS (1u << 1) /* event for each allowed connect and send */
 #define BP_F_HAS_SETS  (1u << 2) /* the box has name-set rules: look up pins */
 
@@ -49,12 +49,7 @@ struct bp_box_cfg {
 	__u32 flags;
 	__u32 generation;
 	__u8  default_action[BP_DIR_COUNT];
-	__u8  _pad;
-	__u16 refuse_errno; /* for a refused system call; 0 means EPERM */
-	__u16 _pad2;
-	__u32 addr4;     /* the box's addresses; all zero: none of that kind */
-	__u8  addr6[16];
-	__u8  ll6[16];   /* its link-local address */
+	__u8  _pad[5];
 };
 
 #define BP_RULES_MAX 32
@@ -106,7 +101,16 @@ struct bp_rule6_key {
 	__u8  addr[16];
 };
 
-/* An address the resolver answered for a name, and the set of that name. */
+/*
+ * An address in one of the box's sets: one the resolver answered for a
+ * name, with the set of that name, or one of the box's own addresses, with
+ * BP_SET_OWN and an expiry that never comes. A box has an own address for
+ * each of its network namespaces, and userspace adds and removes them while
+ * the box runs. The source check reads them, and so do the rules for "the
+ * box's own addresses", which are the rules of that set.
+ */
+#define BP_SET_OWN 0
+
 struct bp_pin_key {
 	__u64 box_id;
 	__u8  addr[16];
@@ -161,14 +165,20 @@ struct bp_stats {
 	__u64 ev_limited; /* events not written because the box had used up its rate */
 };
 
-/* The box's end of a flow to one of its endpoints, as the endpoint sees its
- * peer. The value says which box and where the flow was first headed: the
- * endpoint itself, or the destination a redirect rule took it from. */
+/*
+ * The box's end of a flow to one of its endpoints, as the endpoint sees its
+ * peer, in the network namespace both are in: the cookie the kernel gives a
+ * socket there for SO_NETNS_COOKIE. The value says which box and where the
+ * flow was first headed: the endpoint itself, or the destination a redirect
+ * rule took it from.
+ */
 struct bp_flow_key {
+	__u64 netns;
 	__u8  saddr[16];
 	__u16 sport;
 	__u8  proto;  /* one BP_P_* bit */
 	__u8  family;
+	__u8  _pad[4];
 };
 
 struct bp_flow_val {
@@ -178,6 +188,35 @@ struct bp_flow_val {
 	__u8  orig_family;
 	__u8  endpoint;
 	__u32 _pad;
+};
+
+/*
+ * What a box holds of the maps the programs fill, counted so that one box
+ * cannot fill them. Userspace creates the entry with the box. The programs
+ * record nothing for a box without one.
+ */
+struct bp_usage {
+	__u32 flows;   /* sockets with an entry in the flows map */
+	__u32 listens; /* listening sockets with an entry in the listens map */
+};
+
+/*
+ * A TCP socket of a box that listens: one entry per socket, from listen()
+ * to the release of the socket. Userspace reads the map to know which ports
+ * of a box are open, in which of its network namespaces. A record of kind
+ * BP_EV_LISTEN says when to read.
+ */
+struct bp_listen_key {
+	__u64 box_id;
+	__u64 netns;  /* cookie of the socket's network namespace */
+	__u64 cookie; /* socket cookie */
+};
+
+struct bp_listen {
+	__u8  addr[16]; /* the address the socket is bound to; all zero: any */
+	__u16 port;
+	__u8  family;   /* 4 or 6, of the socket */
+	__u8  _pad[5];
 };
 
 /*
@@ -194,7 +233,8 @@ struct bp_ev_hdr {
 };
 
 /* Record kinds. */
-#define BP_EV_NET 1
+#define BP_EV_NET    1
+#define BP_EV_LISTEN 2
 
 /* bp_ev_net.hook */
 #define BP_H_SOCK_CREATE 1
@@ -219,6 +259,7 @@ struct bp_ev_hdr {
 #define BP_R_NO_ENDPOINT 9 /* redirect without an endpoint address of the flow's family */
 #define BP_R_NO_MEMORY   10 /* no memory to remember which box a new socket belongs to */
 #define BP_R_EPHEMERAL_PORT 11 /* never in an event: the evaluator's reason for a bind to port 0 */
+#define BP_R_FLOW_LIMIT  12 /* the box has as many flows to its endpoints as it may */
 
 struct bp_ev_net {
 	struct bp_ev_hdr hdr;
@@ -236,6 +277,17 @@ struct bp_ev_net {
 	__u8  daddr[16];
 	__u32 _pad;
 	__u64 cookie;    /* socket cookie */
+};
+
+/* The listens map changed for this box. The map is the truth: a reader
+ * that misses a record finds the change when it next reads the map. */
+struct bp_ev_listen {
+	struct bp_ev_hdr hdr;
+	__u64 netns;
+	__u16 port;
+	__u8  family; /* 4 or 6 */
+	__u8  open;   /* 1: a socket started to listen. 0: a listener is gone. */
+	__u32 _pad;
 };
 
 #endif /* BOXBPF_ABI_H */

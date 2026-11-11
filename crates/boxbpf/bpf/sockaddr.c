@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
 /*
- * Syscall-time hooks: sock_create, connect, sendmsg, recvmsg, getpeername, bind.
+ * Syscall-time hooks: sock_create, connect, sendmsg, recvmsg, getpeername,
+ * bind, and the listen callback of sock_ops.
  *
  * They give the application an errno at once, and they are the only place a
  * destination can be rewritten. The packet hooks in skb.c stay authoritative.
@@ -13,13 +14,13 @@
 #define ICMP_ECHO        8
 #define ICMPV6_ECHO_REQ  128
 
-static __always_inline int refuse(__u64 box, __u16 err)
+/* Refuses the system call. The kernel returns EPERM for it. */
+static __always_inline int refuse(__u64 box)
 {
 	struct bp_stats *s = stats_of(box);
 
 	if (s)
 		s->refused++;
-	bpf_set_retval(-(int)(err ? err : EPERM));
 	return 0;
 }
 
@@ -188,7 +189,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 		v.reason = BP_R_NO_CFG;
 		v.rule = BP_NO_RULE;
 		sa_event(ctx, hook, &f, &v);
-		return refuse(f.box, EPERM);
+		return refuse(f.box);
 	}
 
 	decide(cfg, &f, &v);
@@ -205,7 +206,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 	}
 	if (v.action == BP_DENY) {
 		sa_event(ctx, hook, &f, &v);
-		return refuse(f.box, cfg->refuse_errno);
+		return refuse(f.box);
 	}
 	if (cfg->flags & BP_F_LOG_FLOWS)
 		sa_event(ctx, hook, &f, &v);
@@ -290,7 +291,7 @@ static __always_inline int bind_any(struct bpf_sock_addr *ctx, __u8 hook, __u8 s
 		v.reason = BP_R_NO_CFG;
 		v.rule = BP_NO_RULE;
 		sa_event(ctx, hook, &f, &v);
-		return refuse(f.box, EPERM);
+		return refuse(f.box);
 	}
 	/* Port 0 asks the kernel for an ephemeral port, which a socket also
 	 * gets without any bind call. */
@@ -301,7 +302,7 @@ static __always_inline int bind_any(struct bpf_sock_addr *ctx, __u8 hook, __u8 s
 		return 1;
 	v.action = BP_DENY;
 	sa_event(ctx, hook, &f, &v);
-	return refuse(f.box, cfg->refuse_errno);
+	return refuse(f.box);
 }
 
 SEC("cgroup/bind4")
@@ -327,20 +328,20 @@ int bp_sock_create(struct bpf_sock *sk)
 	struct bp_box_cfg *cfg = bpf_map_lookup_elem(&box_cfg, &box);
 	struct ev_args a = {};
 	__u8 pbit = proto_bit(sk->protocol);
-	__u16 err = cfg ? cfg->refuse_errno : EPERM;
 	__u8 reason = cfg ? BP_R_SOCK_TYPE : BP_R_NO_CFG;
 
 	if (cfg && ((sk->type == SOCK_STREAM && pbit == BP_P_TCP) ||
 		    (sk->type == SOCK_DGRAM && (pbit == BP_P_UDP || pbit == BP_P_ICMP)))) {
-		__u64 *owner = bpf_sk_storage_get(&sk_box, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+		struct sk_owner *owner =
+			bpf_sk_storage_get(&sk_box, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 
 		if (owner) {
-			*owner = box;
+			owner->box = box;
+			owner->netns = bpf_get_netns_cookie(sk);
 			return 1;
 		}
 		/* A socket nobody can name the box of would be refused at
 		 * every later call. */
-		err = ENOMEM;
 		reason = BP_R_NO_MEMORY;
 	}
 
@@ -354,17 +355,106 @@ int bp_sock_create(struct bpf_sock *sk)
 	a.verdict = BP_DENY;
 	a.reason = reason;
 	emit_net(&a);
-	return refuse(box, err);
+	return refuse(box);
 }
 
-/* The socket's entry in the flows map must not outlive it: the next socket
- * with the same local address and port may belong to anyone. */
+/*
+ * A box socket started to listen. The daemon publishes ports that boxes
+ * open, and this is how it learns of one without watching the box's
+ * processes. Only TCP has the callback.
+ *
+ * A box has room for listens_per_box entries. A listener over that is not
+ * recorded, and so not published.
+ */
+SEC("sockops")
+int bp_sock_ops(struct bpf_sock_ops *ctx)
+{
+	struct bp_listen_key lk = {};
+	struct bp_listen lv = {};
+	struct sk_owner *owner;
+	struct bp_usage *use;
+	struct sk_state *st;
+	struct bpf_sock *sk;
+
+	if (ctx->op != BPF_SOCK_OPS_TCP_LISTEN_CB)
+		return 1;
+	sk = ctx->sk;
+	if (!sk)
+		return 1;
+	owner = bpf_sk_storage_get(&sk_box, sk, 0, 0);
+	if (!owner || !owner->box)
+		return 1;
+	st = bpf_sk_storage_get(&sk_state, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!st)
+		return 1;
+	if (!(st->flags & ST_LISTEN)) {
+		use = bpf_map_lookup_elem(&box_use, &owner->box);
+		if (!use || use->listens >= listens_per_box)
+			return 1;
+		__sync_fetch_and_add(&use->listens, 1);
+		st->flags |= ST_LISTEN;
+	}
+
+	lk.box_id = owner->box;
+	lk.netns = owner->netns;
+	lk.cookie = bpf_get_socket_cookie(ctx);
+	lv.port = ctx->local_port;
+	if (ctx->family == AF_INET6) {
+		__u32 a[4];
+
+		/* The verifier takes these fields one at a time. The barriers
+		 * keep the compiler from reading two as one. */
+		a[0] = ctx->local_ip6[0];
+		barrier();
+		a[1] = ctx->local_ip6[1];
+		barrier();
+		a[2] = ctx->local_ip6[2];
+		barrier();
+		a[3] = ctx->local_ip6[3];
+		lv.family = 6;
+		__builtin_memcpy(lv.addr, a, 16);
+	} else {
+		__u32 a = ctx->local_ip4;
+
+		lv.family = 4;
+		__builtin_memcpy(lv.addr, &a, 4);
+	}
+	bpf_map_update_elem(&listens, &lk, &lv, BPF_ANY);
+	st->listen_port = lv.port;
+	st->listen_family = lv.family;
+	emit_listen(lk.box_id, lk.netns, lv.port, lv.family, 1);
+	return 1;
+}
+
+/* What a socket has in the flows and listens maps must not outlive it: the
+ * next socket with the same local address and port may belong to anyone. */
 SEC("cgroup/sock_release")
 int bp_sock_release(struct bpf_sock *sk)
 {
 	struct sk_state *st = bpf_sk_storage_get(&sk_state, sk, 0, 0);
+	struct sk_owner *owner;
+	struct bp_usage *use;
 
-	if (st && (st->flags & ST_FLOW))
+	if (!st || !(st->flags & (ST_FLOW | ST_LISTEN)))
+		return 1;
+	if (st->flags & ST_FLOW)
 		bpf_map_delete_elem(&flows, &st->flow_key);
+	owner = bpf_sk_storage_get(&sk_box, sk, 0, 0);
+	if (!owner)
+		return 1;
+	use = bpf_map_lookup_elem(&box_use, &owner->box);
+	if (use && (st->flags & ST_FLOW) && use->flows)
+		__sync_fetch_and_add(&use->flows, -1);
+	if (st->flags & ST_LISTEN) {
+		struct bp_listen_key lk = {};
+
+		lk.box_id = owner->box;
+		lk.netns = owner->netns;
+		lk.cookie = bpf_get_socket_cookie(sk);
+		bpf_map_delete_elem(&listens, &lk);
+		if (use && use->listens)
+			__sync_fetch_and_add(&use->listens, -1);
+		emit_listen(lk.box_id, lk.netns, st->listen_port, st->listen_family, 0);
+	}
 	return 1;
 }
