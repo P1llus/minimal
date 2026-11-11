@@ -22,22 +22,12 @@ pub(crate) enum BoxProcesses {
 }
 
 impl BoxProcesses {
-    /// The pids in the cgroup that a signal goes to. The supervisor of a
-    /// container is left out: it ends when the container's program does,
-    /// and a supervisor that dies first takes the program with it at once,
-    /// which is what a stop's grace period is there to avoid.
-    fn signalled(cgroup: &sandbox::cgroup::BoxCgroup) -> Vec<u32> {
-        let spawner = sandbox::Spawner::current();
-        match cgroup.procs() {
-            Ok(pids) => pids
-                .into_iter()
-                .filter(|pid| !spawner.supervises(*pid))
-                .collect(),
-            Err(error) => {
-                tracing::debug!(%error, cgroup = cgroup.name(), "stop: the box's cgroup is gone");
-                Vec::new()
-            }
-        }
+    /// Whether a signal leaves `pid` out. The supervisor of a container
+    /// ends when the container's program does, and a supervisor that dies
+    /// first takes the program with it at once, which is what a stop's
+    /// grace period is there to avoid.
+    fn spared(pid: u32) -> bool {
+        sandbox::Spawner::current().supervises(pid)
     }
 
     /// Sends `signal` to the box's processes, and says how many it reached.
@@ -52,14 +42,10 @@ impl BoxProcesses {
                 }
                 reached
             }
-            Self::Cgroup(cgroup) => Self::signalled(cgroup)
-                .into_iter()
-                .filter(|pid| {
-                    // SAFETY: `kill` takes a pid and a signal. A pid that
-                    // has exited answers ESRCH, which is not counted.
-                    unsafe { libc::kill(*pid as libc::pid_t, signal) == 0 }
-                })
-                .count(),
+            Self::Cgroup(cgroup) => cgroup.signal(signal, Self::spared).unwrap_or_else(|error| {
+                tracing::debug!(%error, cgroup = cgroup.name(), "stop: the box's cgroup is gone");
+                0
+            }),
             Self::Entrypoint(host) => usize::from(host.signal_entrypoint(signal).await.is_ok()),
         }
     }
@@ -69,7 +55,9 @@ impl BoxProcesses {
     /// and answers zero: its stop goes by its entrypoint's end alone.
     pub(crate) fn left(&self) -> usize {
         match self {
-            Self::Cgroup(cgroup) => Self::signalled(cgroup).len(),
+            Self::Cgroup(cgroup) => cgroup.procs().map_or(0, |pids| {
+                pids.into_iter().filter(|pid| !Self::spared(*pid)).count()
+            }),
             Self::Entrypoint(_) => 0,
         }
     }
