@@ -179,13 +179,17 @@ impl Server {
                     .and_then(|(stdio, cgroup)| core::run(&run, stdio, cgroup, self.titled));
                 match started {
                     Ok(mut container) => {
+                        let netns = container.netns.take();
                         let tap = container.tap.take();
                         let event = Event::Started {
                             id,
                             pid: container.child.id(),
+                            netns: netns.is_some(),
                             tap: tap.is_some(),
                         };
-                        self.send(&event, tap.as_ref().map(|fd| fd.as_fd()).as_slice());
+                        let fds: Vec<BorrowedFd<'_>> =
+                            netns.iter().chain(&tap).map(|fd| fd.as_fd()).collect();
+                        self.send(&event, &fds);
                         self.jobs.insert(
                             id,
                             Job {
@@ -208,6 +212,7 @@ impl Server {
                     let event = Event::Started {
                         id,
                         pid: shim.pid,
+                        netns: false,
                         tap: false,
                     };
                     self.send(&event, &[]);

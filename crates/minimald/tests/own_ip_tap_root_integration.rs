@@ -154,9 +154,7 @@ async fn a_placed_fetch_leaves_from_the_held_namespace() {
         let held = Arc::clone(&held);
         common::Sockets::new(move |v6, kind| held.socket(v6, kind == common::SocketKind::Datagram))
     };
-    let namespace =
-        common::NetNamespace::of_process(pid, sockets, held.nameservers(), Arc::new(|_| true))
-            .unwrap();
+    let namespace = common::NetNamespace::new(sockets, held.nameservers(), Arc::new(|_| true));
 
     let placed = storage
         .download_web_placed(&url, sha, &common::Placement::Namespace(namespace), &op)

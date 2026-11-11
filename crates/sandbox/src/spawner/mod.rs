@@ -664,6 +664,7 @@ impl Command {
             stdout: stdout_ours.map(PipeReader::from),
             stderr: stderr_ours.map(PipeReader::from),
             pid: started.pid,
+            netns: started.netns,
             tap: started.tap,
             job: started.id,
             outcome: started.outcome,
@@ -705,6 +706,7 @@ pub struct Child {
     /// The program's standard error, when it is a pipe.
     pub stderr: Option<PipeReader>,
     pid: u32,
+    netns: Option<OwnedFd>,
     tap: Option<OwnedFd>,
     job: u64,
     outcome: Arc<client::Outcome>,
@@ -729,6 +731,13 @@ impl Child {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.pid
+    }
+
+    /// The container's network namespace, when it has one of its own. The
+    /// descriptor names the namespace whatever becomes of the pid.
+    #[must_use]
+    pub fn netns(&self) -> Option<BorrowedFd<'_>> {
+        self.netns.as_ref().map(|fd| fd.as_fd())
     }
 
     /// The tap the container was started with. Yields it once.

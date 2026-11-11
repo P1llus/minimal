@@ -1866,7 +1866,8 @@ impl std::fmt::Debug for HeldNetwork {
 }
 
 impl HeldNetwork {
-    /// The process whose `/proc/<pid>/ns` holds the namespace.
+    /// The process that holds the namespace, for a message. Its spawner
+    /// reaps it, so the pid names it only while the network is held.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
@@ -1999,6 +2000,19 @@ pub async fn hold_network(
         .spawn()
         .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
     let pid = child.id();
+    // A network whose plan gives no namespace of its own is the requester's
+    // network. A socket made "in" it would leave under no rule of the box.
+    if child.netns().is_none() {
+        end_held(&mut child);
+        return Err(Error::IO(
+            "holding a network",
+            base_dir.to_path_buf(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the network's plan gives it no network namespace of its own",
+            ),
+        ));
+    }
     let spawned = network::Spawned::from_child(&mut child);
     // A held process waits at its start gate, so one that has ended failed
     // its own setup. Its exit status says why, and neither the attach's
@@ -2452,7 +2466,7 @@ mod tests {
             "the provider's plan is carried forward"
         );
 
-        let guard = planned.attach(network::Spawned::new(4242)).await.unwrap();
+        let guard = planned.attach(network::Spawned::new()).await.unwrap();
         assert_eq!(rec.events(), vec!["plan", "attach"]);
         guard.teardown().await;
     }
@@ -2473,7 +2487,7 @@ mod tests {
         });
         assert!(
             planned_with(&rec)
-                .attach(network::Spawned::new(1))
+                .attach(network::Spawned::new())
                 .await
                 .is_err()
         );
@@ -2499,20 +2513,20 @@ mod tests {
         };
         let rec = failing();
         let attached = planned_with(&rec)
-            .attach_unless_ended(network::Spawned::new(1), || true)
+            .attach_unless_ended(network::Spawned::new(), || true)
             .await;
         assert!(matches!(attached, Ok(None)));
         assert_eq!(rec.events(), vec!["plan", "attach", "abandon"]);
 
         let rec = failing();
         let attached = planned_with(&rec)
-            .attach_unless_ended(network::Spawned::new(1), || false)
+            .attach_unless_ended(network::Spawned::new(), || false)
             .await;
         assert!(attached.is_err(), "the process still runs");
 
         let rec = std::sync::Arc::new(Recorder::default());
         let attached = planned_with(&rec)
-            .attach_unless_ended(network::Spawned::new(1), || {
+            .attach_unless_ended(network::Spawned::new(), || {
                 panic!("a good attach never asks")
             })
             .await;
@@ -2540,13 +2554,13 @@ mod tests {
         let fd = std::os::fd::OwnedFd::from(read_end);
         let raw = fd.as_raw_fd();
 
-        let mut spawned = network::Spawned::new(7).with_tap_fd(fd);
+        let mut spawned = network::Spawned::new().with_tap_fd(fd);
         assert_eq!(spawned.take_tap_fd().expect("first take").as_raw_fd(), raw);
         assert!(
             spawned.take_tap_fd().is_none(),
             "a second take gets nothing"
         );
-        assert!(network::Spawned::new(7).take_tap_fd().is_none());
+        assert!(network::Spawned::new().take_tap_fd().is_none());
     }
 
     /// 017-004. Both ways a sandbox process starts — the invocation path
@@ -3618,6 +3632,30 @@ ff02::2\tip6-allrouters
             .await
             .expect("the program ends");
         assert!(status.success(), "{status:?}");
+    }
+
+    /// A network that shares the requester's namespace is not held: a
+    /// socket made in it would be the requester's own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_with_no_namespace_of_its_own_is_not_held() {
+        if user_namespaces_restriction().is_some() {
+            return;
+        }
+        let name = "held-host";
+        let base_dir = box_base_dir(name);
+        let home = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let refused = hold_network(home.path(), std::sync::Arc::new(HostNet), None)
+            .await
+            .expect_err("the host's network is not a box's");
+        assert!(
+            refused
+                .to_string()
+                .contains("no network namespace of its own")
+                || format!("{refused:?}").contains("no network namespace of its own"),
+            "{refused:?}"
+        );
     }
 
     /// A spawner whose requester is gone reads the end of its socket and

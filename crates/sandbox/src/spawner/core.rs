@@ -28,6 +28,8 @@ pub(crate) struct Container {
     pub(crate) child: hakoniwa::Child,
     /// The supervisor, pinned.
     pub(crate) supervisor: OwnedFd,
+    /// The container's network namespace, when it has one of its own.
+    pub(crate) netns: Option<OwnedFd>,
     /// The tap hakoniwa built, when the container asked for one.
     pub(crate) tap: Option<OwnedFd>,
 }
@@ -182,9 +184,17 @@ pub(crate) fn run(
         .rustslirp_tapfd
         .take()
         .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
+    // The supervisor made its namespaces before the spawn returned, and it
+    // is this process's child, so its pid is its own until it is reaped.
+    let netns = if run.container.netns {
+        Some(std::fs::File::open(format!("/proc/{}/ns/net", child.id()))?.into())
+    } else {
+        None
+    };
     Ok(Container {
         child,
         supervisor,
+        netns,
         tap,
     })
 }

@@ -178,36 +178,37 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
 }
 
 /// The `ip`/`nsenter` command lines that move an opened tap into the network
-/// namespace of `netns_pid` and configure it there as an `OwnIp` PTask's switch
-/// interface (set the lease MAC, assign the lease address within `subnet`, bring
-/// the interface and loopback up, install a default route via the switch
-/// gateway).
+/// namespace `netns` names and configure it there as an `OwnIp` PTask's
+/// switch interface (set the lease MAC, assign the lease address within
+/// `subnet`, bring the interface and loopback up, install a default route via
+/// the switch gateway).
 ///
 /// Each command is returned as an argv vector rather than executed, so the two
 /// callers can run them under the privileges they have: the daemon
 /// ([`move_tap_into_netns`]) execs them directly with `CAP_NET_ADMIN`, while the
 /// netns proof (`tests/netns_root_integration.rs`) wraps each in `sudo` on an
-/// unprivileged runner. Single-sourcing the command construction keeps the proof
-/// driving the same wiring the daemon does.
+/// unprivileged runner.
 ///
-/// The namespace is identified by PID, addressing `/proc/<pid>/ns/net` — the
-/// namespace `sandbox` unshared for the PTask, surfaced to the launcher via the
-/// `hakoniwa::Child`'s PID.
+/// `netns` is a path that opens the namespace: both tools take one wherever
+/// they take a pid. The daemon passes an open descriptor of its own, so no
+/// command names the namespace by a pid that another process could have by
+/// then.
 #[must_use]
 pub fn tap_netns_commands(
     tap: &str,
-    netns_pid: u32,
+    netns: &std::path::Path,
     lease: PtaskLease,
     subnet: SwitchSubnet,
 ) -> Vec<Vec<String>> {
-    let pid = netns_pid.to_string();
+    let netns = netns.to_string_lossy().into_owned();
+    let enter = format!("--net={netns}");
     let mac = lease.mac.to_string();
     let cidr = format!("{}/{}", lease.ip, subnet.prefix());
     let gw = subnet.gateway().to_string();
 
-    // Enter the PTask's net namespace (by PID) to run an `ip` subcommand there.
+    // Enter the PTask's net namespace to run an `ip` subcommand there.
     let nsenter = |args: &[&str]| -> Vec<String> {
-        ["nsenter", "-t", &pid, "-n"]
+        ["nsenter", &enter]
             .into_iter()
             .chain(args.iter().copied())
             .map(str::to_string)
@@ -216,7 +217,7 @@ pub fn tap_netns_commands(
 
     vec![
         // Move the interface into the PTask's namespace (run in the host ns).
-        ["ip", "link", "set", tap, "netns", &pid]
+        ["ip", "link", "set", tap, "netns", &netns]
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -249,8 +250,8 @@ fn trusted_program(program: &str) -> String {
     program.to_string()
 }
 
-/// Moves the opened tap `tap` into the PTask network namespace held by
-/// `netns_pid` and configures its switch address there, by execing the
+/// Moves the opened tap `tap` into the PTask network namespace `netns` and
+/// configures its switch address there, by execing the
 /// [`tap_netns_commands`] directly. The host-side tap fd keeps working after the
 /// interface moves namespaces, which is what [`attach_to_switch`] relays on.
 ///
@@ -266,11 +267,17 @@ fn trusted_program(program: &str) -> String {
 /// non-zero, naming the failing command line.
 pub async fn move_tap_into_netns(
     tap: &str,
-    netns_pid: u32,
+    netns: std::os::fd::BorrowedFd<'_>,
     lease: PtaskLease,
     subnet: SwitchSubnet,
 ) -> io::Result<()> {
-    for (index, argv) in tap_netns_commands(tap, netns_pid, lease, subnet)
+    // This daemon's own descriptor, as its children can open it.
+    let netns = std::path::PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        std::os::fd::AsRawFd::as_raw_fd(&netns)
+    ));
+    for (index, argv) in tap_netns_commands(tap, &netns, lease, subnet)
         .into_iter()
         .enumerate()
     {
@@ -307,12 +314,8 @@ pub async fn move_tap_into_netns(
             } else {
                 format!("said {said:?}")
             };
-            // Whether the namespace this addresses still exists separates "the
-            // supervisor exited under us" from "the tap is not where we think".
-            // Both reach here as 255, and only one of them is our bug.
-            let ns = std::path::Path::new(&format!("/proc/{netns_pid}/ns/net")).exists();
             return Err(io::Error::other(format!(
-                "{phase} failed (`{}` exited with {}, {said}; /proc/{netns_pid}/ns/net present: {ns})",
+                "{phase} failed (`{}` exited with {}, {said})",
                 argv.join(" "),
                 out.status
             )));
@@ -8417,7 +8420,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tap_netns_commands_move_then_configure_by_pid() {
+    fn tap_netns_commands_move_then_configure_by_path() {
         use std::net::Ipv4Addr;
 
         let lease = PtaskLease {
@@ -8425,15 +8428,19 @@ pub(crate) mod tests {
             mac: super::super::MacAddr::for_switch_ip(Ipv4Addr::new(100, 64, 0, 2)),
             epoch: 1,
         };
-        let cmds = tap_netns_commands("mtap0_2", 4321, lease, SwitchSubnet::default());
+        let netns = std::path::Path::new("/proc/77/fd/9");
+        let cmds = tap_netns_commands("mtap0_2", netns, lease, SwitchSubnet::default());
 
-        // First the interface is moved into the PTask's namespace by PID; every
-        // later command enters that namespace via `nsenter -t <pid> -n`.
-        assert_eq!(cmds[0], ["ip", "link", "set", "mtap0_2", "netns", "4321"]);
+        // First the interface is moved into the PTask's namespace by its
+        // path. Every later command enters that namespace by the same path.
+        assert_eq!(
+            cmds[0],
+            ["ip", "link", "set", "mtap0_2", "netns", "/proc/77/fd/9"]
+        );
         assert!(
             cmds[1..]
                 .iter()
-                .all(|c| c[..4] == ["nsenter", "-t", "4321", "-n"])
+                .all(|c| c[..2] == ["nsenter", "--net=/proc/77/fd/9"])
         );
 
         // The lease's address is configured as CIDR with the subnet prefix, and

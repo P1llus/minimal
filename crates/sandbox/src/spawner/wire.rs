@@ -127,10 +127,12 @@ pub(crate) enum Request {
 /// What a spawner tells the process it serves.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Event {
-    /// The job's process exists. Descriptors: the tap if `tap`.
+    /// The job's process exists. Descriptors: the container's network
+    /// namespace if `netns`, then the tap if `tap`.
     Started {
         id: u64,
         pid: u32,
+        netns: bool,
         tap: bool,
     },
     Failed {

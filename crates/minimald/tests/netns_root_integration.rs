@@ -2030,7 +2030,9 @@ impl Ptask {
         // PTask's netns by PID, set its MAC/address/route and bring it and `lo`
         // up there) — the exact argv `SandboxLauncher` execs, here run under
         // `sudo` because this runner is unprivileged.
-        for argv in tap_netns_commands(&tap, netns_pid, lease, subnet) {
+        // The holder is this proof's own child, so its pid names it.
+        let netns = PathBuf::from(format!("/proc/{netns_pid}/ns/net"));
+        for argv in tap_netns_commands(&tap, &netns, lease, subnet) {
             let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
             sudo_ok("configure PTask tap", &strs);
         }
