@@ -70,6 +70,16 @@ if [ -z "$VERSION" ] || [ -z "$COMMIT" ]; then
   exit 1
 fi
 
+# What the archive is built from: the pin and every carried patch. The id is
+# staged beside the archive, so a prefix that holds another pin or patch set
+# is rebuilt and one that holds this one is left alone.
+PATCHES="$ROOT/vendor/libkrun/patches"
+SOURCE_ID="$({ cat "$LOCK"; for patch in "$PATCHES"/*.patch; do [ -e "$patch" ] && cat "$patch"; done; echo "$TARGET"; } | sha256sum | cut -d' ' -f1)"
+if [ -f "$PREFIX/libkrun.a" ] && [ "$(cat "$PREFIX/libkrun.source" 2>/dev/null || true)" = "$SOURCE_ID" ]; then
+  echo "static libkrun in $PREFIX is built from the current pin and patches"
+  exit 0
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -90,7 +100,6 @@ fi
 # `git apply` exits non-zero on any rejected hunk and, without --reject, leaves
 # the tree untouched — so a stale patch aborts the build instead of silently
 # producing an unpatched archive.
-PATCHES="$ROOT/vendor/libkrun/patches"
 if [ -d "$PATCHES" ]; then
   for patch in "$PATCHES"/*.patch; do
     [ -e "$patch" ] || continue
@@ -211,6 +220,16 @@ if [ "$TARGET_ARCH_BU" != "$HOST_ARCH_BU" ]; then
   echo "cross-build: using ${BU_PREFIX}* binutils"
 fi
 
+# Name the object format outright. Left to guess it, nm, objcopy and ar offer
+# the file to every linker plugin installed on the machine first, and an LLVM
+# plugin older than the compiler aborts on the bitcode that the release
+# profile's LTO leaves in the objects.
+case "$TARGET_ARCH_BU" in
+  x86_64)  BFD_TARGET=elf64-x86-64 ;;
+  aarch64) BFD_TARGET=elf64-littleaarch64 ;;
+  *) echo "::error::no object format known for $TARGET_ARCH_BU" >&2; exit 1 ;;
+esac
+
 echo "merging archive members into one relocatable object"
 "${BU_PREFIX}ld" -r --whole-archive "$RAW" -o "$WORK/libkrun-merged.o"
 
@@ -221,23 +240,23 @@ echo "merging archive members into one relocatable object"
 # that aborts the script right here — so the explanatory error below would never
 # print and a symbol-free merge would fail with no diagnostic at all. Tolerate
 # the no-match status and let the count check report it.
-"${BU_PREFIX}nm" -g --defined-only "$WORK/libkrun-merged.o" \
+"${BU_PREFIX}nm" --target="$BFD_TARGET" -g --defined-only "$WORK/libkrun-merged.o" \
   | awk '{print $NF}' | { grep '^krun_' || true; } | sort -u > "$WORK/keep.syms"
 count="$(wc -l < "$WORK/keep.syms" | tr -d ' ')"
 [ "$count" -gt 0 ] || { echo "::error::no krun_* symbols found in the merged object" >&2; exit 1; }
 echo "keeping $count krun_* symbols global, localizing the rest"
 
-"${BU_PREFIX}objcopy" --keep-global-symbols="$WORK/keep.syms" \
+"${BU_PREFIX}objcopy" --target="$BFD_TARGET" --keep-global-symbols="$WORK/keep.syms" \
   "$WORK/libkrun-merged.o" "$WORK/libkrun-local.o"
 
 rm -f "$WORK/libkrun.a"
-"${BU_PREFIX}ar" crs "$WORK/libkrun.a" "$WORK/libkrun-local.o"
+"${BU_PREFIX}ar" --target="$BFD_TARGET" crs "$WORK/libkrun.a" "$WORK/libkrun-local.o"
 
 # Dump the final symbol table ONCE and assert against the file, never against a
 # live pipe: under `set -o pipefail` a `grep -q` that exits on its first match
 # SIGPIPEs `nm` mid-write, and the non-zero producer fails the whole pipeline —
 # so a passing assertion reads as a failing one.
-"${BU_PREFIX}nm" -g --defined-only "$WORK/libkrun.a" > "$WORK/final.syms"
+"${BU_PREFIX}nm" --target="$BFD_TARGET" -g --defined-only "$WORK/libkrun.a" > "$WORK/final.syms"
 
 # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0 — assert the pin
 # never silently regresses below the API surface minvmd uses. Mirrors the same
@@ -269,7 +288,7 @@ fi
 # build time and only surfaces at VM boot, and because `ld -r` +
 # `objcopy --keep-global-symbols` is binutils behaviour, not a stability
 # contract — a toolchain upgrade is the plausible way it regresses.
-"${BU_PREFIX}nm" -u "$WORK/libkrun.a" > "$WORK/undef.syms"
+"${BU_PREFIX}nm" --target="$BFD_TARGET" -u "$WORK/libkrun.a" > "$WORK/undef.syms"
 rust_undef="$(awk '{print $NF}' "$WORK/undef.syms" \
   | { grep -E '^(_ZN|_R[a-zA-Z0-9]|__rust|rust_eh_personality)' || true; } | head -5)"
 if [ -n "$rust_undef" ]; then
@@ -280,4 +299,5 @@ fi
 
 mkdir -p "$PREFIX"
 cp "$WORK/libkrun.a" "$PREFIX/libkrun.a"
+echo "$SOURCE_ID" > "$PREFIX/libkrun.source"
 echo "staged static libkrun $VERSION ($COMMIT, $TARGET) -> $PREFIX/libkrun.a"
