@@ -19,7 +19,7 @@ use std::{
 
 use boxbpf::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
 use boxes::{BoxPolicy, NetworkMode, SessionId};
-use netpol::{Compiled, Protocol, SetId, Verdict, base::Services, compile::Spec};
+use netpol::{Compiled, Protocol, Verdict, base::Services, compile::Spec};
 use sandbox::cgroup::{BoxCgroup, Root};
 use tokio::sync::mpsc;
 
@@ -908,13 +908,13 @@ impl Engine {
             .cloned()
     }
 
-    /// Admits `addr` for the box as an address of a name in `set`, for the
-    /// pin lifetime.
+    /// Admits `addr` for the box as an address of `name`, for the pin
+    /// lifetime.
     pub(crate) fn pin(
         &self,
         of: &Installed,
         addr: IpAddr,
-        set: SetId,
+        name: &str,
     ) -> Result<(), boxbpf::Error> {
         let Some(attached) = self.attached_state() else {
             return Ok(());
@@ -923,7 +923,7 @@ impl Engine {
             .handles
             .lock()
             .expect("engine lock")
-            .pin(of.id, addr, set, netpol::pins::PIN_TTL)
+            .pin(of.id, addr, name, netpol::pins::PIN_TTL)
     }
 
     /// Judges a flow of the box as the kernel programs would. `name` is

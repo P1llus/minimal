@@ -89,12 +89,34 @@ pub fn may_pin(addr: IpAddr, allowed: &[Prefix], infrastructure: &[Prefix]) -> b
     !suspicious || allowed.iter().any(|p| p.contains(addr))
 }
 
+/// One pin: the name the address was answered for, the set of that name
+/// in the policy the pin was last checked against, and when it runs out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pin {
+    name: Box<str>,
+    set: SetId,
+    expiry_ns: u64,
+}
+
+/// What a change of policy does to the pins of a box.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rebound {
+    /// Pins of names the new policy has no rule for. They are out of the
+    /// table. The caller deletes them from the kernel map.
+    pub dropped: Vec<IpAddr>,
+    /// Pins whose name now belongs to another set, with the new set and
+    /// the unchanged expiry. The table has them already. The caller
+    /// rewrites them in the kernel map.
+    pub moved: Vec<(IpAddr, SetId, u64)>,
+}
+
 /// The daemon's view of one box's pins. The kernel holds the same entries.
 /// This copy answers "which set is this address pinned to" for the
-/// evaluator and "which entries can be deleted" for the sweep.
+/// evaluator, "which entries can be deleted" for the sweep, and "which
+/// name was this for" when the policy changes.
 #[derive(Debug, Clone, Default)]
 pub struct PinTable {
-    pins: HashMap<IpAddr, (SetId, u64)>,
+    pins: HashMap<IpAddr, Pin>,
 }
 
 impl PinTable {
@@ -103,14 +125,26 @@ impl PinTable {
         Self::default()
     }
 
-    /// Records a pin. A later pin of the same address replaces the earlier
-    /// one: an address belongs to one set at a time.
-    pub fn insert(&mut self, addr: IpAddr, set: SetId, expiry_ns: u64) {
-        self.pins.insert(canonical(addr), (set, expiry_ns));
+    /// Records a pin of `addr` for `name`. A later pin of the same address
+    /// replaces the earlier one: an address belongs to one set at a time.
+    pub fn insert(&mut self, addr: IpAddr, name: &str, set: SetId, expiry_ns: u64) {
+        self.pins.insert(
+            canonical(addr),
+            Pin {
+                name: name.into(),
+                set,
+                expiry_ns,
+            },
+        );
     }
 
     pub fn remove(&mut self, addr: IpAddr) {
         self.pins.remove(&canonical(addr));
+    }
+
+    #[must_use]
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        self.pins.contains_key(&canonical(addr))
     }
 
     /// The set `addr` is pinned to, if the pin is still live.
@@ -118,8 +152,8 @@ impl PinTable {
     pub fn live(&self, addr: IpAddr, now_ns: u64) -> Option<SetId> {
         self.pins
             .get(&canonical(addr))
-            .filter(|(_, expiry)| is_live(*expiry, now_ns))
-            .map(|(set, _)| *set)
+            .filter(|pin| is_live(pin.expiry_ns, now_ns))
+            .map(|pin| pin.set)
     }
 
     /// Removes and returns the addresses whose pins have run out, for the
@@ -128,13 +162,35 @@ impl PinTable {
         let dead: Vec<IpAddr> = self
             .pins
             .iter()
-            .filter(|(_, (_, expiry))| !is_live(*expiry, now_ns))
+            .filter(|(_, pin)| !is_live(pin.expiry_ns, now_ns))
             .map(|(a, _)| *a)
             .collect();
         for addr in &dead {
             self.pins.remove(addr);
         }
         dead
+    }
+
+    /// Checks every pin against a new policy. `set_for` is the policy's
+    /// [`crate::Compiled::set_for_name`]. A pin whose name the policy no
+    /// longer has a rule for is dropped, and one whose name a more specific
+    /// pattern now covers moves to that pattern's set.
+    pub fn rebind(&mut self, set_for: impl Fn(&str) -> Option<SetId>) -> Rebound {
+        let mut out = Rebound::default();
+        self.pins.retain(|addr, pin| match set_for(&pin.name) {
+            None => {
+                out.dropped.push(*addr);
+                false
+            }
+            Some(set) => {
+                if set != pin.set {
+                    pin.set = set;
+                    out.moved.push((*addr, set, pin.expiry_ns));
+                }
+                true
+            }
+        });
+        out
     }
 
     /// Every address with a pin, live or not.
@@ -222,16 +278,35 @@ mod tests {
     #[test]
     fn the_table_tracks_live_pins() {
         let mut t = PinTable::new();
-        t.insert(ip("198.51.100.1"), SetId(1), 100);
-        t.insert(ip("::ffff:198.51.100.2"), SetId(2), 200);
+        t.insert(ip("198.51.100.1"), "a.test", SetId(1), 100);
+        t.insert(ip("::ffff:198.51.100.2"), "b.test", SetId(2), 200);
         assert_eq!(t.live(ip("198.51.100.1"), 50), Some(SetId(1)));
         assert_eq!(t.live(ip("198.51.100.1"), 100), None);
         assert_eq!(t.live(ip("198.51.100.2"), 150), Some(SetId(2)));
-        t.insert(ip("198.51.100.2"), SetId(3), 300);
+        t.insert(ip("198.51.100.2"), "c.test", SetId(3), 300);
         assert_eq!(t.live(ip("198.51.100.2"), 250), Some(SetId(3)));
         assert_eq!(t.take_expired(150), [ip("198.51.100.1")]);
         assert_eq!(t.len(), 1);
         t.remove(ip("198.51.100.2"));
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn a_new_policy_drops_and_moves_pins_by_their_names() {
+        let mut t = PinTable::new();
+        t.insert(ip("198.51.100.1"), "gone.test", SetId(1), 100);
+        t.insert(ip("198.51.100.2"), "kept.test", SetId(2), 200);
+        t.insert(ip("198.51.100.3"), "api.wild.test", SetId(3), 300);
+        let rebound = t.rebind(|name| match name {
+            "kept.test" => Some(SetId(2)),
+            // A more specific pattern now covers the name.
+            "api.wild.test" => Some(SetId(9)),
+            _ => None,
+        });
+        assert_eq!(rebound.dropped, [ip("198.51.100.1")]);
+        assert_eq!(rebound.moved, [(ip("198.51.100.3"), SetId(9), 300)]);
+        assert!(!t.contains(ip("198.51.100.1")));
+        assert_eq!(t.live(ip("198.51.100.2"), 0), Some(SetId(2)));
+        assert_eq!(t.live(ip("198.51.100.3"), 0), Some(SetId(9)));
     }
 }

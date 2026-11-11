@@ -37,6 +37,9 @@ const IN_UNIT: &str = "BOXBPF_TEST_IN_UNIT";
 pub const ROLE: &str = "BOXBPF_TEST_ROLE";
 pub const SOCKET: &str = "BOXBPF_TEST_SOCKET";
 pub const LO_ADDRS: &str = "BOXBPF_TEST_LO_ADDRS";
+/// Prefix entries per family the loader sizes the rule maps for, when a
+/// test wants to fill them.
+pub const RULE_ENTRIES: &str = "BOXBPF_TEST_RULE_ENTRIES";
 
 /// The errno boxes in these tests get for a refused call: one the kernel
 /// itself would not return for a loopback connect, so a refusal by the
@@ -236,6 +239,16 @@ impl Harness {
     /// loopback for the duration of the test. `suffixes` are the low 16
     /// bits; see [`Self::v6`].
     pub fn start_with(test: &str, v6_suffixes: &[u16]) -> Option<Self> {
+        Self::start_as(test, v6_suffixes, None)
+    }
+
+    /// Like [`Self::start`], with rule maps that hold `rule_entries`
+    /// prefixes per family, few enough for a test to fill.
+    pub fn start_sized(test: &str, rule_entries: u32) -> Option<Self> {
+        Self::start_as(test, &[], Some(rule_entries))
+    }
+
+    fn start_as(test: &str, v6_suffixes: &[u16], rule_entries: Option<u32>) -> Option<Self> {
         if std::env::var_os(GATE).is_none() {
             eprintln!("skipping {test}: {GATE} is not set (it needs sudo -n, systemd and clang)");
             return None;
@@ -243,10 +256,10 @@ impl Harness {
         if rerun_delegated(test) {
             return None;
         }
-        Some(Self::set_up(v6_suffixes))
+        Some(Self::set_up(v6_suffixes, rule_entries))
     }
 
-    fn set_up(v6_suffixes: &[u16]) -> Self {
+    fn set_up(v6_suffixes: &[u16], rule_entries: Option<u32>) -> Self {
         // In a scope we start in the unit's own cgroup, in a service with
         // DelegateSubgroup already in supervisor/.
         let here = own_cgroup();
@@ -285,6 +298,10 @@ impl Harness {
             .arg(format!("{ROLE}=loader"))
             .arg(format!("{SOCKET}={}", socket.display()))
             .arg(format!("{LO_ADDRS}={}", lo_addrs.join(",")))
+            .arg(format!(
+                "{RULE_ENTRIES}={}",
+                rule_entries.map(|n| n.to_string()).unwrap_or_default()
+            ))
             .arg(exe())
             .args(["--exact", "helper", "--ignored", "--nocapture"])
             .stdin(Stdio::piped())

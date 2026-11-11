@@ -206,7 +206,8 @@ static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struc
  * (bp_sock_release), so a later socket with the same address and port does
  * not inherit it.
  */
-static __always_inline void record_flow(__u64 box, const struct pkt *p, struct sk_state *st)
+static __always_inline void record_flow(__u64 box, const struct bp_box_cfg *cfg,
+					const struct pkt *p, struct sk_state *st)
 {
 	struct bp_endpoint_key ek = {};
 	struct bp_flow_key fk = {};
@@ -215,6 +216,7 @@ static __always_inline void record_flow(__u64 box, const struct pkt *p, struct s
 	__u32 i;
 
 	ek.box_id = box;
+	ek.generation = cfg->generation;
 	for (i = 0; i < BP_ENDPOINTS_MAX; i++) {
 		ek.idx = i;
 		ep = bpf_map_lookup_elem(&endpoints, &ek);
@@ -290,7 +292,7 @@ int bp_egress(struct __sk_buff *skb)
 	    (p.later_frag || st->ok_port == f.port)) {
 		/* The entry may have been evicted since the first packet. */
 		if (st->flags & ST_FLOW)
-			record_flow(box, &p, st);
+			record_flow(box, cfg, &p, st);
 		goto pass;
 	}
 	if (p.later_frag)
@@ -321,7 +323,7 @@ int bp_egress(struct __sk_buff *skb)
 		__builtin_memcpy(st->ok_addr, p.daddr, 16);
 		st->ok_port = f.port;
 		st->ok_generation = cfg->generation;
-		record_flow(box, &p, st);
+		record_flow(box, cfg, &p, st);
 	}
 	if (p.pbit == BP_P_UDP) {
 		struct udp_peer up;

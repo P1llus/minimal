@@ -213,12 +213,8 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
         names: vec!["allowed.test".parse().expect("name")],
         ..BoxPolicy::default()
     };
-    let live = h.install("c", deployment, policy);
+    let mut live = h.install("c", deployment, policy);
     let id = live.id();
-    let steered = live
-        .compiled()
-        .set_for_name("steered.test")
-        .expect("set of the steered name");
     let allowed = live
         .compiled()
         .set_for_name("allowed.test")
@@ -236,7 +232,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
         (IpAddr::V6(h.v6(0x0507)), &seen6),
     ] {
         h.handles
-            .pin(id, target, steered, Duration::from_secs(60))
+            .pin(id, target, "steered.test", Duration::from_secs(60))
             .expect("pin");
         let shown = SocketAddr::new(target, 443);
         assert_eq!(
@@ -321,7 +317,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
         "not pinned yet"
     );
     h.handles
-        .pin(id, target, allowed, Duration::from_millis(900))
+        .pin(id, target, "allowed.test", Duration::from_millis(900))
         .expect("pin");
     assert_eq!(h.handles.pinned_set(id, target), Some(allowed));
     assert!(
@@ -343,8 +339,12 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
         "a flow opened while the pin lived continues"
     );
     assert_eq!(h.handles.sweep_pins().expect("sweep"), 1);
-    // A new generation ends what sockets have cached: the open flow is
+    // A change of policy ends what sockets have cached: the open flow is
     // judged again, and the pin is gone.
-    h.handles.bump_generation(id).expect("bump");
+    let port = netpol::base::PortOf {
+        protocols: netpol::Protocols::TCP,
+        port: 18400,
+    };
+    h.handles.publish(&mut live, port).expect("publish");
     assert_eq!(open_flow.step(), "err 1");
 }

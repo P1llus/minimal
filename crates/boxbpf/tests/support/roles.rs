@@ -12,7 +12,7 @@ use std::{
 use boxbpf::loader::{ServeOptions, serve};
 use nix::sys::socket::{self, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 
-use super::{LO_ADDRS, ROLE, SOCKET, probe};
+use super::{LO_ADDRS, ROLE, RULE_ENTRIES, SOCKET, probe};
 
 /// Runs the role this process was started for, if any.
 pub fn run() {
@@ -113,10 +113,16 @@ fn loader() {
         .expect("open the socket to all users");
     socket::listen(&listener, Backlog::new(16).expect("backlog")).expect("listen");
 
-    let options = ServeOptions {
+    let mut options = ServeOptions {
         handover_base: Some(handover),
         ..ServeOptions::default()
     };
+    if let Some(entries) = std::env::var(RULE_ENTRIES)
+        .ok()
+        .and_then(|n| n.parse().ok())
+    {
+        options.sizes.rule_entries = entries;
+    }
     loop {
         let conn = socket::accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC).expect("accept");
         // SAFETY: accept4 returned a new descriptor that nothing else owns.

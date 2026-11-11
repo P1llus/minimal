@@ -37,6 +37,8 @@ pub enum CompileError {
     },
     #[error("rule {rule} names no protocol and can match nothing: give it one or remove it")]
     NoProtocol { rule: usize },
+    #[error("the engine cannot tell the names {0} and {1} apart: remove one of them")]
+    NameSetClash(String, String),
     #[error("the policy has {0} rules, more than the engine can number")]
     TooManyRulesTotal(usize),
     #[error("rule {rule} redirects a {direction} flow: only egress can be redirected")]
@@ -370,13 +372,18 @@ pub fn compile(
 
     let mut names: Vec<(NamePattern, SetId)> = Vec::new();
     for (_, r) in &numbered {
-        if let Target::Names(n) = &r.target
-            && !names.iter().any(|(known, _)| known == n)
-        {
-            let id = u32::try_from(names.len() + 1)
-                .map_err(|_e| CompileError::TooManyRulesTotal(rules.len()))?;
-            names.push((n.clone(), SetId(id)));
+        let Target::Names(n) = &r.target else {
+            continue;
+        };
+        if names.iter().any(|(known, _)| known == n) {
+            continue;
         }
+        let id = n.set_id();
+        // Two patterns with one hash: possible, and never seen.
+        if let Some((other, _)) = names.iter().find(|(_, known)| *known == id) {
+            return Err(CompileError::NameSetClash(other.to_string(), n.to_string()));
+        }
+        names.push((n.clone(), id));
     }
     let mut sets = Vec::new();
     for (pattern, id) in &names {
@@ -700,6 +707,35 @@ mod tests {
         assert_eq!(c.set_rules(wild, Direction::Egress).unwrap().len(), 1);
         assert!(c.resolvable("www.example.com"));
         assert!(!c.resolvable("example.org"));
+    }
+
+    #[test]
+    fn a_set_id_does_not_depend_on_what_else_the_policy_names() {
+        let names = |list: &[&str]| BoxPolicy {
+            names: list.iter().map(|n| n.parse().unwrap()).collect(),
+            ..BoxPolicy::default()
+        };
+        let before = compile(
+            &host_ip(),
+            &names(&["removed.test", "kept.test"]),
+            Options::default(),
+        )
+        .unwrap();
+        let after = compile(
+            &host_ip(),
+            &names(&["added.test", "kept.test"]),
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            before.set_for_name("kept.test"),
+            after.set_for_name("kept.test")
+        );
+        // The set of the removed name is gone, and no other name got its id.
+        let removed = before.set_for_name("removed.test").unwrap();
+        assert_eq!(after.set_for_name("removed.test"), None);
+        assert!(after.sets.iter().all(|s| s.id != removed));
+        assert!(after.set_rules(removed, Direction::Egress).is_none());
     }
 
     #[test]

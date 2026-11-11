@@ -90,13 +90,18 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
     };
     let compiled = compile(&base, &policy, options).expect("compile");
     let id = h.new_box("p");
-    h.handles.apply(id, &compiled).expect("apply");
-    // One address the default would refuse is pinned for an allowed name.
-    let set = compiled
-        .set_for_name("pinned.test")
-        .expect("set of the name");
+    let compiled = std::sync::Arc::new(compiled);
     h.handles
-        .pin(id, IpAddr::V4(h.v4(5, 2)), set, Duration::from_secs(60))
+        .apply(id, std::sync::Arc::clone(&compiled))
+        .expect("apply");
+    // One address the default would refuse is pinned for an allowed name.
+    h.handles
+        .pin(
+            id,
+            IpAddr::V4(h.v4(5, 2)),
+            "pinned.test",
+            Duration::from_secs(60),
+        )
         .expect("pin");
 
     let v4 = |g, n| IpAddr::V4(h.v4(g, n));

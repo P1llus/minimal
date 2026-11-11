@@ -32,6 +32,14 @@ pub enum Error {
     Compile(#[from] netpol::CompileError),
     #[error("box id 0 is what the programs see outside any box and cannot be configured")]
     BoxIdZero,
+    #[error("the engine holds no policy for this box")]
+    UnknownBox,
+    #[error("the policy needs {needed} rule entries, and a box may have {limit}")]
+    RuleEntryLimit { needed: usize, limit: usize },
+    #[error("the box has {limit} addresses pinned, the most a box may have")]
+    PinLimit { limit: usize },
+    #[error("no rule of the box names {0}")]
+    NameWithoutRule(String),
     #[error("{0} map descriptors were handed over, {1} are needed")]
     HandleCount(usize, usize),
     /// The loader looked at the request and said no. The text is its reason.

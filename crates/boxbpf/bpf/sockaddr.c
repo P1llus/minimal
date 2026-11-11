@@ -114,8 +114,8 @@ static __always_inline void sa_event(struct bpf_sock_addr *ctx, __u8 hook, const
  * program that turns an IPv6 destination into a v4-mapped one (ENOTSUPP in
  * udpv6_sendmsg), and an AF_INET socket cannot reach an IPv6 endpoint at all.
  */
-static __always_inline int steer(struct bpf_sock_addr *ctx, __u8 sf, const struct flow *f,
-				 const struct verdict *v)
+static __always_inline int steer(struct bpf_sock_addr *ctx, __u8 sf, const struct bp_box_cfg *cfg,
+				 const struct flow *f, const struct verdict *v)
 {
 	struct bp_endpoint_key ek = {};
 	struct bp_endpoint *ep;
@@ -124,6 +124,7 @@ static __always_inline int steer(struct bpf_sock_addr *ctx, __u8 sf, const struc
 	__u16 port;
 
 	ek.box_id = f->box;
+	ek.generation = cfg->generation;
 	ek.idx = v->endpoint;
 	ep = bpf_map_lookup_elem(&endpoints, &ek);
 	if (!ep)
@@ -180,7 +181,7 @@ static __always_inline int sa_out(struct bpf_sock_addr *ctx, __u8 hook, __u8 sf)
 		if (peer_admitted(&up, BP_DIR_INGRESS, cfg->generation))
 			return 1;
 	}
-	if (v.action == BP_REDIRECT && steer(ctx, sf, &f, &v)) {
+	if (v.action == BP_REDIRECT && steer(ctx, sf, cfg, &f, &v)) {
 		v.action = BP_DENY;
 		v.reason = BP_R_NO_ENDPOINT;
 	}

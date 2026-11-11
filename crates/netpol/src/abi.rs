@@ -30,8 +30,8 @@ pub const ENDPOINTS_MAX: u8 = 4;
 pub const RULES_MAX: usize = 32;
 /// `prio` of "no rule": what an event carries when a default decided.
 pub const NO_RULE: u16 = 0xffff;
-/// Bits of an LPM key before the address: box id and direction.
-pub const RULE_KEY_BASE: u32 = 96;
+/// Bits of an LPM key before the address: box id, generation, direction.
+pub const RULE_KEY_BASE: u32 = 128;
 
 pub const FLAG_CHECK_SRC: u32 = 1 << 0;
 pub const FLAG_LOG_FLOWS: u32 = 1 << 1;
@@ -56,7 +56,9 @@ pub unsafe trait Plain: Copy + 'static {}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BoxCfg {
     pub flags: u32,
-    /// Any change of it ends the verdicts sockets have cached.
+    /// Part of the key of every rule, set and endpoint entry of the box:
+    /// writing a config with another generation switches the whole policy
+    /// at once. It also ends the verdicts sockets have cached.
     pub generation: u32,
     /// Indexed by [`Direction::code`].
     pub default_action: [u8; 3],
@@ -103,6 +105,7 @@ impl Default for Rules {
 pub struct Rule4Key {
     pub prefixlen: u32,
     pub box_id: [u8; 8],
+    pub generation: [u8; 4],
     pub dir: u8,
     pub _zero: [u8; 3],
     pub addr: [u8; 4],
@@ -113,6 +116,7 @@ pub struct Rule4Key {
 pub struct Rule6Key {
     pub prefixlen: u32,
     pub box_id: [u8; 8],
+    pub generation: [u8; 4],
     pub dir: u8,
     pub _zero: [u8; 3],
     pub addr: [u8; 16],
@@ -132,15 +136,15 @@ pub struct PinKey {
 pub struct PinVal {
     /// Boot-time clock. The programs ignore the entry once this has passed.
     pub expiry_ns: u64,
-    pub set_id: u32,
-    pub _pad: u32,
+    pub set_id: u64,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct SetKey {
     pub box_id: u64,
-    pub set_id: u32,
+    pub set_id: u64,
+    pub generation: u32,
     pub dir: u8,
     pub _pad: [u8; 3],
 }
@@ -149,8 +153,9 @@ pub struct SetKey {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct EndpointKey {
     pub box_id: u64,
+    pub generation: u32,
     pub idx: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
 }
 
 #[repr(C)]
@@ -475,12 +480,12 @@ layouts! {
     BoxCfg = "bp_box_cfg", 36 { flags, generation, default_action, refuse_errno, addr4, addr6 }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
     Rules = "bp_rules", 388 { count, r }
-    Rule4Key = "bp_rule4_key", 20 { prefixlen, box_id, dir, addr }
-    Rule6Key = "bp_rule6_key", 32 { prefixlen, box_id, dir, addr }
+    Rule4Key = "bp_rule4_key", 24 { prefixlen, box_id, generation, dir, addr }
+    Rule6Key = "bp_rule6_key", 36 { prefixlen, box_id, generation, dir, addr }
     PinKey = "bp_pin_key", 32 { box_id, addr, family }
     PinVal = "bp_pin_val", 16 { expiry_ns, set_id }
-    SetKey = "bp_set_key", 16 { box_id, set_id, dir }
-    EndpointKey = "bp_endpoint_key", 16 { box_id, idx }
+    SetKey = "bp_set_key", 24 { box_id, set_id, generation, dir }
+    EndpointKey = "bp_endpoint_key", 16 { box_id, generation, idx }
     Endpoint = "bp_endpoint", 24 { addr6, addr4, port4, port6 }
     Stats = "bp_stats", 64 { tx_pkts, tx_bytes, rx_pkts, rx_bytes, tx_drop, rx_drop, refused, ev_lost }
     FlowKey = "bp_flow_key", 20 { saddr, sport, proto, family }
@@ -494,11 +499,12 @@ layouts! {
 impl Rule4Key {
     /// The key without its prefix length: what the LPM compares.
     #[must_use]
-    pub fn data(&self) -> [u8; 16] {
-        let mut out = [0u8; 16];
+    pub fn data(&self) -> [u8; 20] {
+        let mut out = [0u8; 20];
         let bytes = self
             .box_id
             .into_iter()
+            .chain(self.generation)
             .chain([self.dir])
             .chain(self._zero)
             .chain(self.addr);
@@ -512,11 +518,12 @@ impl Rule4Key {
 impl Rule6Key {
     /// The key without its prefix length: what the LPM compares.
     #[must_use]
-    pub fn data(&self) -> [u8; 28] {
-        let mut out = [0u8; 28];
+    pub fn data(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
         let bytes = self
             .box_id
             .into_iter()
+            .chain(self.generation)
             .chain([self.dir])
             .chain(self._zero)
             .chain(self.addr);
@@ -587,7 +594,7 @@ fn rules_value(slots: &[Slot]) -> Rules {
     out
 }
 
-/// Every map entry of one box.
+/// Every map entry of one generation of a box's policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BoxEntries {
     pub cfg: BoxCfg,
@@ -595,6 +602,37 @@ pub struct BoxEntries {
     pub rules6: Vec<(Rule6Key, Rules)>,
     pub sets: Vec<(SetKey, Rules)>,
     pub endpoints: Vec<(EndpointKey, Endpoint)>,
+}
+
+/// The keys of [`BoxEntries`]: enough to delete a generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoxKeys {
+    pub rules4: Vec<Rule4Key>,
+    pub rules6: Vec<Rule6Key>,
+    pub sets: Vec<SetKey>,
+    pub endpoints: Vec<EndpointKey>,
+}
+
+impl BoxKeys {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rules4.is_empty()
+            && self.rules6.is_empty()
+            && self.sets.is_empty()
+            && self.endpoints.is_empty()
+    }
+}
+
+impl BoxEntries {
+    #[must_use]
+    pub fn keys(&self) -> BoxKeys {
+        BoxKeys {
+            rules4: self.rules4.iter().map(|(k, _)| *k).collect(),
+            rules6: self.rules6.iter().map(|(k, _)| *k).collect(),
+            sets: self.sets.iter().map(|(k, _)| *k).collect(),
+            endpoints: self.endpoints.iter().map(|(k, _)| *k).collect(),
+        }
+    }
 }
 
 /// The config entry of a compiled box at a generation.
@@ -627,10 +665,20 @@ pub fn box_cfg(compiled: &Compiled, generation: u32) -> BoxCfg {
     }
 }
 
+/// How many rule entries a compiled policy takes in the maps: one per
+/// prefix and one per name set, each per direction it has rules for.
+#[must_use]
+pub const fn rule_entries(compiled: &Compiled) -> usize {
+    compiled.nets.len() + compiled.sets.len()
+}
+
 /// Lays a compiled box out as map entries for the box with this cgroup id.
+/// Every rule, set and endpoint key carries `generation`, so the entries
+/// of two generations of one box lie side by side.
 #[must_use]
 pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries {
     let id = box_id.to_ne_bytes();
+    let generation_bytes = generation.to_ne_bytes();
     let mut out = BoxEntries {
         cfg: box_cfg(compiled, generation),
         ..BoxEntries::default()
@@ -644,6 +692,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
                 Rule4Key {
                     prefixlen,
                     box_id: id,
+                    generation: generation_bytes,
                     dir,
                     _zero: [0; 3],
                     addr: a.octets(),
@@ -654,6 +703,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
                 Rule6Key {
                     prefixlen,
                     box_id: id,
+                    generation: generation_bytes,
                     dir,
                     _zero: [0; 3],
                     addr: a.octets(),
@@ -666,6 +716,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
         let key = SetKey {
             box_id,
             set_id: set.id.0,
+            generation,
             dir: set.direction.code(),
             _pad: [0; 3],
         };
@@ -681,8 +732,9 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
         out.endpoints.push((
             EndpointKey {
                 box_id,
+                generation,
                 idx: index.0,
-                _pad: [0; 7],
+                _pad: [0; 3],
             },
             value,
         ));
@@ -707,7 +759,6 @@ pub const fn pin_val(set: SetId, expiry_ns: u64) -> PinVal {
     PinVal {
         expiry_ns,
         set_id: set.0,
-        _pad: 0,
     }
 }
 
@@ -738,7 +789,7 @@ mod tests {
         let c = c_static_asserts();
         assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 36,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
-        assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 16"));
+        assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
         assert!(c.contains("BP_ABI_VERSION == 3"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
@@ -796,8 +847,9 @@ mod tests {
         assert_eq!(k4.prefixlen, RULE_KEY_BASE + 8);
         assert_eq!(k4.box_id, 0x0102_0304_0506_0708u64.to_ne_bytes());
         assert_eq!((k4.dir, k4.addr), (0, [10, 0, 0, 0]));
-        assert_eq!(&k4.data()[8..], &[0, 0, 0, 0, 10, 0, 0, 0]);
-        assert_eq!(e.rules6.first().unwrap().0.data()[12], 0xfd);
+        assert_eq!(&k4.data()[8..12], &3u32.to_ne_bytes());
+        assert_eq!(&k4.data()[12..], &[0, 0, 0, 0, 10, 0, 0, 0]);
+        assert_eq!(e.rules6.first().unwrap().0.data()[16], 0xfd);
         assert_eq!(
             (v4.r[0].proto_mask, v4.r[0].action, v4.r[0].port_hi),
             (7, ACTION_ALLOW, u16::MAX)
@@ -805,6 +857,20 @@ mod tests {
         assert_eq!((v4.count, v4.r[1].proto_mask), (1, 0));
         assert_eq!(e.rules6.len(), 1);
         assert_eq!(e.sets.len(), 1);
-        assert_eq!(e.sets.first().unwrap().0.set_id, 1);
+        let set = e.sets.first().unwrap().0;
+        assert_eq!(
+            (set.set_id, set.generation),
+            (compiled.set_for_name("example.com").unwrap().0, 3)
+        );
+        assert_eq!(rule_entries(&compiled), 3);
+        // Another generation of the same policy shares no rule key with it.
+        let next = entries(&compiled, 0x0102_0304_0506_0708, 4);
+        assert!(
+            next.keys()
+                .rules4
+                .iter()
+                .all(|k| !e.keys().rules4.contains(k))
+        );
+        assert!(next.keys().sets.iter().all(|k| !e.keys().sets.contains(k)));
     }
 }

@@ -15,6 +15,7 @@ mod cases {
     pub mod loader;
     pub mod netns;
     pub mod parity;
+    pub mod reconfigure;
     pub mod redirect;
     pub mod rules;
     pub mod sockets;

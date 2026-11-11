@@ -36,10 +36,18 @@
 #define BP_F_LOG_FLOWS (1u << 1) /* event for each allowed connect and send */
 #define BP_F_HAS_SETS  (1u << 2) /* the box has name-set rules: look up pins */
 
-/* Keyed by box id: the cgroup id of the box cgroup. */
+/*
+ * Keyed by box id: the cgroup id of the box cgroup.
+ *
+ * `generation` is part of the key of every rule, set and endpoint entry of
+ * the box. Userspace writes a new policy under a new generation beside the
+ * old one, and the write of this struct switches from one to the other. A
+ * program reads the struct once and so sees one policy, never a mix. The
+ * generation also ends the verdicts sockets have cached.
+ */
 struct bp_box_cfg {
 	__u32 flags;
-	__u32 generation; /* any change ends the verdicts sockets have cached */
+	__u32 generation;
 	__u8  default_action[BP_DIR_COUNT];
 	__u8  _pad;
 	__u16 refuse_errno; /* for a refused system call; 0 means EPERM */
@@ -73,15 +81,16 @@ struct bp_rules {
 };
 
 /*
- * LPM keys. Box id and direction take the first 96 bits, so prefixlen is
- * 96 + the address prefix length. Byte arrays keep the structs free of
- * padding, which an LPM key must not have.
+ * LPM keys. Box id, generation and direction take the first 128 bits, so
+ * prefixlen is 128 + the address prefix length. Byte arrays keep the
+ * structs free of padding, which an LPM key must not have.
  */
-#define BP_RULE_KEY_BASE 96
+#define BP_RULE_KEY_BASE 128
 
 struct bp_rule4_key {
 	__u32 prefixlen;
-	__u8  box_id[8]; /* native-endian u64 */
+	__u8  box_id[8];     /* native-endian u64 */
+	__u8  generation[4]; /* native-endian u32 */
 	__u8  dir;
 	__u8  _zero[3];
 	__u8  addr[4];
@@ -90,6 +99,7 @@ struct bp_rule4_key {
 struct bp_rule6_key {
 	__u32 prefixlen;
 	__u8  box_id[8];
+	__u8  generation[4];
 	__u8  dir;
 	__u8  _zero[3];
 	__u8  addr[16];
@@ -103,23 +113,27 @@ struct bp_pin_key {
 	__u8  _pad[7];
 };
 
+/* A set id is a hash of the name pattern, the same under every generation.
+ * A pin of a set the box's current generation has no entry for admits
+ * nothing. */
 struct bp_pin_val {
 	__u64 expiry_ns; /* boot-time clock; ignored once it has passed */
-	__u32 set_id;
-	__u32 _pad;
+	__u64 set_id;
 };
 
 struct bp_set_key {
 	__u64 box_id;
-	__u32 set_id;
+	__u64 set_id;
+	__u32 generation;
 	__u8  dir;
 	__u8  _pad[3];
 };
 
 struct bp_endpoint_key {
 	__u64 box_id;
+	__u32 generation;
 	__u8  idx;
-	__u8  _pad[7];
+	__u8  _pad[3];
 };
 
 /* Endpoint indexes of a box are below this. */

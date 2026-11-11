@@ -437,8 +437,8 @@ impl Resolver {
         );
     }
 
-    fn pin(&self, of: &Installed, address: IpAddr, set: SetId) {
-        if let Err(error) = self.engine.pin(of, address, set) {
+    fn pin(&self, of: &Installed, address: IpAddr, name: &str) {
+        if let Err(error) = self.engine.pin(of, address, name) {
             tracing::warn!(
                 box_id = %of.session(),
                 %address,
@@ -474,10 +474,10 @@ impl Resolver {
                 let answer = self.zone.lookup(&name);
                 // The daemon's own answer needs no rebinding filter: a
                 // listed peer is admitted at the address the zone gives.
-                if let (ZoneAnswer::Address(address), Some(set)) =
+                if let (ZoneAnswer::Address(address), Some(_set)) =
                     (answer, compiled.set_for_name(&name))
                 {
-                    self.pin(of, IpAddr::V4(address), set);
+                    self.pin(of, IpAddr::V4(address), &name);
                 }
                 zone_reply(&query, answer)
             }
@@ -487,8 +487,8 @@ impl Resolver {
                     return encoded(&empty(&query, ResponseCode::ServFail));
                 };
                 let vetted = vet(reply, &name, &view);
-                for (address, set) in &vetted.pins {
-                    self.pin(of, *address, *set);
+                for (address, _set) in &vetted.pins {
+                    self.pin(of, *address, &name);
                 }
                 for address in &vetted.refused {
                     self.refused(of, &name, "rebinding", Some(*address));

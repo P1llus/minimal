@@ -40,9 +40,12 @@ struct {
 	__type(value, struct bp_pin_val);
 } pins SEC(".maps");
 
+/* Written from userspace only, so nothing is gained by allocating every
+ * entry up front. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct bp_set_key);
 	__type(value, struct bp_rules);
 } set_rules SEC(".maps");
@@ -249,6 +252,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 				   struct verdict *v)
 {
 	const struct bp_rules *rs;
+	__u32 generation = cfg->generation;
 
 	v->rule = BP_NO_RULE;
 	v->endpoint = 0;
@@ -258,6 +262,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 
 		k.prefixlen = BP_RULE_KEY_BASE + 32;
 		__builtin_memcpy(k.box_id, &f->box, 8);
+		__builtin_memcpy(k.generation, &generation, 4);
 		k.dir = f->dir;
 		__builtin_memcpy(k.addr, f->addr, 4);
 		rs = bpf_map_lookup_elem(&rules4, &k);
@@ -266,6 +271,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 
 		k.prefixlen = BP_RULE_KEY_BASE + 128;
 		__builtin_memcpy(k.box_id, &f->box, 8);
+		__builtin_memcpy(k.generation, &generation, 4);
 		k.dir = f->dir;
 		__builtin_memcpy(k.addr, f->addr, 16);
 		rs = bpf_map_lookup_elem(&rules6, &k);
@@ -286,6 +292,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 
 			sk.box_id = f->box;
 			sk.set_id = pin->set_id;
+			sk.generation = generation;
 			sk.dir = f->dir;
 			rs = bpf_map_lookup_elem(&set_rules, &sk);
 			if (rs)

@@ -546,6 +546,22 @@ impl NamePattern {
     pub fn specificity(&self) -> (bool, usize) {
         (!self.wildcard, self.domain.len())
     }
+
+    /// The id of the pattern's name set: a hash of the pattern, so the
+    /// same pattern has the same id in every policy that names it. A pin
+    /// made under one policy of a box still means the same pattern under
+    /// the next.
+    #[must_use]
+    pub fn set_id(&self) -> SetId {
+        // FNV-1a, 64 bits.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let prefix: &[u8] = if self.wildcard { b"*." } else { b"" };
+        for byte in prefix.iter().chain(self.domain.as_bytes()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        SetId(hash)
+    }
 }
 
 fn is_below(name: &str, domain: &str) -> bool {
@@ -826,10 +842,11 @@ impl Endpoint {
     }
 }
 
-/// Identifies the rules of one name pattern in the compiled policy.
+/// Identifies the rules of one name pattern in a compiled policy. See
+/// [`NamePattern::set_id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SetId(pub u32);
+pub struct SetId(pub u64);
 
 #[cfg(test)]
 mod tests {
@@ -870,6 +887,16 @@ mod tests {
         for bad in ["", "*", "*.", "a..b", "a.*.b", "sp ace.com"] {
             assert!(bad.parse::<NamePattern>().is_err(), "{bad}");
         }
+        // A set id belongs to the pattern, however it was written.
+        assert_eq!(
+            exact.set_id(),
+            "api.example.com".parse::<NamePattern>().unwrap().set_id()
+        );
+        assert_ne!(exact.set_id(), wild.set_id());
+        assert_ne!(
+            wild.set_id(),
+            "example.com".parse::<NamePattern>().unwrap().set_id()
+        );
     }
 
     #[test]

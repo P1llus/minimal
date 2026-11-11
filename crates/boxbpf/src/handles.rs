@@ -43,6 +43,49 @@ impl BoxId {
     }
 }
 
+/// What one box may take of the maps all boxes share. Without a limit one
+/// box could fill a map and every other box's install, reconfigure or pin
+/// would fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Rule entries of one policy: its prefixes and name sets. While a
+    /// policy is being replaced the box holds the old entries too.
+    pub rule_entries: usize,
+    /// Addresses pinned at one time.
+    pub pins: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            rule_entries: 1024,
+            pins: 1024,
+        }
+    }
+}
+
+/// What a box holds of the shared maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub rule_entries: usize,
+    pub pins: usize,
+    /// Pins refused so far because the box was at its limit.
+    pub pins_refused: u64,
+}
+
+/// What this process wrote for one box.
+struct Held {
+    /// The generation the box's config entry names.
+    generation: u32,
+    compiled: Arc<Compiled>,
+    /// The entries of that generation.
+    keys: abi::BoxKeys,
+    /// The kernel map is the truth for the programs. This copy says which
+    /// set an address is pinned to, what to delete, and when.
+    pins: PinTable,
+    pins_refused: u64,
+}
+
 /// A box whose policy is in the maps, with what is needed to change it.
 #[derive(Debug, Clone)]
 pub struct LiveBox {
@@ -137,17 +180,20 @@ impl Flows {
 
 pub struct Handles {
     box_cfg: HashMap<MapData, u64, Raw<abi::BoxCfg>>,
-    rules4: lpm_trie::LpmTrie<MapData, [u8; 16], Raw<abi::Rules>>,
-    rules6: lpm_trie::LpmTrie<MapData, [u8; 28], Raw<abi::Rules>>,
+    rules4: lpm_trie::LpmTrie<MapData, [u8; 20], Raw<abi::Rules>>,
+    rules6: lpm_trie::LpmTrie<MapData, [u8; 32], Raw<abi::Rules>>,
     pins: HashMap<MapData, Raw<abi::PinKey>, Raw<abi::PinVal>>,
     set_rules: HashMap<MapData, Raw<abi::SetKey>, Raw<abi::Rules>>,
     endpoints: HashMap<MapData, Raw<abi::EndpointKey>, Raw<abi::Endpoint>>,
     stats: PerCpuHashMap<MapData, u64, Raw<abi::Stats>>,
     flows: Flows,
     events: Option<RingBuf<MapData>>,
-    /// The pins this process wrote, per box. The kernel map is the truth
-    /// for the programs. This copy says what to delete and when.
-    pinned: StdHashMap<u64, PinTable>,
+    boxes: StdHashMap<u64, Held>,
+    /// Entries of replaced or abandoned generations that a delete failed
+    /// on. No config entry names them, so they judge nothing. They are
+    /// tried again with the next write.
+    stale: Vec<abi::BoxKeys>,
+    limits: Limits,
 }
 
 /// A lookup or delete that found nothing is not an error for a caller that
@@ -194,7 +240,9 @@ impl Handles {
             events: Some(
                 RingBuf::try_from(Map::RingBuf(next("events")?)).map_err(Error::map("events"))?,
             ),
-            pinned: StdHashMap::new(),
+            boxes: StdHashMap::new(),
+            stale: Vec::new(),
+            limits: Limits::default(),
         };
         if fds.borrow_mut().next().is_some() {
             return Err(Error::HandleCount(count, MAPS.len()));
@@ -208,125 +256,200 @@ impl Handles {
         self.events.take().map(events::Source::new)
     }
 
-    fn next_generation(&self, id: BoxId) -> Result<u32, Error> {
-        let current = absent_ok(self.box_cfg.get(&id.0, 0)).map_err(Error::map("box_cfg"))?;
-        Ok(current.map_or(1, |Raw(cfg)| cfg.generation.wrapping_add(1)))
+    /// Replaces the per-box limits. Boxes already in the maps keep what
+    /// they have.
+    pub const fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
     }
 
-    /// Writes `new` and removes what only `old` has. The config entry is
-    /// not touched.
-    fn write_entries(&mut self, old: &abi::BoxEntries, new: &abi::BoxEntries) -> Result<(), Error> {
-        for (key, value) in new.rules4.iter().filter(|e| !old.rules4.contains(e)) {
+    /// Writes every entry of one generation.
+    fn write(&mut self, entries: &abi::BoxEntries) -> Result<(), Error> {
+        for (key, value) in &entries.rules4 {
             let key = lpm_trie::Key::new(key.prefixlen, key.data());
             self.rules4
                 .insert(&key, &Raw(*value), 0)
                 .map_err(Error::map("rules4"))?;
         }
-        for (key, value) in new.rules6.iter().filter(|e| !old.rules6.contains(e)) {
+        for (key, value) in &entries.rules6 {
             let key = lpm_trie::Key::new(key.prefixlen, key.data());
             self.rules6
                 .insert(&key, &Raw(*value), 0)
                 .map_err(Error::map("rules6"))?;
         }
-        for (key, value) in new.sets.iter().filter(|e| !old.sets.contains(e)) {
+        for (key, value) in &entries.sets {
             self.set_rules
                 .insert(&Raw(*key), &Raw(*value), 0)
                 .map_err(Error::map("set_rules"))?;
         }
-        for (key, value) in new.endpoints.iter().filter(|e| !old.endpoints.contains(e)) {
+        for (key, value) in &entries.endpoints {
             self.endpoints
                 .insert(&Raw(*key), &Raw(*value), 0)
                 .map_err(Error::map("endpoints"))?;
         }
+        Ok(())
+    }
 
-        for (key, _) in old
-            .rules4
-            .iter()
-            .filter(|(k, _)| !new.rules4.iter().any(|(n, _)| n == k))
-        {
-            let key = lpm_trie::Key::new(key.prefixlen, key.data());
-            absent_ok(self.rules4.remove(&key)).map_err(Error::map("rules4"))?;
+    /// Deletes the entries of a generation no config entry names. What a
+    /// delete fails on is kept for [`Self::collect`].
+    fn discard(&mut self, keys: abi::BoxKeys) {
+        let mut left = abi::BoxKeys::default();
+        for key in keys.rules4 {
+            let lpm = lpm_trie::Key::new(key.prefixlen, key.data());
+            if absent_ok(self.rules4.remove(&lpm)).is_err() {
+                left.rules4.push(key);
+            }
         }
-        for (key, _) in old
-            .rules6
-            .iter()
-            .filter(|(k, _)| !new.rules6.iter().any(|(n, _)| n == k))
-        {
-            let key = lpm_trie::Key::new(key.prefixlen, key.data());
-            absent_ok(self.rules6.remove(&key)).map_err(Error::map("rules6"))?;
+        for key in keys.rules6 {
+            let lpm = lpm_trie::Key::new(key.prefixlen, key.data());
+            if absent_ok(self.rules6.remove(&lpm)).is_err() {
+                left.rules6.push(key);
+            }
         }
-        for (key, _) in old
-            .sets
-            .iter()
-            .filter(|(k, _)| !new.sets.iter().any(|(n, _)| n == k))
-        {
-            absent_ok(self.set_rules.remove(&Raw(*key))).map_err(Error::map("set_rules"))?;
+        for key in keys.sets {
+            if absent_ok(self.set_rules.remove(&Raw(key))).is_err() {
+                left.sets.push(key);
+            }
         }
-        for (key, _) in old
-            .endpoints
-            .iter()
-            .filter(|(k, _)| !new.endpoints.iter().any(|(n, _)| n == k))
-        {
-            absent_ok(self.endpoints.remove(&Raw(*key))).map_err(Error::map("endpoints"))?;
+        for key in keys.endpoints {
+            if absent_ok(self.endpoints.remove(&Raw(key))).is_err() {
+                left.endpoints.push(key);
+            }
+        }
+        if !left.is_empty() {
+            self.stale.push(left);
+        }
+    }
+
+    /// Tries again to delete what earlier deletes failed on.
+    fn collect(&mut self) {
+        for keys in std::mem::take(&mut self.stale) {
+            self.discard(keys);
+        }
+    }
+
+    fn zero_stats(&mut self, id: BoxId) -> Result<(), Error> {
+        let cpus = aya::util::nr_cpus().map_err(|(_, e)| Error::Sys {
+            what: "count CPUs",
+            source: e,
+        })?;
+        let zero = vec![Raw(abi::Stats::default()); cpus.get() as usize];
+        let zero = PerCpuValues::try_from(zero).map_err(|e| Error::Sys {
+            what: "size per-CPU counters",
+            source: e,
+        })?;
+        self.stats
+            .insert(&id.0, zero, 0)
+            .map_err(Error::map("stats"))
+    }
+
+    /// Makes the box's pins fit `compiled`: a pin of a name the policy has
+    /// no rule for goes, and a pin whose name a more specific pattern now
+    /// covers moves to that pattern's set.
+    fn rebind_pins(&mut self, id: BoxId, compiled: &Compiled) -> Result<(), Error> {
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Ok(());
+        };
+        let rebound = held.pins.rebind(|name| compiled.set_for_name(name));
+        for addr in rebound.dropped {
+            absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
+                .map_err(Error::map("pins"))?;
+        }
+        for (addr, set, expiry) in rebound.moved {
+            self.pins
+                .insert(
+                    &Raw(abi::pin_key(id.0, addr)),
+                    &Raw(abi::pin_val(set, expiry)),
+                    0,
+                )
+                .map_err(Error::map("pins"))?;
         }
         Ok(())
     }
 
-    /// Puts a box's policy into the maps.
-    ///
-    /// Rules, sets and endpoints go first and the config entry last: a
-    /// cgroup without a config entry has no network, so a half-written box
-    /// is never live.
-    pub fn apply(&mut self, id: BoxId, compiled: &Compiled) -> Result<(), Error> {
-        self.update(id, None, compiled)
-    }
-
-    /// Replaces the policy of a box. Only entries that differ are written.
-    /// The config entry goes last with a new generation, which ends the
-    /// verdicts sockets have cached under the old policy.
-    pub fn update(
+    /// Everything of [`Self::apply`] up to and including the switch.
+    fn switch_to(
         &mut self,
         id: BoxId,
-        old: Option<&Compiled>,
-        new: &Compiled,
+        first: bool,
+        compiled: &Compiled,
+        entries: &abi::BoxEntries,
     ) -> Result<(), Error> {
+        self.write(entries)?;
+        if first {
+            self.zero_stats(id)?;
+        }
+        // Before the switch: a pin of a name the new policy dropped must
+        // not live into it. Until the switch such a pin admits nothing
+        // more than the old policy did.
+        self.rebind_pins(id, compiled)?;
+        self.box_cfg
+            .insert(&id.0, &Raw(entries.cfg), 0)
+            .map_err(Error::map("box_cfg"))
+    }
+
+    /// Puts a policy in force for a box: its first, or one that replaces
+    /// the policy the box has.
+    ///
+    /// The new entries are written under a new generation, beside those in
+    /// force. The write of the config entry then switches the programs
+    /// from one generation to the other, so no flow is ever judged by a
+    /// mix of two policies. If anything fails before that write, the new
+    /// entries are deleted and the box keeps what it had: its old policy,
+    /// or for a new box no network.
+    pub fn apply(&mut self, id: BoxId, compiled: Arc<Compiled>) -> Result<(), Error> {
         if id.0 == 0 {
             return Err(Error::BoxIdZero);
         }
-        let generation = self.next_generation(id)?;
-        let old = old.map(|c| abi::entries(c, id.0, 0)).unwrap_or_default();
-        let new = abi::entries(new, id.0, generation);
-        self.write_entries(&old, &new)?;
-        if absent_ok(self.stats.get(&id.0, 0))
-            .map_err(Error::map("stats"))?
-            .is_none()
-        {
-            let cpus = aya::util::nr_cpus().map_err(|(_, e)| Error::Sys {
-                what: "count CPUs",
-                source: e,
-            })?;
-            let zero = vec![Raw(abi::Stats::default()); cpus.get() as usize];
-            let zero = PerCpuValues::try_from(zero).map_err(|e| Error::Sys {
-                what: "size per-CPU counters",
-                source: e,
-            })?;
-            self.stats
-                .insert(&id.0, zero, 0)
-                .map_err(Error::map("stats"))?;
+        let needed = abi::rule_entries(&compiled);
+        if needed > self.limits.rule_entries {
+            return Err(Error::RuleEntryLimit {
+                needed,
+                limit: self.limits.rule_entries,
+            });
         }
-        self.box_cfg
-            .insert(&id.0, &Raw(new.cfg), 0)
-            .map_err(Error::map("box_cfg"))
+        self.collect();
+        let current = self.boxes.get(&id.0).map(|held| held.generation);
+        let generation = current.map_or(1, |g| g.wrapping_add(1));
+        let entries = abi::entries(&compiled, id.0, generation);
+        let keys = entries.keys();
+        if let Err(error) = self.switch_to(id, current.is_none(), &compiled, &entries) {
+            self.discard(keys);
+            if current.is_none() {
+                // Nothing reads the counters of a box that never started.
+                let _absent = self.stats.remove(&id.0);
+            }
+            return Err(error);
+        }
+        match self.boxes.get_mut(&id.0) {
+            Some(held) => {
+                held.generation = generation;
+                held.compiled = compiled;
+                let replaced = std::mem::replace(&mut held.keys, keys);
+                self.discard(replaced);
+            }
+            None => {
+                self.boxes.insert(
+                    id.0,
+                    Held {
+                        generation,
+                        compiled,
+                        keys,
+                        pins: PinTable::new(),
+                        pins_refused: 0,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Takes a box out of the maps. The config entry goes first, so the
     /// box has no network from the first write on.
-    pub fn remove(&mut self, id: BoxId, compiled: &Compiled) -> Result<(), Error> {
+    pub fn remove(&mut self, id: BoxId) -> Result<(), Error> {
         absent_ok(self.box_cfg.remove(&id.0)).map_err(Error::map("box_cfg"))?;
-        let old = abi::entries(compiled, id.0, 0);
-        self.write_entries(&old, &abi::BoxEntries::default())?;
-        if let Some(table) = self.pinned.remove(&id.0) {
-            for addr in table.addresses() {
+        if let Some(held) = self.boxes.remove(&id.0) {
+            self.discard(held.keys);
+            for addr in held.pins.addresses() {
                 absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
                     .map_err(Error::map("pins"))?;
             }
@@ -335,30 +458,18 @@ impl Handles {
         Ok(())
     }
 
-    /// Makes the egress hook forget its cached verdicts for the box.
-    pub fn bump_generation(&mut self, id: BoxId) -> Result<(), Error> {
-        let Some(Raw(mut cfg)) =
-            absent_ok(self.box_cfg.get(&id.0, 0)).map_err(Error::map("box_cfg"))?
-        else {
-            return Ok(());
-        };
-        cfg.generation = cfg.generation.wrapping_add(1);
-        self.box_cfg
-            .insert(&id.0, &Raw(cfg), 0)
-            .map_err(Error::map("box_cfg"))
-    }
-
     /// Compiles a spec and puts it into the maps.
     pub fn install(&mut self, id: BoxId, spec: Spec) -> Result<LiveBox, Error> {
         let compiled = Arc::new(spec.compile()?);
-        self.apply(id, &compiled)?;
+        self.apply(id, Arc::clone(&compiled))?;
         Ok(LiveBox { id, spec, compiled })
     }
 
-    /// Gives a live box a new spec. On a compile error nothing changes.
+    /// Gives a live box a new spec. On any error the box keeps the policy
+    /// it had.
     pub fn reconfigure(&mut self, live: &mut LiveBox, spec: Spec) -> Result<(), Error> {
         let compiled = Arc::new(spec.compile()?);
-        self.update(live.id, Some(&live.compiled), &compiled)?;
+        self.apply(live.id, Arc::clone(&compiled))?;
         live.spec = spec;
         live.compiled = compiled;
         Ok(())
@@ -398,13 +509,39 @@ impl Handles {
     }
 
     pub fn uninstall(&mut self, live: &LiveBox) -> Result<(), Error> {
-        self.remove(live.id, &live.compiled)
+        self.remove(live.id)
     }
 
-    /// Pins an address the resolver answered to the set of its name, for
-    /// `ttl` from now. A pin of the same address replaces the earlier one.
-    pub fn pin(&mut self, id: BoxId, addr: IpAddr, set: SetId, ttl: Duration) -> Result<(), Error> {
-        let expiry = pins::expiry(sys::boot_time_ns(), ttl);
+    /// Pins an address the resolver answered for `name` to the set of that
+    /// name in the box's policy, for `ttl` from now. A pin of the same
+    /// address replaces the earlier one.
+    ///
+    /// The name is kept with the pin: when the box's policy changes, the
+    /// pin follows the name to its new set or goes with it.
+    ///
+    /// A box at its pin limit gets [`Error::PinLimit`], and the refusal is
+    /// counted in [`Self::usage`].
+    pub fn pin(&mut self, id: BoxId, addr: IpAddr, name: &str, ttl: Duration) -> Result<(), Error> {
+        let limit = self.limits.pins;
+        let now = sys::boot_time_ns();
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return Err(Error::UnknownBox);
+        };
+        let Some(set) = held.compiled.set_for_name(name) else {
+            return Err(Error::NameWithoutRule(name.to_owned()));
+        };
+        if held.pins.len() >= limit && !held.pins.contains(addr) {
+            // Pins that have run out give their room back first.
+            for dead in held.pins.take_expired(now) {
+                absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, dead))))
+                    .map_err(Error::map("pins"))?;
+            }
+            if held.pins.len() >= limit {
+                held.pins_refused += 1;
+                return Err(Error::PinLimit { limit });
+            }
+        }
+        let expiry = pins::expiry(now, ttl);
         self.pins
             .insert(
                 &Raw(abi::pin_key(id.0, addr)),
@@ -412,17 +549,14 @@ impl Handles {
                 0,
             )
             .map_err(Error::map("pins"))?;
-        self.pinned
-            .entry(id.0)
-            .or_default()
-            .insert(addr, set, expiry);
+        held.pins.insert(addr, name, set, expiry);
         Ok(())
     }
 
     pub fn unpin(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
         absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr)))).map_err(Error::map("pins"))?;
-        if let Some(table) = self.pinned.get_mut(&id.0) {
-            table.remove(addr);
+        if let Some(held) = self.boxes.get_mut(&id.0) {
+            held.pins.remove(addr);
         }
         Ok(())
     }
@@ -430,24 +564,35 @@ impl Handles {
     /// The set an address is pinned to right now, for the evaluator.
     #[must_use]
     pub fn pinned_set(&self, id: BoxId, addr: IpAddr) -> Option<SetId> {
-        self.pinned
+        self.boxes
             .get(&id.0)
-            .and_then(|t| t.live(addr, sys::boot_time_ns()))
+            .and_then(|held| held.pins.live(addr, sys::boot_time_ns()))
     }
 
     /// Deletes pins whose time has passed. The programs already ignore
     /// them. This gives the space back. Returns how many were deleted.
     pub fn sweep_pins(&mut self) -> Result<usize, Error> {
+        self.collect();
         let now = sys::boot_time_ns();
         let mut swept = 0;
-        for (box_id, table) in &mut self.pinned {
-            for addr in table.take_expired(now) {
+        for (box_id, held) in &mut self.boxes {
+            for addr in held.pins.take_expired(now) {
                 absent_ok(self.pins.remove(&Raw(abi::pin_key(*box_id, addr))))
                     .map_err(Error::map("pins"))?;
                 swept += 1;
             }
         }
         Ok(swept)
+    }
+
+    /// What the box holds of the shared maps. `None` for an unknown box.
+    #[must_use]
+    pub fn usage(&self, id: BoxId) -> Option<Usage> {
+        self.boxes.get(&id.0).map(|held| Usage {
+            rule_entries: held.keys.rules4.len() + held.keys.rules6.len() + held.keys.sets.len(),
+            pins: held.pins.len(),
+            pins_refused: held.pins_refused,
+        })
     }
 
     /// The counters of a box, summed over CPUs. `None` for an unknown box.
