@@ -1109,6 +1109,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 &boxes,
                 wire,
                 bep_box_source(proxy_listening, boxes.table(), proxy_attachments.clone()),
+                std::sync::Arc::new(|| {}),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();

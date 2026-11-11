@@ -156,6 +156,16 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
     }
 }
 
+/// The file gvproxy reads its API token from, beside its socket.
+const API_TOKEN_FILE: &str = "gvproxy-api.token";
+
+/// The environment variable gvproxy would also take a token from.
+const API_TOKEN_ENV: &str = "GV_API_TOKEN";
+
+/// The waits between attempts to start gvproxy again after it died.
+const RESPAWN_MIN: Duration = Duration::from_millis(250);
+const RESPAWN_MAX: Duration = Duration::from_secs(4);
+
 /// Builder for the per-host gvproxy switch process.
 #[derive(Debug, Clone)]
 pub struct GvproxyConfig {
@@ -165,6 +175,8 @@ pub struct GvproxyConfig {
     switch_socket: PathBuf,
     /// Path the `-config` YAML is written to before spawn.
     config_path: PathBuf,
+    /// Path of the API token file written before each spawn.
+    token_path: PathBuf,
     /// Subnet the switch assigns to own-IP PTasks.
     subnet: SwitchSubnet,
     /// Grace period before SIGTERM escalates to SIGKILL on teardown.
@@ -181,14 +193,14 @@ impl GvproxyConfig {
     /// override it with [`with_config_path`](Self::with_config_path).
     #[must_use]
     pub fn new(binary: PathBuf, switch_socket: PathBuf) -> Self {
-        let config_path = switch_socket
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("gvproxy.yaml");
+        let dir = switch_socket.parent().unwrap_or_else(|| Path::new("."));
+        let config_path = dir.join("gvproxy.yaml");
+        let token_path = dir.join(API_TOKEN_FILE);
         Self {
             binary,
             switch_socket,
             config_path,
+            token_path,
             subnet: SwitchSubnet::default(),
             term_timeout: DEFAULT_TERM_TIMEOUT,
             datapath_check_interval: DEFAULT_DATAPATH_CHECK_INTERVAL,
@@ -247,7 +259,65 @@ impl GvproxyConfig {
             format!("unix://{}", self.switch_socket.display()),
             "-ssh-port".to_string(),
             "-1".to_string(),
+            "-api-token-file".to_string(),
+            self.token_path.display().to_string(),
         ]
+    }
+
+    /// The path of the API token file.
+    #[must_use]
+    pub fn token_path(&self) -> &Path {
+        &self.token_path
+    }
+
+    /// Writes a fresh API token for the next gvproxy start, readable by
+    /// this user only.
+    ///
+    /// gvproxy serves its forwarder API inside the virtual network at the
+    /// gateway address. With a token set it answers 401 there to anyone who
+    /// does not present it. Nobody is given this token: minvmd itself uses
+    /// the unix socket, which needs none. So nothing in the VM can list,
+    /// add or remove a forward.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of reading the random source or writing the file.
+    pub fn write_token(&self) -> io::Result<()> {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut random = [0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let mut token = String::with_capacity(64);
+        for byte in random {
+            token.push_str(&format!("{byte:02x}"));
+        }
+        if let Some(dir) = self.token_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // A new file each time, so the mode is this call's and an old
+        // file's wider mode cannot carry over.
+        match std::fs::remove_file(&self.token_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.token_path)?
+            .write_all(token.as_bytes())
+    }
+
+    /// The command that starts gvproxy.
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(self.argv())
+            // gvproxy also reads a token from this variable. Only the file
+            // above may set it.
+            .env_remove(API_TOKEN_ENV);
+        command
     }
 
     /// Write the gvproxy `-config` YAML for the configured subnet with the given
@@ -287,7 +357,8 @@ impl GvproxyConfig {
         leases: &[(Ipv4Addr, MacAddr)],
     ) -> io::Result<(GvproxySupervisor, SwitchExit)> {
         self.write_config(leases)?;
-        let child = Command::new(&self.binary).args(self.argv()).spawn()?;
+        self.write_token()?;
+        let child = self.command().spawn()?;
         let (switch, exit) = GvproxySupervisor::supervise(
             child,
             self.term_timeout,
@@ -720,9 +791,14 @@ pub struct HostGvproxy {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// The runtime thread; joined on [`stop`](Self::stop) / `Drop`.
     thread: Option<std::thread::JoinHandle<()>>,
-    /// PID of the spawned gvproxy, surfaced for logging/diagnostics.
-    pid: u32,
+    /// PID of the running gvproxy. It changes when gvproxy is started again.
+    pid: Arc<std::sync::atomic::AtomicU32>,
 }
+
+/// Called after gvproxy was started again and its socket accepts
+/// connections. A restarted gvproxy holds no forward, so the caller binds
+/// its forwards again here.
+pub type OnSwitchRestart = Arc<dyn Fn() + Send + Sync>;
 
 impl HostGvproxy {
     /// Spawn and supervise the host gvproxy switch on a dedicated runtime,
@@ -764,6 +840,7 @@ impl HostGvproxy {
         registry: &crate::box_registry::BoxRegistry,
         wire: BepWire,
         boxes: Arc<dyn BepBoxSource>,
+        on_restart: OnSwitchRestart,
     ) -> io::Result<Self> {
         // A switch that fails to start exports its span with an error status
         // (TEL-035), as `vm.boot` does.
@@ -776,6 +853,7 @@ impl HostGvproxy {
             registry,
             wire,
             boxes,
+            on_restart,
         );
         if started.is_ok() {
             failed.ok();
@@ -790,6 +868,7 @@ impl HostGvproxy {
         registry: &crate::box_registry::BoxRegistry,
         wire: BepWire,
         boxes: Arc<dyn BepBoxSource>,
+        on_restart: OnSwitchRestart,
     ) -> io::Result<Self> {
         let config = GvproxyConfig::new(binary, switch_sock)
             .with_datapath_check_interval(datapath_check_interval)
@@ -830,6 +909,8 @@ impl HostGvproxy {
             .with_host_exposures(host_exposures::HostExposures::client_config());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
+        let shared_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime_pid = Arc::clone(&shared_pid);
 
         let thread = std::thread::Builder::new()
             .name("minvmd-gvproxy".into())
@@ -846,7 +927,7 @@ impl HostGvproxy {
                 };
                 runtime.block_on(async move {
                     // Empty lease table: the guest assigns PTask IPs statically.
-                    let (switch, exit) = match config.spawn(&[]) {
+                    let (mut switch, mut exit) = match config.clone().spawn(&[]) {
                         Ok(pair) => pair,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
@@ -854,19 +935,6 @@ impl HostGvproxy {
                         }
                     };
                     let pid = switch.pid();
-                    // The gate beside the switch socket, before anything is
-                    // reported ready: the guest's shuttle connects to it (the
-                    // vsock bridge points here, not at the switch), and every
-                    // frame it relays on is one its verdict admitted against
-                    // `table` — the node plane's own traffic against the
-                    // baseline set (in force; announced, the interim node row
-                    // still decides it), everything else against the boxes'
-                    // rows, and a DNS-declaring row's undeclared destinations
-                    // against `pins`.
-                    // Underscore-bound and never read: it is held for
-                    // its lifetime — to the end of this block — so it lives and
-                    // dies with the switch runtime, and dropping it stops the
-                    // gate and every live relay.
                     let sock = switch.switch_socket().to_path_buf();
                     let _gate = match EgressGate::spawn(
                         shuttle::gate_sock_beside(&sock),
@@ -892,16 +960,8 @@ impl HostGvproxy {
                         drop(ready_tx.send(Err(e)));
                         return;
                     }
-                    // Start the Box Egress Proxy host stack peer after the switch
-                    // socket is known to accept connections: the peer owns the
-                    // proxy's infrastructure address on the subnet, speaks the
-                    // same length-framed Ethernet the switch socket carries, and
-                    // stops when this runtime drops at switch teardown. The wire
-                    // and the registered boxes arrive from the supervisor, which
-                    // mints the per-boot token and holds the rows the pool is
-                    // partitioned by (NET-132).
-                    let _bep_peer = match BepPeer::spawn(&sock, subnet, wire, boxes).await {
-                        Ok(peer) => peer,
+                    let mut bep_peer = match BepPeer::spawn(&sock, subnet, wire, boxes).await {
+                        Ok(peer) => Some(peer),
                         Err(e) => {
                             tracing::error!(error = %e, "failed to start box egress proxy peer");
                             switch.stop().await;
@@ -909,48 +969,70 @@ impl HostGvproxy {
                             return;
                         }
                     };
-                    tracing::info!(
-                        proxy_ip = %subnet.box_egress_proxy_address(),
-                        proxy_mac = %subnet.bep_mac(),
-                        "box egress proxy peer started",
-                    );
-
                     if ready_tx.send(Ok(pid)).is_err() {
                         // Caller went away before learning the PID; tear down.
-                        _bep_peer.shutdown().await;
+                        if let Some(peer) = bep_peer.take() {
+                            peer.shutdown().await;
+                        }
                         switch.stop().await;
                         return;
                     }
-                    // Wait for either an explicit stop or an unexpected gvproxy
-                    // exit, then tear down cleanly. The peer goes first, so its
-                    // reader is not the one to find the switch socket closed.
-                    tokio::select! {
-                        _ = stop_rx => {
-                            _bep_peer.shutdown().await;
-                            switch.stop().await;
-                            drop(_gate);
-                        }
-                        status = exit.recv() => {
-                            tracing::error!(
-                                pid,
-                                code = status.and_then(|s| s.code()),
-                                "host gvproxy switch exited unexpectedly",
-                            );
-                            // gvproxy is already gone; drop the handles (no signal).
-                            drop(_bep_peer);
-                            drop(_gate);
-                            drop(switch);
+                    // gvproxy runs for the VM's life. When it dies it is
+                    // started again: the guest's NIC stays up through the
+                    // pump, and the forwards are bound again by the caller.
+                    let mut stop_rx = stop_rx;
+                    loop {
+                        tokio::select! {
+                            _ = &mut stop_rx => {
+                                if let Some(peer) = bep_peer.take() {
+                                    peer.shutdown().await;
+                                }
+                                switch.stop().await;
+                                break;
+                            }
+                            status = exit.recv() => {
+                                tracing::error!(
+                                    pid = switch.pid(),
+                                    code = status.and_then(|s| s.code()),
+                                    "host gvproxy switch exited unexpectedly; starting it again",
+                                );
+                                drop(bep_peer.take());
+                                drop(switch);
+                                let Some(restarted) =
+                                    respawn(&config, &sock, &mut stop_rx).await
+                                else {
+                                    break;
+                                };
+                                (switch, exit) = restarted;
+                                runtime_pid.store(switch.pid(), Ordering::Release);
+                                tracing::info!(
+                                    pid = switch.pid(),
+                                    "host gvproxy switch is up again",
+                                );
+                                let on_restart = Arc::clone(&on_restart);
+                                // The caller's work makes blocking calls to
+                                // the new gvproxy.
+                                let span = crate::telemetry::vm_task("net.switch.restarted");
+                                drop(tokio::task::spawn_blocking(move || {
+                                    span.in_scope(|| on_restart());
+                                }));
+                            }
                         }
                     }
+                    let _ = std::fs::remove_file(config.token_path());
+                    drop(_gate);
                 });
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(pid)) => Ok(Self {
-                stop_tx: Some(stop_tx),
-                thread: Some(thread),
-                pid,
-            }),
+            Ok(Ok(pid)) => {
+                shared_pid.store(pid, Ordering::Release);
+                Ok(Self {
+                    stop_tx: Some(stop_tx),
+                    thread: Some(thread),
+                    pid: shared_pid,
+                })
+            }
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -968,7 +1050,7 @@ impl HostGvproxy {
     /// The PID of the supervised gvproxy process.
     #[must_use]
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.pid.load(Ordering::Acquire)
     }
 
     /// Stop the switch and join the supervising runtime thread.
@@ -985,7 +1067,41 @@ impl HostGvproxy {
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
-            tracing::warn!(pid = self.pid, "host gvproxy supervisor thread panicked");
+            tracing::warn!(pid = self.pid(), "host gvproxy supervisor thread panicked");
+        }
+    }
+}
+
+/// Starts gvproxy again until it is up, waiting longer after each failed
+/// attempt. `None` when `stop` fires first.
+async fn respawn(
+    config: &GvproxyConfig,
+    sock: &Path,
+    stop: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Option<(GvproxySupervisor, SwitchExit)> {
+    let mut wait = RESPAWN_MIN;
+    loop {
+        tokio::select! {
+            _ = &mut *stop => return None,
+            () = tokio::time::sleep(wait) => {}
+        }
+        wait = (wait * 2).min(RESPAWN_MAX);
+        // The dead gvproxy's socket file would make the next one fail to
+        // bind. A socket that still accepts is not a dead one's.
+        if tokio::net::UnixStream::connect(sock).await.is_err() {
+            let _ = std::fs::remove_file(sock);
+        }
+        match config.clone().spawn(&[]) {
+            Ok((switch, exit)) => {
+                match wait_for_switch_socket(sock, SWITCH_SOCKET_READY_TIMEOUT).await {
+                    Ok(()) => return Some((switch, exit)),
+                    Err(error) => {
+                        tracing::warn!(%error, "the restarted gvproxy did not come up");
+                        switch.stop().await;
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not start gvproxy again"),
         }
     }
 }
@@ -1165,9 +1281,133 @@ mod tests {
                 "unix:///run/minvmd/switch.sock".to_string(),
                 "-ssh-port".to_string(),
                 "-1".to_string(),
+                "-api-token-file".to_string(),
+                "/run/minvmd/gvproxy-api.token".to_string(),
             ]
         );
         assert_eq!(cfg.config_path(), Path::new("/run/minvmd/gvproxy.yaml"));
+    }
+
+    #[test]
+    fn each_start_gets_a_fresh_token_only_this_user_can_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cfg = GvproxyConfig::new(
+            PathBuf::from("/usr/bin/gvproxy"),
+            dir.path().join("switch.sock"),
+        );
+        // A leftover file with a wide mode must not lend its mode.
+        std::fs::write(cfg.token_path(), "old").unwrap();
+        std::fs::set_permissions(cfg.token_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        cfg.write_token().unwrap();
+        let first = std::fs::read_to_string(cfg.token_path()).unwrap();
+        let mode = std::fs::metadata(cfg.token_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // gvproxy takes 32 to 256 characters.
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        cfg.write_token().unwrap();
+        let second = std::fs::read_to_string(cfg.token_path()).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn gvproxy_cannot_take_a_token_from_the_inherited_environment() {
+        let cfg = GvproxyConfig::new(
+            PathBuf::from("/usr/bin/gvproxy"),
+            PathBuf::from("/run/minvmd/switch.sock"),
+        );
+        let command = cfg.command();
+        let removed = command
+            .as_std()
+            .get_envs()
+            .any(|(name, value)| name == "GV_API_TOKEN" && value.is_none());
+        assert!(removed);
+    }
+
+    /// A stand-in gvproxy that appends its pid and the token it was started
+    /// with to files beside itself, then stays alive.
+    fn recording_gvproxy(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("recording-gvproxy.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nhere=$(dirname \"$0\")\nfor a; do last=$a; done\n\
+             echo \"$(cat \"$last\")\" >> \"$here/tokens\"\necho $$ >> \"$here/pids\"\nexec sleep 1000\n",
+        )
+        .expect("write stand-in gvproxy");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stand-in gvproxy");
+        path
+    }
+
+    fn lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_gvproxy_that_dies_is_started_again_with_a_new_token() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gvproxy-switch.sock");
+        let _switch_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&restarts);
+        let gvproxy = HostGvproxy::spawn(
+            recording_gvproxy(dir.path()),
+            sock,
+            DEFAULT_DATAPATH_CHECK_INTERVAL,
+            &empty_box_registry(),
+            idle_bep_wire(dir.path()),
+            Arc::new(NoBoxes),
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .expect("spawn host gvproxy");
+        let first = gvproxy.pid();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let recorded = |starts: usize| {
+            while lines(&dir.path().join("pids")).len() < starts {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "start {starts} left no record"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // The stand-in writes its files a moment after it is spawned.
+        recorded(1);
+        // SAFETY: kill touches no memory; the pid is the child's.
+        unsafe { libc::kill(first as libc::pid_t, libc::SIGKILL) };
+
+        while restarts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gvproxy was not started again"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let second = gvproxy.pid();
+        assert_ne!(first, second);
+        assert!(pid_is_alive(second));
+        recorded(2);
+        let tokens = lines(&dir.path().join("tokens"));
+        assert_eq!(tokens.len(), 2);
+        assert_ne!(tokens[0], tokens[1]);
+
+        gvproxy.stop();
+        assert!(!pid_is_alive(second));
+        assert!(!dir.path().join("gvproxy-api.token").exists());
     }
 
     #[test]
@@ -1178,12 +1418,7 @@ mod tests {
         assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
         assert!(yaml.contains("gatewayIP: \"100.64.0.1\""));
         assert!(yaml.contains(&format!("\"{ip}\": \"{mac}\"")));
-        // Host alias is NAT'd to loopback and never allocated.
-        assert!(yaml.contains("\"100.64.255.254\": \"127.0.0.1\""));
-        // NET-003: the host switch answers `host.min.internal` in its static
-        // zone at the NAT'd alias, so guest boxes resolve the host by name.
-        assert!(yaml.contains("    - name: \"min.internal.\"\n"));
-        assert!(yaml.contains("        - name: \"host\"\n          ip: \"100.64.255.254\"\n"));
+        assert!(!yaml.contains("100.64.255.254"));
     }
 
     #[test]
@@ -1468,6 +1703,7 @@ mod tests {
             &empty_box_registry(),
             idle_bep_wire(dir.path()),
             Arc::new(NoBoxes),
+            Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
         let pid = gvproxy.pid();
@@ -1497,6 +1733,7 @@ mod tests {
             &empty_box_registry(),
             idle_bep_wire(dir.path()),
             Arc::new(NoBoxes),
+            Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
         let pid = gvproxy.pid();
@@ -1519,6 +1756,7 @@ mod tests {
             &empty_box_registry(),
             idle_bep_wire(dir.path()),
             Arc::new(NoBoxes),
+            Arc::new(|| {}),
         )
         .expect_err("spawning a missing binary must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -1541,6 +1779,7 @@ mod tests {
             &empty_box_registry(),
             idle_bep_wire(dir.path()),
             Arc::new(NoBoxes),
+            Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
 
@@ -1586,6 +1825,7 @@ mod tests {
             &registry,
             idle_bep_wire(dir.path()),
             Arc::new(NoBoxes),
+            Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
 
