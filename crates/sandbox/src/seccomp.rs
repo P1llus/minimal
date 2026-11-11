@@ -932,14 +932,21 @@ mod tests {
                 outcome(unsafe { libc::syscall(libc::SYS_ioctl, fd, request, arg) })
             };
             let byte_ptr = (&raw const byte).cast::<libc::c_void>();
+            let [sti, linux] = [
+                u64::from(TERMINAL_INJECTION[0]),
+                u64::from(TERMINAL_INJECTION[1]),
+            ];
+            // `TIOCGWINSZ` and `FIONREAD`, by number: the type of the libc
+            // constants differs between C libraries.
+            let (winsize, pending_bytes) = (0x5413_u64, 0x541b_u64);
             [
-                ioctl(libc::TIOCSTI as u64, byte_ptr),
-                ioctl(libc::TIOCLINUX as u64, byte_ptr),
-                ioctl(0xdead_beef_0000_0000 | libc::TIOCSTI as u64, byte_ptr),
-                ioctl(0x1_0000_0000 | libc::TIOCLINUX as u64, byte_ptr),
+                ioctl(sti, byte_ptr),
+                ioctl(linux, byte_ptr),
+                ioctl(0xdead_beef_0000_0000 | sti, byte_ptr),
+                ioctl(0x1_0000_0000 | linux, byte_ptr),
                 // No terminal, so the kernel's own answer is `ENOTTY`.
-                ioctl(libc::TIOCGWINSZ as u64, byte_ptr),
-                ioctl(libc::FIONREAD as u64, (&raw mut pending).cast()),
+                ioctl(winsize, byte_ptr),
+                ioctl(pending_bytes, (&raw mut pending).cast()),
             ]
         })
         .expect("the probe ran under the profile");
