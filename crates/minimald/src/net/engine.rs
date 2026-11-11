@@ -84,6 +84,9 @@ impl std::fmt::Display for Absent {
 /// Why a box cannot run here with its network policy applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unenforceable {
+    /// The engine's programs may be attached to the daemon's boxes, and
+    /// the daemon cannot write their maps: no box would have a network.
+    EngineUnusable(Absent),
     /// A setting nothing applies yet to a box that shares the node's
     /// address.
     Setting(&'static str),
@@ -96,6 +99,17 @@ impl std::fmt::Display for Unenforceable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the box did not start: ")?;
         match self {
+            Self::EngineUnusable(why) => {
+                write!(
+                    f,
+                    "the network policy engine is attached to this daemon's boxes and the \
+                     daemon cannot use it ({why}), so no box would have a network."
+                )?;
+                match why.fix() {
+                    "" => f.write_str(" Restart the daemon."),
+                    fix => write!(f, " {fix} Then restart the daemon."),
+                }
+            }
             Self::Setting(setting) => write!(
                 f,
                 "its network policy sets `{setting}`, which this version of Minimal cannot \
@@ -146,10 +160,11 @@ pub(crate) struct BoxFacts {
 pub(crate) struct Installed {
     session: SessionId,
     id: BoxId,
-    facts: BoxFacts,
     block: Option<Block>,
     wants: Wants,
-    live: Mutex<LiveBox>,
+    /// The box's entry and what it was written for. Every writer takes
+    /// this lock first and the engine's handles second.
+    entry: Mutex<Entry>,
     /// The policy as the kernel has it, for readers that must not wait for
     /// a writer.
     compiled: RwLock<Arc<Compiled>>,
@@ -157,6 +172,14 @@ pub(crate) struct Installed {
     log: Arc<dyn Log>,
     /// The tasks serving the box's endpoints. Aborting one closes its socket.
     serving: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+struct Entry {
+    live: LiveBox,
+    facts: BoxFacts,
+    /// Set when the box was taken out of the maps. A writer that comes
+    /// late must not put it back: its processes may have outlived the kill.
+    removed: bool,
 }
 
 impl std::fmt::Debug for Installed {
@@ -180,9 +203,10 @@ impl Installed {
 
     /// The prefixes the box allows, for the resolver's rebinding filter.
     pub(crate) fn allowed_prefixes(&self) -> Vec<netpol::Prefix> {
-        self.live
+        self.entry
             .lock()
-            .expect("live box lock")
+            .expect("box entry lock")
+            .live
             .spec()
             .policy
             .allow
@@ -192,8 +216,8 @@ impl Installed {
     /// Addresses of the node's infrastructure, which a public name has no
     /// business resolving to.
     pub(crate) fn infrastructure(&self) -> Vec<netpol::Prefix> {
-        let live = self.live.lock().expect("live box lock");
-        let deployment = &live.spec().deployment;
+        let entry = self.entry.lock().expect("box entry lock");
+        let deployment = &entry.live.spec().deployment;
         let mut out: Vec<netpol::Prefix> = deployment
             .endpoint_ranges
             .iter()
@@ -207,9 +231,10 @@ impl Installed {
 
     /// Whether the transport under the box carries IPv6.
     pub(crate) fn has_ipv6(&self) -> bool {
-        self.live
+        self.entry
             .lock()
-            .expect("live box lock")
+            .expect("box entry lock")
+            .live
             .spec()
             .deployment
             .transport_ipv6
@@ -280,15 +305,21 @@ struct Attached {
     boxes: RwLock<HashMap<BoxId, Arc<Installed>>>,
     by_session: RwLock<HashMap<SessionId, BoxId>>,
     allocator: Allocator,
-    observations: mpsc::Sender<Observation>,
+    events: mpsc::Sender<events::Write>,
     /// Taken by [`Engine::start_tasks`].
-    pending: Mutex<Option<(boxbpf::events::Source, mpsc::Receiver<Observation>)>>,
+    pending: Mutex<Option<(boxbpf::events::Source, mpsc::Receiver<events::Write>)>>,
     serving: OnceLock<Serving>,
 }
 
 enum State {
     Attached(Box<Attached>),
+    /// No programs are attached: boxes run unjudged, so only those that
+    /// need no enforcement run.
     Absent(Absent),
+    /// Programs may be attached, and the daemon has no maps to give a box
+    /// an entry in. A box without an entry has no network at all, so no
+    /// box runs.
+    Unusable(Absent),
 }
 
 /// The engine, or the reason there is none.
@@ -303,37 +334,43 @@ static NOT_STARTED: Engine = Engine {
 
 /// How often expired name pins are deleted from the maps.
 const PIN_SWEEP: Duration = Duration::from_secs(30);
-/// Observations waiting for the event task. More than this are dropped
-/// and counted: a box cannot make the daemon hold its refusals in memory.
-const OBSERVATION_QUEUE: usize = 4096;
+/// Events waiting to be written. Each box's limiter runs before this
+/// queue, so one box cannot fill it. What does not fit is counted for its
+/// box and reported in the box's next summary.
+const EVENT_QUEUE: usize = 4096;
 
 pub(crate) fn loader_socket() -> PathBuf {
     std::env::var_os(LOADER_SOCKET_ENV)
         .map_or_else(|| PathBuf::from(paths::POLICY_LOADER_SOCKET), PathBuf::from)
 }
 
-fn from_loader(boxes: std::os::fd::BorrowedFd<'_>, socket: &Path) -> Result<Handles, Absent> {
+/// Asks the loader for the engine. An error comes with whether the
+/// loader may have attached the programs before it: true for everything
+/// but a loader that was not reached or that refused the request.
+fn from_loader(
+    boxes: std::os::fd::BorrowedFd<'_>,
+    socket: &Path,
+) -> Result<Handles, (Absent, bool)> {
     use boxbpf::Error;
 
+    let no_loader = || Absent::NoLoader {
+        socket: socket.to_owned(),
+    };
     if !socket.exists() {
-        return Err(Absent::NoLoader {
-            socket: socket.to_owned(),
-        });
+        return Err((no_loader(), false));
     }
     boxbpf::loader::request(socket, boxes).map_err(|error| match error {
-        Error::AbiMismatch { .. } | Error::ObjectMismatch { .. } => Absent::LoaderOutOfDate,
-        Error::Refused(reason) => Absent::LoaderRefused(reason),
+        Error::AbiMismatch { .. } | Error::ObjectMismatch { .. } => (Absent::LoaderOutOfDate, true),
+        Error::Refused(reason) => (Absent::LoaderRefused(reason), false),
         Error::Sys { source, .. }
             if matches!(
                 source.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            Absent::NoLoader {
-                socket: socket.to_owned(),
-            }
+            (no_loader(), false)
         }
-        other => Absent::Failed(other.to_string()),
+        other => (Absent::Failed(other.to_string()), true),
     })
 }
 
@@ -356,6 +393,11 @@ impl Engine {
                  enforcement are refused. {}",
                 why.fix()
             ),
+            State::Unusable(why) => tracing::error!(
+                "the network policy engine is attached and cannot be used: {why}. No box \
+                 can start until the daemon is restarted. {}",
+                why.fix()
+            ),
         }
         if ENGINE.set(engine).is_err() {
             tracing::warn!("a network policy engine was set before the daemon's own");
@@ -372,17 +414,25 @@ impl Engine {
                 return Self::absent(Absent::Failed(format!("opening the boxes cgroup: {error}")));
             }
         };
+        // Each error says whether programs may be attached by now.
         let handles = if nix::unistd::geteuid().is_root() {
             use std::os::fd::AsFd as _;
             boxbpf::Engine::start(boxes.as_fd(), &boxbpf::MapSizes::default())
-                .map_err(|error| Absent::Failed(error.to_string()))
+                .map_err(|error| (Absent::Failed(error.to_string()), true))
         } else {
             use std::os::fd::AsFd as _;
             from_loader(boxes.as_fd(), socket)
         };
-        match handles.and_then(|handles| Self::attached(handles, node)) {
-            Ok(engine) => engine,
-            Err(why) => Self::absent(why),
+        match handles {
+            // From here on the programs are attached. A daemon that cannot
+            // finish taking the maps must not start boxes below them.
+            Ok(handles) => Self::attached(handles, node).unwrap_or_else(|why| Self {
+                state: State::Unusable(why),
+            }),
+            Err((why, true)) => Self {
+                state: State::Unusable(why),
+            },
+            Err((why, false)) => Self::absent(why),
         }
     }
 
@@ -392,7 +442,7 @@ impl Engine {
         let source = handles
             .take_events()
             .ok_or_else(|| Absent::Failed("the engine has no event buffer".to_owned()))?;
-        let (observations, receiver) = mpsc::channel(OBSERVATION_QUEUE);
+        let (events, receiver) = mpsc::channel(EVENT_QUEUE);
         Ok(Self {
             state: State::Attached(Box::new(Attached {
                 handles: Mutex::new(handles),
@@ -401,7 +451,7 @@ impl Engine {
                 boxes: RwLock::default(),
                 by_session: RwLock::default(),
                 allocator: Allocator::new(),
-                observations,
+                events,
                 pending: Mutex::new(Some((source, receiver))),
                 serving: OnceLock::new(),
             })),
@@ -423,7 +473,7 @@ impl Engine {
     const fn attached_state(&self) -> Option<&Attached> {
         match &self.state {
             State::Attached(attached) => Some(attached),
-            State::Absent(_) => None,
+            State::Absent(_) | State::Unusable(_) => None,
         }
     }
 
@@ -508,13 +558,26 @@ impl Engine {
         }
     }
 
-    /// Reports a refusal. Never waits: a full queue drops it.
+    /// Reports a refusal. The box's limiter decides here, before the
+    /// queue all boxes share, what becomes an event. Never waits: an event
+    /// the queue has no room for is counted for the box.
     pub(crate) fn observe(&self, of: Arc<Installed>, refusal: events::NetRefusal) {
-        if let Some(attached) = self.attached_state() {
-            let _full = attached.observations.try_send(Observation {
-                of,
-                body: events::Body::Net(refusal),
-            });
+        let Some(attached) = self.attached_state() else {
+            return;
+        };
+        let observation = Observation {
+            of,
+            body: events::Body::Net(refusal),
+        };
+        for (kind, data) in events::limited(&observation, Instant::now()) {
+            let write = events::Write {
+                of: Arc::clone(&observation.of),
+                kind,
+                data,
+            };
+            if attached.events.try_send(write).is_err() {
+                observation.of.limiter().lost();
+            }
         }
     }
 
@@ -541,6 +604,9 @@ impl Engine {
         policy: &BoxPolicy,
         deny_all_opt_out: bool,
     ) -> Result<(), Unenforceable> {
+        if let State::Unusable(why) = &self.state {
+            return Err(Unenforceable::EngineUnusable(why.clone()));
+        }
         if let Some(setting) = Self::unapplied_setting(mode, policy) {
             return Err(Unenforceable::Setting(setting));
         }
@@ -557,6 +623,7 @@ impl Engine {
                     .map(drop)
                     .map_err(Unenforceable::Compile)
             }
+            State::Unusable(why) => Err(Unenforceable::EngineUnusable(why.clone())),
             State::Absent(why) => {
                 // Without the programs a box runs unjudged. That is what a
                 // box with no network or with nothing to enforce asks for,
@@ -656,11 +723,14 @@ impl Engine {
         let installed = Arc::new(Installed {
             session: facts.session,
             id,
-            facts,
             block,
             wants,
             compiled: RwLock::new(Arc::clone(live.compiled())),
-            live: Mutex::new(live),
+            entry: Mutex::new(Entry {
+                live,
+                facts,
+                removed: false,
+            }),
             limiter: Mutex::new(Limiter::new(Instant::now())),
             log,
             serving: Mutex::default(),
@@ -782,24 +852,28 @@ impl Engine {
         .map_err(Unenforceable::Spec)?;
         let node = attached.node.read().expect("engine lock").clone();
         let spec = Self::spec_of(&node, facts.mode, own, of.block);
-        let mut live = of.live.lock().expect("live box lock");
-        if *live.spec() == spec {
+        let mut entry = of.entry.lock().expect("box entry lock");
+        if entry.removed {
             return Ok(());
         }
-        attached
-            .handles
-            .lock()
-            .expect("engine lock")
-            .reconfigure(&mut live, spec)?;
-        *of.compiled.write().expect("compiled policy lock") = Arc::clone(live.compiled());
+        if *entry.live.spec() != spec {
+            attached
+                .handles
+                .lock()
+                .expect("engine lock")
+                .reconfigure(&mut entry.live, spec)?;
+            *of.compiled.write().expect("compiled policy lock") = Arc::clone(entry.live.compiled());
+        }
+        entry.facts = facts.clone();
         Ok(())
     }
 
     /// Whether the box's entry was written for these facts.
     pub(crate) fn matches(of: &Installed, facts: &BoxFacts) -> bool {
-        of.facts.mode == facts.mode
-            && of.facts.policy.egress == facts.policy.egress
-            && of.facts.deny_all_opt_out == facts.deny_all_opt_out
+        let entry = of.entry.lock().expect("box entry lock");
+        entry.facts.mode == facts.mode
+            && entry.facts.policy.egress == facts.policy.egress
+            && entry.facts.deny_all_opt_out == facts.deny_all_opt_out
     }
 
     /// Tells the engine where the node's hostname proxy listens, once it
@@ -823,7 +897,8 @@ impl Engine {
             .cloned()
             .collect();
         for of in boxes {
-            if let Err(error) = Self::recompile(attached, &of, &of.facts) {
+            let facts = of.entry.lock().expect("box entry lock").facts.clone();
+            if let Err(error) = Self::recompile(attached, &of, &facts) {
                 tracing::error!(
                     box_id = %of.session,
                     %error,
@@ -853,10 +928,15 @@ impl Engine {
         for task in of.serving.lock().expect("endpoint task lock").drain(..) {
             task.abort();
         }
+        // The box's lock first, as every writer does, and the mark under
+        // it: a recompile that waited for this lock finds the box removed.
+        let mut entry = of.entry.lock().expect("box entry lock");
+        entry.removed = true;
         let mut handles = attached.handles.lock().expect("engine lock");
         let counters = handles.stats(id).ok().flatten();
-        let removed = handles.uninstall(&of.live.lock().expect("live box lock"));
+        let removed = handles.uninstall(&entry.live);
         drop(handles);
+        drop(entry);
         if let Err(error) = removed {
             tracing::warn!(box_id = %session, %error, "removing the box's network policy");
         }
@@ -1025,6 +1105,48 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    #[test]
+    fn an_engine_that_is_attached_and_unusable_refuses_every_box() {
+        let engine = Engine {
+            state: State::Unusable(Absent::LoaderOutOfDate),
+        };
+        // Below attached programs a box without an entry has no network at
+        // all, loopback included. So a box that needs no enforcement, and
+        // one with no network of its own, must not start either.
+        let open = BoxPolicy::new(None, None);
+        for mode in [NetworkMode::HostNet, NetworkMode::NoNet, NetworkMode::OwnIp] {
+            let refusal = engine
+                .can_enforce(mode, &open, false)
+                .expect_err("no box runs below programs the daemon cannot use");
+            assert_eq!(
+                refusal,
+                Unenforceable::EngineUnusable(Absent::LoaderOutOfDate),
+                "{mode:?}"
+            );
+            let text = refusal.to_string();
+            assert!(text.contains("no box would have a network"), "{text}");
+            assert!(text.contains("min finalize-install"), "{text}");
+            assert!(text.contains("restart the daemon"), "{text}");
+        }
+        let unknown = Unenforceable::EngineUnusable(Absent::Failed("map lookup".to_owned()));
+        assert!(unknown.to_string().ends_with("Restart the daemon."));
+    }
+
+    #[test]
+    fn a_daemon_with_no_cgroup_root_runs_a_host_address_box_that_allows_everything() {
+        let engine = Engine::absent(Absent::NoCgroupRoot);
+        let open = BoxPolicy::new(None, None);
+        assert_eq!(
+            engine.can_enforce(NetworkMode::HostNet, &open, false),
+            Ok(())
+        );
+        let restricted = egress(|e| e.allow_subnets = list(&["10.0.0.0/8"]));
+        let refusal = engine
+            .can_enforce(NetworkMode::HostNet, &restricted, false)
+            .expect_err("needs the engine");
+        assert!(refusal.to_string().contains("Delegate=yes"), "{refusal}");
     }
 
     #[test]

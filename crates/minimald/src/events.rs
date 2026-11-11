@@ -1,9 +1,10 @@
 //! What a box was refused, as box events.
 //!
 //! Three sources report refusals: the policy programs in the kernel, the
-//! box's resolver, and the hostname proxy. All send the same
-//! [`Observation`]. One task limits them per box and appends what passes
-//! to the box's event log, where `min box events` reads it.
+//! box's resolver, and the hostname proxy. All make the same
+//! [`Observation`]. The box's own limiter decides what becomes an event,
+//! and one task appends those to the box's event log, where
+//! `min box events` reads it.
 //!
 //! A later source of another kind (system calls, files) adds a variant to
 //! [`Body`] and its own event type. Nothing here is specific to the network
@@ -207,14 +208,22 @@ struct Seen {
     repeats: u32,
 }
 
+/// What a burst window left unwritten.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Unwritten {
+    /// Events over the box's burst limit.
+    pub(crate) suppressed: u32,
+    /// Events the daemon's write queue had no room for.
+    pub(crate) lost: u32,
+}
+
 /// What the limiter lets through for one box.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Passed {
     /// Write the event, with this many repeats since it was last written.
     pub(crate) write: Option<u32>,
-    /// Write a summary first: this many events fell to the burst limit in
-    /// the window that just ended.
-    pub(crate) suppressed: Option<u32>,
+    /// Write a summary first: what the window that just ended left out.
+    pub(crate) unwritten: Option<Unwritten>,
 }
 
 /// Keeps one box from flooding its event log.
@@ -223,7 +232,7 @@ pub(crate) struct Limiter {
     seen: HashMap<Key, Seen>,
     window: Instant,
     written: u32,
-    suppressed: u32,
+    unwritten: Unwritten,
 }
 
 impl Limiter {
@@ -232,38 +241,44 @@ impl Limiter {
             seen: HashMap::new(),
             window: now,
             written: 0,
-            suppressed: 0,
+            unwritten: Unwritten::default(),
         }
     }
 
-    /// Ends the burst window when its time is up. Returns how many events
-    /// it suppressed, if any.
-    pub(crate) fn roll(&mut self, now: Instant) -> Option<u32> {
+    /// Counts an event of this box that passed the limiter and found the
+    /// write queue full.
+    pub(crate) fn lost(&mut self) {
+        self.unwritten.lost = self.unwritten.lost.saturating_add(1);
+    }
+
+    /// Ends the burst window when its time is up. Returns what it left
+    /// unwritten, if anything.
+    pub(crate) fn roll(&mut self, now: Instant) -> Option<Unwritten> {
         if now.duration_since(self.window) < BURST_WINDOW {
             return None;
         }
         self.window = now;
         self.written = 0;
-        let suppressed = std::mem::take(&mut self.suppressed);
-        (suppressed > 0).then_some(suppressed)
+        let unwritten = std::mem::take(&mut self.unwritten);
+        (unwritten != Unwritten::default()).then_some(unwritten)
     }
 
     fn admit(&mut self, key: Key, now: Instant) -> Passed {
-        let suppressed = self.roll(now);
+        let unwritten = self.roll(now);
         if let Some(seen) = self.seen.get_mut(&key)
             && now.duration_since(seen.written) < REPEAT_WINDOW
         {
             seen.repeats = seen.repeats.saturating_add(1);
             return Passed {
                 write: None,
-                suppressed,
+                unwritten,
             };
         }
         if self.written >= BURST {
-            self.suppressed = self.suppressed.saturating_add(1);
+            self.unwritten.suppressed = self.unwritten.suppressed.saturating_add(1);
             return Passed {
                 write: None,
-                suppressed,
+                unwritten,
             };
         }
         if self.seen.len() >= KEYS_MAX
@@ -289,14 +304,17 @@ impl Limiter {
         self.written += 1;
         Passed {
             write: Some(repeats),
-            suppressed,
+            unwritten,
         }
     }
 }
 
-fn summary(suppressed: u32) -> EventData {
+fn summary(unwritten: Unwritten) -> EventData {
     let mut data = EventData::new();
-    data.insert("suppressed".to_owned(), suppressed.into());
+    data.insert("suppressed".to_owned(), unwritten.suppressed.into());
+    if unwritten.lost > 0 {
+        data.insert("lost".to_owned(), unwritten.lost.into());
+    }
     data.insert(
         "reason".to_owned(),
         "more refusals than the event log takes at once".into(),
@@ -309,8 +327,8 @@ pub(crate) fn limited(observation: &Observation, now: Instant) -> Vec<(BoxEventT
     let Body::Net(refusal) = &observation.body;
     let passed = observation.of.limiter().admit(refusal.key(), now);
     let mut out = Vec::new();
-    if let Some(suppressed) = passed.suppressed {
-        out.push((BoxEventType::NetRefused, summary(suppressed)));
+    if let Some(unwritten) = passed.unwritten {
+        out.push((BoxEventType::NetRefused, summary(unwritten)));
     }
     if let Some(repeats) = passed.write {
         out.push((BoxEventType::NetRefused, refusal.data(repeats)));
@@ -323,7 +341,7 @@ pub(crate) fn limited(observation: &Observation, now: Instant) -> Vec<(BoxEventT
 pub(crate) fn overdue(of: &Installed, now: Instant) -> Option<(BoxEventType, EventData)> {
     of.limiter()
         .roll(now)
-        .map(|suppressed| (BoxEventType::NetRefused, summary(suppressed)))
+        .map(|unwritten| (BoxEventType::NetRefused, summary(unwritten)))
 }
 
 /// Where a box's events are appended.
@@ -343,38 +361,49 @@ impl Log for DiskLog {
     }
 }
 
-/// Takes observations until every sender is gone, and writes what the
-/// limiters pass. The append locks and syncs a file, so it runs off the
-/// async workers.
+/// One event to append to a box's log.
+#[derive(Debug)]
+pub(crate) struct Write {
+    pub(crate) of: Arc<Installed>,
+    pub(crate) kind: BoxEventType,
+    pub(crate) data: EventData,
+}
+
+/// Appends events until every sender is gone, and the summaries boxes owe
+/// when a window ended with nothing after it to carry the count. The
+/// append locks and syncs a file, so it runs off the async workers.
 pub(crate) async fn sink(
-    mut observations: tokio::sync::mpsc::Receiver<Observation>,
+    mut events: tokio::sync::mpsc::Receiver<Write>,
     boxes: impl Fn() -> Vec<Arc<Installed>> + Send + 'static,
 ) {
     let mut tick = tokio::time::interval(BURST_WINDOW);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let writes: Vec<(Arc<Installed>, BoxEventType, EventData)> = tokio::select! {
-            observation = observations.recv() => {
-                let Some(observation) = observation else { return };
-                limited(&observation, Instant::now())
-                    .into_iter()
-                    .map(|(kind, data)| (Arc::clone(&observation.of), kind, data))
-                    .collect()
+        let mut writes = Vec::new();
+        tokio::select! {
+            first = events.recv() => {
+                let Some(first) = first else { return };
+                writes.push(first);
+                // Whatever else is waiting goes in the same pass.
+                while writes.len() < 256
+                    && let Ok(next) = events.try_recv()
+                {
+                    writes.push(next);
+                }
             }
             _ = tick.tick() => {
                 let now = Instant::now();
-                boxes()
-                    .into_iter()
-                    .filter_map(|of| overdue(&of, now).map(|(kind, data)| (of, kind, data)))
-                    .collect()
+                writes.extend(boxes().into_iter().filter_map(|of| {
+                    overdue(&of, now).map(|(kind, data)| Write { of, kind, data })
+                }));
             }
-        };
+        }
         if writes.is_empty() {
             continue;
         }
         let written = crate::traced::spawn_blocking(move || {
-            for (of, kind, data) in writes {
-                of.log().append(kind, data);
+            for write in writes {
+                write.of.log().append(write.kind, write.data);
             }
         })
         .await;
@@ -424,10 +453,26 @@ mod tests {
         assert_eq!(written, BURST as usize);
         assert_eq!(limiter.roll(start + Duration::from_secs(1)), None);
         let next = start + BURST_WINDOW;
+        // Events the write queue had no room for are counted for the box
+        // too, and the same summary reports both.
+        limiter.lost();
+        limiter.lost();
         let passed = limiter.admit(key(9000), next);
-        assert_eq!(passed.suppressed, Some(180));
+        assert_eq!(
+            passed.unwritten,
+            Some(Unwritten {
+                suppressed: 180,
+                lost: 2
+            })
+        );
         assert_eq!(passed.write, Some(0));
         assert_eq!(limiter.roll(next + BURST_WINDOW), None);
+        let data = summary(Unwritten {
+            suppressed: 180,
+            lost: 2,
+        });
+        assert_eq!(data.get("suppressed").and_then(Value::as_u64), Some(180));
+        assert_eq!(data.get("lost").and_then(Value::as_u64), Some(2));
     }
 
     #[test]

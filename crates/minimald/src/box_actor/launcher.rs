@@ -51,15 +51,6 @@ pub(super) fn with_userns_hint(
     }
 }
 
-/// What a box that shares the host's address is refused with on a daemon
-/// that has no cgroup root.
-#[cfg(not(test))]
-const NO_CGROUP_FOR_HOST_ADDRESS_BOX: &str = "the box did not start: Minimal has no cgroup to \
-     run it in, so it cannot tell the box's connections from the host's. A box that shares the \
-     host's address (`host_ip`) needs the daemon to run in a delegated cgroup: a systemd unit or \
-     scope with `Delegate=yes`. A box with its own address (`own_ip`) or with no network runs \
-     without one.";
-
 impl BoxActor {
     /// Builds the session launcher used to mint a session host: the real
     /// sandboxed shell in production.
@@ -139,19 +130,6 @@ impl BoxActor {
             },
         }
         .map_err(AttachError::ContextCreationFailed)?;
-        // The hostname proxy names the box behind a connection by the cgroup
-        // of the process that opened it. A box that shares the host's
-        // address has nothing else to be told from the host by.
-        if matches!(network_mode, boxes::NetworkMode::HostNet) && ctx.box_cgroup().is_none() {
-            tracing::warn!(
-                box_id = %record.id,
-                "refused a host-address box: this daemon has no cgroup to run it in"
-            );
-            return Err(AttachError::SpawnFailed(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                NO_CGROUP_FOR_HOST_ADDRESS_BOX,
-            )));
-        }
         Ok(box_runtime::SandboxLauncher {
             ctx,
             attach_env,

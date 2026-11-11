@@ -701,8 +701,10 @@ impl BoxActor {
             }
             return Ok(Some(cgroup.clone()));
         }
-        let cgroup = root.create_box(&record.id.to_string())?;
+        // Everything that can fail without the cgroup comes before it, so
+        // an error leaves none behind.
         let log = Arc::new(crate::events::DiskLog(self.record.object().await?));
+        let cgroup = root.create_box(&record.id.to_string())?;
         if let Err(error) = engine.install(&cgroup, facts, log) {
             // Nothing ran in it. Without an entry it must not stay around
             // for a later launch to find.
