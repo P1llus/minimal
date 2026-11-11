@@ -10,6 +10,11 @@ pub(crate) struct MockBackend {
 
 #[cfg(test)]
 impl MockBackend {
+    /// The stand-in process, for a test that signals it.
+    pub(super) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Translates a plain process status into the shape `hakoniwa` reports, so
     /// the host cannot tell a mock reap from a sandboxed one: a signalled
     /// process has no exit code of its own and carries the container's 125.
@@ -37,8 +42,8 @@ impl MockBackend {
 
 #[cfg(test)]
 impl ProcessBackend for MockBackend {
-    fn container_pid(&self) -> u32 {
-        self.child.id()
+    fn has_init(&self) -> bool {
+        sandbox::spawner::enter::init_of(self.child.id()).is_ok()
     }
 
     fn entrance(&self) -> crate::box_command::BoxEntrance {

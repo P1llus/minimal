@@ -1221,7 +1221,7 @@ impl BoxLauncher for SandboxLauncher {
             // a task run relays its stdin, stdout and stderr (T43). The
             // host reads the stdout pipe where it reads a terminal's
             // master, and nothing holds the terminal opened above.
-            let (master, tty_path, late_notice_fd, pipes) = if on_pipes {
+            let (master, tty_path, pipes) = if on_pipes {
                 let child = ChildPipes::open()?;
                 command.stdin(sandbox::Stdio::from(child.stdin));
                 command.stdout(sandbox::Stdio::from(child.stdout));
@@ -1230,25 +1230,15 @@ impl BoxLauncher for SandboxLauncher {
                 (
                     child.stdout_reader,
                     std::path::PathBuf::from("/dev/null"),
-                    None,
                     Some(child.parent),
                 )
             } else {
                 command.stdin(sandbox::Stdio::from(pty.dup_slave_fd()?));
                 command.stdout(sandbox::Stdio::from(pty.dup_slave_fd()?));
                 let tty_path = pty.slave_path().to_path_buf();
-                // Kept for one notice written after the switch attach below
-                // (an own-address box the hostname proxy stranded), so it is
-                // said in the terminal, not only in the daemon's log. Never
-                // for a hook launch: its pty is read by nobody. Dropped
-                // before the launch returns, so it never outlives the
-                // shell's own slave fds.
-                let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
-                    .then(|| pty.dup_slave_fd().ok())
-                    .flatten();
                 let (master, slave) = pty.into_fds();
                 command.stderr(sandbox::Stdio::from(slave));
-                (master, tty_path, late_notice_fd, None)
+                (master, tty_path, None)
             };
 
             let process = command
@@ -1262,14 +1252,13 @@ impl BoxLauncher for SandboxLauncher {
                 master,
                 process,
                 tty_path,
-                late_notice_fd,
                 start_gate,
                 pipes,
             ))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd, start_gate, pipes) = build_and_spawn?;
+        let (env, master, process, tty_path, start_gate, pipes) = build_and_spawn?;
 
         // From here the process exists, so every way out of this function
         // has to account for it — including the one no `return` covers, a
@@ -1319,30 +1308,6 @@ impl BoxLauncher for SandboxLauncher {
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::ingress_gate::live_gate);
-        // Design §7.1: a box that attached while the hostname proxy was not
-        // serving past the settle was compiled with no node-address opening
-        // (fail closed rather than at a port the proxy may not hold), so it
-        // cannot reach the hostname proxy until it restarts. Said in the
-        // session's own terminal — the person whose `HTTP(S)_PROXY` requests
-        // will not route is told why and what clears it — beside the
-        // daemon's warning. Best-effort, like the banner notices above.
-        if let (Some(fd), Some(lease)) = (late_notice_fd, lease)
-            && net_switch.lock().await.hostname_proxy_stranded(lease)
-        {
-            use std::io::Write as _;
-            let written = std::fs::File::from(fd).write_all(
-                b"minimal: the hostname proxy was not serving yet when this session's \
-                  box attached, so the box cannot reach it (*.min.internal requests \
-                  through HTTP(S)_PROXY will not route); restart the session once the \
-                  daemon's hostname proxy serves\r\n",
-            );
-            if let Err(e) = written {
-                tracing::debug!(
-                    error = %e,
-                    "could not print the hostname-proxy notice to the terminal"
-                );
-            }
-        }
         if matches!(network_mode, NetworkMode::OwnIp)
             && (lease.is_none() || published.is_none() || gate.is_none())
         {

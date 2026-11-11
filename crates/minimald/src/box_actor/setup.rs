@@ -85,7 +85,7 @@ pub(crate) fn own_address_build_network(
     let denies_all = egress
         .as_ref()
         .is_some_and(boxes::EgressPolicy::admits_nothing);
-    let admits_name = move |host: &str| crate::net::dns_gate::admits_name(egress.as_ref(), host);
+    let admits_name = move |host: &str| admits_name(egress.as_ref(), host);
     let record = record.clone();
     let switch = Arc::clone(switch);
     Some(
@@ -1407,4 +1407,22 @@ impl BoxActor {
             }
         }
     }
+}
+
+/// Whether a box with this egress section may look `host` up. A box that
+/// lists no names is refused none, and a name of the box zone is always
+/// answered.
+fn admits_name(policy: Option<&boxes::EgressPolicy>, host: &str) -> bool {
+    let Some(names) = policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .filter(|names| !names.is_empty())
+    else {
+        return true;
+    };
+    let normalized = |name: &str| {
+        let lowered = name.to_ascii_lowercase();
+        lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
+    };
+    let host = normalized(host);
+    names.iter().any(|name| normalized(name) == host) || crate::net::dns::is_zone_name(&host)
 }

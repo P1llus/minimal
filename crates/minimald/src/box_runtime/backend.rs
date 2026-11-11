@@ -43,15 +43,9 @@ impl ExitReason {
 /// `wait` reduce the `hakoniwa::ExitStatus` payload to a portable exit code;
 /// [`Self::exit_reason`] carries the part of it that has to reach the user.
 pub(crate) trait BoxProcess: Send + 'static {
-    /// Returns the PID of hakoniwa's container supervisor — **not** the PID of
-    /// the shell it exec'd.
-    ///
-    /// The supervisor unshared the sandbox's namespaces itself, so this is a
-    /// valid handle for all of them except the PID namespace, which it created
-    /// for its children without entering. Use
-    /// [`Host::session_leader_pid`](Host::session_leader_pid) for the shell's
-    /// own PID.
-    fn container_pid(&self) -> u32;
+    /// Whether the box's first process exists: after the supervisor forked
+    /// it, and until it exits.
+    fn has_init(&self) -> bool;
     /// The way into the box for more programs.
     fn entrance(&self) -> crate::box_command::BoxEntrance;
     /// Returns `Some(code)` if the process has exited, `None` if still running.
@@ -86,8 +80,8 @@ pub(crate) struct ExitReport {
 /// test double. Everything else — the exit-reason cache and its record-once
 /// policy — lives in [`HostProcess`] and is shared.
 pub(crate) trait ProcessBackend: Send + 'static {
-    /// See [`BoxProcess::container_pid`].
-    fn container_pid(&self) -> u32;
+    /// See [`BoxProcess::has_init`].
+    fn has_init(&self) -> bool;
     /// See [`BoxProcess::entrance`].
     fn entrance(&self) -> crate::box_command::BoxEntrance;
     /// See [`BoxProcess::try_wait`]; `Ok(None)` while the process runs.
@@ -115,6 +109,11 @@ pub(crate) struct HostProcess<B: ProcessBackend> {
 }
 
 impl<B: ProcessBackend> HostProcess<B> {
+    #[cfg(test)]
+    pub(super) fn backend(&self) -> &B {
+        &self.backend
+    }
+
     pub(super) fn new(backend: B) -> Self {
         Self {
             backend,
@@ -138,8 +137,8 @@ impl<B: ProcessBackend> HostProcess<B> {
 }
 
 impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
-    fn container_pid(&self) -> u32 {
-        self.backend.container_pid()
+    fn has_init(&self) -> bool {
+        self.backend.has_init()
     }
 
     fn entrance(&self) -> crate::box_command::BoxEntrance {
@@ -191,8 +190,9 @@ impl SandboxBackend {
 }
 
 impl ProcessBackend for SandboxBackend {
-    fn container_pid(&self) -> u32 {
-        self.child.id()
+    fn has_init(&self) -> bool {
+        // A spawner that is gone has no box left to run a hook in.
+        self.child.has_init().unwrap_or(false)
     }
 
     fn entrance(&self) -> crate::box_command::BoxEntrance {

@@ -932,42 +932,6 @@ pub(crate) fn report_expose_decision(
     );
 }
 
-/// Reports one refused own-address egress flow to the VM host daemon: the
-/// relay calls this when its rate-limited drop line fires, so the report
-/// shares that line's rate limit and is never sent once per frame. Nothing
-/// is sent for a box with no audit route.
-pub(crate) fn report_refused_egress(
-    switch_address: Ipv4Addr,
-    destination: Option<std::net::SocketAddrV4>,
-    proto: &str,
-    rule: &str,
-) {
-    let channel = HOST_AUDIT_ROUTES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&switch_address)
-        .map(|route| route.channel.clone());
-    let Some(channel) = channel else {
-        return;
-    };
-    let clamp = |text: &str| {
-        let mut end = text.len().min(minimald_rpc::REFUSED_EGRESS_TEXT_MAX);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text[..end].to_string()
-    };
-    send_host_audit(
-        channel,
-        minimald_rpc::BoxControlRequest::ReportRefusedEgress(minimald_rpc::RefusedEgressReport {
-            switch_address,
-            destination,
-            proto: clamp(proto),
-            rule: clamp(rule),
-        }),
-    );
-}
-
 /// The withdrawal's attempts over a resolved report channel, shared by
 /// [`report_withdrawn_port`] and the unwind of an admit whose reply never
 /// arrived.

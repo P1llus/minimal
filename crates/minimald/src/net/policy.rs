@@ -192,48 +192,26 @@ pub struct PortForwarder {
     /// forwarder is cloned onto the guard's list and every clone must agree
     /// on whether the forward stands.
     revoked: Arc<AtomicBool>,
-    /// The forward's port held as one of Minimal's own listeners, when the
-    /// forward binds at `127.0.0.1`, where the native host alias lands
-    /// (NET-162). So no `[host-exposures]` entry opens a published box port
-    /// to another box. Released when an unbind succeeds, or when the last
-    /// clone drops. Shared by every clone, as `revoked` is.
-    listener_hold: Arc<Mutex<Option<super::switch::MinimalListenerHold>>>,
 }
 
 impl PortForwarder {
-    /// The forwarder of a forward the switch bound at `mapping`. A forward
-    /// at `127.0.0.1` holds its port in the daemon's registry of Minimal's
-    /// own listeners from here until its unbind succeeds (NET-162).
+    /// The forwarder of a forward the switch bound at `mapping`.
     fn bound(
         mapping: ExposedMapping,
         internal_port: u16,
         gate: Option<Arc<super::ingress_gate::IngressGate>>,
     ) -> Self {
-        let listener_hold = loopback_listener_hold(&mapping);
         Self {
             mapping,
             internal_port,
             gate,
             revoked: Arc::new(AtomicBool::new(false)),
-            listener_hold: Arc::new(Mutex::new(listener_hold)),
         }
     }
 
-    /// Marks the forward unbound: the switch dropped it, so its port is no
-    /// longer one of Minimal's listeners.
+    /// Marks the forward unbound: the switch dropped it.
     fn mark_unbound(&self) {
         self.revoked.store(true, Ordering::Release);
-        self.release_listener_hold();
-    }
-
-    /// Lets the forward's port go from the registry of Minimal's listeners.
-    fn release_listener_hold(&self) {
-        let released = self
-            .listener_hold
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        drop(released);
     }
 
     /// The `host:port` the forward is bound on, as [`ExposedMapping`] reads
@@ -384,28 +362,6 @@ impl PortForwarder {
         );
         Ok(())
     }
-}
-
-/// The hold a forward at `mapping` takes in the daemon's registry of
-/// Minimal's own listeners (NET-162): one for the forward's protocol at its
-/// port, when it binds at `127.0.0.1`. A forward at another address is not
-/// reachable through the native host alias, so it holds nothing.
-fn loopback_listener_hold(mapping: &ExposedMapping) -> Option<super::switch::MinimalListenerHold> {
-    use super::switch::{MinimalListener, MinimalListeners, PUBLISHED_BOX_PORT_LISTENER};
-    let (host, port) = mapping.host_port()?;
-    if host.parse() != Ok(Ipv4Addr::LOCALHOST) {
-        return None;
-    }
-    let protocol = match mapping.protocol.as_str() {
-        "tcp" => Some(6),
-        "udp" => Some(17),
-        _ => None,
-    };
-    Some(MinimalListeners::daemon().hold_while(MinimalListener {
-        port,
-        protocol,
-        name: PUBLISHED_BOX_PORT_LISTENER,
-    }))
 }
 
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
@@ -849,8 +805,6 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
         };
         match unexpose_closing(control, &req).await {
             Ok(closed) => {
-                // The forward is down, so its port is no longer Minimal's.
-                forwarder.release_listener_hold();
                 tracing::info!(
                     host,
                     port = external_port,
@@ -882,7 +836,6 @@ pub async fn unexpose_forwarder(
         return Ok(());
     }
     let closed = unexpose_mapping(control, &forwarder.mapping).await?;
-    forwarder.release_listener_hold();
     // The callers withdraw an unaudited publish or unbind the forward a move
     // left behind, and each says why in its own line. This line carries the
     // switch's count, and claims no withdrawal.
@@ -3750,118 +3703,7 @@ mod tests {
                 internal_port: 80,
                 gate: None,
                 revoked: Arc::new(AtomicBool::new(false)),
-                listener_hold: Arc::new(std::sync::Mutex::new(None)),
             }
-        }
-
-        /// NET-162 on a native host: a forward that `min net expose` binds
-        /// at `127.0.0.1`, where the host alias lands, holds its port as one
-        /// of Minimal's own listeners from the bind until its unbind
-        /// succeeds, on each path that unbinds it. So no `[host-exposures]`
-        /// entry opens a published box port to another box. A forward at
-        /// another loopback address holds nothing. The ports are ones no
-        /// other test binds, since the registry is the daemon's.
-        #[tokio::test]
-        async fn native_own_ip_runtime_published_box_port_held_until_it_unbinds() {
-            use super::super::{expose_dynamic, remove_ingress, unexpose_forwarder};
-            use crate::net::switch::{MinimalListeners, PUBLISHED_BOX_PORT_LISTENER};
-            const TCP: u8 = 6;
-            const UDP: u8 = 17;
-            let dir = tempfile::TempDir::new().unwrap();
-            let sock = dir.path().join("gvproxy.sock");
-            let (fake, _asked) = spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
-            let control = ControlChannel::Unix(sock);
-            let registry = MinimalListeners::daemon();
-            let box_ip = std::net::Ipv4Addr::new(100, 64, 0, 9);
-            let expose = |port, proto| {
-                expose_dynamic(
-                    &control,
-                    std::net::Ipv4Addr::LOCALHOST,
-                    box_ip,
-                    port,
-                    proto,
-                    None,
-                )
-            };
-
-            assert_eq!(registry.holder(TCP, 47280), None, "nothing holds 47280 yet");
-            let first = expose(47280, boxes::IpProto::Tcp)
-                .await
-                .expect("the forward of 47280 binds");
-            assert_eq!(
-                registry.holder(TCP, 47280),
-                Some(PUBLISHED_BOX_PORT_LISTENER),
-                "the bound forward holds its port"
-            );
-            assert_eq!(
-                registry.holder(UDP, 47280),
-                None,
-                "a TCP forward holds the port for TCP only"
-            );
-            let clone = first.clone();
-            drop(first);
-            assert_eq!(
-                registry.holder(TCP, 47280),
-                Some(PUBLISHED_BOX_PORT_LISTENER),
-                "a clone that is still tracked keeps the hold"
-            );
-            unexpose_forwarder(&control, &clone)
-                .await
-                .expect("the forward of 47280 unbinds");
-            assert_eq!(
-                registry.holder(TCP, 47280),
-                None,
-                "an unexposed forward holds its port no more"
-            );
-
-            let revoked = expose(47281, boxes::IpProto::Udp)
-                .await
-                .expect("the forward of 47281 binds");
-            assert_eq!(
-                registry.holder(UDP, 47281),
-                Some(PUBLISHED_BOX_PORT_LISTENER)
-            );
-            revoked
-                .revoke(&control, &std::collections::HashSet::new())
-                .await
-                .expect("the forward of 47281 unbinds");
-            assert_eq!(
-                registry.holder(UDP, 47281),
-                None,
-                "a revoked forward holds its port no more"
-            );
-
-            let stopped = expose(47282, boxes::IpProto::Tcp)
-                .await
-                .expect("the forward of 47282 binds");
-            assert_eq!(
-                registry.holder(TCP, 47282),
-                Some(PUBLISHED_BOX_PORT_LISTENER)
-            );
-            remove_ingress(&control, std::slice::from_ref(&stopped)).await;
-            assert_eq!(
-                registry.holder(TCP, 47282),
-                None,
-                "a forward removed at box stop holds its port no more"
-            );
-
-            let elsewhere = expose_dynamic(
-                &control,
-                std::net::Ipv4Addr::new(127, 0, 64, 9),
-                box_ip,
-                47283,
-                boxes::IpProto::Tcp,
-                None,
-            )
-            .await
-            .expect("the forward at the box's own address binds");
-            assert_eq!(
-                registry.holder(TCP, 47283),
-                None,
-                "the host alias does not reach a forward at another address"
-            );
-            drop(elsewhere);
-            fake.abort();
         }
 
         /// On a VM-backed host the host's egress gate refuses any withdrawal

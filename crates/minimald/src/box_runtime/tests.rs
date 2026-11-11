@@ -1107,7 +1107,7 @@ async fn a_requested_kill_logs_its_reap_at_info() {
 async fn an_unrequested_kill_still_warns_abnormal() {
     let capture = captured_log();
     let (mut host, _handle) = reap_log_host("reap-unrequested").await;
-    let pid = host.container_pid();
+    let pid = host.process.backend().pid();
     let mut rx = watch_binding(&mut host);
     let stdin = host.remote_tx.clone();
     let task = crate::traced::spawn(host.mainloop());
@@ -5216,7 +5216,7 @@ async fn daemon_kill_racing_reap_is_not_a_natural_exit() {
     /// Kills the host's process and waits until it is a zombie, so the
     /// loop's first `try_wait` reaps it.
     async fn kill_and_await_zombie(host: &Host<MockProcess, ()>) {
-        let pid = libc::pid_t::try_from(host.container_pid()).expect("pid fits in pid_t");
+        let pid = libc::pid_t::try_from(host.process.backend().pid()).expect("pid fits in pid_t");
         // SAFETY: `kill` takes plain integers; `pid` is the mock entrypoint
         // this test spawned, which is not reaped yet.
         let rc = unsafe { libc::kill(pid, libc::SIGKILL) };

@@ -597,30 +597,6 @@ impl NameMarker {
 }
 
 impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
-    /// The PID of hakoniwa's container supervisor for this session.
-    ///
-    /// Correct as a handle for every namespace the sandbox unshared *except*
-    /// the PID namespace — which is what the own-IP tap wiring uses it for. To
-    /// address the session's PID namespace, or to name the shell itself, use
-    /// [`Self::session_leader_pid`].
-    // Reachable only through `session_leader_pid`, which the exec path uses;
-    // kept as the named counterpart so the distinction stays visible.
-    #[allow(dead_code)]
-    pub(crate) fn container_pid(&self) -> u32 {
-        self.process.container_pid()
-    }
-
-    /// The PID of the session shell itself — the process hakoniwa exec'd inside
-    /// every one of the sandbox's namespaces.
-    ///
-    /// # Errors
-    ///
-    /// [`EnterError::NoSessionLeader`](sandbox::spawner::enter::EnterError::NoSessionLeader)
-    /// once the shell has exited; the session's namespaces do not outlive it.
-    pub(crate) fn session_leader_pid(&self) -> Result<u32, sandbox::spawner::enter::EnterError> {
-        sandbox::spawner::enter::init_of(self.process.container_pid())
-    }
-
     /// Builds a command that runs `program` inside this session's box, with
     /// the session's variables, then the attached terminal's facts, then
     /// `extra_env`. The terminal's facts sit above the session's own for the
@@ -650,17 +626,13 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     /// to run or nothing to run it in.
     fn hook_plan(&self, event: crate::hooks::HookEvent) -> Option<HookPlan> {
         let composition = self.composition.clone()?;
-        match self.session_leader_pid() {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(
-                    event = event.as_str(),
-                    error = %e,
-                    "no session leader; skipping lifecycle hooks",
-                );
-                return None;
-            }
-        };
+        if !self.process.has_init() {
+            tracing::debug!(
+                event = event.as_str(),
+                "the box has no first process; skipping lifecycle hooks",
+            );
+            return None;
+        }
         let environment = self.guard.command_environment();
         Some(HookPlan {
             event,
@@ -803,10 +775,6 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             Some(crate::net::listeners::ListenWatcher::start(plan, source))
         });
 
-        // Read before the process moves into the host: a stop signals the
-        // box's processes from it (BOX-013).
-        let container_pid = process.container_pid();
-
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };
 
@@ -843,7 +811,6 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             output_log,
             box_dir,
             attrs: HostAttrs {
-                container_pid: Some(container_pid),
                 ..HostAttrs::default()
             },
 

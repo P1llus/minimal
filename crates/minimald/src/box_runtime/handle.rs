@@ -563,9 +563,4 @@ pub struct HostAttrs {
     pub(crate) stdout_last: Option<SystemTime>,
     /// When the last byte was sent to the process from a binding.
     pub(crate) stdin_last: Option<SystemTime>,
-
-    /// The pid of the box's container supervisor, which a stop signals the
-    /// box's processes from (BOX-013). `None` only for attrs no host
-    /// reported.
-    pub(crate) container_pid: Option<u32>,
 }

@@ -68,17 +68,6 @@ impl BoxActor {
     /// `Draft` session, which has nothing to route to until its composition
     /// finalizes.
     ///
-    /// An `OwnIp` PTask is also recorded as the *caller* a proxied request
-    /// from it is checked against (NET-070): its egress declaration, over the
-    /// switch its own relay is attached to, is kept until the box's lease
-    /// joins onto it, and the rules built there are the ones its own outbound
-    /// frames are decided by on the switch
-    /// ([`crate::net::switch::compiled_egress`] over the switch's subnet, so
-    /// the resolver carve-out matches too, and with the box's lease, so the
-    /// verdict's source check does too — NET-084), so a request from the box
-    /// through the hostname proxy meets its own declaration — exactly what a
-    /// direct connection from it meets (NET-071).
-    ///
     /// `wait_for_verdict` is whether a hand the range verdict has not
     /// vouched for may wait for it ([`Self::hand_or_interim`]): only the
     /// box's first finalize does, inside its own actor. Every other
@@ -95,50 +84,6 @@ impl BoxActor {
             return Vec::new();
         }
         let name = registry_name(record);
-        // The hostname proxy's port for the box's own-address set (design
-        // §7.1): resolved through the serving transition (see
-        // [`crate::net::hostname_proxy_serving_port`]) so a registration
-        // racing the proxy's detached startup cannot compile the seeded —
-        // possibly relocated (NET-025) — port into the node's opening. Only a
-        // registration that may wait (`wait_for_verdict`) waits for it: the
-        // others run inside the manager's own message handling, where a
-        // wait would park every other session's operation, so they read the
-        // port only if it is already settled and fail closed otherwise. What
-        // that withholds is the caller check's reach to the node address at
-        // the proxy's own port — a proxied request back at the proxy — never
-        // the box's relay opening, which the attach path resolves itself.
-        // Scoped: the switch lock is dropped before the registry is taken, so
-        // no path holds both.
-        let (subnet, settled_port, unsettled) = {
-            let switch = self.net_switch.lock().await;
-            (
-                switch.subnet(),
-                switch.serving_hostname_proxy_port(),
-                switch.hostname_proxy_unsettled(),
-            )
-        };
-        // Only an `OwnIp` box carries the opening: a `HostNet` one never
-        // waits for it. The wait does not count the box as stranded: this
-        // is the caller check's copy, not the box's relay opening, which
-        // the attach path resolves (and counts) itself.
-        let hostname_proxy_port = match record.network {
-            boxes::NetworkMode::OwnIp if wait_for_verdict => {
-                crate::net::hostname_proxy_serving_port(&self.net_switch, None).await
-            }
-            boxes::NetworkMode::OwnIp if unsettled => {
-                // Said, not silent: this registration keeps no opening at
-                // the node address for the caller check until the session
-                // re-registers (a rename, a re-finalize, a restart).
-                tracing::info!(
-                    session = %record.id,
-                    "the hostname proxy is not serving yet; this session's \
-                     caller check is registered with no node-address opening \
-                     (design §7.1)"
-                );
-                settled_port
-            }
-            _ => settled_port,
-        };
         let mut shared_port_collisions = Vec::new();
         // The registry generation this registration left the zone at, taken
         // under the same write lock as the change (NET-011).
@@ -326,14 +271,7 @@ impl BoxActor {
                     }
                     None => published,
                 };
-                reg.register_caller(
-                    record.id,
-                    &name,
-                    &record.policy,
-                    subnet,
-                    hostname_proxy_port,
-                );
-                let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
+                let declared = crate::net::dns::declared_request_ports(Some(&record.policy));
                 if let Some(hand) = handed {
                     // The hand is the box's own address whether this
                     // publish lands at it or at the interim the wait's

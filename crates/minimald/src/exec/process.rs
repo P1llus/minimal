@@ -1846,7 +1846,7 @@ pub(super) fn start_managed_exec_within(
     // The pump and the feed wait for the descriptor in the runtime, not in a
     // blocking thread, so the supervisor can stop them. A write to a terminal
     // whose program reads nothing would otherwise hold a thread for good.
-    crate::net::switch::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&source))?;
+    set_nonblocking(&source)?;
     // The command holds the daemon's copies of the terminal's slave side
     // or the pipe's write end. The spawn consumes it, so the pump sees the
     // end of the output when the exec ends.
@@ -2420,4 +2420,11 @@ mod entrypoint_end_code_tests {
         assert_eq!(end(RecordState::Exited(ExitEnding::Oom)), Some(137));
         assert_eq!(end(RecordState::Running), None);
     }
+}
+/// Sets `O_NONBLOCK` on `file`, which `std::fs::File` cannot do itself.
+fn set_nonblocking(file: &std::fs::File) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let flags = OFlag::from_bits_retain(fcntl(file, FcntlArg::F_GETFL)?);
+    fcntl(file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
 }

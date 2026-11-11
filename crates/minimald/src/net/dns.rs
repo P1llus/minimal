@@ -59,7 +59,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use boxes::core::egress::EgressRules;
 #[cfg(target_os = "linux")]
 use boxes::core::loopback::LoopbackAllocator;
 use boxes::{BoxPolicy, SessionId};
@@ -67,8 +66,6 @@ use hickory_proto::rr::Name;
 use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-
-use super::SwitchSubnet;
 
 /// The DNS suffix every PTask box name carries (see the module docs). Read
 /// from the sessions zone's apex, the one spelling every registry shares.
@@ -686,6 +683,23 @@ impl Route {
     }
 }
 
+/// The external ports a request to an own-address box may name: the ports
+/// its ingress declaration publishes. Empty when it declares none, which
+/// refuses every port.
+#[must_use]
+pub fn declared_request_ports(policy: Option<&BoxPolicy>) -> BTreeSet<u16> {
+    policy
+        .and_then(|policy| policy.ingress.as_ref())
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|mapping| mapping.external_port)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The declared ports of an applied external→internal map: its keys.
 fn declared_keys(ports: &BTreeMap<u16, u16>) -> BTreeSet<u16> {
     ports.keys().copied().collect()
@@ -791,71 +805,6 @@ pub struct InterimPublish {
     /// The loopback address a creator handed the box, if one did: the
     /// move's target for a handed box — its own hand, never a fresh grant.
     pub hand: Option<Ipv4Addr>,
-}
-
-/// Who a proxied request came from (NET-070): the live session the request's
-/// peer address names, at the switch lease its box holds, with the compiled
-/// egress rules its own outbound frames are decided by — the same rules a
-/// request from it is put to, exactly as a direct connection from it would be
-/// ([`super::switch::proxied_request_verdict`]). Named by the
-/// lease-to-session map ([`HostnameRegistry::by_lease`]). A host-side client
-/// is no caller: it has no declaration to honour.
-#[derive(Debug, Clone)]
-pub struct Caller {
-    /// The address the caller's proxied connections come from: the switch
-    /// lease its box holds.
-    lease: Ipv4Addr,
-    /// The caller's session name, for the refusal log.
-    name: String,
-    /// The caller's compiled egress rules, as the relay decides its own
-    /// frames by ([`super::switch::compiled_egress`]) — compiled at the join
-    /// with this lease, so the verdict's source check (NET-084) reads the
-    /// frame a request stands for as the box's own.
-    egress: EgressRules,
-}
-
-impl Caller {
-    /// The switch lease the caller's box holds.
-    #[must_use]
-    pub fn lease(&self) -> Ipv4Addr {
-        self.lease
-    }
-
-    /// The caller's session name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The caller's compiled egress rules — what its own outbound frames are
-    /// decided by, and what a request from it is put to.
-    #[must_use]
-    pub fn egress(&self) -> &EgressRules {
-        &self.egress
-    }
-}
-
-/// The name and egress declaration of a live session, kept by stable id
-/// ([`HostnameRegistry::callers`]) until its lease joins onto them and either
-/// ends. The declaration is held uncompiled: the lease that completes it
-/// arrives by a different path than the registration does, so the rules are
-/// compiled at the join ([`HostnameRegistry::caller_at`]) — with the lease that
-/// names the caller, through the same [`super::switch::compiled_egress`] the
-/// relay's gate compiles its own rules by — and the two surfaces can never
-/// disagree about whose frame a request from that lease stands for.
-#[derive(Debug, Clone)]
-struct CallerFacts {
-    name: String,
-    /// The caller's policy as launch recorded it — the egress half is what a
-    /// request from it is put to; the ingress half is not read here.
-    policy: BoxPolicy,
-    /// The switch the box's relay is attached to, whose resolver its egress
-    /// carve-out is keyed to (NET-079).
-    subnet: SwitchSubnet,
-    /// The hostname proxy's port that switch's boxes are compiled with — the
-    /// node address's interim opening — so the caller check compiles the
-    /// same rules the relay does (NET-071).
-    hostname_proxy_port: Option<u16>,
 }
 
 /// What the box zone holds for a name, as the answerer answers from it. The
@@ -993,11 +942,6 @@ pub struct HostnameRegistry {
     by_session: HashMap<String, Registration>,
     /// Reported `OwnIp` leases, by stable session id (see [`OwnAddress`]).
     own: HashMap<SessionId, OwnAddress>,
-    /// The name and egress declaration of every live session, by stable id
-    /// — the facts that check a proxied request's *caller* (NET-070).
-    /// Recorded by [`Self::register_caller`] at hostname registration, before
-    /// the box has a lease, so the join is ready the moment it attaches.
-    callers: HashMap<SessionId, CallerFacts>,
     /// The sessions registered as `HostNet` boxes
     /// ([`Self::register_host_net`]). On a VM node the host answers their
     /// names, so this registry's zone holds no address for them.
@@ -1168,7 +1112,6 @@ impl HostnameRegistry {
             by_host: HashMap::new(),
             by_session: HashMap::new(),
             own: HashMap::new(),
-            callers: HashMap::new(),
             host_net: HashSet::new(),
             by_lease: HashMap::new(),
             zone_track: ZoneTrack::default(),
@@ -1415,61 +1358,6 @@ impl HostnameRegistry {
             .map(|route| self.register(session_id, session_name, route))
     }
 
-    /// Records the facts that check this session as the *caller* of a proxied
-    /// request (NET-070): its name and its egress declaration, as launch
-    /// recorded it, over the switch its own relay is attached to — so the
-    /// rules a request from it is put to are the ones its own outbound frames
-    /// are decided by, exactly as a direct connection from it would be. The
-    /// declaration is held uncompiled and the rules are built at the join
-    /// ([`Self::caller_at`]): recorded here at hostname registration, before
-    /// the box has a lease, and completed by the lease that names it once the
-    /// attach path reports one ([`Self::report_own_address`], which maps the
-    /// lease onto the stable id).
-    pub fn register_caller(
-        &mut self,
-        session_id: SessionId,
-        session_name: &str,
-        policy: &BoxPolicy,
-        subnet: SwitchSubnet,
-        hostname_proxy_port: Option<u16>,
-    ) {
-        self.callers.insert(
-            session_id,
-            CallerFacts {
-                name: session_name.to_string(),
-                policy: policy.clone(),
-                subnet,
-                hostname_proxy_port,
-            },
-        );
-    }
-
-    /// The live caller at `lease`, if one is (NET-070): the session whose box
-    /// holds that lease, with its name and its compiled egress rules — built
-    /// here, from the declaration recorded at registration and the `lease`
-    /// that names it, by the same compilation the relay's gate makes
-    /// ([`super::switch::compiled_egress`]), so the caller's rules carry the
-    /// lease a request from it is put to as the one source its frames may
-    /// carry (NET-084) and the two surfaces decide by one rule set (NET-071).
-    /// `None` when the lease names no session — which is what a host-side
-    /// caller (the developer's browser, the daemon's own lanes) is, and what a
-    /// host-address session is too: neither has a box on the switch.
-    #[must_use]
-    pub fn caller_at(&self, lease: Ipv4Addr) -> Option<Caller> {
-        let id = self.by_lease.get(&lease)?;
-        let facts = self.callers.get(id)?;
-        Some(Caller {
-            lease,
-            name: facts.name.clone(),
-            egress: super::switch::compiled_egress(
-                Some(&facts.policy),
-                facts.subnet,
-                lease,
-                facts.hostname_proxy_port,
-            ),
-        })
-    }
-
     /// Numbers a host launch of `session_id`, and makes that number the
     /// box's current launch.
     /// The host's loop passes it to [`Self::mark_host_stopped`], so the loop
@@ -1669,7 +1557,6 @@ impl HostnameRegistry {
         if let Some(own) = self.own.remove(&session_id) {
             self.by_lease.remove(&own.lease);
         }
-        self.callers.remove(&session_id);
         self.host_net.remove(&session_id);
         self.host_launches.remove(&session_id);
         self.stopped.remove(&session_id);
@@ -3835,7 +3722,7 @@ mod tests {
 
         assert_eq!(HOSTNAME_SUFFIX, "min.internal");
         assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
-        assert_eq!(crate::net::switch::HOST_MIN_INTERNAL, "host.min.internal");
+        assert_eq!(HOST_ROW_NAME, "host.min.internal");
         assert_eq!(sandbox::HOST_MIN_INTERNAL, HOST_ROW_NAME);
     }
 

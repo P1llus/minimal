@@ -4938,7 +4938,7 @@ impl BoxManager {
                     .register_own_ip(
                         successor,
                         &name,
-                        crate::net::switch::declared_request_ports(Some(&record.policy)),
+                        crate::net::dns::declared_request_ports(Some(&record.policy)),
                     )
                     .is_some(),
                 _ => false,

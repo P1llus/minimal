@@ -9880,20 +9880,14 @@ async fn expose_allow_publishes_and_lists() {
         .write()
         .expect("registry lock")
         .report_own_address(web, "listweb", switch, std::collections::BTreeMap::new());
-    // Before the expose, the proxy refuses the port with the refusal a
-    // direct connection gets: the box published nothing at it.
-    let before = {
-        let route = hostnames
-            .read()
-            .expect("registry lock")
-            .resolve("listweb.min.internal")
-            .expect("the box's name resolves");
-        crate::net::switch::proxied_request_verdict(None, &route, 3000)
-    };
-    assert!(
-        matches!(before, crate::net::switch::ProxiedRequest::Refused(_)),
-        "an unpublished port is refused through the proxy: {before:?}"
-    );
+    // Before the expose the box's route carries nothing at the port.
+    let before = hostnames
+        .read()
+        .expect("registry lock")
+        .resolve("listweb.min.internal")
+        .expect("the box's name resolves")
+        .upstream(3000);
+    assert_eq!(before, None, "an unpublished port routes nowhere");
     assert!(!gate.admits_tcp(3000));
     let sock = handle
         .net_switch()
@@ -10000,8 +9994,8 @@ async fn expose_allow_publishes_and_lists() {
     );
     let local: std::net::SocketAddr = mapping.local.parse().expect("the mapping names a socket");
     assert_eq!(
-        crate::net::switch::proxied_request_verdict(None, &route, 3000),
-        crate::net::switch::ProxiedRequest::Forward(local),
+        route.upstream(3000),
+        Some(local),
         "the proxy forwards the exposed port to the forward the publish bound"
     );
     // The fake forwarder bound nothing, so this test stands in for the box
@@ -10025,10 +10019,7 @@ async fn expose_allow_publishes_and_lists() {
     let proxy_addr = proxy.local_addr().expect("the proxy has an address");
     crate::traced::spawn(crate::net::proxy::serve(
         proxy,
-        crate::net::proxy::Router::new(
-            std::sync::Arc::clone(&hostnames),
-            crate::net::switch::proxied_request_verdict,
-        ),
+        crate::net::proxy::Router::new(std::sync::Arc::clone(&hostnames)),
     ));
     let reached = crate::net::proxy::proxy_get(proxy_addr, "listweb.min.internal:3000").await;
     assert!(

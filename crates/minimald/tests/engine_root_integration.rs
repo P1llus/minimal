@@ -11,7 +11,7 @@
 
 use std::{
     io::{Read as _, Write as _},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -345,6 +345,35 @@ impl Daemon {
         )
     }
 
+    /// Starts a command in the box that runs until its client is ended.
+    fn run_in(&self, name: &str, argv: &[&str]) -> Running {
+        let child = Command::new(min_binary())
+            .arg("--minimal-dir")
+            .arg(&self.state)
+            .args(["--no-input", "box", "exec", name, "--"])
+            .args(argv)
+            .current_dir(&self.project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run min");
+        Running(child)
+    }
+
+    /// The loopback address the host reaches the box's published ports at.
+    fn published_address(&self, name: &str) -> Ipv4Addr {
+        let listing = self.min(&["ls"]);
+        listing
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace().skip(1);
+                (words.next() == Some(name)).then(|| words.next())?
+            })
+            .find_map(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("no published address for {name} in:\n{listing}"))
+    }
+
     fn log(&self) -> String {
         std::fs::read_to_string(self.state.with_file_name("minimald.log")).unwrap_or_default()
     }
@@ -390,6 +419,42 @@ impl Daemon {
             .join(own.trim_end_matches("/supervisor"))
             .clone()
     }
+}
+
+/// A command running in a box. Ending its client ends it.
+struct Running(Child);
+
+impl Running {
+    fn end(mut self) {
+        self.signal();
+        let _reaped = self.0.wait();
+    }
+
+    fn signal(&self) {
+        let _signalled = Command::new("kill").arg(self.0.id().to_string()).status();
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
+/// Whether a connection to `at` is accepted and then kept. A forward whose
+/// box end refuses is accepted too, and closed at once.
+fn stays_open(at: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&at, Duration::from_secs(2)) else {
+        return false;
+    };
+    let _set = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    matches!(
+        stream.read(&mut [0u8; 1]),
+        Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    )
 }
 
 impl Drop for Daemon {
@@ -635,6 +700,129 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     wait_for("the box's cgroup to go", Duration::from_secs(15), || {
         std::fs::read_dir(&boxes).is_ok_and(|d| d.count() < before)
     });
+}
+
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_box_with_its_own_address_is_judged_published_and_named() {
+    if !gated("a_box_with_its_own_address_is_judged_published_and_named") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let _addrs = LoopbackAddrs::add();
+    let loader = Loader::start(dir.path());
+    let upstream = Upstream::start();
+    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
+    // The virtual network dials these from the host, where they are local.
+    let port = targets(&[v4(PUBLIC4), v4(WILD4)], v4(PUBLIC4));
+    let daemon = Daemon::start(dir.path(), &loader.socket, Some(upstream.at));
+
+    // Fills the package cache, which a restricted box cannot.
+    daemon.activate("open", &["--network", "host_ip"]);
+
+    let subnet = format!("{PUBLIC4}/32");
+    let out = daemon.activate(
+        "web",
+        &[
+            "--network",
+            "own_ip",
+            "--allow-subnets",
+            &subnet,
+            "--allow-dns-hosts",
+            "a.wild.test",
+            "--ingress",
+            "18080:8080",
+            "--dynamic-ingress",
+            "allow",
+            "--dynamic-range",
+            "3000-3010",
+        ],
+    );
+
+    // Egress: the listed subnet, then the listed name, and nothing else.
+    let public = PUBLIC4.to_string();
+    let wild = WILD4.to_string();
+    assert_eq!(daemon.connect("web", &public, port).trim(), "ok", "{out}");
+    let refused = daemon.connect("web", &wild, port);
+    assert!(refused.contains(REFUSED), "{refused}");
+    assert_eq!(daemon.connect("web", "a.wild.test", port).trim(), "ok");
+    let unlisted = daemon.connect("web", "allowed.test", port);
+    assert_ne!(unlisted.trim(), "ok", "{unlisted}");
+    let events = daemon.min(&["box", "events", "web"]);
+    assert!(events.contains("net_refused"), "{events}");
+    assert!(events.contains("name_not_allowed"), "{events}");
+
+    // Ingress: the declared port, a port the box listens on inside the
+    // range, and not a loopback listener or a port nobody published.
+    let declared = daemon.run_in(
+        "web",
+        &[
+            "git",
+            "daemon",
+            "--listen=0.0.0.0",
+            "--port=8080",
+            "--base-path=/tmp",
+        ],
+    );
+    let listening = daemon.run_in(
+        "web",
+        &[
+            "git",
+            "daemon",
+            "--listen=0.0.0.0",
+            "--port=3005",
+            "--base-path=/tmp",
+        ],
+    );
+    let _loopback_only = daemon.run_in(
+        "web",
+        &[
+            "git",
+            "daemon",
+            "--listen=127.0.0.1",
+            "--port=3006",
+            "--base-path=/tmp",
+        ],
+    );
+    let published = daemon.published_address("web");
+    let at = |port: u16| SocketAddr::new(IpAddr::V4(published), port);
+    wait_for("the declared port", Duration::from_secs(20), || {
+        stays_open(at(18080))
+    });
+    wait_for("the listening port", Duration::from_secs(20), || {
+        stays_open(at(3005))
+    });
+    assert!(
+        !stays_open(at(3006)),
+        "a loopback listener is not published"
+    );
+    assert!(!stays_open(at(3999)), "nothing published this port");
+    listening.end();
+    wait_for("the withdrawal", Duration::from_secs(20), || {
+        TcpStream::connect_timeout(&at(3005), Duration::from_secs(2)).is_err()
+    });
+
+    // A peer that lists the box by name is told its address on the
+    // virtual network and reaches the port it declared. It has no other
+    // egress.
+    daemon.activate(
+        "peer",
+        &[
+            "--network",
+            "own_ip",
+            "--allow-dns-hosts",
+            "web.min.internal",
+        ],
+    );
+    let told = daemon.exec("peer", "getent hosts web.min.internal; true");
+    assert!(told.contains("100.64."), "{told}");
+    assert_eq!(
+        daemon.connect("peer", "web.min.internal", 8080).trim(),
+        "ok"
+    );
+    let refused = daemon.connect("peer", &public, port);
+    assert!(refused.contains(REFUSED), "{refused}");
+    drop(declared);
 }
 
 #[test]

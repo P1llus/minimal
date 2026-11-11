@@ -46,7 +46,6 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 use super::policy::Direction;
-use super::switch::ProxiedRequest;
 
 /// The port the host-side egress/DNS proxy listens on (TC3): the documented
 /// default the recipes that export `HTTP(S)_PROXY` assume. A daemon started
@@ -94,23 +93,11 @@ const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 pub trait HostRoute: Send + Sync + 'static {
     /// Resolves a `Host:`-header host to the route its requests forward on.
     fn resolve_host(&self, host: &str) -> Option<super::dns::Route>;
-
-    /// The live caller at a switch lease (NET-070): the session whose box
-    /// holds `lease`, with the compiled egress rules its own outbound frames
-    /// are decided by — what a proxied request from that box is put to,
-    /// exactly as a direct connection from it would be. `None` when no live
-    /// box holds the lease, which is what a host-side peer is (the developer's
-    /// browser, the daemon's own lanes).
-    fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller>;
 }
 
 impl HostRoute for HostnameRegistry {
     fn resolve_host(&self, host: &str) -> Option<super::dns::Route> {
         self.resolve(host)
-    }
-
-    fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller> {
-        self.caller_at(lease)
     }
 }
 
@@ -129,13 +116,6 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
             Err(poisoned) => poisoned.into_inner().resolve(host),
         }
     }
-
-    fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller> {
-        match self.read() {
-            Ok(guard) => guard.caller_at(lease),
-            Err(poisoned) => poisoned.into_inner().caller_at(lease),
-        }
-    }
 }
 
 /// The rule a loopback-only refusal names in its `network policy violation`
@@ -149,20 +129,10 @@ pub const LOOPBACK_ONLY_LISTENER_RULE: &str = "loopback-only listener";
 pub const LOOPBACK_ONLY_LISTENER_REASON: &str =
     "The box listens on this port at 127.0.0.1 only. Bind it to 0.0.0.0 to reach it by name.";
 
-/// The admit-or-drop decision every proxied request is put to before the
-/// proxy dials anything (NET-069, NET-070, NET-071) — the relay's own verdict,
-/// [`super::switch::proxied_request_verdict`], so the hostname-routing surface
-/// gives no reach a direct connection would not. Typed as a plain function so
-/// the router stays a small `Clone` value handed to every connection task.
-pub type SharedVerdict = fn(Option<&super::dns::Caller>, &super::dns::Route, u16) -> ProxiedRequest;
-
 /// The shared routing core: maps an HTTP authority (`host` or `host:port`) to
 /// the upstream socket address a request forwards to.
 pub struct Router<T> {
     table: Arc<T>,
-    /// The verdict each request is put to (see [`SharedVerdict`]), applied
-    /// before the proxy dials the upstream.
-    verdict: SharedVerdict,
 }
 
 // Manual `Clone` so a `Router` is cheap to hand to each connection task without
@@ -171,18 +141,15 @@ impl<T> Clone for Router<T> {
     fn clone(&self) -> Self {
         Self {
             table: Arc::clone(&self.table),
-            verdict: self.verdict,
         }
     }
 }
 
 impl<T: HostRoute> Router<T> {
-    /// Builds a router over a shared host-routing table, deciding each request
-    /// with `verdict` — the relay's own
-    /// [`super::switch::proxied_request_verdict`] in every production caller.
+    /// Builds a router over a shared host-routing table.
     #[must_use]
-    pub fn new(table: Arc<T>, verdict: SharedVerdict) -> Self {
-        Self { table, verdict }
+    pub fn new(table: Arc<T>) -> Self {
+        Self { table }
     }
 
     /// Routes an HTTP authority to its upstream socket address, or `None` if no
@@ -220,13 +187,6 @@ impl<T: HostRoute> Router<T> {
     /// resolved to in its logs.
     fn resolve(&self, host: &str) -> Option<super::dns::Route> {
         self.table.resolve_host(host)
-    }
-
-    /// The live caller at a switch lease ([`HostRoute::caller_at`]) — who a
-    /// proxied request from that address is, and whose egress rules it is put
-    /// to (NET-070).
-    fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller> {
-        self.table.caller_at(lease)
     }
 }
 
@@ -388,8 +348,7 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
         let (client, peer) = listener.accept().await?;
         let router = router.clone();
         crate::traced::spawn(async move {
-            if let Err(error) = handle_connection(client, Some(peer), Asker::Shared, &router).await
-            {
+            if let Err(error) = handle_connection(client, Asker::Shared, &router).await {
                 tracing::debug!(
                     component = "dns-proxy",
                     %peer,
@@ -455,8 +414,7 @@ impl<T: HostRoute> crate::net::engine::BoxProxy for BoxEndpoints<T> {
                     engine,
                 });
                 crate::traced::spawn(async move {
-                    if let Err(error) = handle_connection(client, Some(peer), asker, &router).await
-                    {
+                    if let Err(error) = handle_connection(client, asker, &router).await {
                         tracing::debug!(
                             component = "dns-proxy",
                             %peer,
@@ -507,26 +465,11 @@ struct BoxAsker {
 ///
 /// Every refusal is logged as a warn line that names what is known about the
 /// request.
-async fn handle_connection<C, T>(
-    mut client: C,
-    peer: Option<SocketAddr>,
-    asker: Asker,
-    router: &Router<T>,
-) -> io::Result<()>
+async fn handle_connection<C, T>(mut client: C, asker: Asker, router: &Router<T>) -> io::Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     T: HostRoute,
 {
-    // On the shared listener a peer at a live lease is that box, and every
-    // other peer is a program outside every box, whose egress is not gated
-    // here. A box that shares the node's address never reaches the shared
-    // listener: the policy engine redirects its connection to the box's own
-    // endpoint.
-    let caller = match (&asker, peer) {
-        (Asker::Shared, Some(SocketAddr::V4(peer))) => router.caller_at(*peer.ip()),
-        _ => None,
-    };
-
     // Bound the head read so a client that connects but never sends a complete
     // head cannot occupy this task indefinitely.
     let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut client)).await {
@@ -632,48 +575,25 @@ where
         }
     }
 
-    // The shared verdict, before the proxy dials anything: a request the
-    // switch's own gates would refuse is refused here, where the host, the
-    // session and the port are all in hand, rather than dialed into a gate
-    // that would only drop the SYN — a dropped SYN is a silent connect hang,
-    // not a refusal (NET-001, NET-014, NET-069, NET-070, NET-071).
-    let upstream_addr = match (router.verdict)(caller.as_ref(), &route, port) {
-        ProxiedRequest::Forward(upstream_addr) => upstream_addr,
-        ProxiedRequest::Refused(refusal) => {
-            let reason = match refusal.direction {
-                Direction::Egress => "the caller's egress policy denies this target",
-                Direction::Ingress => "the box has not published this port",
-            };
-            // One warn line per refusal (not rate-limited: a request is a
-            // user action, not a frame flood), in the shape of the relay's
-            // drop line — `direction`, `remote_addr`, `proto`, `dst_port`,
-            // `rule_matched` — beside the proxy's own fields. `session` is
-            // the target and `caller` the caller, the two boxes the relay's
-            // `session_id`/`remote_addr` pair names for the same refusal.
-            tracing::warn!(
-                component = "dns-proxy",
-                host,
-                session = route.session(),
-                caller = caller.as_ref().map_or("none", super::dns::Caller::name),
-                port,
-                // Whether the target published the port, and how: `none`
-                // for an ingress refusal, the source for an egress one.
-                route_source = route
-                    .source(port)
-                    .map_or("none", super::dns::RouteSource::as_str),
-                direction = %refusal.direction,
-                remote_addr = refusal
-                    .other
-                    .map_or_else(|| "none".to_string(), |addr| addr.to_string()),
-                proto = "tcp",
-                dst_port = port,
-                rule_matched = refusal.rule,
-                reason,
-                status = "403 Forbidden",
-                "network policy violation"
-            );
-            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
-        }
+    // A port the target has not published is refused here, where the host,
+    // the session and the port are in hand.
+    let Some(upstream_addr) = route.upstream(port) else {
+        let reason = "the box has not published this port";
+        tracing::warn!(
+            component = "dns-proxy",
+            host,
+            session = route.session(),
+            port,
+            route_source = "none",
+            direction = %Direction::Ingress,
+            proto = "tcp",
+            dst_port = port,
+            rule_matched = ::switch::refusal::NO_INGRESS_MAPPING_RULE,
+            reason,
+            status = "403 Forbidden",
+            "network policy violation"
+        );
+        return write_refusal_status(&mut client, "403 Forbidden", reason).await;
     };
     // NET-071: a host-address box shares loopback with the host, so a port
     // that only a 127.0.0.1 listener holds can be a host service. It is
@@ -714,7 +634,6 @@ where
             component = "dns-proxy",
             host,
             session = route.session(),
-            caller = caller.as_ref().map_or("none", super::dns::Caller::name),
             port,
             route_source = super::dns::RouteSource::Ungated.as_str(),
             direction = %Direction::Ingress,
@@ -1763,21 +1682,14 @@ mod tests {
             .await
             .expect("it accepts afterwards");
     }
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::net::SocketAddrV4;
+    use std::collections::BTreeMap;
     use std::sync::{Mutex, RwLock};
 
-    use boxes::core::egress::{self, FrameVerdict};
-    use boxes::{BoxPolicy, EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId};
+    use ::switch::refusal::NO_INGRESS_MAPPING_RULE;
+    use boxes::{BoxPolicy, IngressPolicy, IpProto, PortMapping, SessionId};
     use tokio::net::TcpSocket;
 
-    use crate::net::SwitchSubnet;
     use crate::net::dns::DEFAULT_HOST_ID;
-    use crate::net::policy::Direction;
-    use crate::net::switch::{
-        NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, declared_request_ports,
-        proxied_request_verdict,
-    };
     use crate::test_harness::CaptureWriter;
 
     /// Proof artifact 1 (registry/proxy routing contract): a `HostNet` PTask's
@@ -1796,7 +1708,7 @@ mod tests {
             .write()
             .unwrap()
             .register_host_net(SessionId::nil(), "myservice");
-        let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
+        let router = Router::new(Arc::clone(&shared));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -1888,7 +1800,7 @@ mod tests {
             .write()
             .unwrap()
             .register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
+        let router = Router::new(Arc::clone(&shared));
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         crate::traced::spawn(serve(proxy, router));
@@ -1922,7 +1834,7 @@ mod tests {
         reg.report_own_address(SessionId::nil(), "web", lease, ports);
         // A host-address box beside it: no lease, plain loopback.
         reg.register_host_net(SessionId::nil(), "static");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         // The URL's published port is translated to the internal one behind it;
         // the HostNet box's port is not translated.
@@ -1968,7 +1880,7 @@ mod tests {
         let mut ports = BTreeMap::new();
         ports.insert(18080, 8080);
         reg.report_own_address(SessionId::nil(), "web", Ipv4Addr::LOCALHOST, ports);
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         // The published external port routes; the internal number behind it and
         // an unrelated port route nowhere.
@@ -2041,7 +1953,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         crate::traced::spawn(serve(proxy, router));
@@ -2104,7 +2016,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         // The legacy form routes exactly as the two-label form does.
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
@@ -2152,7 +2064,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2285,7 +2197,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         // An in-memory client, so the only real socket the proxy waits on is
         // the stalled upstream dial.
@@ -2299,7 +2211,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(60),
-            handle_connection(proxy_side, None, Asker::Shared, &router),
+            handle_connection(proxy_side, Asker::Shared, &router),
         )
         .await
         .expect("the proxy must bound the upstream dial, not wait out the SYN retries")
@@ -2731,7 +2643,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new("dev", false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2786,7 +2698,7 @@ mod tests {
         // Register the host that appears in the URI authority, not the one in
         // the `Host:` header.
         reg.register_host_net(SessionId::nil(), "real");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2845,7 +2757,7 @@ mod tests {
         let backend_port = spawn_backend().await;
         let mut reg = HostnameRegistry::new("dev", false);
         reg.register_host_net(SessionId::nil(), "mysvc");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2902,7 +2814,7 @@ mod tests {
         let backend_port = spawn_backend().await;
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2953,7 +2865,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3086,7 +2998,7 @@ mod tests {
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "box-a");
         reg.register_host_net(SessionId::nil(), "box-b");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3158,7 +3070,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "box-a");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3202,7 +3114,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3238,7 +3150,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3298,7 +3210,7 @@ mod tests {
 
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3418,7 +3330,7 @@ mod tests {
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "box-a");
         reg.register_host_net(SessionId::nil(), "box-b");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         crate::traced::spawn(serve(proxy, router));
@@ -3606,12 +3518,12 @@ mod tests {
         let port = upstream.local_addr().unwrap().port();
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let (buf, guard) = capture_logs();
         let (mut client, proxy_side) = tokio::io::duplex(1024);
         client.write_all(head(port).as_bytes()).await.unwrap();
-        handle_connection(proxy_side, None, Asker::Shared, &router)
+        handle_connection(proxy_side, Asker::Shared, &router)
             .await
             .unwrap();
         drop(guard);
@@ -3820,16 +3732,6 @@ mod tests {
     // connection's drops do.
     // -----------------------------------------------------------------------
 
-    /// The caller's lease stand-in: a loopback address the test can bind a
-    /// client connection from, distinct from the target's. On the switch the
-    /// same move is a real lease — the address the peer of a proxied request
-    /// is, and the key the registry's lease-to-session map names the caller
-    /// by (NET-070).
-    const CALLER_LEASE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-
-    /// A second caller's lease stand-in.
-    const OTHER_LEASE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
-
     /// NET-069's verify line: a proxied request to a port the target box did
     /// not declare is refused with the same refusal a direct connection gets.
     /// The two halves of the claim, from one declaration: the relay's own gate
@@ -3869,7 +3771,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             BTreeMap::from([(18080, backend_port)]),
         );
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let router = Router::new(Arc::new(reg));
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3963,7 +3865,7 @@ mod tests {
         let target = SessionId::parse_str("00000000-0000-0000-0000-000000000071").unwrap();
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
         reg.report_own_address(target, "rtweb", RUNTIME_LEASE, BTreeMap::new());
-        let router = Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict);
+        let router = Router::new(Arc::new(RwLock::new(reg)));
 
         // The box's relay gate, registered under its lease as the relay's
         // spawn registers it: the gate a direct connection meets.
@@ -4054,555 +3956,6 @@ mod tests {
             3,
             "each refusal says the port had no route source, got: {logged}"
         );
-    }
-
-    /// NET-070's verify line: a request through the hostname proxy from a
-    /// caller whose egress rules deny the target is refused — put to the same
-    /// pure verdict the caller's own outbound frames meet on the relay,
-    /// before the proxy dials anything. The denial is the caller's, not the
-    /// request's: a caller whose rules admit the target sends the same
-    /// request and routes.
-    #[tokio::test]
-    async fn proxy_caller_egress_denied() {
-        let backend_port = spawn_backend().await;
-        let subnet = SwitchSubnet::default();
-        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let client = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-        let allowed = SessionId::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
-
-        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
-        // The target: an own-address box publishing one port.
-        reg.report_own_address(
-            web,
-            "web",
-            Ipv4Addr::LOCALHOST,
-            BTreeMap::from([(18080, backend_port)]),
-        );
-        // The callers, as the session actor records them and the attach path
-        // joins them: the egress declaration by stable id, then the lease
-        // that names them — and the rules the proxy checks a request from that
-        // lease against are built at the join, with the lease as their source.
-        for (id, name, lease, policy) in [
-            (client, "client", CALLER_LEASE, egress_denying_the_target()),
-            (
-                allowed,
-                "allowed",
-                OTHER_LEASE,
-                egress_allowing_the_target(),
-            ),
-        ] {
-            reg.register_caller(id, name, &policy, subnet, None);
-            reg.report_own_address(id, name, lease, BTreeMap::new());
-        }
-        let router = Router::new(Arc::new(reg), proxied_request_verdict);
-
-        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
-
-        let (buf, guard) = capture_logs();
-
-        // The caller whose rules deny the target: refused before the proxy
-        // dialed anything — no connect error is named, only the rule.
-        let refused = proxy_get_from(proxy_addr, CALLER_LEASE, "web.min.internal:18080").await;
-        assert!(
-            refused.contains("403 Forbidden"),
-            "expected the denied caller's request to be refused, got: {refused}"
-        );
-
-        // The caller whose rules admit the target: the same request routes.
-        let routed = proxy_get_from(proxy_addr, OTHER_LEASE, "web.min.internal:18080").await;
-        assert!(
-            routed.contains("200 OK"),
-            "expected the allowed caller's same request to route, got: {routed}"
-        );
-
-        drop(guard);
-        let logged = buf.contents();
-        assert!(
-            logged.contains(r#"caller="client""#),
-            "expected the refusal to name the caller, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"session="web""#),
-            "expected the refusal to name the target, got: {logged}"
-        );
-        assert!(
-            logged.contains("port=18080"),
-            "expected the refusal to name the requested port, got: {logged}"
-        );
-        assert!(
-            logged.contains("rule_matched=\"egress-denied-subnet\""),
-            "expected the refusal to carry the rule the caller's own egress drop \
-             logs, got: {logged}"
-        );
-        assert!(
-            logged.contains("direction=egress"),
-            "expected the refusal to carry the egress direction, got: {logged}"
-        );
-        assert!(
-            logged.contains("remote_addr=\"127.0.0.1:18080\""),
-            "expected the refusal to name the refused target, got: {logged}"
-        );
-        assert!(
-            logged.contains("the caller's egress policy denies this target"),
-            "expected the caller-egress reason, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"status="403 Forbidden""#),
-            "expected the refusal to name the status it sent, got: {logged}"
-        );
-        assert!(
-            !logged.contains("the upstream box refused the connection"),
-            "the refusal must happen before the dial, got: {logged}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // NET-071's property (T1): for every network mode, every rule set, and
-    // every request, the hostname proxy's verdict equals the direct
-    // connection's verdict — the caller's egress half decided by the same
-    // pure frame verdict the relay applies (asked here about a real IPv4+TCP
-    // frame built byte by byte), the target's ingress half by the relay's own
-    // gate over the same declaration.
-    // -----------------------------------------------------------------------
-
-    /// The network modes a request's target can stand in (NET-071 ranges over
-    /// host-address and own-address targets alike).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum TargetMode {
-        /// A `HostNet` box: no ingress declaration (launch validation rejects
-        /// one on this mode), no gate, direct connections ungated.
-        HostAddress,
-        /// An `OwnIp` box on a VM host: the daemon is on the switch, so the
-        /// name routes to the box's lease and the request's port is
-        /// translated through the declaration's map.
-        OwnAddressOnSwitch,
-        /// An `OwnIp` box on a native host: the published-loopback model —
-        /// the request's port is the published external one, and the
-        /// session's own registration carries the declared set.
-        OwnAddressNative,
-    }
-
-    /// The caller's egress stances the property ranges over: each is a
-    /// distinct verdict the pure frame verdict returns for an IPv4 TCP frame
-    /// to the target — two admits and the three drops such a frame can earn
-    /// (every IPv4 drop a TCP frame can take).
-    #[derive(Clone, Copy, Debug)]
-    enum CallerStance {
-        /// No egress section: allow-all.
-        NoDeclaration,
-        /// An allow list naming the target's address.
-        AllowsTheTarget,
-        /// A deny list naming the target's address.
-        DeniesTheTarget,
-        /// An allow list naming nothing.
-        AllowsNothing,
-        /// An allow list of protocols that names no TCP.
-        DeclaresUdpOnly,
-    }
-
-    /// The egress policy of one stance, as launch records it.
-    fn stance_egress(stance: CallerStance) -> EgressPolicy {
-        let target = "127.0.0.1/32";
-        match stance {
-            CallerStance::NoDeclaration => EgressPolicy::default(),
-            CallerStance::AllowsTheTarget => EgressPolicy {
-                allow_subnets: Some(vec![target.to_string()]),
-                ..EgressPolicy::default()
-            },
-            CallerStance::DeniesTheTarget => EgressPolicy {
-                deny_subnets: Some(vec![target.to_string()]),
-                ..EgressPolicy::default()
-            },
-            CallerStance::AllowsNothing => EgressPolicy {
-                allow_subnets: Some(vec![]),
-                ..EgressPolicy::default()
-            },
-            CallerStance::DeclaresUdpOnly => EgressPolicy {
-                allow_protocols: Some(vec![IpProto::Udp]),
-                ..EgressPolicy::default()
-            },
-        }
-    }
-
-    /// A minimal Ethernet II + IPv4 + TCP frame from `src` to `dst:port`, built
-    /// byte by byte in the shape the relay's egress leg reads: 14-byte
-    /// Ethernet header, EtherType 0x0800, minimum IPv4 header with protocol 6,
-    /// the source at offset 12, the destination at offset 16, and the L4
-    /// destination port behind the IPv4 header, at `ip[ihl + 2..ihl + 4]` —
-    /// the same offsets `switch::tcp_frame_summary` writes and
-    /// `egress::summarize` reads, so the parity property compares two frames
-    /// that name the same source and port. `src` is the caller's lease, the
-    /// one its compiled rules carry (NET-084).
-    fn tcp_frame_to(src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
-        let mut frame = [0u8; 14 + 20 + 4];
-        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-        let ip = &mut frame[14..];
-        ip[0] = 0x45;
-        ip[9] = 6;
-        ip[12..16].copy_from_slice(&src.octets());
-        ip[16..20].copy_from_slice(&dst.octets());
-        ip[22..24].copy_from_slice(&port.to_be_bytes());
-        frame.to_vec()
-    }
-
-    proptest! {
-        /// NET-071's verify line: the proxy's verdict for a request equals
-        /// the direct connection's verdict for it — the caller's egress rules
-        /// applied to a frame to the target, then the target's declared
-        /// ports — whatever the target's network mode, the caller's rule set,
-        /// and the requested port are. The addresses are loopback stand-ins
-        /// (the target's lease and the caller's, as the tests above use them);
-        /// the verdicts are pure over them, so the property ranges over the
-        /// modes, rule sets and requests the property names.
-        #[test]
-        fn proxy_parity_across_network_modes(
-            mode in prop::sample::select(vec![
-                TargetMode::HostAddress,
-                TargetMode::OwnAddressOnSwitch,
-                TargetMode::OwnAddressNative,
-            ]),
-            stance in prop::sample::select(vec![
-                CallerStance::NoDeclaration,
-                CallerStance::AllowsTheTarget,
-                CallerStance::DeniesTheTarget,
-                CallerStance::AllowsNothing,
-                CallerStance::DeclaresUdpOnly,
-            ]),
-            // The target's published ports: bit i set publishes external
-            // port 1024+i forwarding to internal port 8000+i.
-            published in 0u8..=15,
-            // Whether an own-address target declares an ingress section at
-            // all. `boxes::validate_policy` accepts an `OwnIp` record with
-            // none, whose posture is deny-all — so the property ranges over
-            // the absent declaration too, and every own-address path that
-            // fills the registry must carry it as the empty set it is, never
-            // as "no gate" (the value that means a host-address box).
-            declares_ingress in prop::bool::ANY,
-            // Whether the request comes from a box — whose egress rules the
-            // request is put to — or from a host-side peer, whose egress is
-            // ungated here exactly as its direct connections are.
-            from_a_box in prop::bool::ANY,
-            // The ports the target published at runtime: bit 0 exposes port
-            // 3000 (`min net expose` decided `allow`), bit 1 publishes port
-            // 3001 for a listener. Only an own-address box has a gate to
-            // admit them on.
-            runtime in 0u8..=3,
-            // The requested port: one of the publishable externals, one of the
-            // internal ports behind them, a runtime one, or an unrelated one.
-            request_port in prop::sample::select(vec![
-                1024u16, 1025, 1026, 1027, 8000, 8001, 8002, 8003, 3000, 3001, 9000,
-            ]),
-        ) {
-            let subnet = SwitchSubnet::default();
-            let mappings: Vec<PortMapping> = (0..4u8)
-                .filter(|i| published & (1 << i) != 0)
-                .map(|i| PortMapping {
-                    external_port: 1024 + u16::from(i),
-                    internal_port: 8000 + u16::from(i),
-                    proto: IpProto::Tcp,
-                })
-                .collect();
-            // The target's declaration. A host-address box cannot carry one
-            // (launch validation rejects it); an own-address box carries
-            // exactly its mappings, or no section at all.
-            let target_policy = BoxPolicy {
-                egress: None,
-                ingress: (mode != TargetMode::HostAddress && declares_ingress).then(|| {
-                    IngressPolicy {
-                        port_mappings: mappings.clone(),
-                        dynamic_allowed_range: None,
-                        dynamic_ingress: None,
-                    }
-                }),
-                credentialed_upstream: None,
-                quic443: None,
-            };
-            // The registry, as the session actor and the attach path fill it
-            // for each mode. Loopback stands in for the target's lease; no
-            // other test registers a live gate under it, so the gate below
-            // is the only one the process-wide table holds for it.
-            let target_lease = Ipv4Addr::LOCALHOST;
-            // The target's relay gate, registered under its lease as the
-            // relay's spawn registers it, with the runtime publishes made:
-            // the gate a direct connection to the target meets.
-            let gate = crate::net::ingress_gate::IngressGate::detached(&target_policy);
-            if runtime & 1 != 0 {
-                gate.admit_exposed(3000);
-            }
-            if runtime & 2 != 0 {
-                gate.admit_published(3001);
-            }
-            crate::net::ingress_gate::register(target_lease, &gate);
-            let runtime_ports: BTreeSet<u16> = [(1u8, 3000u16), (2, 3001)]
-                .into_iter()
-                .filter(|(bit, _)| runtime & bit != 0)
-                .map(|(_, port)| port)
-                .collect();
-            // The applied external→internal map the attach path reports: the
-            // declaration's own mappings, so a box with no ingress section
-            // reports an empty map, exactly as the attach path derives it.
-            let applied: BTreeMap<u16, u16> = mappings
-                .iter()
-                .filter(|_| declares_ingress)
-                .map(|m| (m.external_port, m.internal_port))
-                .collect();
-            let target = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-            let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, mode == TargetMode::OwnAddressOnSwitch);
-            match mode {
-                TargetMode::HostAddress => {
-                    reg.register_host_net(target, "web");
-                }
-                TargetMode::OwnAddressOnSwitch => {
-                    reg.report_own_address(target, "web", target_lease, applied);
-                }
-                TargetMode::OwnAddressNative => {
-                    // The creator's hand has published the box's address, as
-                    // `BoxActor::register_hostname` records it; the attach
-                    // path's report and the session's own registration both
-                    // follow it, and neither is a source of the address.
-                    reg.publish_own_address(
-                        target,
-                        "web",
-                        target_lease,
-                        declared_request_ports(Some(&target_policy)),
-                    );
-                    reg.report_own_address(target, "web", target_lease, applied);
-                    // The session's own registration carries the declared
-                    // set, as `BoxActor::register_hostname` passes it.
-                    reg.register_own_ip(
-                        target,
-                        "web",
-                        declared_request_ports(Some(&target_policy)),
-                    );
-                }
-            }
-            // The caller, when the request is a box's: its egress declaration
-            // as the session actor records it, and its lease, which the join
-            // compiles the rules with.
-            let caller = from_a_box.then(|| {
-                let client = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-                reg.register_caller(
-                    client,
-                    "client",
-                    &BoxPolicy {
-                        egress: Some(stance_egress(stance)),
-                        ingress: None,
-                        credentialed_upstream: None,
-                        quic443: None,
-                    },
-                    subnet,
-                    None,
-                );
-                reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
-                reg.caller_at(CALLER_LEASE)
-                    .expect("the reported lease names the registered caller")
-            });
-
-            let route = reg
-                .resolve("web.min.internal")
-                .expect("the target's name resolves");
-
-            // The direct connection's verdict: the caller's egress half on a
-            // real frame to the target, from its own lease, decided by the
-            // same pure verdict the relay applies — over the caller's own
-            // compiled rules, the ones the registry hands the proxy — then
-            // the target's ingress half by its declared ports. A host-side
-            // caller has no egress half: its direct connections are ungated,
-            // so its proxied requests are too.
-            let mut expected = None;
-            if let Some(caller) = &caller {
-                let frame = tcp_frame_to(caller.lease(), route.address(), request_port);
-                if let FrameVerdict::Drop(reason) =
-                    egress::verdict(&egress::summarize(&frame), caller.egress())
-                {
-                    expected = Some(ProxiedRequest::Refused(Refusal {
-                        rule: reason.rule(),
-                        direction: Direction::Egress,
-                        other: Some(SocketAddr::V4(SocketAddrV4::new(
-                            route.address(),
-                            request_port,
-                        ))),
-                    }));
-                }
-            }
-            let expected = expected.unwrap_or_else(|| match route.upstream(request_port) {
-                Some(upstream) => ProxiedRequest::Forward(upstream),
-                None => ProxiedRequest::Refused(Refusal {
-                    rule: NO_INGRESS_MAPPING_RULE,
-                    direction: Direction::Ingress,
-                    other: caller.as_ref().map(|caller| {
-                        SocketAddr::V4(SocketAddrV4::new(caller.lease(), request_port))
-                    }),
-                }),
-            });
-
-            let observed = proxied_request_verdict(caller.as_ref(), &route, request_port);
-            prop_assert_eq!(
-                &observed, &expected,
-                "the proxy's verdict must equal the direct connection's"
-            );
-
-            // The runtime half, held to the gate itself rather than to the
-            // route: an own-address target's runtime port is forwarded, at
-            // the same number, exactly when its gate admits a direct
-            // connection to it and the caller's egress lets the frame out.
-            if mode != TargetMode::HostAddress
-                && (3000..=3001).contains(&request_port)
-                && !matches!(
-                    &observed,
-                    ProxiedRequest::Refused(Refusal { direction: Direction::Egress, .. })
-                )
-            {
-                let reached = matches!(
-                    &observed,
-                    ProxiedRequest::Forward(SocketAddr::V4(up))
-                        if *up == SocketAddrV4::new(target_lease, request_port)
-                );
-                prop_assert_eq!(
-                    reached,
-                    gate.admits_tcp(request_port),
-                    "a runtime port is reached through the proxy exactly when \
-                     the gate admits a direct connection to it"
-                );
-                prop_assert_eq!(reached, runtime_ports.contains(&request_port));
-            }
-
-            // No reach a direct connection would not have: where the target
-            // has a gate, the port the forwarded connection terminates on is
-            // one its own declaration admits. A host-address target has no
-            // gate to compare with — a direct connection to it is ungated, so
-            // its proxied requests are too — so only the two own-address
-            // forms name a port to check.
-            if let ProxiedRequest::Forward(upstream) = &observed
-                && let SocketAddr::V4(up) = upstream
-            {
-                let terminated_on = match mode {
-                    TargetMode::HostAddress => None,
-                    TargetMode::OwnAddressOnSwitch => Some(up.port()),
-                    TargetMode::OwnAddressNative => Some(
-                        // The forwarder carries the published external port;
-                        // the connection terminates on the internal one. A
-                        // runtime port is the same number on both sides.
-                        mappings
-                            .iter()
-                            .find(|m| m.external_port == up.port())
-                            .map(|m| m.internal_port)
-                            .or_else(|| runtime_ports.contains(&up.port()).then_some(up.port()))
-                            .expect("a forwarded request names a published port"),
-                    ),
-                };
-                if let Some(internal) = terminated_on {
-                    prop_assert!(
-                        gate.admits_tcp(internal),
-                        "the proxy forwarded to port {internal}, which the target's gate refuses"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The own-address/absent-ingress case the NET-071 property ranges over
-    /// and must never lose again: a box that declares no ingress — a
-    /// configuration `boxes::validate_policy` accepts on `own_ip` — is
-    /// deny-all on *every* host form, because `None` on a route is the
-    /// *host-address* box's ungated route, and an own-address box with no
-    /// declaration is not one. Both registry paths that build its route are
-    /// checked: the applied external→internal map the attach path reports
-    /// (empty when nothing is declared) and the session's own registration a
-    /// rename or re-finalize re-registers through
-    /// [`crate::net::switch::declared_request_ports`], which read the absent
-    /// declaration as `None` — the host-address value — and so had a native
-    /// host's proxy dial `127.0.0.1:<any port>` for a request the VM host's
-    /// refused (NET-069, NET-071).
-    #[test]
-    fn own_ip_target_with_no_ingress_is_deny_all_on_every_host_form() {
-        // The target's declaration: none, which launch accepts on `own_ip`.
-        let policy = BoxPolicy {
-            egress: None,
-            ingress: None,
-            credentialed_upstream: None,
-            quic443: None,
-        };
-        // The direct half: the relay's own gate for that declaration refuses
-        // every new inbound connection — the own-IP default-block posture.
-        let gate = crate::net::ingress_gate::IngressGate::detached(&policy);
-        assert!(
-            !gate.admits_tcp(18080),
-            "a box that declares no ingress admits no direct connection"
-        );
-
-        let target = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let client = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-        for (on_switch, form) in [(true, "a VM host"), (false, "a native host")] {
-            let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, on_switch);
-            // A caller whose egress admits the target, so the ingress half is
-            // the one that refuses: the refusal names the rule, not a verdict
-            // another half got in first.
-            reg.register_caller(
-                client,
-                "client",
-                &egress_allowing_the_target(),
-                SwitchSubnet::default(),
-                None,
-            );
-            reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
-            let caller = reg
-                .caller_at(CALLER_LEASE)
-                .expect("the reported lease names the registered caller");
-
-            // The creator's hand published the box's address; the attach
-            // path's report — an applied map with no mappings — and then the
-            // session actor's own registration, as a rename makes it, both
-            // follow it: both must leave the route deny-all.
-            reg.publish_own_address(
-                target,
-                "web",
-                Ipv4Addr::LOCALHOST,
-                declared_request_ports(Some(&policy)),
-            );
-            reg.report_own_address(target, "web", Ipv4Addr::LOCALHOST, BTreeMap::new());
-            reg.register_own_ip(target, "web", declared_request_ports(Some(&policy)));
-            let route = reg
-                .resolve("web.min.internal")
-                .expect("an own-address box's name routes");
-
-            assert_eq!(
-                route.declared_ports(),
-                Some(&BTreeSet::new()),
-                "{form}: a box with no ingress declaration is deny-all, not ungated"
-            );
-            assert_eq!(
-                route.upstream(18080),
-                None,
-                "{form}: no port routes to a box that publishes none"
-            );
-
-            // The proxy's verdict is the same refusal for a host-side peer and
-            // for a box whose egress admits the target: the ingress half
-            // alone refuses it, with the rule a direct connection's drop
-            // carries.
-            for caller in [None, Some(caller)] {
-                match proxied_request_verdict(caller.as_ref(), &route, 18080) {
-                    ProxiedRequest::Forward(upstream) => panic!(
-                        "{form}: the proxy forwarded to {upstream}, a port the \
-                         target's own gate refuses"
-                    ),
-                    ProxiedRequest::Refused(refusal) => {
-                        assert_eq!(
-                            refusal.rule, NO_INGRESS_MAPPING_RULE,
-                            "{form}: the refusal must name the ingress rule"
-                        );
-                        assert_eq!(
-                            refusal.direction,
-                            Direction::Ingress,
-                            "{form}: the refusal must be the ingress half's"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// NET-059: two VMs on one host both route their box names through the
@@ -5269,20 +4622,6 @@ mod tests {
         (port, received)
     }
 
-    /// Drives the proxy with a `GET` carrying `Host: <authority>`, the
-    /// connection bound to `from` so the proxy sees that address as the
-    /// request's caller — the loopback stand-in for a box's switch lease.
-    async fn proxy_get_from(proxy_addr: SocketAddr, from: Ipv4Addr, authority: &str) -> String {
-        let socket = TcpSocket::new_v4().unwrap();
-        socket.bind(SocketAddr::new(IpAddr::V4(from), 0)).unwrap();
-        let mut client = socket.connect(proxy_addr).await.unwrap();
-        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
-        client.write_all(request.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        String::from_utf8_lossy(&response).into_owned()
-    }
-
     /// Spawns a one-shot backend on `lease`, at a port the kernel hands it,
     /// that answers every connection with a `200 OK` carrying `body`,
     /// closing when it has — the box each VM's name routes to,
@@ -5450,33 +4789,5 @@ mod tests {
                 }
             }
         });
-    }
-
-    /// A caller's egress declaration that denies exactly the target's address
-    /// (the loopback stand-in the test's boxes live at).
-    fn egress_denying_the_target() -> BoxPolicy {
-        BoxPolicy {
-            egress: Some(EgressPolicy {
-                deny_subnets: Some(vec!["127.0.0.1/32".to_string()]),
-                ..EgressPolicy::default()
-            }),
-            ingress: None,
-            credentialed_upstream: None,
-            quic443: None,
-        }
-    }
-
-    /// A caller's egress declaration that allows the target's address: an
-    /// allow list naming it.
-    fn egress_allowing_the_target() -> BoxPolicy {
-        BoxPolicy {
-            egress: Some(EgressPolicy {
-                allow_subnets: Some(vec!["127.0.0.1/32".to_string()]),
-                ..EgressPolicy::default()
-            }),
-            ingress: None,
-            credentialed_upstream: None,
-            quic443: None,
-        }
     }
 }
