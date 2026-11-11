@@ -7487,7 +7487,6 @@ mod tests {
 
     use boxes::IpProto;
     use switch::SwitchSubnet;
-    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -7790,7 +7789,7 @@ mod tests {
             dynamic_ingress: None,
             dynamic_allowed_range: None,
         };
-        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let withdrawn = registry.table().subscribe_row_withdrawals();
         drop(registry.table().subscribe_row_withdrawals());
         let web = registry
             .register_client_box(spec("web"))
@@ -7833,7 +7832,7 @@ mod tests {
     #[test]
     fn a_withdrawn_rows_addresses_stay_unregistrable_until_its_revocation_ends() {
         let registry = BoxRegistry::new(SUBNET);
-        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let withdrawn = registry.table().subscribe_row_withdrawals();
         let web = registry
             .register_client_box(ClientBoxSpec {
                 name: "web".to_string(),
@@ -7913,7 +7912,7 @@ mod tests {
     #[test]
     fn a_client_registration_waits_for_the_revocation_holding_its_address() {
         let registry = BoxRegistry::new(SUBNET);
-        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let withdrawn = registry.table().subscribe_row_withdrawals();
         let spec = |name: &str| ClientBoxSpec {
             name: name.to_string(),
             ingress_ports: vec![8080],
@@ -7955,7 +7954,7 @@ mod tests {
     #[test]
     fn a_registration_refused_for_a_held_address_spends_no_switch_address() {
         let registry = BoxRegistry::new(SUBNET);
-        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let withdrawn = registry.table().subscribe_row_withdrawals();
         let spec = |name: &str| ClientBoxSpec {
             name: name.to_string(),
             ingress_ports: vec![8080],
@@ -8046,15 +8045,6 @@ mod tests {
                 .is_some(),
             "the creator's destroy removes the row"
         );
-    }
-
-    /// Polls `holds` until it does, failing the test after five seconds.
-    fn wait_until(holds: impl Fn() -> bool, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !holds() {
-            assert!(Instant::now() < deadline, "{what}: not within 5 s");
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// The registry a test persists at `dir`, under its default plan.
@@ -11219,10 +11209,6 @@ mod tests {
             registry.holds_host_ip_id(first),
             "the renamed box's id stays in the minted set"
         );
-    }
-
-    fn resident_sessions(registry: &BoxRegistry) -> Vec<boxes::SessionId> {
-        registry.resident_host_ip_boxes().into_iter().collect()
     }
 
     /// The creator's resume of `row`, as the control door makes it.

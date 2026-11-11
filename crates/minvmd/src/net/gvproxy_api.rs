@@ -309,12 +309,14 @@ pub(crate) mod testing {
                                     500,
                                     format!("listen tcp {local}: bind: address already in use"),
                                 )
-                            } else if state.forwards.contains_key(&key) {
-                                (500, "proxy already running".to_string())
-                            } else {
+                            } else if let std::collections::btree_map::Entry::Vacant(e) =
+                                state.forwards.entry(key)
+                            {
                                 let remote = body["remote"].as_str().unwrap().to_string();
-                                state.forwards.insert(key, remote);
+                                e.insert(remote);
                                 (200, String::new())
+                            } else {
+                                (500, "proxy already running".to_string())
                             }
                         } else if state.forwards.remove(&(local, proto)).is_some() {
                             (200, format!("{{\"closed\":{}}}", state.closed))

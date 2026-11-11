@@ -864,7 +864,7 @@ impl Publisher {
         let _turn = self.turn();
         for forward in owed {
             // The forward may have gone while the turn was awaited.
-            if !self.ledger().forwards.iter().any(|held| *held == forward) {
+            if !self.ledger().forwards.contains(&forward) {
                 continue;
             }
             if self.expose(&forward).is_ok() {

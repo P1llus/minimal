@@ -1,80 +1,78 @@
 //! The host exposures: the ports at which a box reaches the host through
 //! `host.min.internal`, read from the `[host-exposures]` table of the client
-//! `config.toml` (design §7.1, NET-159, NET-161, NET-162).
+//! `config.toml`.
 //!
-//! The design holds the host alias default-deny except explicitly
-//! configured host exposures. The table names each exposure by a key of the
-//! user's choice. The value is an inline table with a port and a protocol,
-//! and the protocol defaults to `tcp`:
+//! The table names each exposure by a key of the user's choice. The value is
+//! an inline table with a port and a protocol, and the protocol defaults to
+//! `tcp`:
 //!
 //! ```toml
 //! [host-exposures]
 //! postgres = { proto = "tcp", port = 5432 }
 //! ```
 //!
-//! The gate decides each flow by the current table (NET-161). The handle
-//! re-reads the file when its stat changes, as `bep serve` does for
-//! `[secret-store-rules]`, so an entry added opens its port and an entry
-//! removed closes it, with no restart. The handle stats the file at most
-//! once per [`RECHECK`], because the gate asks at every frame to the alias.
+//! The stream door asks for the current table at every stream. The handle
+//! re-reads the file when its stat changes, so an entry added opens its port
+//! and an entry removed closes it, with no restart. The handle stats the
+//! file at most once per [`RECHECK`].
 //!
-//! Minimal's own listeners are never exposures (NET-162). The gate hands
-//! the handle the listeners that hold a port at each decision
-//! ([`Holder`]). An entry at such a port is refused when the table loads,
-//! and an entry whose port a listener binds later is shadowed from that
-//! decision on. The daemon log names the entry and the listener, once.
+//! Minimal's own listeners are never exposures. The caller hands the handle
+//! the listeners that hold a port at each decision ([`Holder`]). An entry at
+//! such a port is refused when the table loads, and an entry whose port a
+//! listener binds later is shadowed from that decision on. The daemon log
+//! names the entry and the listener, once.
 //!
 //! The file is read through the shared reader in `client-config`
-//! ([`HostExposuresFile`]), the one the native session daemon reads it
-//! through, so both daemons handle a bad entry one way. The reader fails
-//! closed. A missing file, a file that does not parse, or a table that is
-//! not a table gives no exposure, and the alias stays closed at every port.
-//! An entry that is not a table with a port from 1 to 65535 and a protocol
-//! of `tcp` or `udp` is skipped, and the daemon log names it.
+//! ([`HostExposuresFile`]). The reader fails closed: a missing file, a file
+//! that does not parse, or a table that is not a table gives no exposure.
+//! The stream door carries TCP only, so a `udp` entry opens nothing.
+
+#![cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP};
 use client_config::host_exposures::{HOST_EXPOSURES_TABLE, HostExposuresFile};
 
-/// The longest time a changed table waits before the gate decides by it:
-/// the handle stats the file at most once in this interval.
-pub(crate) const RECHECK: Duration = Duration::from_secs(1);
+/// The IP protocol numbers an exposure can name.
+pub(crate) const PROTOCOL_TCP: u8 = 6;
+pub(crate) const PROTOCOL_UDP: u8 = 17;
 
-/// One port set as inclusive port ranges, `(lo, hi)`: the baseline set's
-/// own openings at the alias.
-pub(crate) type PortRange = (u16, u16);
+/// The longest time a changed table waits before a stream is decided by
+/// it: the handle stats the file at most once in this interval.
+pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
 /// One host exposure: the IP protocol and the port a table entry opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostExposure {
-    /// The IP protocol number: [`IPPROTO_TCP`] or [`IPPROTO_UDP`].
+    /// The IP protocol number: [`PROTOCOL_TCP`] or [`PROTOCOL_UDP`].
     pub(crate) protocol: u8,
     pub(crate) port: u16,
 }
 
 impl HostExposure {
     /// A TCP exposure at `port`.
+    #[cfg(test)]
     #[must_use]
     pub const fn tcp(port: u16) -> Self {
         Self {
-            protocol: IPPROTO_TCP,
+            protocol: PROTOCOL_TCP,
             port,
         }
     }
 
     /// A UDP exposure at `port`.
+    #[cfg(test)]
     #[must_use]
     pub const fn udp(port: u16) -> Self {
         Self {
-            protocol: IPPROTO_UDP,
+            protocol: PROTOCOL_UDP,
             port,
         }
     }
 
-    /// Whether a frame with this IP protocol and destination port matches.
+    /// Whether a connection of this IP protocol to this port matches.
     #[must_use]
     pub(crate) fn admits(self, protocol: u8, port: u16) -> bool {
         self.protocol == protocol && self.port == port
@@ -89,12 +87,12 @@ pub(crate) struct Entry {
 }
 
 /// One of Minimal's own listeners or sockets on the host, with the ports
-/// it holds (NET-162). An entry at a held port is never an exposure: it
+/// it holds . An entry at a held port is never an exposure: it
 /// hands a box the listener in place of a service of the user's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Holder {
     /// The ports the listener holds, inclusive.
-    pub(crate) ports: PortRange,
+    pub(crate) ports: (u16, u16),
     /// The IP protocol it holds them for, `None` for both.
     pub(crate) protocol: Option<u8>,
     /// The listener as the daemon log names it.
@@ -120,26 +118,12 @@ impl Holder {
 pub(crate) const HOSTNAME_PROXY: &str = "the hostname proxy";
 /// The box-name answerer, as the daemon log names it.
 pub(crate) const ANSWERER: &str = "the box-name answerer";
-/// The node-local Box Egress Proxy, as the daemon log names it.
-pub(crate) const BOX_EGRESS_PROXY: &str = "the Box Egress Proxy";
-/// A node-plane baseline endpoint at the alias, as the daemon log names it.
-pub(crate) const BASELINE_ENDPOINT: &str = "a node-plane baseline endpoint at host.min.internal";
 
-/// Minimal's own listeners and sockets that hold a port at the host alias,
-/// as the gate knows them at one flow (NET-162):
-///
-/// - the hostname proxy at each port in `hostname_proxy`: the node row's
-///   assigned port, an operator's pin or a drawn fallback;
-/// - the box-name answerer at the port each VM-backed node reserves for it;
-/// - the node-local Box Egress Proxy at its listener's port;
-/// - the node-plane baseline endpoints at `baseline_alias_ports`, over the
-///   protocol the baseline fetches with.
+/// Minimal's own listeners on the host's loopback: the hostname proxy at
+/// each port it serves on, and the box-name answerer. An exposure at one of
+/// their ports would hand a box Minimal's own control surface.
 #[must_use]
-pub(crate) fn minimal_listeners(
-    hostname_proxy: &[u16],
-    baseline_alias_ports: &[PortRange],
-    baseline_protocol: u8,
-) -> Vec<Holder> {
+pub(crate) fn minimal_listeners(hostname_proxy: &[u16]) -> Vec<Holder> {
     let mut held: Vec<Holder> = hostname_proxy
         .iter()
         .map(|&port| Holder {
@@ -154,22 +138,11 @@ pub(crate) fn minimal_listeners(
         protocol: None,
         name: ANSWERER,
     });
-    let proxy = switch::bep_host::PROXY_PORT;
-    held.push(Holder {
-        ports: (proxy, proxy),
-        protocol: None,
-        name: BOX_EGRESS_PROXY,
-    });
-    held.extend(baseline_alias_ports.iter().map(|&ports| Holder {
-        ports,
-        protocol: Some(baseline_protocol),
-        name: BASELINE_ENDPOINT,
-    }));
     held
 }
 
 /// A shared handle on the current host-exposure table. Clones share one
-/// table, so the gate and the start-up line read the same ports.
+/// table.
 #[derive(Clone)]
 pub struct HostExposures {
     inner: Arc<Inner>,
@@ -326,7 +299,7 @@ impl HostExposures {
 
     /// Asks the shared reader for the table when the recheck interval
     /// passed, and returns the entries when its table changed. The reader
-    /// runs outside this handle's lock, so a slow disk stalls only the frame
+    /// runs outside this handle's lock, so a slow disk stalls only the stream
     /// that found the recheck due, never the other callers.
     fn reload(&self) -> Option<Arc<[Entry]>> {
         let file = self.inner.file.as_ref()?;
@@ -373,14 +346,6 @@ impl HostExposures {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
-
-    /// The current table as the daemon log spells it: one `proto/port` term
-    /// per exposure the last decision opened, and `(none)` for no exposure.
-    #[must_use]
-    pub(crate) fn render(&self) -> String {
-        let held = self.lock().held.clone();
-        render(&self.current(&held))
-    }
 }
 
 impl std::fmt::Debug for HostExposures {
@@ -404,7 +369,7 @@ impl PartialEq for HostExposures {
 impl Eq for HostExposures {}
 
 fn proto_name(exposure: HostExposure) -> &'static str {
-    if exposure.protocol == IPPROTO_UDP {
+    if exposure.protocol == PROTOCOL_UDP {
         "udp"
     } else {
         "tcp"

@@ -6004,27 +6004,6 @@ mod tests {
         );
     }
 
-    /// A row named `web` whose grant admits runtime ports 3000-3999.
-    fn allow_box(sock_path: &std::path::Path) -> RegisteredBox {
-        handed(
-            register(
-                sock_path,
-                &RegisterBoxRequest {
-                    name: "web".to_string(),
-                    ingress_ports: Vec::new(),
-                    egress: None,
-                    credentialed_upstream: None,
-                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
-                    dynamic_allowed_range: Some((3000, 3999)),
-                    hold: false,
-                    task_slots: 0,
-                    host_ip: false,
-                },
-            )
-            .expect("the registration is answered"),
-        )
-    }
-
     /// A ticket whose thread panics before its turn still hands the turn
     /// on through its drop: the tickets behind it apply, and the door's
     /// order never wedges.
@@ -6601,29 +6580,6 @@ mod tests {
         assert_eq!(json["box_id"], "019a2b3c4d5e7f608192a3b4c5d6e7f8");
     }
 
-    /// Registers one box on the host socket for the audit report tests and
-    /// answers its row: a plain box, so its switch address is a row key the
-    /// guest door's reports can name.
-    fn register_audited_box(sock_path: &std::path::Path, name: &str) -> RegisteredBox {
-        handed(
-            register(
-                sock_path,
-                &RegisterBoxRequest {
-                    name: name.to_string(),
-                    ingress_ports: vec![],
-                    egress: None,
-                    credentialed_upstream: None,
-                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
-                    dynamic_allowed_range: Some((3000, 3999)),
-                    hold: false,
-                    task_slots: 0,
-                    host_ip: false,
-                },
-            )
-            .expect("the registration is answered"),
-        )
-    }
-
     /// The host's audit log beside `sock_path`, parsed one record per line.
     fn host_audit_records(sock_path: &std::path::Path) -> Vec<serde_json::Value> {
         let logged = std::fs::read_to_string(audit_log_path(sock_path)).unwrap_or_default();
@@ -6689,46 +6645,6 @@ mod tests {
         assert_eq!(bound[0]["proto"], "tcp");
         assert_eq!(bound[0]["origin"], "expose");
         assert_eq!(bound[0]["asked"], true);
-    }
-
-    /// The reconcile thread's read, as a test drives it: each call says it
-    /// started on `calls`, then waits for the test's answer on `answers`.
-    type GuestList = anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>;
-
-    fn scripted_guest_reader(
-        calls: std::sync::mpsc::Sender<()>,
-        answers: std::sync::mpsc::Receiver<GuestList>,
-    ) -> impl FnMut() -> GuestList + Send + 'static {
-        move || {
-            calls
-                .send(())
-                .map_err(|_| anyhow::anyhow!("the test ended"))?;
-            answers
-                .recv()
-                .map_err(|_| anyhow::anyhow!("the test ended"))?
-        }
-    }
-
-    fn reconcile_session(n: u8) -> boxes::SessionId {
-        boxes::SessionId::parse_str(&format!("00000000-0000-4000-8000-0000000000{n:02}"))
-            .expect("a session id")
-    }
-
-    fn resident_host_ip_sessions(registry: &BoxRegistry) -> Vec<boxes::SessionId> {
-        registry.resident_host_ip_boxes().into_iter().collect()
-    }
-
-    /// Polls until the resident `host_ip` boxes are `want`, or panics.
-    fn wait_for_resident(registry: &BoxRegistry, want: &[boxes::SessionId]) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while resident_host_ip_sessions(registry) != want {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the resident host_ip boxes stayed {:?}, not {want:?}",
-                resident_host_ip_sessions(registry)
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// Past the door's connection cap a connection is refused on the

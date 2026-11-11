@@ -40,6 +40,7 @@ pub(crate) mod host_exposures;
 pub(crate) mod proxy_reclaim;
 pub(crate) mod publish;
 mod stale_gvproxy;
+pub(crate) mod stream_door;
 pub(crate) mod uplink;
 #[cfg_attr(not(minvmd_libkrun), allow(unused_imports))]
 pub(crate) use stale_gvproxy::reap_stale_gvproxy;

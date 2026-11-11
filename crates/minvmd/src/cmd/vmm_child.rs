@@ -149,6 +149,15 @@ fn run_vmm() -> Result<()> {
             .context("registering the guest report door's vsock port")?;
     }
 
+    // The stream door's vsock port: the guest daemon opens one connection
+    // per stream it wants carried to the host side.
+    if let Some(stream_sock) = std::env::var_os(crate::net::stream_door::STREAM_DOOR_SOCK_ENV)
+        .filter(|path| !path.is_empty())
+    {
+        ctx.add_vsock_port(minimald_rpc::VM_HOST_STREAM_PORT, &stream_sock)
+            .context("registering the stream door's vsock port")?;
+    }
+
     // The guest telemetry door's vsock port (TEL-034): registered only when
     // the supervisor bound the door, which is what the env names; the
     // in-VM daemon's telemetry records then reach the host over it.

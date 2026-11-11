@@ -1,48 +1,12 @@
-//! The stand-in for the Box Egress Proxy's own acceptor (NET-132, T69) —
-//! test and e2e only, never a production surface.
+//! A stand-in for the credential proxy's acceptor, for tests and for hosts
+//! where the proxy does not run (it keeps its keys in the macOS Keychain).
 //!
-//! The pool in `switch::bep_host` delivers a box's connection by dialing
-//! the proxy's unix socket and writing the per-boot token, then a fixed
-//! header naming the box's own switch address. The proxy that owns that
-//! socket is a later task; until it lands, something has to sit at the end
-//! of the delivery so the e2e lane and the unit tests can read what the
-//! pool actually presents. This module is that something: it binds the
-//! proxy socket path the supervisor names, presents the same refusals the
-//! proxy is promised to, and answers one line naming the source it saw —
-//! the same line shape the switch crate's pool tests accept, so both sides
-//! of the delivery speak one answer format.
-//!
-//! A stand-in must not be a hole. The socket gets the bridge-socket posture
-//! ([`crate::sock`]): a 0700 parent dir and 0600 on the socket itself, so
-//! only the same user can reach it at all. Every connection then proves,
-//! in order, what the pool's delivery is supposed to carry: the peer's uid
-//! against the daemon's own, then — where the kernel names the peer's
-//! process, which Linux does — that pid against the host daemon's, then
-//! the per-boot token, then the delivery header's version. Any mismatch is
-//! refused and audited: the connection is closed without an answer, one
-//! warn line records the reason, and the connection is never presented as
-//! a box. A same-uid host process that finds the socket's path can know
-//! neither the daemon's pid nor the token minted for this boot, so it can
-//! reach the stand-in but never arrive through it.
-//!
-//! Beyond the credentials and the token, the stand-in is the proxy's
-//! attribution rule too (NET-133): it holds the host's attachment table
-//! ([`crate::bep_attach`]) and attributes a connection only to a live box
-//! that table holds an attachment for — a header whose source address
-//! resolves to nothing is refused, whatever else it says — and a box id the
-//! header carries is cross-checked against the attachment the source
-//! resolved to. One id names one box (BEP-070), and the mint cannot make
-//! zero, so a zero id is a header that was never filled from its
-//! attachment: it is refused and audited like a mismatch, exactly as the
-//! pool writes it.
-//!
-//! The supervisor ([`crate::cmd::run`]) starts the stand-in only when
-//! `MINVMD_BEP_STUB` is set in its environment — the e2e lane sets it for
-//! its daemon and nothing else does — and hands the same per-boot token it
-//! wired into the peer over the start-up channel this module receives.
-//! Nothing on a production boot ever listens at the proxy socket path: a
-//! box's connection to the proxy's address is reset there, exactly as an
-//! acceptor that is down is specified to answer (NET-132).
+//! The supervisor binds it behind `MINVMD_BEP_STUB`. It checks what the real
+//! acceptor checks first, the peer's credentials and the boot token, and
+//! reads the delivery header with the proxy's own parser. Like the proxy it
+//! takes the box id the supervisor wrote: the token proves who wrote it. It
+//! answers one line naming what it was presented and closes, and it keeps
+//! every line and every refusal for a test to read.
 
 use std::io::{Read, Write};
 // Both peer-credential reads ask the kernel over the stream's own fd —
@@ -56,21 +20,12 @@ use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use switch::bep_host::{DELIVERY_HEADER_LEN, DELIVERY_HEADER_VERSION, DeliveryHeader, TOKEN_LEN};
-
-use crate::bep_attach::Attachments;
+use bep::listener::{DELIVERY_HEADER_LEN, Delivery, TOKEN_LEN};
 
 /// How long one connection may take to present its token and header. The
 /// pool writes both in one go, so this bound only catches a connection that
 /// is stalling; it must not let one hold the serving thread forever.
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Where the delivery header names the source a flow is presented from:
-/// bytes 17..21, the box's switch address, per the fixed layout
-/// [`DeliveryHeader`] documents. Read straight off the wire bytes because
-/// the type that owns the layout keeps its address as the switch crate's
-/// private stack type, which this crate sees no value of.
-const SOURCE_OCTETS_START: usize = 17;
 
 /// The start-up facts the supervisor hands the stand-in over the channel it
 /// receives at [`spawn`]: the per-boot token minted for this boot — the same
@@ -84,9 +39,6 @@ pub struct StubStart {
     /// The host daemon's pid; on Linux a connection from any other process
     /// is refused before it presents anything.
     pub daemon_pid: u32,
-    /// The host's attachment table, fed by the box registry: what the
-    /// stand-in attributes a delivered connection by.
-    pub attachments: Attachments,
 }
 
 /// What the stand-in holds for its caller: the handle of the serving thread
@@ -158,7 +110,6 @@ pub fn spawn(sock_path: PathBuf, start: Receiver<StubStart>) -> std::io::Result<
                 token: start.token,
                 daemon_pid: start.daemon_pid,
                 daemon_uid: daemon_uid(),
-                attachments: start.attachments,
                 presented: thread_presented,
                 refusals: thread_refusals,
             });
@@ -198,7 +149,6 @@ struct Shared {
     daemon_uid: u32,
     /// The host's attachment table: what a delivered connection is
     /// attributed by (NET-133), looked up through and never written.
-    attachments: Attachments,
     /// The answer lines sent, one per accepted connection.
     presented: Arc<Mutex<Vec<String>>>,
     /// The refusal reasons audited, one per refused connection.
@@ -248,18 +198,6 @@ fn token_matches(presented: &[u8; TOKEN_LEN], expected: &[u8; TOKEN_LEN]) -> boo
         diff |= presented[byte] ^ expected[byte];
     }
     diff == 0
-}
-
-/// The source address a delivered header names, as the octets the
-/// attachment table is keyed by: the box's switch address, the source the
-/// flow is presented from, at [`SOURCE_OCTETS_START`] in the fixed layout
-/// [`DeliveryHeader`] documents.
-fn source_octets(head: &[u8; DELIVERY_HEADER_LEN]) -> [u8; 4] {
-    let mut octets = [0u8; 4];
-    for (dst, src) in octets.iter_mut().zip(head.iter().skip(SOURCE_OCTETS_START)) {
-        *dst = *src;
-    }
-    octets
 }
 
 /// The peer's credentials, the kernel's own answer for who holds the other
@@ -363,42 +301,29 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
         audit(shared, "short");
         return;
     }
-    if head[0] != DELIVERY_HEADER_VERSION {
+    let Some(delivery) = Delivery::parse(&head) else {
         audit(shared, "version");
         return;
-    }
-    let header = DeliveryHeader::parse(&head)
-        .expect("the header slice is exactly DELIVERY_HEADER_LEN bytes long");
-    // The proxy's attribution rule (NET-133): a delivered connection
-    // belongs to a live box the attachment table holds one for, resolved
-    // by the source the flow is presented from. A source that resolves to
-    // nothing is not a box this proxy knows — refused, audited, never
-    // presented, whatever else its header says.
-    let Some(attachment) = shared.attachments.by_source(source_octets(&head)) else {
-        audit(shared, "no_attachment");
-        return;
     };
-    // A box id the header carries is cross-checked against the attachment
-    // the source resolved to: a mismatch names a header claiming another
-    // box's identity, and nothing about it is presented. One id names one
-    // box (BEP-070), and the mint cannot make zero, so a zero id is a
-    // header that was never filled from its attachment — refused and
-    // audited exactly like a mismatch, which is also how the pool writes it.
-    if header.box_id != attachment.box_id() {
+    // The mint cannot make a zero id, so a zero id is a header that was
+    // never filled.
+    if delivery.box_id == [0u8; 16] {
         audit(shared, "box_id");
         return;
     }
     let line = format!(
-        "source={} destination={}\n",
-        header.source, header.destination
+        "box_id={} source={} destination={}\n",
+        crate::bep_attach::BoxIdText(&delivery.box_id),
+        delivery.source,
+        delivery.destination
     );
     if stream.write_all(line.as_bytes()).is_err() {
         return;
     }
     tracing::debug!(
-        source = %header.source,
-        destination = %header.destination,
-        "box egress proxy stand-in answered a delivered connection"
+        source = %delivery.source,
+        destination = %delivery.destination,
+        "credential proxy stand-in answered a delivered connection"
     );
     shared
         .presented
@@ -425,435 +350,98 @@ fn audit(shared: &Shared, reason: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
-    use std::path::Path;
 
-    use switch::SwitchSubnet;
-    use switch::bep_host::test_util::{FIRST_CLIENT_PORT, State, TestLane};
-    use switch::bep_host::{BepWire, DEFAULT_PER_SOURCE_CAP, PROXY_PORT};
+    const TOKEN: [u8; TOKEN_LEN] = [7u8; TOKEN_LEN];
 
-    /// The source address a hand-made presentation claims: a box's address
-    /// on the plan's lease run, the kind of address a host process would
-    /// have to steal to be mistaken for a box.
-    fn claimed_source() -> Ipv4Addr {
-        Ipv4Addr::from(SwitchSubnet::default().first_ptask())
-    }
-
-    /// Present `token` and a header with `version`, `box_id` and `source` to
-    /// the stand-in at `sock` the way the pool's delivery writes one — token
-    /// first, then the fixed header — and return whatever it answered before
-    /// closing. A close with no answer reads as empty however the kernel
-    /// reports it: a refusal that stops reading mid-presentation closes on
-    /// unread bytes, which the kernel reports to the peer as a reset, and a
-    /// refusal decided on the credentials closes at accept, before a byte
-    /// is read — which can land before this side has written, so the
-    /// write itself fails with a broken pipe. The refusal's meaning —
-    /// nothing was answered — is the same every way.
-    fn present(
-        sock: &Path,
-        token: &[u8],
-        version: u8,
-        box_id: &[u8; 16],
-        source: Ipv4Addr,
-    ) -> Vec<u8> {
-        let mut stream = UnixStream::connect(sock).expect("the stand-in's socket accepts");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("a read timeout on the presentation");
-        let mut head = vec![version];
-        head.extend_from_slice(box_id);
-        head.extend_from_slice(&source.octets());
-        head.extend_from_slice(&40_000u16.to_be_bytes());
-        head.extend_from_slice(&[100, 64, 255, 252]); // the proxy's address
-        head.extend_from_slice(&PROXY_PORT.to_be_bytes());
-        assert_eq!(head.len(), DELIVERY_HEADER_LEN);
-        let mut bytes = token.to_vec();
-        bytes.extend_from_slice(&head);
-        match stream.write_all(&bytes) {
-            Ok(()) => {}
-            // Closed before the presentation arrived: a refusal that was
-            // decided at accept. Nothing was answered, and the reason is
-            // in the audit the caller checks next.
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Vec::new(),
-            Err(error) => panic!("the stand-in refused the presentation's bytes: {error}"),
-        }
-        let mut answer = Vec::new();
-        match stream.read_to_end(&mut answer) {
-            Ok(_) => answer,
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => answer,
-            Err(error) => panic!("the stand-in closed its connection unexpectedly: {error}"),
-        }
-    }
-
-    /// Poll `what` until it holds `reason`, or fail the test: the audit is
-    /// written before the connection closes, so the poll needs only the
-    /// serving thread's scheduling, not a window.
-    fn await_refusal(stub: &BepStub, reason: &str) {
-        for _ in 0..100 {
-            if stub.refusals().contains(&reason) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!(
-            "no connection was refused for {reason}: {:?}",
-            stub.refusals()
-        );
-    }
-
-    /// NET-132/T69: a same-uid host process without this boot's token — or
-    /// with the token but the wrong header version, or (on Linux, where the
-    /// kernel names the peer's process) from a process that is not the host
-    /// daemon — is refused and audited, and never arrives as a box: the
-    /// stand-in presents nothing to any of them.
-    #[test]
-    fn host_process_never_arrives_from_a_box_address() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sock = dir.path().join("bep-stub.sock");
-        let token = [0xa7u8; TOKEN_LEN];
+    fn stub(dir: &tempfile::TempDir, daemon_pid: u32) -> (PathBuf, BepStub) {
+        let sock = dir.path().join("bep.sock");
         let (start_tx, start_rx) = std::sync::mpsc::channel();
-        let stub = spawn(sock.clone(), start_rx).expect("the stand-in binds its socket");
+        let stub = spawn(sock.clone(), start_rx).unwrap();
         start_tx
             .send(StubStart {
-                token,
-                daemon_pid: std::process::id(),
-                attachments: Attachments::new(),
+                token: TOKEN,
+                daemon_pid,
             })
-            .expect("the supervisor hands the start facts over the channel");
+            .unwrap();
+        (sock, stub)
+    }
 
-        // The socket carries the bridge-socket posture: 0600, so only the
-        // same user can reach it at all.
-        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&sock).expect("socket"));
-        assert_eq!(mode & 0o777, 0o600, "the stand-in's socket is mode 0600");
-
-        // A same-uid host process with the wrong token: the per-boot token
-        // is the proof of belonging to this boot, and it does not hold it.
-        // Its header carries a minted id — the shape a box's header holds —
-        // so nothing about the token refusal depends on what the id says.
-        let answer = present(
-            &sock,
-            &[0u8; TOKEN_LEN],
-            DELIVERY_HEADER_VERSION,
-            &crate::bep_attach::mint_box_id(),
-            claimed_source(),
-        );
-        assert!(answer.is_empty(), "a wrong token is answered with nothing");
-        await_refusal(&stub, "token");
-
-        // The right token with the wrong header version: refused for the
-        // version, never answered.
-        let answer = present(
-            &sock,
-            &token,
-            0,
-            &crate::bep_attach::mint_box_id(),
-            claimed_source(),
-        );
-        assert!(
-            answer.is_empty(),
-            "a wrong version is answered with nothing"
-        );
-        await_refusal(&stub, "version");
-
-        // Nothing so far was presented as a box.
-        assert!(
-            stub.presented().is_empty(),
-            "no refused connection was presented as a box"
-        );
-
-        // A same-uid host process that is not the host daemon: the pid check
-        // refuses it before it presents anything, token or not. Naming the
-        // peer's process is `SO_PEERCRED`'s, a Linux socket option, so this
-        // leg of the proof runs only there: off Linux the stand-in has no
-        // pid to check (see `peer_credentials`) and the token is the whole
-        // of what a same-uid process must hold. The stand-in here claims a
-        // foreign daemon — init stands in for one — so this test process is
-        // the foreign one.
-        #[cfg(target_os = "linux")]
-        {
-            let foreign_sock = dir.path().join("bep-stub-foreign.sock");
-            let (foreign_tx, foreign_rx) = std::sync::mpsc::channel();
-            let foreign =
-                spawn(foreign_sock.clone(), foreign_rx).expect("the stand-in binds its socket");
-            foreign_tx
-                .send(StubStart {
-                    token,
-                    daemon_pid: 1,
-                    attachments: Attachments::new(),
-                })
-                .expect("the supervisor hands the start facts over the channel");
-            let answer = present(
-                &foreign_sock,
-                &token,
-                DELIVERY_HEADER_VERSION,
-                &crate::bep_attach::mint_box_id(),
-                claimed_source(),
-            );
-            assert!(
-                answer.is_empty(),
-                "a foreign process is answered with nothing"
-            );
-            await_refusal(&foreign, "pid");
-            assert!(
-                foreign.presented().is_empty(),
-                "a foreign process was never presented as a box"
-            );
-        }
-
-        // The uid check decides before anything is read, so a foreign user
-        // is refused on the credential alone — no socket on this host can
-        // be held as that user to prove it end to end, and the decision is
-        // the fact to pin.
-        let uid = daemon_uid();
-        assert_eq!(credential_refusal(uid, None, uid, std::process::id()), None);
-        assert_eq!(
-            credential_refusal(uid.wrapping_add(1), None, uid, std::process::id()),
-            Some("uid")
-        );
-        assert_eq!(
-            credential_refusal(uid, Some(2), uid, 3),
-            Some("pid"),
-            "a same-uid process that is not the daemon is refused for its pid"
-        );
-        assert_eq!(credential_refusal(uid, Some(3), uid, 3), None);
-
-        // Off Linux the kernel still names the peer's uid — `getpeereid`
-        // — and the stand-in reads it: this process's own uid, the fact
-        // the uid check runs on there. No pid comes with it, so the pid
-        // check is the Linux extra it has always been.
-        #[cfg(not(target_os = "linux"))]
-        {
-            let stream = UnixStream::connect(&sock).expect("the stand-in's socket accepts");
-            let (peer_uid, peer_pid) =
-                peer_credentials(&stream).expect("the kernel names the peer's uid");
-            assert_eq!(
-                peer_uid,
-                daemon_uid(),
-                "getpeereid names this process's own uid"
-            );
-            assert_eq!(peer_pid, None, "no pid is named off Linux");
+    fn delivery(box_id: [u8; 16]) -> Delivery {
+        Delivery {
+            box_id,
+            source: "100.64.128.2:51234".parse().unwrap(),
+            destination: "140.82.112.3:443".parse().unwrap(),
         }
     }
 
-    /// NET-133/T44: a delivered header's box id is cross-checked against the
-    /// acceptor's own facts, and a mismatch is refused and audited — never
-    /// presented as a box. The facts are the host's attachment table: the
-    /// attachment the header's source resolved to, issued by the box's
-    /// registration, and an id naming another box is refused whatever the
-    /// header's credentials were. One id names one box (BEP-070) and the
-    /// mint cannot make zero, so an all-zero id is not a claim an acceptor
-    /// answers: it is a header that was never filled from its attachment,
-    /// refused and audited exactly like a mismatch. And a source the table
-    /// holds no attachment for is not a box at all: the node namespace's row
-    /// is not one, and an ended box's attachment is gone with its row, so
-    /// its values are refused from the moment the host observed the end,
-    /// even though the box's revocation was never recorded.
+    /// Presents `token` and `head` and returns everything the stub answers.
+    fn present(sock: &std::path::Path, token: &[u8], head: &[u8]) -> String {
+        let mut stream = UnixStream::connect(sock).unwrap();
+        stream.write_all(token).unwrap();
+        stream.write_all(head).unwrap();
+        // Nothing more follows, so a short presentation is seen at once.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        // A refusal closes with bytes unread, which can reset the
+        // connection: either way nothing was answered.
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    }
+
+    fn until_refusals(stub: &BepStub, count: usize) -> Vec<&'static str> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while stub.refusals().len() < count {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stub.refusals()
+    }
+
     #[test]
-    fn mismatched_box_id_in_delivery_header_is_refused() {
-        let subnet = SwitchSubnet::default();
-        let attachments = Attachments::new();
-        let registry = crate::box_registry::BoxRegistry::new(subnet)
-            .feeding_proxy_attachments(attachments.clone());
-
-        // The guest node's row — the namespace the host publishes at boot —
-        // and one client box, registered the way the activating client
-        // registers one (T66).
-        registry.register_node_namespace(7654);
-        let box_row = registry
-            .register_client_box(crate::box_registry::ClientBoxSpec {
-                name: "web".to_string(),
-                ingress_ports: Vec::new(),
-                credentialed_upstream: None,
-                dynamic_ingress: None,
-                dynamic_allowed_range: None,
-            })
-            .expect("the plan has a switch address to hand out");
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sock = dir.path().join("bep-stub.sock");
-        let token = [0x5au8; TOKEN_LEN];
-        let (start_tx, start_rx) = std::sync::mpsc::channel();
-        let stub = spawn(sock.clone(), start_rx).expect("the stand-in binds its socket");
-        start_tx
-            .send(StubStart {
-                token,
-                daemon_pid: std::process::id(),
-                attachments: attachments.clone(),
-            })
-            .expect("the supervisor hands the start facts over the channel");
-
-        // The acceptor's own fact: the attachment the box's registration
-        // issued, keyed by the address the box's connections arrive from,
-        // naming the box by the id its row holds.
-        let attachment = attachments
-            .by_source(box_row.switch_addr().octets())
-            .expect("the box's registration issued its attachment");
+    fn a_delivery_with_the_token_is_presented_under_the_id_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sock, stub) = stub(&dir, std::process::id());
+        let id = crate::bep_attach::mint_box_id();
+        let answer = present(&sock, &TOKEN, &delivery(id).emit());
         assert_eq!(
-            attachment.box_id(),
-            box_row.box_id(),
-            "the attachment carries the box's own id, the one its row holds"
+            answer,
+            format!(
+                "box_id={} source=100.64.128.2:51234 destination=140.82.112.3:443\n",
+                crate::bep_attach::BoxIdText(&id)
+            )
         );
-        assert_ne!(
-            attachment.box_id(),
-            [0u8; 16],
-            "the attachment names the box, never the all-zero non-id"
-        );
-        assert!(
-            attachments.by_source(subnet.daemon_ip().octets()).is_none(),
-            "the node namespace is not a box: its row buys no attachment"
-        );
-
-        // The box's own id is answered: the cross-check passes, and the
-        // answer names the box's address as the connection's source.
-        let answer = present(
-            &sock,
-            &token,
-            DELIVERY_HEADER_VERSION,
-            &attachment.box_id(),
-            box_row.switch_addr(),
-        );
-        assert!(
-            String::from_utf8_lossy(&answer)
-                .starts_with(&format!("source={}", box_row.switch_addr())),
-            "the box's own id is answered, naming the box's address"
-        );
-        assert_eq!(stub.presented().len(), 1, "one answer so far");
-
-        // Another box's id is a mismatch: refused, audited, never presented.
-        let mut other = attachment.box_id();
-        other[0] ^= 0xff;
-        let answer = present(
-            &sock,
-            &token,
-            DELIVERY_HEADER_VERSION,
-            &other,
-            box_row.switch_addr(),
-        );
-        assert!(
-            answer.is_empty(),
-            "a mismatched box id is answered with nothing"
-        );
-        await_refusal(&stub, "box_id");
-        assert_eq!(
-            stub.presented().len(),
-            1,
-            "the mismatched header presented no box"
-        );
-
-        // An all-zero id is refused and audited exactly like a mismatch
-        // (BEP-070): one id names one box, the mint cannot make zero, and a
-        // zero id is a header that was never filled from its attachment —
-        // the pool writes that shape only when no attachment named the box,
-        // and nothing about it is presented.
-        let answer = present(
-            &sock,
-            &token,
-            DELIVERY_HEADER_VERSION,
-            &[0u8; 16],
-            box_row.switch_addr(),
-        );
-        assert!(
-            answer.is_empty(),
-            "an all-zero box id is answered with nothing"
-        );
-        assert!(
-            stub.refusals()
-                .iter()
-                .filter(|reason| **reason == "box_id")
-                .count()
-                >= 2,
-            "the all-zero id was audited for the box_id reason, like the mismatch: {:?}",
-            stub.refusals()
-        );
-        assert_eq!(
-            stub.presented().len(),
-            1,
-            "the all-zero id presented no box"
-        );
-
-        // A source no attachment holds is not a box: the node namespace's
-        // address — a row the host publishes, but not a box — is refused
-        // outright, id or not.
-        let answer = present(
-            &sock,
-            &token,
-            DELIVERY_HEADER_VERSION,
-            &attachment.box_id(),
-            subnet.daemon_ip(),
-        );
-        assert!(
-            answer.is_empty(),
-            "a source with no attachment is answered with nothing"
-        );
-        await_refusal(&stub, "no_attachment");
-        assert_eq!(
-            stub.presented().len(),
-            1,
-            "nothing unattached was presented as a box"
-        );
-
-        // The box ends — its creator withdraws it, the way a destroy does —
-        // and its attachment goes with its row: the same presentation, the
-        // box's own id from its own address, is refused now.
-        assert!(
-            registry
-                .withdraw_client_box("web", box_row.switch_addr(), box_row.loopback_addr(), None)
-                .expect("the withdrawing client is the row's creator")
-                .is_some(),
-            "the row was published"
-        );
-        assert!(
-            attachments
-                .by_source(box_row.switch_addr().octets())
-                .is_none(),
-            "the box's end retired its attachment with its row"
-        );
-        let answer = present(
-            &sock,
-            &token,
-            DELIVERY_HEADER_VERSION,
-            &attachment.box_id(),
-            box_row.switch_addr(),
-        );
-        assert!(
-            answer.is_empty(),
-            "an ended box's values are answered with nothing, revocation \
-             recorded or not"
-        );
-        await_refusal(&stub, "no_attachment");
-        assert_eq!(
-            stub.presented().len(),
-            1,
-            "the ended box presented nothing more"
-        );
+        assert_eq!(stub.presented(), vec![answer]);
+        assert!(stub.refusals().is_empty());
     }
 
-    /// Drive the lane for `rounds` turns, letting the delivery tasks run
-    /// between them.
-    async fn drive(lane: &mut TestLane, rounds: usize) {
-        for _ in 0..rounds {
-            lane.step().await;
-        }
+    #[test]
+    fn a_wrong_token_a_bad_header_and_a_zero_id_are_refused_without_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sock, stub) = stub(&dir, std::process::id());
+        let id = crate::bep_attach::mint_box_id();
+
+        assert_eq!(present(&sock, &[0u8; TOKEN_LEN], &delivery(id).emit()), "");
+        let mut wrong_version = delivery(id).emit();
+        wrong_version[0] = 9;
+        assert_eq!(present(&sock, &TOKEN, &wrong_version), "");
+        assert_eq!(present(&sock, &TOKEN, &delivery([0u8; 16]).emit()), "");
+        assert_eq!(present(&sock, &TOKEN, &[1, 2, 3]), "");
+
+        assert_eq!(
+            until_refusals(&stub, 4),
+            vec!["token", "version", "box_id", "short"]
+        );
+        assert!(stub.presented().is_empty());
     }
 
-    /// Read what a flow has received so far, driving the lane while it
-    /// stays empty.
-    async fn read_flow(lane: &mut TestLane, box_idx: usize, flow: usize, rounds: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        for _ in 0..rounds {
-            {
-                let box_stack = &mut lane.boxes_mut()[box_idx];
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = box_stack.recv(flow, &mut buf);
-                    if n == 0 {
-                        break;
-                    }
-                    out.extend_from_slice(&buf[..n]);
-                }
-            }
-            lane.step().await;
-        }
-        out
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connection_from_another_process_is_refused_before_it_presents() {
+        let dir = tempfile::tempdir().unwrap();
+        // The stub expects deliveries from a pid that is not this test's.
+        let (sock, stub) = stub(&dir, std::process::id().wrapping_add(1));
+        let id = crate::bep_attach::mint_box_id();
+        assert_eq!(present(&sock, &TOKEN, &delivery(id).emit()), "");
+        assert_eq!(until_refusals(&stub, 1), vec!["pid"]);
     }
 }

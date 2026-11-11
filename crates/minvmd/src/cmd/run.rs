@@ -869,6 +869,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // first.
     let mut _bep_proxy: Option<BepProxy> = None;
     let _bep_stub;
+    let mut proxy_delivery = None;
     let gvproxy = match (gvproxy_binary, switch_sock.clone()) {
         (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
@@ -894,7 +895,6 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 let _ = start_tx.send(crate::net::bep_stub::StubStart {
                     token,
                     daemon_pid: std::process::id(),
-                    attachments: proxy_attachments.clone(),
                 });
                 tracing::info!(
                     sock = %proxy_sock.display(),
@@ -918,6 +918,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             };
             if let Some(listening) = &proxy_listening {
                 bep_listening.attach(std::sync::Arc::clone(listening));
+                proxy_delivery = Some(crate::net::stream_door::ProxyDelivery {
+                    sock: proxy_sock.clone(),
+                    token,
+                    listening: bep_listening.clone(),
+                });
             }
             let on_restart: crate::net::OnSwitchRestart = match publisher.clone() {
                 Some(publisher) => std::sync::Arc::new(move || publisher.reapply()),
@@ -981,6 +986,26 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             Some((switch_sock.clone(), publisher.clone()))
         }
         _ => None,
+    };
+
+    // The stream door: the one way a box's connection reaches the host's
+    // loopback or the credential proxy. It decides by the box table, the
+    // `[host-exposures]` table as it is at each stream, and whether the
+    // proxy listens. Bound before the guest boots, like the control doors.
+    let stream_door = {
+        let served = proxy_publish.clone();
+        crate::net::stream_door::spawn(
+            control_sock.with_file_name(crate::net::GUEST_STREAM_SOCK_FILE),
+            crate::net::stream_door::Config {
+                boxes: boxes.clone(),
+                exposures: crate::net::host_exposures::HostExposures::client_config(),
+                own_listeners: std::sync::Arc::new(move || {
+                    crate::net::host_exposures::minimal_listeners(&served.serving_ports())
+                }),
+                proxy: proxy_delivery,
+            },
+        )
+        .context("binding the stream door")?
     };
 
     // The node's hostname proxy is published by this process, before the VM
@@ -1094,6 +1119,10 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // ports to the sockets this supervisor bound.
     let (name, path) = &guest_report_door;
     cmd.env(name, path);
+    cmd.env(
+        crate::net::stream_door::STREAM_DOOR_SOCK_ENV,
+        stream_door.sock(),
+    );
     if let Some(path) = guest_telemetry_door.as_ref() {
         cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
     }
@@ -1418,7 +1447,7 @@ impl BepProxy {
     fn spawn(
         binary: &std::path::Path,
         listener: &std::path::Path,
-        token: &[u8; switch::bep_host::TOKEN_LEN],
+        token: &[u8; bep::listener::TOKEN_LEN],
         log: &std::path::Path,
         on_listening: Option<OnListening>,
     ) -> std::io::Result<Self> {
@@ -1705,7 +1734,7 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn start_bep_proxy(
     listener: &std::path::Path,
-    token: &[u8; switch::bep_host::TOKEN_LEN],
+    token: &[u8; bep::listener::TOKEN_LEN],
     boxes: &crate::box_registry::BoxRegistry,
 ) -> Option<BepProxy> {
     let Some(binary) = resolve_bep_binary() else {
@@ -2849,8 +2878,6 @@ mod tests {
         std::process::ExitStatus::from_raw(code << 8)
     }
 
-    const WAIT: std::time::Duration = std::time::Duration::from_millis(200);
-
     #[test]
     fn detach_poll_ready_predicate_wins_over_child_exit() {
         // The child exited, but the readiness predicate already holds: the VM
@@ -3676,7 +3703,7 @@ mod tests {
         // A socket a previous boot left behind is not the proxy listening.
         let stale = std::os::unix::net::UnixListener::bind(&listener).expect("stale socket");
         let log = listener.with_file_name(super::BEP_LOG_FILE);
-        let mut token = [0u8; switch::bep_host::TOKEN_LEN];
+        let mut token = [0u8; bep::listener::TOKEN_LEN];
         for (i, byte) in token.iter_mut().enumerate() {
             *byte = u8::try_from(i * 7 + 1).unwrap();
         }
@@ -3767,7 +3794,7 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let listener = dir.path().join("gvproxy-bep.sock");
         let log = listener.with_file_name(super::BEP_LOG_FILE);
-        let token = [7u8; switch::bep_host::TOKEN_LEN];
+        let token = [7u8; bep::listener::TOKEN_LEN];
 
         let proxy = std::thread::spawn({
             let (bin, listener, log) = (bin.clone(), listener.clone(), log.clone());
@@ -3819,7 +3846,7 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let listener = dir.path().join("gvproxy-bep.sock");
         let log = listener.with_file_name(super::BEP_LOG_FILE);
-        let token = [9u8; switch::bep_host::TOKEN_LEN];
+        let token = [9u8; bep::listener::TOKEN_LEN];
 
         let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
         std::thread::sleep(super::BEP_WATCH_INTERVAL * 3);
@@ -3961,51 +3988,6 @@ mod tests {
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         watcher.join().unwrap();
-    }
-
-    /// A stand-in switch: answers each forwarder request on `sock` with the
-    /// next of `answers` (status, body), and sends every request it read,
-    /// head and body, on the returned channel.
-    fn fake_switch(
-        sock: &std::path::Path,
-        answers: Vec<(u16, &'static str)>,
-    ) -> std::sync::mpsc::Receiver<String> {
-        use std::io::{Read as _, Write as _};
-        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the fake switch");
-        let (sent, requests) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for (status, body) in answers {
-                let (mut stream, _) = listener.accept().expect("accept");
-                let mut request = Vec::new();
-                let mut chunk = [0u8; 1024];
-                loop {
-                    let n = stream.read(&mut chunk).expect("read the request");
-                    request.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&request);
-                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                        let length: usize = head
-                            .lines()
-                            .find_map(|line| line.strip_prefix("Content-Length: "))
-                            .and_then(|value| value.parse().ok())
-                            .unwrap_or(0);
-                        if rest.len() >= length {
-                            break;
-                        }
-                    }
-                    if n == 0 {
-                        break;
-                    }
-                }
-                sent.send(String::from_utf8_lossy(&request).into_owned())
-                    .expect("send the request");
-                let answer = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(answer.as_bytes()).expect("answer");
-            }
-        });
-        requests
     }
 
     // NET-138: the upkeep opens the node's mirror only while the whole-range

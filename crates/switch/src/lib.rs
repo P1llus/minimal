@@ -12,10 +12,6 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "stack-peer")]
-pub mod bep_host;
-#[cfg(feature = "stack-peer")]
-pub use bep_host::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
 pub mod loopback;
 #[cfg(feature = "pump")]
 pub mod pump;
@@ -42,11 +38,6 @@ pub const TCP_CONNECT_TIMEOUT_SECS: u32 = 30;
 
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
-
-/// Stable, locally-administered MAC for the Box Egress Proxy on the default
-/// [`DEFAULT_SUBNET`]. It matches [`MacAddr::for_switch_ip`] applied to
-/// [`SwitchSubnet::box_egress_proxy_address`] on that subnet.
-pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
 
 /// How long the Box Egress Proxy leg's smoltcp neighbour cache keeps an
 /// entry: smoltcp 0.14's `iface::neighbor::Cache::ENTRY_LIFETIME`, which the
@@ -378,12 +369,6 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.daemon_ip()) - 1)
     }
 
-    /// The locally-administered MAC for [`Self::box_egress_proxy_address`].
-    #[must_use]
-    pub fn bep_mac(self) -> MacAddr {
-        MacAddr::for_switch_ip(self.box_egress_proxy_address())
-    }
-
     /// The daemon address (the address below [`Self::host_alias`],
     /// `broadcast - 2`): the guest root netns' primary tap, which gives
     /// `minimald` itself egress through the host gvproxy (so it can fetch
@@ -701,8 +686,6 @@ mod tests {
             net.box_egress_proxy_address(),
             Ipv4Addr::new(100, 64, 255, 252)
         );
-        assert_eq!(net.bep_mac(), BEP_MAC);
-        assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
     }

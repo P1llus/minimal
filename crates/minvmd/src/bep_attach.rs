@@ -39,7 +39,7 @@ use std::time::Instant;
 /// A box's identity in a delivered connection: 16 opaque bytes — the shape
 /// [`switch::bep_host::DeliveryHeader`] carries and this table names its
 /// boxes by.
-pub use switch::bep_host::BoxId;
+pub use bep::listener::BoxId;
 
 /// Mints the box id one attachment names its box by (BEP-070): one
 /// UUIDv7 — a millisecond timestamp and 74 random bits — minted fresh at

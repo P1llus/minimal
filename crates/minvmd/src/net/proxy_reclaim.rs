@@ -383,58 +383,6 @@ mod tests {
         assert!(quiet.is_empty(), "{quiet}");
     }
 
-    /// A stand-in switch: answers every forwarder request with HTTP 200 and
-    /// hands each request's text to the test.
-    fn fake_switch(sock: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
-        fake_switch_answering(sock, 200, "")
-    }
-
-    /// A stand-in switch that answers every forwarder request with `status`
-    /// and `body`, and hands each request's text to the test.
-    fn fake_switch_answering(
-        sock: &std::path::Path,
-        status: u16,
-        body: &'static str,
-    ) -> std::sync::mpsc::Receiver<String> {
-        use std::io::{Read as _, Write as _};
-        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the fake switch");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut request = Vec::new();
-                let mut chunk = [0u8; 1024];
-                // The request is one write: head and body. Read until the
-                // body the head announces is in.
-                loop {
-                    let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(chunk.get(..n).unwrap_or_default());
-                    let text = String::from_utf8_lossy(&request);
-                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                        let length = head
-                            .lines()
-                            .find_map(|line| line.strip_prefix("Content-Length: "))
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if body.len() >= length {
-                            break;
-                        }
-                    }
-                }
-                let answer = format!(
-                    "HTTP/1.1 {status} Answer\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(answer.as_bytes());
-                let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
-            }
-        });
-        rx
-    }
-
     // NET-021: the held-port watcher waits 1 s first, doubles the wait, and
     // never waits past 30 s.
     #[test]

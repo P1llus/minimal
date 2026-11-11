@@ -56,10 +56,9 @@ minimald-rpc.workspace = true
 # The JSON file-log layer both daemons write through, so the on-disk log format
 # has one definition (Unit 4).
 mlog.workspace = true
-# Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by
-# `net`, with the Box Egress Proxy's host-side stack peer (`switch::bep_host`,
-# NET-132) that `net` starts beside the switch.
-switch = { workspace = true, features = ["stack-peer", "pump"] }
+# Shared gvproxy primitives: the address plan, MAC derivation, the `-config`
+# rendering, and the frame pump behind the VM's network device.
+switch = { workspace = true, features = ["pump"] }
 # The DNS wire format the host zone answerer (`net::answerer`) decodes
 # queries and encodes replies in — the same library the native daemon's
 # answerer uses, so the two agree on the wire by construction. Also the DNS
@@ -96,10 +95,6 @@ serial_test.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
-# The Box Egress Proxy stand-in acceptor's tests drive the delivery against a
-# real registry (`bep_stub`, NET-132) on the switch crate's channel-wired
-# lane and box-side client — the same `test_util` the pool's own tests use.
-switch = { workspace = true, features = ["test-util"] }
 # The supervisor's span-phase tests (`telemetry`) record what the OTel layer
 # exports in memory, with the same layer `mlog::otel` installs.
 opentelemetry.workspace = true
