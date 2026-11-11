@@ -1615,7 +1615,7 @@ impl ListenWatcher {
     /// host built — a shell mid-spawn, a `/proc` that could not answer —
     /// publishes the moment the next poll finds it, rather than never.
     #[must_use]
-    pub fn start(plan: ListenPlan, source: Arc<dyn Listeners>) -> Self {
+    pub(crate) fn start(plan: ListenPlan, source: Arc<dyn Listeners>) -> Self {
         let (stop, mut stop_rx) = watch::channel(false);
         tracing::debug!(
             session = %plan.box_name,
@@ -3076,6 +3076,7 @@ fn listening_ports_held_by(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<
 }
 
 /// [`listening_ports`] for one `/proc` entry.
+#[cfg(test)]
 fn listening_ports_in(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let mut ports = read_listening(&entry.join("net/tcp"), false, lease)?;
     match read_listening(&entry.join("net/tcp6"), true, lease) {
@@ -3089,6 +3090,7 @@ fn listening_ports_in(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>>
 /// One kernel socket table's listening ports: every row in state `0A`
 /// (`TCP_LISTEN`) whose local address a forward dialing the box's lease can
 /// deliver to. The first line is the table's header.
+#[cfg(test)]
 fn read_listening(table: &Path, v6: bool, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let text = std::fs::read_to_string(table)?;
     Ok(text
@@ -3447,6 +3449,33 @@ pub(crate) async fn send_listen_notice(
         .map(Some)
 }
 
+/// The listening sockets this test process holds that a forward to `lease`
+/// could reach, standing in for the engine's record of a box's. It says
+/// that something changed ten times a second, as the engine's reports
+/// would.
+#[cfg(test)]
+pub(crate) fn held_by_this_process(lease: Ipv4Addr) -> Arc<dyn Listeners> {
+    struct Held(Ipv4Addr);
+
+    impl Listeners for Held {
+        fn listening(&self) -> io::Result<Vec<super::listens::Listener>> {
+            Ok(listening_ports_held_by(Path::new("/proc/self"), self.0)?
+                .into_iter()
+                .map(|port| super::listens::Listener {
+                    address: std::net::IpAddr::V4(self.0),
+                    port,
+                })
+                .collect())
+        }
+
+        fn changed(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(tokio::time::sleep(Duration::from_millis(100)))
+        }
+    }
+
+    Arc::new(Held(lease))
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -3462,29 +3491,8 @@ mod tests {
 
     use super::*;
 
-    /// The listening sockets this test process holds, standing in for the
-    /// engine's record of a box's. It says that something changed ten
-    /// times a second, as the engine's reports would.
-    struct HeldHere;
-
-    impl Listeners for HeldHere {
-        fn listening(&self) -> io::Result<Vec<crate::net::listens::Listener>> {
-            Ok(listening_ports_held_by(Path::new("/proc/self"), LEASE)?
-                .into_iter()
-                .map(|port| crate::net::listens::Listener {
-                    address: std::net::IpAddr::V4(LEASE),
-                    port,
-                })
-                .collect())
-        }
-
-        fn changed(&self) -> futures::future::BoxFuture<'_, ()> {
-            Box::pin(tokio::time::sleep(Duration::from_millis(100)))
-        }
-    }
-
     fn held_here() -> Arc<dyn Listeners> {
-        Arc::new(HeldHere)
+        held_by_this_process(LEASE)
     }
 
     /// One request the fake forwarder served: the verb's path and the

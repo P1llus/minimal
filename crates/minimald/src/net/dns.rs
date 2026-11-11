@@ -137,12 +137,14 @@ struct ListenerSource {
     asking: std::sync::atomic::AtomicBool,
 }
 
+#[allow(dead_code, reason = "read by the relay only, which goes next")]
 /// The one listener state of each switch, by its control channel. Held
 /// weakly: the gates own a state, so it ends with the switch's last gate.
 static SWITCH_LISTENERS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, std::sync::Weak<SharedListener>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+#[allow(dead_code, reason = "partly read by the relay only, which goes next")]
 impl ProxyListenerState {
     /// A state that reads down until [`Self::set_live`] reports otherwise.
     #[must_use]

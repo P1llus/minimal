@@ -191,7 +191,11 @@ impl IngressGate {
                 Ok(())
             }
         }
-        Self::new(policy.ingress.as_ref(), Arc::new(Nowhere), None).expect("nothing to fail")
+        // Its listening sockets are the wildcard listeners of the test's
+        // own process.
+        let listeners = super::listeners::held_by_this_process(Ipv4Addr::UNSPECIFIED);
+        Self::new(policy.ingress.as_ref(), Arc::new(Nowhere), Some(listeners))
+            .expect("nothing to fail")
     }
 }
 

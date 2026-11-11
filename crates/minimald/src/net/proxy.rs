@@ -3957,7 +3957,6 @@ mod tests {
     #[tokio::test]
     async fn proxy_forwards_runtime_published_port() {
         let backend_port = spawn_backend_on(RUNTIME_LEASE, "runtime").await;
-        let subnet = SwitchSubnet::default();
 
         // The own-address box on a VM host: its lease reported with an empty
         // applied map, because it declares no ingress.

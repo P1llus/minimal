@@ -28,6 +28,10 @@ pub mod listeners;
 pub mod loopback;
 pub mod policy;
 pub mod proxy;
+#[allow(
+    dead_code,
+    reason = "nothing attaches the relay any more; the module goes next"
+)]
 pub mod switch;
 
 // The own-IP switch attach, and the mode-to-provider factory that reaches it.
