@@ -1057,6 +1057,17 @@ pub(crate) mod linux {
         well_formed.then_some(line)
     }
 
+    /// What an out-of-date loader means today, when the daemon cannot use
+    /// it: its programs or layouts are another version's.
+    pub(crate) const LOADER_OTHER_PROGRAMS: &str = "the installed network policy loader is from \
+         another version of Minimal, so boxes with a network policy are refused until \
+         `min finalize-install` runs";
+    /// The same when only the loader's own code is older: it still serves
+    /// the daemon.
+    pub(crate) const LOADER_OLDER: &str = "the installed network policy loader is older than \
+         this version of Minimal; it still serves the daemon, without what this version \
+         changed in the loader";
+
     /// The network policy engine item over `facts`. Blocked where the host
     /// cannot run the loader or the script cannot name what it installs.
     /// Done when the root-owned copy is this host's minimald, both units
@@ -1163,13 +1174,24 @@ pub(crate) mod linux {
             && facts.service_unit.is_some()
             && !copy_current
         {
+            // A daemon uses a loader that carries its programs and
+            // layouts, whatever else differs. One that carries others is
+            // refused.
+            let serves = |identity: &str| identity.split(" loader=").next().map(str::to_owned);
+            let still_serves = facts
+                .copy_identity
+                .as_deref()
+                .and_then(serves)
+                .is_some_and(|copy| Some(copy) == serves(daemon_identity));
+            let today = if still_serves {
+                LOADER_OLDER
+            } else {
+                LOADER_OTHER_PROGRAMS
+            };
             return Item::out_of_date(
                 POLICY_ENGINE_ID,
                 POLICY_ENGINE_LABEL,
-                "the installed network policy loader is from another version of Minimal, \
-                 so boxes with a network policy are refused until `min finalize-install` \
-                 runs"
-                    .to_string(),
+                today.to_string(),
                 step,
                 script,
             );
@@ -2228,15 +2250,14 @@ mod tests {
         for (case, facts) in &out_of_date {
             let item = policy_engine_item_over(facts);
             assert_eq!(item.state, ItemState::OutOfDate, "{case}");
-            assert_eq!(
-                item.today.as_deref(),
-                Some(
-                    "the installed network policy loader is from another version of Minimal, \
-                     so boxes with a network policy are refused until `min finalize-install` \
-                     runs"
-                ),
-                "{case}"
-            );
+            // The copy in these cases has the daemon's programs and other
+            // loader code, or prints no identity at all.
+            let expected = if facts.copy_identity.is_some() {
+                linux::LOADER_OLDER
+            } else {
+                linux::LOADER_OTHER_PROGRAMS
+            };
+            assert_eq!(item.today.as_deref(), Some(expected), "{case}");
             assert_eq!(
                 item.script, fresh.script,
                 "{case}: the step a fresh host runs"
@@ -2491,8 +2512,8 @@ mod tests {
         assert!(
             summary.contains(
                 "  ✗ network policy engine\n      today: the installed network policy loader \
-                 is from another version of Minimal, so boxes with a network policy are \
-                 refused until `min finalize-install` runs\n      this step: installs a \
+                 is older than this version of Minimal; it still serves the daemon, without \
+                 what this version changed in the loader\n      this step: installs a \
                  root-owned copy of minimald"
             ),
             "{summary}"
