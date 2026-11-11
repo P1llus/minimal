@@ -49,6 +49,9 @@ pub struct LinkSpec {
     pub gateway: std::net::Ipv4Addr,
     /// The largest packet the interface carries.
     pub mtu: u16,
+    /// Whether the interface carries IPv6. When it does not, the kernel
+    /// gives it no IPv6 address and sends no IPv6 from it.
+    pub ipv6: bool,
 }
 
 /// A container, as data: what `Sandbox::new_container` decided.

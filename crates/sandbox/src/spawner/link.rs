@@ -26,13 +26,14 @@ enum Step {
     Mtu,
     Address,
     Netmask,
+    Ipv6,
     Loopback,
     Up,
     Route,
 }
 
 impl Step {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Join,
         Self::Device,
         Self::Control,
@@ -40,6 +41,7 @@ impl Step {
         Self::Mtu,
         Self::Address,
         Self::Netmask,
+        Self::Ipv6,
         Self::Loopback,
         Self::Up,
         Self::Route,
@@ -58,6 +60,7 @@ impl Step {
             Self::Mtu => format!("setting the MTU of {name}"),
             Self::Address => format!("setting the address of {name}"),
             Self::Netmask => format!("setting the netmask of {name}"),
+            Self::Ipv6 => format!("turning IPv6 off on {name}"),
             Self::Loopback => "bringing lo up".into(),
             Self::Up => format!("bringing {name} up"),
             Self::Route => format!("adding the default route through {name}"),
@@ -74,6 +77,8 @@ struct Plan {
     mtu: libc::ifreq,
     address: libc::ifreq,
     netmask: libc::ifreq,
+    /// The setting to write `1` to when the interface carries no IPv6.
+    no_ipv6: Option<std::ffi::CString>,
     /// The two interfaces to bring up. The child reads their flags into
     /// these and writes them back.
     lo: libc::ifreq,
@@ -175,6 +180,16 @@ impl Plan {
             mtu,
             address,
             netmask: mask,
+            no_ipv6: (!spec.ipv6)
+                .then(|| {
+                    let name = match &spec.kind {
+                        LinkKind::Tap => INTERFACE,
+                        LinkKind::Existing(name) => name,
+                    };
+                    std::ffi::CString::new(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"))
+                })
+                .transpose()
+                .map_err(|_| invalid("the interface name holds a NUL byte".into()))?,
             lo: request(name_field("lo")),
             up: request(name),
             route,
@@ -270,6 +285,20 @@ unsafe fn child(plan: &mut Plan, namespaces: (libc::c_int, libc::c_int), out: li
                 fail(out, step);
             }
         }
+        // Before the interface comes up, so it never gets a link-local
+        // address and announces none.
+        if let Some(setting) = &plan.no_ipv6 {
+            let file = libc::open(setting.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if file >= 0 {
+                if libc::write(file, c"1".as_ptr().cast(), 1) != 1 {
+                    fail(out, Step::Ipv6);
+                }
+                libc::close(file);
+            } else if core::errno() != libc::ENOENT {
+                // A kernel without IPv6 has no such setting.
+                fail(out, Step::Ipv6);
+            }
+        }
         for (step, interface) in [
             (Step::Loopback, &raw mut plan.lo),
             (Step::Up, &raw mut plan.up),
@@ -303,6 +332,7 @@ mod tests {
             prefix: 16,
             gateway: Ipv4Addr::new(100, 64, 0, 1),
             mtu: 1500,
+            ipv6: false,
         }
     }
 
@@ -353,6 +383,10 @@ mod tests {
         assert_eq!(name_of(&plan.lo), "lo");
         assert_eq!(name_of(&plan.up), "eth0");
         assert_eq!(
+            plan.no_ipv6.as_deref(),
+            Some(c"/proc/sys/net/ipv6/conf/eth0/disable_ipv6")
+        );
+        assert_eq!(
             address_of(plan.route.rt_gateway),
             Ipv4Addr::new(100, 64, 0, 1)
         );
@@ -393,6 +427,6 @@ mod tests {
             assert_eq!(Step::of(step as u8), Some(step));
         }
         assert_eq!(Step::of(0), None);
-        assert_eq!(Step::of(11), None);
+        assert_eq!(Step::of(12), None);
     }
 }

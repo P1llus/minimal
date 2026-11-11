@@ -36,6 +36,8 @@ impl Place {
             prefix: self.subnet.prefix(),
             gateway: self.subnet.gateway(),
             mtu: switch::DEFAULT_MTU,
+            // The virtual network carries IPv4 only.
+            ipv6: false,
         }
     }
 }

@@ -870,6 +870,7 @@ async fn the_link_job_sets_up_the_interface_of_a_box() {
         prefix: 16,
         gateway: "100.64.0.1".parse().unwrap(),
         mtu: 1400,
+        ipv6: false,
     };
 
     // With no room for one more process in the box's cgroup, nothing that
@@ -919,6 +920,10 @@ async fn the_link_job_sets_up_the_interface_of_a_box() {
         default_route(supervisor),
         Some(("eth0".to_string(), spec.gateway))
     );
+    // The link was asked for without IPv6, so it has no IPv6 address.
+    let v6 =
+        std::fs::read_to_string(format!("/proc/{supervisor}/net/if_inet6")).unwrap_or_default();
+    assert!(!v6.contains("eth0"), "{v6}");
 
     // A datagram of the box to an address past the gateway makes the
     // kernel ask who the gateway is, on the device the job returned.
@@ -1016,6 +1021,7 @@ async fn the_link_job_configures_an_interface_that_is_already_there() {
         prefix: 24,
         gateway: "10.88.0.1".parse().unwrap(),
         mtu: 1500,
+        ipv6: true,
     };
     let tap = boxed.child.link(spec.clone()).expect("the link job");
     assert!(

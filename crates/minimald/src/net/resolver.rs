@@ -206,44 +206,29 @@ pub(crate) enum ZoneAnswer {
     NoSuchName,
 }
 
-/// A zone answer after the pin check, for a name a rule of the box names.
+/// A zone answer for a box: what it is told, and the address to admit when
+/// a rule of the box names the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ZoneAdmission {
     /// What the box is told.
     pub(crate) answer: ZoneAnswer,
     /// The address to admit for the box.
     pub(crate) pin: Option<IpAddr>,
-    /// The address the zone holds and the box is not told: one its policy
-    /// would have to allow by prefix before a name may open it.
-    pub(crate) refused: Option<IpAddr>,
 }
 
-/// Puts a zone answer through the check every pinned address passes. A
-/// listed name opens the address it resolves to on every port, so a zone
-/// name gets no more than an upstream name would: an internal address is
-/// pinned only when a prefix the box allows covers it.
+/// Decides what a zone answer opens for the box.
+///
+/// The zone holds the names of this daemon's boxes, each at the address the
+/// daemon gave that box. So an address in it is no rebinding: a box that
+/// lists a peer's name means that peer, and gets its address although the
+/// address lies in a range the box's subnet rules do not open. The host's
+/// name is not such a row and has no address here.
 pub(crate) fn admit_zone(answer: ZoneAnswer, name: &str, view: &View<'_>) -> ZoneAdmission {
-    let told = ZoneAdmission {
-        answer,
-        pin: None,
-        refused: None,
+    let pin = match (answer, view.compiled.set_for_name(name)) {
+        (ZoneAnswer::Address(address), Some(_)) => Some(IpAddr::V4(address)),
+        _ => None,
     };
-    let (ZoneAnswer::Address(address), Some(_)) = (answer, view.compiled.set_for_name(name)) else {
-        return told;
-    };
-    let address = IpAddr::V4(address);
-    if pins::may_pin(address, view.allowed, view.infrastructure) {
-        ZoneAdmission {
-            pin: Some(address),
-            ..told
-        }
-    } else {
-        ZoneAdmission {
-            answer: ZoneAnswer::NoData,
-            pin: None,
-            refused: Some(address),
-        }
-    }
+    ZoneAdmission { answer, pin }
 }
 
 /// The reply for a zone name.
@@ -546,9 +531,6 @@ impl Resolver {
                 let admitted = admit_zone(self.zone.lookup(&name), &name, &view);
                 if let Some(address) = admitted.pin {
                     self.pin(of, address, &name);
-                }
-                if let Some(address) = admitted.refused {
-                    self.refused(of, &name, "rebinding", Some(address));
                 }
                 zone_reply(&query, admitted.answer)
             }
@@ -951,30 +933,23 @@ mod tests {
     }
 
     #[test]
-    fn a_zone_name_opens_no_more_than_an_upstream_name_would() {
+    fn a_listed_peer_is_admitted_at_the_address_the_zone_gives() {
         let listed = by_name(&["peer.min.internal"]);
-        let loopback = ZoneAnswer::Address(Ipv4Addr::new(127, 0, 64, 9));
-        // An internal address is told and pinned only inside a prefix the
-        // box allows. Otherwise the box learns the name exists and gets no
-        // address, which is also what it is refused.
-        let closed = admit_zone(loopback, "peer.min.internal", &view(&listed));
-        assert_eq!(closed.answer, ZoneAnswer::NoData);
-        assert_eq!(closed.pin, None);
-        assert_eq!(closed.refused, Some("127.0.64.9".parse().expect("address")));
-
-        let allowed = ["127.0.64.0/24".parse().expect("prefix")];
-        let mut open = view(&listed);
-        open.allowed = &allowed;
-        let admitted = admit_zone(loopback, "peer.min.internal", &open);
-        assert_eq!(admitted.answer, loopback);
-        assert_eq!(admitted.pin, Some("127.0.64.9".parse().expect("address")));
-        // A box that allows everything pins nothing and is told the answer.
+        // Inside the virtual network, which no subnet rule of the box opens.
+        let lease = ZoneAnswer::Address(Ipv4Addr::new(100, 64, 1, 9));
+        let admitted = admit_zone(lease, "peer.min.internal", &view(&listed));
+        assert_eq!(admitted.answer, lease);
+        assert_eq!(admitted.pin, Some("100.64.1.9".parse().expect("address")));
+        // A name the box does not list is told and opens nothing.
+        let other = admit_zone(lease, "other.min.internal", &view(&listed));
+        assert_eq!((other.answer, other.pin), (lease, None));
+        // A box that allows everything has no name rules to pin under.
         let everything = compiled(BoxPolicy::default());
-        let told = admit_zone(loopback, "peer.min.internal", &view(&everything));
-        assert_eq!(
-            (told.answer, told.pin, told.refused),
-            (loopback, None, None)
-        );
+        let told = admit_zone(lease, "peer.min.internal", &view(&everything));
+        assert_eq!((told.answer, told.pin), (lease, None));
+        // The zone's other answers carry no address.
+        let none = admit_zone(ZoneAnswer::NoData, "peer.min.internal", &view(&listed));
+        assert_eq!((none.answer, none.pin), (ZoneAnswer::NoData, None));
     }
 
     #[test]
