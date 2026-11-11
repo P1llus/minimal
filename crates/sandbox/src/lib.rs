@@ -628,14 +628,20 @@ fn bring_lo_up() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Puts this process in a process group of its own and, when its stdin is
-/// the session's terminal, makes that group the terminal's foreground group.
+/// Puts this process in a process group of its own. When its stdin is the
+/// session's terminal and the group it comes from is that terminal's
+/// foreground group, the new group takes the foreground, as a shell's
+/// foreground job does. A job started in the background stays there.
 #[cfg(target_os = "linux")]
 fn take_foreground() -> std::io::Result<()> {
     // SAFETY: plain syscalls on this process and its stdin.
     unsafe {
+        let in_foreground = libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp();
         if libc::setpgid(0, 0) == -1 {
             return Err(std::io::Error::last_os_error());
+        }
+        if !in_foreground {
+            return Ok(());
         }
         // A background group that changes the foreground group is stopped
         // with SIGTTOU unless it blocks the signal.
@@ -644,11 +650,53 @@ fn take_foreground() -> std::io::Result<()> {
         libc::sigemptyset(&raw mut ttou);
         libc::sigaddset(&raw mut ttou, libc::SIGTTOU);
         libc::sigprocmask(libc::SIG_BLOCK, &raw const ttou, &raw mut before);
-        // Not a terminal, or not this session's: nothing to take.
         libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
         libc::sigprocmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
     }
     Ok(())
+}
+
+/// Runs the program as a child and stays behind as the first process of
+/// the box, until the program ends. Never returns.
+///
+/// The first process of a PID namespace takes no signal it has no handler
+/// for, so a program in that place ignores the terminal's interrupt and
+/// stop keys. As the second process it takes them as any program does.
+/// This process ends with the program's status, and reaps what the box
+/// orphans meanwhile.
+#[cfg(target_os = "linux")]
+fn run_as_foreground_job(program: &str, args: &[String]) -> ! {
+    // SAFETY: `fork` in a single-threaded child. Both sides only make
+    // syscalls, exec or exit.
+    let child = unsafe { libc::fork() };
+    if child == -1 {
+        exit_child(
+            "starting the program as a job",
+            &std::io::Error::last_os_error(),
+        );
+    }
+    if child == 0 {
+        let e = execv_in_child(program, args);
+        exit_child(&format!("exec {program}"), &e)
+    }
+    loop {
+        let mut status = 0;
+        // SAFETY: `waitpid` writes the status through a live pointer.
+        let ended = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+        if ended == child {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                128 + libc::WTERMSIG(status)
+            };
+            // SAFETY: `_exit` takes a status.
+            unsafe { libc::_exit(code) }
+        }
+        if ended == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            exit_child("waiting for the program", &std::io::Error::last_os_error());
+        }
+    }
 }
 
 /// The box's pre-exec steps, then the exec of its program. Never returns: a
@@ -694,6 +742,9 @@ fn exec_box_program(
     }
     if let Some(gate) = start_gate {
         wait_at_start_gate(&gate);
+    }
+    if session == spawner::Session::Foreground {
+        run_as_foreground_job(program, args);
     }
     let e = execv_in_child(program, args);
     exit_child(&format!("exec {program}"), &e)
@@ -3527,9 +3578,11 @@ ff02::2\tip6-allrouters
         );
     }
 
-    /// A program that runs as a foreground job is in a process group of its
-    /// own, in the requester's session. A signal it sends to its group does
-    /// not reach the requester, which is this test.
+    /// A program that runs as a foreground job is the child of the box's
+    /// first process, in that process's group, in the requester's session.
+    /// It takes the terminal's stop and interrupt signals as any program
+    /// does. A signal it sends to its group does not reach the requester,
+    /// which is this test.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_foreground_program_has_a_process_group_of_its_own() {
@@ -3566,7 +3619,6 @@ ff02::2\tip6-allrouters
             .build(build.path().join("sandbox"), ())
             .await
             .expect("building the box");
-        let run = sandbox.base_dir.join("run");
         let plan = sandbox.built_in_plan();
         let mut container = sandbox
             .new_container(&plan)
@@ -3584,40 +3636,67 @@ ff02::2\tip6-allrouters
         let child = held.spawn().expect("spawning the probe in the box");
         let supervisor = child.id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let program = loop {
-            if let Ok(program) = spawner::enter::init_of(supervisor) {
-                break program;
+        let eventually = |what: &str, check: &dyn Fn() -> bool| {
+            while !check() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the box never had a program"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         };
+        let child_of = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                .ok()?
+                .split_ascii_whitespace()
+                .next()?
+                .parse::<u32>()
+                .ok()
+        };
+        let state = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next())
+        };
+        eventually("the box never had a first process", &|| {
+            child_of(supervisor).is_some()
+        });
+        let first = child_of(supervisor).unwrap();
+        // The first process starts the program as its child once it has
+        // taken its own group.
+        eventually("the first process never started the program", &|| {
+            child_of(first).is_some()
+        });
+        let program = child_of(first).unwrap();
         let own = ids(std::process::id());
-        // The program takes its group just before it execs.
-        while ids(program).0 != program.to_string() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the program never led a process group"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        assert_eq!(ids(first).0, first.to_string(), "the job leads a group");
+        assert_eq!(ids(program).0, first.to_string(), "the program is in it");
         assert_eq!(ids(program).1, own.1, "the program is in this session");
         assert_eq!(
             ids(supervisor),
             own,
             "the supervisor stays with the requester"
         );
-        fs::write(run.join("go"), "").expect("releasing the probe");
+
+        // The stop key's signal stops the program, and not what stands
+        // above it. This test has no terminal, so nothing suspends it.
+        let group = -(libc::pid_t::try_from(first).unwrap());
+        // SAFETY: `kill` of the job's process group, which this test started.
+        assert_eq!(unsafe { libc::kill(group, libc::SIGTSTP) }, 0);
+        eventually("the program never stopped", &|| state(program) == Some('T'));
+        assert_ne!(state(first), Some('T'));
+        assert_ne!(state(supervisor), Some('T'));
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(group, libc::SIGCONT) }, 0);
+        eventually("the program never ran on", &|| state(program) != Some('T'));
+
+        // The interrupt key's signal ends the program, and the job with it.
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(group, libc::SIGINT) }, 0);
         let status = tokio::time::timeout(std::time::Duration::from_secs(15), child.exited())
             .await
             .expect("the program ends");
-        assert!(status.success(), "{status:?}");
+        assert_eq!(status.exit_code, Some(128 + libc::SIGINT), "{status:?}");
 
-        // A signal to the program's group does not reach this test. The
-        // program itself survives it: it is the init of its PID namespace,
-        // which the kernel shields from signals sent inside the namespace.
+        // A signal the program sends to its own group does not reach this
+        // test.
         let mut noisy = sandbox
             .command(
                 &container,
@@ -3631,7 +3710,7 @@ ff02::2\tip6-allrouters
         let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.exited())
             .await
             .expect("the program ends");
-        assert!(status.success(), "{status:?}");
+        assert_eq!(status.exit_code, Some(128 + libc::SIGKILL), "{status:?}");
     }
 
     /// A network that shares the requester's namespace is not held: a
