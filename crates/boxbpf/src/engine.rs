@@ -34,8 +34,7 @@ struct Program {
 }
 
 /// Every program of the object. One that is missing, fails the verifier or
-/// does not attach fails the whole engine: a partly attached engine would
-/// leave a hook unguarded.
+/// does not attach fails the whole engine.
 const PROGRAMS: [Program; 14] = [
     Program {
         name: "bp_sock_create",
@@ -213,24 +212,54 @@ impl Engine {
         Ok(Self { ebpf })
     }
 
-    /// Attaches every program at `boxes`, next to whatever else is attached
-    /// there or above.
+    fn program_fd(&mut self, p: &Program) -> Result<OwnedFd, Error> {
+        let prog = self.ebpf.program_mut(p.name).ok_or(Error::Missing {
+            kind: "program",
+            name: p.name,
+        })?;
+        let fd = match p.kind {
+            Kind::Sock => <&mut CgroupSock>::try_from(prog).and_then(|p| p.fd()),
+            Kind::SockAddr => <&mut CgroupSockAddr>::try_from(prog).and_then(|p| p.fd()),
+            Kind::Skb => <&mut CgroupSkb>::try_from(prog).and_then(|p| p.fd()),
+        }
+        .map_err(program_error(p.name))?;
+        fd.as_fd()
+            .try_clone_to_owned()
+            .map_err(Error::sys("duplicate a program descriptor"))
+    }
+
+    /// Attaches every program at `boxes`, or none: when one does not
+    /// attach, those before it are detached again. A cgroup with some of
+    /// the hooks guarded and no way to tell would be worse than none.
     pub fn attach(&mut self, boxes: BorrowedFd<'_>) -> Result<(), Error> {
-        for p in &PROGRAMS {
-            let prog = self.ebpf.program_mut(p.name).ok_or(Error::Missing {
-                kind: "program",
-                name: p.name,
-            })?;
-            let fd = match p.kind {
-                Kind::Sock => <&mut CgroupSock>::try_from(prog).and_then(|p| p.fd()),
-                Kind::SockAddr => <&mut CgroupSockAddr>::try_from(prog).and_then(|p| p.fd()),
-                Kind::Skb => <&mut CgroupSkb>::try_from(prog).and_then(|p| p.fd()),
+        for (done, p) in PROGRAMS.iter().enumerate() {
+            let attached = self.program_fd(p).and_then(|fd| {
+                sys::prog_attach(fd.as_fd(), boxes, p.attach_type)
+                    .map_err(|e| program_error(p.name)(ProgramError::IOError(e)))
+            });
+            if let Err(error) = attached {
+                self.detach_some(boxes, done);
+                return Err(error);
             }
-            .map_err(program_error(p.name))?;
-            sys::prog_attach(fd.as_fd(), boxes, p.attach_type)
-                .map_err(|e| program_error(p.name)(ProgramError::IOError(e)))?;
         }
         Ok(())
+    }
+
+    /// Detaches the first `count` programs. A program that is not attached
+    /// is skipped, and so is one that does not detach: there is nothing
+    /// more to do about it here, and the caller already has an error.
+    fn detach_some(&mut self, boxes: BorrowedFd<'_>, count: usize) {
+        for p in PROGRAMS.iter().take(count) {
+            if let Ok(fd) = self.program_fd(p) {
+                let _gone = sys::prog_detach(fd.as_fd(), boxes, p.attach_type);
+            }
+        }
+    }
+
+    /// Takes every program off `boxes` again: for an engine that was
+    /// attached and then could not be handed to its daemon.
+    pub fn detach(&mut self, boxes: BorrowedFd<'_>) {
+        self.detach_some(boxes, PROGRAMS.len());
     }
 
     /// A descriptor of each map a daemon needs, in hand-over order.
@@ -258,77 +287,32 @@ impl Engine {
     /// Loads and attaches in one step and returns the handles: what a
     /// daemon with root does for itself, as in the VM guest.
     ///
-    /// The cgroup must not carry the programs yet. A second set would judge
-    /// every flow as well, from maps nobody writes, and refuse it.
+    /// The cgroup must carry no program of these kinds. An engine left
+    /// from an earlier daemon would judge every flow as well, from maps
+    /// nobody writes, and refuse it. A daemon makes its `boxes` cgroup
+    /// anew at start, so it never meets one.
+    ///
+    /// On any error nothing stays attached.
     pub fn start(boxes: BorrowedFd<'_>, sizes: &MapSizes) -> Result<Handles, Error> {
-        if find_attached(boxes)?.is_some() {
-            return Err(Error::NotSupported(
-                "the boxes cgroup already has policy programs attached",
-            ));
+        if has_programs(boxes)? {
+            return Err(Error::InUse);
         }
         let mut engine = Self::load(boxes, sizes)?;
         engine.attach(boxes)?;
-        engine.handles()
+        engine.handles().inspect_err(|_| engine.detach(boxes))
     }
 }
 
-/// The maps of an engine that is already attached at `cgroup`, found
-/// through the kernel alone: cgroup, attached programs, their maps.
-///
-/// This is what makes the loader stateless: a second request for the same
-/// cgroup gets the same maps instead of a second set of programs.
-pub(crate) fn find_attached(cgroup: BorrowedFd<'_>) -> Result<Option<Vec<OwnedFd>>, Error> {
-    let mut attached = Vec::new();
+/// Whether any program of the kinds the engine attaches is attached at
+/// `cgroup` itself. Programs on the cgroups above do not count: systemd
+/// puts its own there.
+pub(crate) fn has_programs(cgroup: BorrowedFd<'_>) -> Result<bool, Error> {
     for p in &PROGRAMS {
-        attached.extend(
-            sys::prog_query(cgroup, p.attach_type)
-                .map_err(Error::sys("query attached programs"))?,
-        );
-    }
-    if attached.is_empty() {
-        return Ok(None);
-    }
-    let mut found: Vec<(String, MapData)> = Vec::new();
-    for info in aya::programs::loaded_programs() {
-        let info = info.map_err(program_error("(loaded programs)"))?;
-        let ours = PROGRAMS.iter().any(|p| info.name_as_str() == Some(p.name));
-        if !ours || !attached.contains(&info.id()) {
-            continue;
-        }
-        for id in info
-            .map_ids()
-            .map_err(program_error("(loaded programs)"))?
-            .unwrap_or_default()
-        {
-            let data = MapData::from_id(id).map_err(Error::map("(attached)"))?;
-            let name = data
-                .info()
-                .map_err(Error::map("(attached)"))?
-                .name_as_str()
-                .unwrap_or_default()
-                .to_owned();
-            if !found.iter().any(|(known, _)| *known == name) {
-                found.push((name, data));
-            }
+        let attached = sys::prog_query(cgroup, p.attach_type)
+            .map_err(Error::sys("query attached programs"))?;
+        if !attached.is_empty() {
+            return Ok(true);
         }
     }
-    if found.is_empty() {
-        return Ok(None);
-    }
-    MAPS.iter()
-        .map(|name| {
-            let (_, data) = found
-                .iter()
-                .find(|(n, _)| n == name)
-                .ok_or(Error::Missing {
-                    kind: "attached map",
-                    name,
-                })?;
-            data.fd()
-                .as_fd()
-                .try_clone_to_owned()
-                .map_err(Error::sys("duplicate a map descriptor"))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    Ok(false)
 }

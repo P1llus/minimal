@@ -3,17 +3,14 @@
 
 use std::{
     fs,
-    os::fd::{AsFd, AsRawFd, OwnedFd},
+    os::fd::{AsFd, OwnedFd},
     time::Duration,
 };
 
 use boxbpf::{Error, events::Reader, loader};
 use netpol::{abi::Hook, policy::BoxPolicy};
-use nix::sys::socket::{
-    self, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
-};
 
-use crate::support::{Cgroups, Harness, host_ip};
+use crate::support::{Cgroups, Harness, host_ip, probe};
 
 fn open(path: &std::path::Path) -> OwnedFd {
     fs::File::open(path).expect("open a directory").into()
@@ -69,62 +66,60 @@ fn the_loader_serves_only_the_supervisor_of_a_delegated_boxes_cgroup() {
     fs::create_dir(&nested).expect("create a nested cgroup");
     let reason = refusal(loader::request(&h.socket, open(&nested).as_fd()));
     assert!(
-        reason.contains("not in"),
-        "a boxes cgroup whose supervisor we are not in: {reason}"
+        reason.contains("no supervisor cgroup beside"),
+        "a boxes cgroup with no supervisor of its own: {reason}"
     );
     fs::remove_dir(&nested).expect("remove the nested cgroup");
 
-    // A daemon built against other layouts is told so.
-    let conn = socket::socket(
-        AddressFamily::Unix,
-        SockType::SeqPacket,
-        SockFlag::SOCK_CLOEXEC,
-        None,
-    )
-    .expect("socket");
-    socket::connect(
-        conn.as_raw_fd(),
-        &UnixAddr::new(&h.socket).expect("address"),
-    )
-    .expect("connect");
-    let rights = [h.boxes.as_raw_fd()];
-    let iov = [std::io::IoSlice::new(b"attach abi=4000000000")];
-    socket::sendmsg::<()>(
-        conn.as_raw_fd(),
-        &iov,
-        &[ControlMessage::ScmRights(&rights)],
-        MsgFlags::empty(),
-        None,
-    )
-    .expect("send");
-    let mut buf = [0u8; 256];
-    let n = socket::recv(conn.as_raw_fd(), &mut buf, MsgFlags::empty()).expect("reply");
-    let reply = String::from_utf8_lossy(&buf[..n]);
+    // A process below the daemon, in its helpers cgroup, that makes a
+    // root of its own there and moves into it: every name is right, and
+    // it is still not a daemon.
+    let fake = h.root.join("helpers").join("x");
+    for dir in ["supervisor", "boxes"] {
+        fs::create_dir_all(fake.join(dir)).expect("create a root inside the root");
+    }
+    let out = h.cgroups().probe_at(
+        "helpers/x/supervisor",
+        &[
+            "loader-request",
+            &h.socket.to_string_lossy(),
+            &fake.join("boxes").to_string_lossy(),
+        ],
+    );
+    assert!(
+        out.starts_with("err ") && out.contains("the cgroup root of an engine that is running"),
+        "{out}"
+    );
+
+    // A daemon built against other layouts is told so, and so is one
+    // built with other programs, before anything is loaded for it.
+    let say = |line: String| {
+        let (_conn, reply, fds) =
+            probe::loader_message(&h.socket, &line, Some(h.boxes.as_fd())).expect("exchange");
+        assert!(fds.is_empty(), "{reply}");
+        reply
+    };
     assert_eq!(
-        reply,
+        say("attach abi=4000000000".to_owned()),
         format!(
             "err abi mismatch: loader={} daemon=4000000000",
             netpol::abi::VERSION
         )
     );
-
-    // Asking again attaches nothing new: the same maps come back.
-    let again = loader::request(&h.socket, h.boxes.as_fd()).expect("a second request");
-    let id = h.new_box("shared");
-    let live = h.handles.install(
-        id,
-        netpol::Spec {
-            deployment: host_ip(),
-            policy: BoxPolicy::default(),
-            options: netpol::compile::Options::default(),
-        },
+    assert_eq!(
+        say(format!("attach object=0000 abi={}", netpol::abi::VERSION)),
+        format!(
+            "err object mismatch: loader={} daemon=0000",
+            boxbpf::object_id()
+        )
     );
-    let live = live.expect("install through the first handles");
+
+    // The cgroup has its engine. Nobody gets a second one there, or the
+    // maps of the first.
+    let reason = refusal(loader::request(&h.socket, h.boxes.as_fd()));
     assert!(
-        again
-            .stats(live.id())
-            .expect("read through the second handles")
-            .is_some()
+        reason.contains("already has policy programs attached"),
+        "{reason}"
     );
     let attached = std::process::Command::new("sudo")
         .args([
@@ -284,4 +279,65 @@ fn a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader() {
     assert_eq!(value("owner"), nix::unistd::getuid().as_raw().to_string());
     assert_eq!(value("engine"), "ok");
     assert_ne!(value("before"), value("cgroup"));
+
+    // A daemon that asks and dies. Whatever the loader had made for it by
+    // then is gone again: no cgroup of that user is left behind.
+    let line = Cgroups::outside_probe(&["root-request-abandoned", &h.socket.to_string_lossy()]);
+    let pid = line
+        .strip_prefix("ok pid=")
+        .unwrap_or_else(|| panic!("{line}"));
+    // The loader serves one request at a time: when it answers this one,
+    // it is done with the one before.
+    let _refused = loader::request_root(&h.socket);
+    let name = format!("u{}-{pid}", nix::unistd::getuid().as_raw());
+    let left: Vec<_> = fs::read_dir("/sys/fs/cgroup")
+        .expect("list the cgroup mount")
+        .flatten()
+        .map(|base| base.path().join(&name))
+        .filter(|root| root.exists())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn an_engine_nobody_confirms_is_taken_off_again() {
+    let Some(g) = Harness::bare("cases::loader::an_engine_nobody_confirms_is_taken_off_again")
+    else {
+        return;
+    };
+    let attach = format!(
+        "attach object={} abi={}",
+        boxbpf::object_id(),
+        netpol::abi::VERSION
+    );
+    // A daemon that gets the maps and goes away without a word, and one
+    // that answers something else.
+    for answer in [None, Some("thanks")] {
+        let (conn, reply, maps) =
+            probe::loader_message(&g.socket, &attach, Some(g.boxes.as_fd())).expect("exchange");
+        assert!(reply.starts_with("ok abi="), "{reply}");
+        assert_eq!(maps.len(), 9);
+        if let Some(word) = answer {
+            nix::sys::socket::send(
+                std::os::fd::AsRawFd::as_raw_fd(&conn),
+                word.as_bytes(),
+                nix::sys::socket::MsgFlags::empty(),
+            )
+            .expect("answer");
+        }
+        drop(conn);
+    }
+    // Had the programs stayed, this request would be refused: the cgroup
+    // would have an engine whose maps nobody holds, and every box in it
+    // no network.
+    let mut handles =
+        loader::request(&g.socket, g.boxes.as_fd()).expect("an engine after the abandoned ones");
+    assert!(handles.take_events().is_some());
+    // This one was confirmed, and stays.
+    let reason = refusal(loader::request(&g.socket, g.boxes.as_fd()));
+    assert!(
+        reason.contains("already has policy programs attached"),
+        "{reason}"
+    );
 }

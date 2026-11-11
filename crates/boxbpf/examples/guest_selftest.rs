@@ -216,6 +216,24 @@ mod guest {
             true,
             "every program passed the verifier and attached at boxes/",
         );
+        // A second engine at the same cgroup would judge every flow too,
+        // from maps nobody writes.
+        let again = fs::File::open(format!("{CGROUP}/boxes"))
+            .map_err(|source| Error::Sys {
+                what: "open boxes/",
+                source,
+            })
+            .and_then(|boxes| Engine::start(boxes.as_fd(), &MapSizes::default()));
+        report.check(
+            "in_use",
+            matches!(again, Err(Error::InUse)),
+            &format!(
+                "a cgroup with an engine gets no second one: {}",
+                again
+                    .err()
+                    .map_or_else(|| "it did".to_owned(), |e| e.to_string())
+            ),
+        );
         let mut events = handles.take_events();
 
         let listener = TcpListener::bind("[::]:0").map_err(|source| Error::Sys {

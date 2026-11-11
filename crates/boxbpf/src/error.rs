@@ -55,8 +55,12 @@ pub enum Error {
         "the installed policy loader carries other policy programs than this daemon: run `min finalize-install` to update the loader"
     )]
     ObjectMismatch { loader: String, daemon: String },
-    #[error("not supported: {0}")]
-    NotSupported(&'static str),
+    #[error(
+        "the boxes cgroup already has policy programs attached: a daemon makes the cgroup anew when it starts"
+    )]
+    InUse,
+    #[error("the policy loader took the programs off again: {0}")]
+    Unconfirmed(String),
 }
 
 impl Error {

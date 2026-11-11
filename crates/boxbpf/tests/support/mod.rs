@@ -216,6 +216,16 @@ pub struct Cgroups {
     root: PathBuf,
 }
 
+/// One test's delegated root and loader, with no engine asked for yet.
+pub struct Bare {
+    pub root: PathBuf,
+    pub boxes: OwnedFd,
+    pub socket: PathBuf,
+    net: (u8, u8),
+    tmp: tempfile::TempDir,
+    loader: LoaderProcess,
+}
+
 /// One test's delegated root, engine and addresses.
 pub struct Harness {
     pub root: PathBuf,
@@ -256,10 +266,34 @@ impl Harness {
         if rerun_delegated(test) {
             return None;
         }
-        Some(Self::set_up(v6_suffixes, rule_entries))
+        let bare = Self::ground(v6_suffixes, rule_entries);
+        let handles = boxbpf::loader::request(&bare.socket, bare.boxes.as_fd())
+            .expect("get handles from the loader");
+        Some(Self {
+            root: bare.root,
+            boxes: bare.boxes,
+            handles,
+            socket: bare.socket,
+            net: bare.net,
+            _tmp: bare.tmp,
+            _loader: bare.loader,
+        })
     }
 
-    fn set_up(v6_suffixes: &[u16], rule_entries: Option<u32>) -> Self {
+    /// Sets a test up without asking the loader for an engine: for tests
+    /// of the request itself.
+    pub fn bare(test: &str) -> Option<Bare> {
+        if std::env::var_os(GATE).is_none() {
+            eprintln!("skipping {test}: {GATE} is not set (it needs sudo -n, systemd and clang)");
+            return None;
+        }
+        if rerun_delegated(test) {
+            return None;
+        }
+        Some(Self::ground(&[], None))
+    }
+
+    fn ground(v6_suffixes: &[u16], rule_entries: Option<u32>) -> Bare {
         // In a scope we start in the unit's own cgroup, in a service with
         // DelegateSubgroup already in supervisor/.
         let here = own_cgroup();
@@ -310,17 +344,13 @@ impl Harness {
             .expect("start the loader through sudo -n: these tests need passwordless sudo");
         let loader = LoaderProcess(loader);
         wait_for("the loader socket", || socket.exists());
-
-        let handles =
-            boxbpf::loader::request(&socket, boxes.as_fd()).expect("get handles from the loader");
-        Self {
+        Bare {
             root,
             boxes,
-            handles,
             socket,
             net,
-            _tmp: tmp,
-            _loader: loader,
+            tmp,
+            loader,
         }
     }
 
@@ -415,11 +445,15 @@ impl Cgroups {
         BoxId::of(fs::File::open(&dir).expect("open a box cgroup").as_fd()).expect("box id")
     }
 
-    fn in_box(&self, name: &str, mut cmd: Command) -> Command {
+    fn in_box(&self, name: &str, cmd: Command) -> Command {
+        self.in_cgroup(&format!("boxes/{name}"), cmd)
+    }
+
+    /// Makes `cmd` start in the cgroup `rel` below the test's root.
+    fn in_cgroup(&self, rel: &str, mut cmd: Command) -> Command {
         let procs = CString::new(
             self.root
-                .join("boxes")
-                .join(name)
+                .join(rel)
                 .join("cgroup.procs")
                 .to_string_lossy()
                 .as_bytes(),
@@ -514,6 +548,12 @@ impl Cgroups {
     /// line: `ok ...` or `err <errno>`.
     pub fn probe(&self, box_name: &str, args: &[&str]) -> String {
         Self::run(self.in_box(box_name, Self::probe_command(args, None)))
+    }
+
+    /// Runs a probe in the cgroup `rel` below the test's root, which need
+    /// not be a box.
+    pub fn probe_at(&self, rel: &str, args: &[&str]) -> String {
+        Self::run(self.in_cgroup(rel, Self::probe_command(args, None)))
     }
 
     /// Like [`Self::probe`], with `channel` as the probe's standard input:

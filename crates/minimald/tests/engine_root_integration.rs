@@ -686,7 +686,10 @@ fn a_loader_of_another_version_is_not_used() {
         while let Ok(conn) = accept(listener.as_raw_fd()) {
             let mut request = [0u8; 256];
             let _read = recv(conn, &mut request, MsgFlags::empty());
-            let reply = format!("ok abi=2 object={} cgroup=1 reused=0", "0".repeat(64));
+            let reply = format!(
+                "err object mismatch: loader={} daemon=unread",
+                "0".repeat(64)
+            );
             let _sent = send(conn, reply.as_bytes(), MsgFlags::empty());
         }
     });

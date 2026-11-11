@@ -479,6 +479,81 @@ fn root_request(socket: &str) -> String {
     )
 }
 
+/// One message to the loader, with a descriptor if `fd` is given, and its
+/// reply with the descriptors that came along. The connection comes back
+/// so the caller decides when it closes.
+pub fn loader_message(
+    path: &Path,
+    line: &str,
+    fd: Option<BorrowedFd<'_>>,
+) -> std::io::Result<(OwnedFd, String, Vec<OwnedFd>)> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+
+    let conn = socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )?;
+    connect(conn.as_raw_fd(), &UnixAddr::new(path)?)?;
+    let raw: Vec<_> = fd.iter().map(AsRawFd::as_raw_fd).collect();
+    let rights = [ControlMessage::ScmRights(&raw)];
+    let cmsgs: &[ControlMessage<'_>] = if raw.is_empty() { &[] } else { &rights };
+    let iov = [std::io::IoSlice::new(line.as_bytes())];
+    sendmsg::<()>(conn.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None)?;
+
+    let mut buf = [0u8; 512];
+    let mut space = nix::cmsg_space!([std::os::fd::RawFd; 16]);
+    let (n, fds) = {
+        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let msg = recvmsg::<()>(
+            conn.as_raw_fd(),
+            &mut iov,
+            Some(&mut space),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        )?;
+        let mut fds = Vec::new();
+        for cmsg in msg.cmsgs()? {
+            if let ControlMessageOwned::ScmRights(received) = cmsg {
+                for fd in received {
+                    // SAFETY: the kernel just installed this descriptor for
+                    // us and nothing else owns it.
+                    fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+            }
+        }
+        (msg.bytes, fds)
+    };
+    let reply = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+    Ok((conn, reply, fds))
+}
+
+/// Asks the loader for a root and exits without waiting for it, as a
+/// daemon that dies during the handover.
+fn root_request_abandoned(path: &str) -> String {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+
+    let request = format!("root abi={}", netpol::abi::VERSION);
+    let sent = socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .and_then(|conn| {
+        connect(conn.as_raw_fd(), &UnixAddr::new(path)?)?;
+        let iov = [std::io::IoSlice::new(request.as_bytes())];
+        sendmsg::<()>(conn.as_raw_fd(), &iov, &[], MsgFlags::empty(), None)?;
+        // Keep the socket open to the end of the process.
+        std::mem::forget(conn);
+        Ok(())
+    });
+    match sent {
+        Ok(()) => format!("ok pid={}", std::process::id()),
+        Err(e) => format!("err {e}"),
+    }
+}
+
 pub fn run() {
     let spec = std::env::var("BOXBPF_TEST_PROBE").expect("probe action");
     let args: Vec<&str> = spec.split(' ').collect();
@@ -528,6 +603,7 @@ pub fn run() {
         ["accept-bind", ip] => report(accept_bind(ip.parse().expect("address"))),
         ["loader-request", socket, boxes] => loader_request(socket, boxes),
         ["root-request", socket] => root_request(socket),
+        ["root-request-abandoned", socket] => root_request_abandoned(socket),
         _ => format!("err unknown-probe {spec}"),
     };
     say(&result);
