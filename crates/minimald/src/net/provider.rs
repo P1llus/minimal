@@ -743,26 +743,27 @@ impl OwnIpNetwork {
             )));
         };
 
-        // The spawner sets the interface up from inside the namespace and
-        // hands the device back. The box's program waits until the launch
-        // lets it start, after this attach.
-        let link = crate::net::attach::Place {
+        // A native node carries the box's frames to its own gvproxy. A
+        // guest has the node's bridge to hang the namespace off. Either
+        // way the box's program waits until the launch lets it start.
+        let place = crate::net::attach::Place {
             address: reserved.lease.ip,
             subnet: reserved.subnet,
-        }
-        .link_spec(sandbox::LinkKind::Tap);
-        let tap_fd = spawned
-            .link(link)
-            .map_err(NetworkError::new)?
-            .ok_or_else(|| {
-                NetworkError::new(std::io::Error::other(
-                    "the spawner returned no network device for the box",
-                ))
-            })?;
+        };
+        let uplink: Box<dyn crate::net::attach::Uplink> = match &reserved.control {
+            ControlChannel::Unix(gvproxy) => {
+                Box::new(crate::net::attach::tap::TapUplink::new(gvproxy.clone()))
+            }
+            ControlChannel::Vsock { .. } => Box::new(crate::net::attach::veth::VethUplink),
+        };
+        let link = uplink
+            .connect(&spawned, place)
+            .await
+            .map_err(NetworkError::new)?;
 
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &self.switch,
-            tap_fd,
+            link,
             reserved.control,
             reserved.lease,
             crate::net::gvproxy_network::AttachInputs {

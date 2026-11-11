@@ -32,6 +32,10 @@ const GATE: &str = "MINIMALD_NETNS_TEST";
 const PUBLIC4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
 const WILD4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 8);
 const PUBLIC6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
+/// The addresses of the test of a box with its own address. Tests run at
+/// the same time and each removes its addresses when it ends.
+const OWN_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 17);
+const OWN_NAMED4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 18);
 const REFUSED: &str = "Operation not permitted";
 
 fn gated(test: &str) -> bool {
@@ -78,12 +82,11 @@ fn wait_for(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) {
 struct LoopbackAddrs(Vec<String>);
 
 impl LoopbackAddrs {
-    fn add() -> Self {
-        let addrs = vec![
-            format!("{PUBLIC4}/32"),
-            format!("{WILD4}/32"),
-            format!("{PUBLIC6}/128"),
-        ];
+    fn add(addrs: &[IpAddr]) -> Self {
+        let addrs: Vec<String> = addrs
+            .iter()
+            .map(|addr| format!("{addr}/{}", if addr.is_ipv4() { 32 } else { 128 }))
+            .collect();
         for addr in &addrs {
             // Left over from a run that was killed: fine.
             let _exists = sudo(&["ip", "addr", "add", addr, "dev", "lo", "nodad"]);
@@ -153,13 +156,15 @@ impl Upstream {
             ("allowed.test", RecordType::A) => vec![RData::A(A(PUBLIC4))],
             ("allowed.test", RecordType::AAAA) => vec![RData::AAAA(AAAA(PUBLIC6))],
             ("a.wild.test", RecordType::A) => vec![RData::A(A(WILD4))],
+            ("own.open.test", RecordType::A) => vec![RData::A(A(OWN_OPEN4))],
+            ("own.named.test", RecordType::A) => vec![RData::A(A(OWN_NAMED4))],
             // A listed name that points at a private address.
             ("rebind.test", RecordType::A) => vec![RData::A(A(Ipv4Addr::new(127, 0, 0, 2)))],
             _ => Vec::new(),
         };
         let known = matches!(
             name.as_str(),
-            "allowed.test" | "a.wild.test" | "rebind.test"
+            "allowed.test" | "a.wild.test" | "rebind.test" | "own.open.test" | "own.named.test"
         );
         let mut reply = Message::response(message.metadata.id, message.metadata.op_code);
         reply.metadata = Metadata::response_from_request(&message.metadata);
@@ -505,10 +510,10 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
-    let _addrs = LoopbackAddrs::add();
+    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
+    let _addrs = LoopbackAddrs::add(&[v4(PUBLIC4), v4(WILD4), IpAddr::V6(PUBLIC6)]);
     let loader = Loader::start(dir.path());
     let upstream = Upstream::start();
-    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
     let port = targets(
         &[
             v4(Ipv4Addr::LOCALHOST),
@@ -740,18 +745,18 @@ fn a_box_with_its_own_address_is_judged_published_and_named() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
-    let _addrs = LoopbackAddrs::add();
+    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
+    let _addrs = LoopbackAddrs::add(&[v4(OWN_OPEN4), v4(OWN_NAMED4)]);
     let loader = Loader::start(dir.path());
     let upstream = Upstream::start();
-    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
     // The virtual network dials these from the host, where they are local.
-    let port = targets(&[v4(PUBLIC4), v4(WILD4)], v4(PUBLIC4));
+    let port = targets(&[v4(OWN_OPEN4), v4(OWN_NAMED4)], v4(OWN_OPEN4));
     let daemon = Daemon::start(dir.path(), &loader.socket, Some(upstream.at));
 
     // Fills the package cache, which a restricted box cannot.
     daemon.activate("open", &["--network", "host_ip"]);
 
-    let subnet = format!("{PUBLIC4}/32");
+    let subnet = format!("{OWN_OPEN4}/32");
     let out = daemon.activate(
         "web",
         &[
@@ -760,7 +765,7 @@ fn a_box_with_its_own_address_is_judged_published_and_named() {
             "--allow-subnets",
             &subnet,
             "--allow-dns-hosts",
-            "a.wild.test",
+            "own.named.test",
             "--ingress",
             "18080:8080",
             "--dynamic-ingress",
@@ -771,13 +776,13 @@ fn a_box_with_its_own_address_is_judged_published_and_named() {
     );
 
     // Egress: the listed subnet, then the listed name, and nothing else.
-    let public = PUBLIC4.to_string();
-    let wild = WILD4.to_string();
+    let public = OWN_OPEN4.to_string();
+    let named = OWN_NAMED4.to_string();
     assert_eq!(daemon.connect("web", &public, port).trim(), "ok", "{out}");
-    let refused = daemon.connect("web", &wild, port);
+    let refused = daemon.connect("web", &named, port);
     assert!(refused.contains(REFUSED), "{refused}");
-    assert_eq!(daemon.connect("web", "a.wild.test", port).trim(), "ok");
-    let unlisted = daemon.connect("web", "allowed.test", port);
+    assert_eq!(daemon.connect("web", "own.named.test", port).trim(), "ok");
+    let unlisted = daemon.connect("web", "own.open.test", port);
     assert_ne!(unlisted.trim(), "ok", "{unlisted}");
     let events = daemon.min(&["box", "events", "web"]);
     assert!(events.contains("net_refused"), "{events}");

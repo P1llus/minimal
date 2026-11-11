@@ -2,9 +2,11 @@
 //!
 //! A box with an address of its own has a network namespace with one
 //! interface, `eth0`, that carries the box's lease. What is on the other
-//! side of `eth0` depends on the node: a guest node hangs the namespace off
-//! its bridge with a veth pair.
+//! side of `eth0` depends on the node: a native node pumps the frames of a
+//! TAP device to its gvproxy, and a guest node hangs the namespace off its
+//! bridge with a veth pair.
 
+pub(crate) mod tap;
 pub(crate) mod veth;
 
 use std::io;
@@ -44,13 +46,13 @@ impl Place {
 
 /// How a box's network namespace reaches the virtual network on this node.
 pub(crate) trait Uplink: Send + Sync {
-    /// Connects the namespace of `job` at `place`. Inside, the link is
+    /// Connects the namespace of `spawned` at `place`. Inside, the link is
     /// `eth0`, up, with the lease as its address and the gateway as its
-    /// default route. The job's program should be held at its start gate
+    /// default route. The box's program should be held at its start gate
     /// until this returns.
     fn connect<'a>(
         &'a self,
-        job: &'a sandbox::Child,
+        spawned: &'a sandbox::Spawned,
         place: Place,
     ) -> BoxFuture<'a, io::Result<Link>>;
 }

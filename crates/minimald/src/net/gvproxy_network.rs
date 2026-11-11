@@ -9,13 +9,13 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
-use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use sandbox::NetGuard;
 use tokio::sync::Mutex;
 
+use crate::net::attach::Link;
 use crate::net::engine::{Engine, Installed, Namespace};
 use crate::net::ingress_gate::{self, IngressGate};
 use crate::net::policy::{ControlChannel, PortForwarder};
@@ -27,16 +27,6 @@ use crate::net::{PtaskLease, SwitchClient};
 pub(crate) struct EngineBox {
     pub(crate) engine: &'static Engine,
     pub(crate) of: Arc<Installed>,
-}
-
-/// The task that copies frames between a box's TAP and gvproxy. Dropping it
-/// ends the task, which closes the TAP.
-struct Pump(tokio::task::JoinHandle<()>);
-
-impl Drop for Pump {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// An ingress side with no engine under it: every port is open, as it is
@@ -55,7 +45,8 @@ impl Admission for Unjudged {
 
 /// What stands once a namespace is connected, before its ports are open.
 struct Wired {
-    pump: Pump,
+    /// The namespace's connection to the virtual network.
+    _link: Link,
     /// The box's address in the engine and the daemon's endpoints inside
     /// the namespace.
     namespace: Option<Namespace>,
@@ -146,13 +137,13 @@ impl OwnIpAttach {
         // frames stop last. All of it is gone before the lease goes back.
         drop(exposed);
         let Wired {
-            pump,
+            _link: link,
             namespace,
             gate,
         } = wired;
         drop(gate);
         drop(namespace);
-        drop(pump);
+        drop(link);
         if let Err(e) = switch.lock().await.detach(lease).await {
             tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
         }
@@ -203,8 +194,9 @@ pub(crate) struct AttachInputs<'a> {
     pub(crate) spawned: &'a sandbox::Spawned,
 }
 
-/// Connects a box's namespace, whose TAP is `tap_fd`, to the node's switch
-/// and opens its declared ports. The box's program does not run yet.
+/// Finishes the attach of a box's namespace that `link` connects to the
+/// virtual network: the engine's side of it and its declared ports. The
+/// box's program does not run yet.
 ///
 /// # Errors
 ///
@@ -212,7 +204,7 @@ pub(crate) struct AttachInputs<'a> {
 /// lease stays with the launch to give back.
 pub(crate) async fn complete_own_ip_attach(
     switch: &Arc<Mutex<SwitchClient>>,
-    tap_fd: OwnedFd,
+    link: Link,
     control: ControlChannel,
     lease: PtaskLease,
     inputs: AttachInputs<'_>,
@@ -246,20 +238,6 @@ pub(crate) async fn complete_own_ip_attach(
     if let Some(gate) = &gate {
         ingress_gate::register(lease_ip, gate);
     }
-    let ControlChannel::Unix(gvproxy) = &control else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "a box's TAP is carried to a switch on this node only",
-        ));
-    };
-    let frames = ::switch::pump::Packets::new(tap_fd)?;
-    let config = ::switch::pump::Config::new(gvproxy.clone());
-    let root = tracing::info_span!(parent: None, "net.pump", lease = %lease_ip);
-    let pump = Pump(crate::traced::spawn_detached(root, async move {
-        let stats = Arc::new(::switch::pump::Stats::default());
-        let end = ::switch::pump::run(frames, config, stats).await;
-        tracing::debug!(?end, "a box's frame pump ended");
-    }));
     tracing::debug!(
         session = session_name,
         switch_address = %lease_ip,
@@ -269,7 +247,7 @@ pub(crate) async fn complete_own_ip_attach(
     finish_own_ip_attach(
         switch,
         Wired {
-            pump,
+            _link: link,
             namespace,
             gate,
         },
@@ -435,7 +413,6 @@ async fn finish_own_ip_attach(
 mod tests {
     use std::collections::BTreeSet;
     use std::net::Ipv4Addr;
-    use std::os::fd::FromRawFd as _;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -448,6 +425,7 @@ mod tests {
     use crate::net::PtaskLease;
     use crate::net::SwitchClient;
     use crate::net::SwitchTransport;
+    use crate::net::attach::Link;
     use crate::net::dns;
     use crate::net::policy::{ControlChannel, register_dns_name};
 
@@ -843,8 +821,6 @@ mod tests {
         control_path: PathBuf,
         registry: Arc<std::sync::RwLock<dns::HostnameRegistry>>,
         reporter: crate::net::provider::OwnAddressReporter,
-        tap_fd: std::os::fd::OwnedFd,
-        _box_end: std::fs::File,
     }
 
     /// Builds one scenario inside `dir`, on its own `socket`, so a test can
@@ -859,24 +835,16 @@ mod tests {
             Arc::clone(&registry),
             boxes::SessionId::nil(),
         );
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `socketpair` with a valid domain/type either returns -1
-        // (checked) or fills `fds` with two fresh descriptors.
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "socketpair: {}", std::io::Error::last_os_error());
-        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
-        // returned by socketpair.
-        let tap_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
-        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
-        // returned by socketpair.
-        let box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         AttachScenario {
             control_path,
             registry,
             reporter,
-            tap_fd,
-            _box_end: box_end,
         }
+    }
+
+    /// A connection of a namespace that nothing carries.
+    fn no_link() -> Link {
+        Link::new(|| {})
     }
 
     /// The control requests that have arrived. An attach that has returned
@@ -1007,7 +975,7 @@ mod tests {
         );
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
             &refused_switch,
-            refused.tap_fd,
+            no_link(),
             ControlChannel::Unix(refused.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1120,7 +1088,7 @@ mod tests {
         );
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
             &failed_switch,
-            failed.tap_fd,
+            no_link(),
             ControlChannel::Unix(failed.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1202,7 +1170,7 @@ mod tests {
         let policy = declared_two_ports();
         let err = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            bare.tap_fd,
+            no_link(),
             ControlChannel::Unix(bare.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1269,7 +1237,7 @@ mod tests {
         );
         let err = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            unhand.tap_fd,
+            no_link(),
             ControlChannel::Unix(unhand.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1349,7 +1317,7 @@ mod tests {
 
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            scenario.tap_fd,
+            no_link(),
             ControlChannel::Unix(scenario.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1416,7 +1384,7 @@ mod tests {
             .expect("the slot is free");
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            scenario.tap_fd,
+            no_link(),
             ControlChannel::Unix(scenario.control_path.clone()),
             attached.lease,
             crate::net::gvproxy_network::AttachInputs {
@@ -1514,7 +1482,7 @@ mod tests {
 
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            scenario.tap_fd,
+            no_link(),
             ControlChannel::Unix(scenario.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1613,7 +1581,7 @@ mod tests {
         // First spawn: the box yields 8080, so its attach binds 9090 alone.
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            scenario.tap_fd,
+            no_link(),
             control.clone(),
             lease_at(FIRST_LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1679,7 +1647,7 @@ mod tests {
 
         // The next spawn holds the port of record: its attach binds both
         // ports itself, toward its own lease.
-        let second_tap = attach_scenario(&dir, "unused.sock").tap_fd;
+        let second_tap = no_link();
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             second_tap,
@@ -1758,7 +1726,7 @@ mod tests {
         // First spawn: attach, then a runtime publish delivering to its lease.
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            scenario.tap_fd,
+            no_link(),
             control.clone(),
             lease_at(FIRST_LEASE),
             crate::net::gvproxy_network::AttachInputs {
@@ -1822,7 +1790,7 @@ mod tests {
 
         // Second spawn, on a new lease: it starts with no runtime forward,
         // and publishes are accepted again.
-        let second_tap = attach_scenario(&dir, "unused.sock").tap_fd;
+        let second_tap = no_link();
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             second_tap,
@@ -1914,7 +1882,7 @@ mod tests {
 
         let guard = match crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
-            scenario.tap_fd,
+            no_link(),
             ControlChannel::Unix(scenario.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {

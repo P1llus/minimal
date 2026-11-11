@@ -35,10 +35,6 @@ pub mod proxy;
 pub(crate) mod gvproxy_network;
 pub(crate) mod provider;
 
-#[allow(
-    dead_code,
-    reason = "no caller until a guest's own_ip box gets its veth"
-)]
 pub(crate) mod attach;
 #[allow(
     dead_code,

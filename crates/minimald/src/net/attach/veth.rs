@@ -71,11 +71,11 @@ fn delete(host: &str) {
 impl Uplink for VethUplink {
     fn connect<'a>(
         &'a self,
-        job: &'a sandbox::Child,
+        spawned: &'a sandbox::Spawned,
         place: Place,
     ) -> BoxFuture<'a, io::Result<Link>> {
         Box::pin(async move {
-            let netns = job
+            let netns = spawned
                 .netns()
                 .ok_or_else(|| {
                     io::Error::new(
@@ -90,7 +90,7 @@ impl Uplink for VethUplink {
             let node_end = host.clone();
             let link = Link::new(move || delete(&node_end));
             let spec = place.link_spec(sandbox::LinkKind::Existing(INSIDE.to_owned()));
-            job.link(spec)?;
+            spawned.link(spec)?;
             tracing::debug!(interface = %host, address = %place.address, "connected a box to the node's bridge");
             Ok(link)
         })
