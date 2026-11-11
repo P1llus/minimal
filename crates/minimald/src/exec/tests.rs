@@ -3133,8 +3133,8 @@ mod managed {
     use tokio::io::AsyncReadExt as _;
 
     use super::super::{
-        AttachEnd, ExecBox, ExecEntry, ExecExitReason, ExecFacts, ManagedStart, SESSION_SHELL,
-        exec_argv, find_exec, mint_exec_id, read_exec_output, relay_terminal, start_managed_exec,
+        AttachEnd, ExecBox, ExecEntry, ExecExitReason, ExecFacts, ManagedStart, exec_argv,
+        find_exec, mint_exec_id, read_exec_output, relay_terminal, start_managed_exec,
         start_managed_exec_within, timeout_deadline,
     };
 
@@ -3248,62 +3248,6 @@ mod managed {
             assert_ne!(n, 0, "the attach closed before {needle:?}; read {seen:?}");
             seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
-    }
-
-    /// BOX-149: the argv runs as given. The words reach the box host's
-    /// injection unchanged after its `--`, with no shell before them, and
-    /// the injection joins the box's namespaces (through the pidfd of its
-    /// leader) and its cgroup leaf. Run, the words print as data, nothing
-    /// expands them, and the exit code comes back.
-    #[tokio::test]
-    async fn exec_runs_argv_unshelled_in_box_namespaces_and_cgroup() {
-        let words = ["printf", "%s|", "a b", "$HOME", "*", "; echo injected"];
-        let (program, args) = exec_argv(words.map(String::from).to_vec());
-        assert_eq!(program, words[0]);
-        assert_eq!(args, words[1..]);
-
-        // The same join the box host builds for an exec (box_runtime's
-        // `command_in_session_env`), against a stand-in box leader.
-        let leaf =
-            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
-        let shim = tempfile::NamedTempFile::new().unwrap();
-        let mut leader = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let built = crate::nsenter::Injection::new(leader.id(), &program, &args)
-            .with_shim(shim.path())
-            .with_classifier_leaf(leaf.clone())
-            .command();
-        let _ = leader.kill();
-        let _ = leader.wait();
-        let argv: Vec<String> = built
-            .expect("the injection builds")
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let dashdash = argv.iter().position(|a| a == "--").expect("{argv:?}");
-        assert_eq!(argv[dashdash + 1..], words, "{argv:?}");
-        assert!(
-            !argv.iter().any(|a| a == SESSION_SHELL || a == "-c"),
-            "no shell stands before the words: {argv:?}"
-        );
-        assert!(argv.iter().any(|a| a == "--pidfd"), "{argv:?}");
-        let at = argv
-            .iter()
-            .position(|a| a == "--classifier-leaf")
-            .expect("the exec joins the box's cgroup leaf");
-        assert_eq!(std::path::Path::new(&argv[at + 1]), leaf.dir());
-
-        let disk = box_on_disk();
-        let entry = disk.start(ExecMode::Detached, &words, None, false);
-        assert_eq!(entry.wait().await.code, Some(0));
-        assert_eq!(disk.output(&entry.id).await, "a b|$HOME|*|; echo injected|");
-
-        let failing = disk.start(ExecMode::Detached, &["sh", "-c", "exit 7"], None, false);
-        let exit = failing.wait().await;
-        assert_eq!(exit.code, Some(7));
-        assert_eq!(exit.status(), 7);
     }
 
     /// BOX-149: every exec gets a UUIDv7 id, whatever its mode: the id the

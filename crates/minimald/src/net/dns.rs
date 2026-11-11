@@ -3889,25 +3889,14 @@ fn owner_of_holders(holders: impl IntoIterator<Item = Option<HolderBox>>) -> Con
     }
 }
 
-/// The box whose classifier leaf a process's `/proc/<pid>/cgroup` names:
-/// the path component after `boxes/allow` or `boxes/deny`, read as a box id.
-/// `None` for a process in no box's leaf.
+/// The box whose cgroup a process's `/proc/<pid>/cgroup` names. `None` for a
+/// process in no box cgroup.
 fn box_in_cgroup(cgroup: &str) -> Option<SessionId> {
-    use sandbox::classifier::BOXES_DIR;
-    let subtrees = [
-        sandbox::config::Verdict::Allow.dir_name(),
-        sandbox::config::Verdict::Deny.dir_name(),
-    ];
-    cgroup.lines().find_map(|line| {
+    cgroup
+        .lines()
         // cgroup2's line is `0::<path>`; a v1 line names a controller.
-        let path = line.strip_prefix("0::")?;
-        let parts: Vec<&str> = path.split('/').collect();
-        parts.windows(3).find_map(|window| {
-            (window[0] == BOXES_DIR && subtrees.contains(&window[1]))
-                .then(|| SessionId::parse_str(window[2]).ok())
-                .flatten()
-        })
-    })
+        .find_map(|line| line.strip_prefix("0::"))
+        .and_then(crate::box_cgroups::box_of_cgroup)
 }
 
 /// The wall clock the record stamps grants with, in Unix seconds — the same
@@ -4352,25 +4341,26 @@ mod tests {
         assert_eq!(own_ip.host_address_listener(wildcard_port), None);
     }
 
-    /// NET-070's socket-owner lookup, step by step. The cgroup a process
-    /// reports names its box when it runs in a classifier leaf, in either
-    /// subtree, and names no box otherwise.
+    /// The cgroup a process reports names its box when it is a box cgroup of
+    /// this daemon, and names no box otherwise.
     #[test]
-    fn box_in_cgroup_reads_the_classifier_leaf() {
+    fn box_in_cgroup_reads_the_box_cgroup() {
         let id = "00000000-0000-0000-0000-0000000000aa";
         let want = SessionId::parse_str(id).ok();
-        for subtree in ["allow", "deny"] {
-            let cgroup = format!("0::/minimald.slice/boxes/{subtree}/{id}\n");
-            assert_eq!(box_in_cgroup(&cgroup), want, "{subtree}");
-        }
-        for cgroup in [
-            "0::/user.slice/user-1000.slice/session-2.scope\n",
-            "0::/minimald.slice/boxes/other/00000000-0000-0000-0000-0000000000aa\n",
-            "0::/minimald.slice/boxes/allow/not-a-box-id\n",
-            "4:cpu:/minimald.slice/boxes/allow/00000000-0000-0000-0000-0000000000aa\n",
-        ] {
-            assert_eq!(box_in_cgroup(cgroup), None, "{cgroup}");
-        }
+        crate::box_cgroups::with_root_name("/minimal", || {
+            assert_eq!(box_in_cgroup(&format!("0::/minimal/boxes/{id}\n")), want);
+            for cgroup in [
+                "0::/user.slice/user-1000.slice/session-2.scope\n",
+                "0::/minimal/supervisor\n",
+                "0::/minimal/boxes/not-a-box-id\n",
+                "0::/other/boxes/00000000-0000-0000-0000-0000000000aa\n",
+                "4:cpu:/minimal/boxes/00000000-0000-0000-0000-0000000000aa\n",
+            ] {
+                assert_eq!(box_in_cgroup(cgroup), None, "{cgroup}");
+            }
+        });
+        // A daemon with no cgroup root names no box.
+        assert_eq!(box_in_cgroup(&format!("0::/minimal/boxes/{id}\n")), None);
     }
 
     /// NET-070: a socket can have several holders. A holder in a box's leaf
@@ -4382,11 +4372,13 @@ mod tests {
         let a = "00000000-0000-0000-0000-0000000000aa";
         let b = "00000000-0000-0000-0000-0000000000bb";
         let in_box = |id: &str| {
-            holder_box(
-                &format!("0::/minimal/boxes/deny/{id}\n"),
-                Some(&[(1, 1)]),
-                |_| None,
-            )
+            crate::box_cgroups::with_root_name("/minimal", || {
+                holder_box(
+                    &format!("0::/minimal/boxes/{id}\n"),
+                    Some(&[(1, 1)]),
+                    |_| None,
+                )
+            })
         };
         let outside = || {
             holder_box(
@@ -4453,11 +4445,11 @@ mod tests {
             "a holder whose namespace cannot be read"
         );
         assert_eq!(
-            holder_box(
-                "0::/minimal/boxes/allow/00000000-0000-0000-0000-0000000000bb\n",
+            crate::box_cgroups::with_root_name("/minimal", || holder_box(
+                "0::/minimal/boxes/00000000-0000-0000-0000-0000000000bb\n",
                 None,
                 in_a
-            ),
+            )),
             Some(HolderBox::Leaf(b)),
             "a classifier leaf names its box first"
         );

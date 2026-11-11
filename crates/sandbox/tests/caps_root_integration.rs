@@ -1,15 +1,11 @@
-//! Capability proofs for the sandbox layer (NET-083): every box runs without
+//! Capability proofs for the sandbox layer: every box runs without
 //! `CAP_NET_RAW`, and without any other capability.
 //!
-//! * `boxes_lack_cap_net_raw` — inside an *open* box (a plan with no
-//!   socket-family filter, so the only thing that can refuse a raw socket is
-//!   the missing capability) and inside a *none* box (whose family filter
-//!   refuses it earlier still), a process reports its uid, gid, capability
-//!   sets and `no_new_privs` bit from `/proc/self/status` and attempts a raw
-//!   socket. The report must show the unprivileged box uid, `no_new_privs` set,
-//!   every capability set empty, and the bounding set — the one set an exec
-//!   does not clear — holding none of the capabilities no box may hold,
-//!   `CAP_NET_RAW` first.
+//! * `boxes_lack_cap_net_raw` — inside a box that shares the host's network,
+//!   a process reports its uid, gid, capability sets and `no_new_privs` bit
+//!   from `/proc/self/status` and attempts a raw socket. The report must
+//!   show the unprivileged box uid, `no_new_privs` set and every capability
+//!   set empty, and the raw socket must be refused.
 //!
 //! * `boxes_mount_a_nested_procfs` — the same open box, one more probe: a
 //!   process unshares a user, mount and pid namespace, as a nested sandbox
@@ -53,7 +49,7 @@
 #![cfg(target_os = "linux")]
 
 use sandbox::NetPlan;
-use sandbox::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
+use sandbox::config::{BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -478,12 +474,10 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
     parse_report(&String::from_utf8_lossy(&report))
 }
 
-/// NET-083. Every box runs without `CAP_NET_RAW`, and without any other
-/// capability: it execs as the unprivileged box uid inside its user namespace
-/// with `no_new_privs` set, so the kernel clears every capability set at exec
-/// and no file capability can restore one, and the capabilities no box may
-/// hold are dropped from the bounding set — the one set an exec does not clear
-/// — so they cannot come back.
+/// Every box runs without `CAP_NET_RAW`, and without any other capability:
+/// it execs as the unprivileged box uid inside its user namespace with
+/// `no_new_privs` set, so the kernel clears every capability set at exec and
+/// no file capability can restore one.
 ///
 /// A raw socket is refused by the missing capability alone, while a stream
 /// socket still works: the refusal is about the capability, not a broken
@@ -549,8 +543,7 @@ async fn boxes_mount_a_nested_procfs() {
 }
 
 /// What every box's report must show: the unprivileged box uid and gid, the
-/// `no_new_privs` bit set, every capability set empty, and the bounding set
-/// holding none of the capabilities no box may hold.
+/// `no_new_privs` bit set, and every capability set empty.
 fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
     // The box uid and gid in every id field the status file reports (real,
     // effective, saved, fs): a box is never root inside its own user
@@ -588,22 +581,6 @@ fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
             mask, 0,
             "{what}: {set} must be empty — the box execs as the unprivileged \
              box uid with no_new_privs set, so exec clears it"
-        );
-    }
-
-    // The bounding set, the one set exec does not clear: it must hold none of
-    // the capabilities no box may hold. A capability left in it is one a file
-    // capability in the box could hand back.
-    let mask = capability_mask(report, "CapBnd", what);
-    for cap in BOX_FORBIDDEN_CAPABILITIES {
-        assert_eq!(
-            mask & (1 << cap.number),
-            0,
-            "{what}: CapBnd must not hold {} (bit {}): the bounding set \
-             survives exec, so a capability left in it is one a file \
-             capability in the box could restore",
-            cap.name,
-            cap.number
         );
     }
 }

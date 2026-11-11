@@ -53,18 +53,16 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// cgroups v2 cpu.weights.
     pub cpu_weight: Option<u64>,
 
-    /// The classifier leaf of the box this build runs for, if any (NET-155).
-    /// When set, the build's sandbox runs in that leaf, so the box's egress
-    /// verdict decides every connection the build makes. When `None`, the
-    /// build runs in the cgroup of its caller, as the caller's own traffic.
-    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The cgroup of the box this build runs for, if any. The build's
+    /// sandbox and its source fetches then run in that cgroup. `None` runs
+    /// the build in the cgroup of its caller, as the caller's own traffic.
+    pub box_cgroup: Option<sandbox::cgroup::BoxCgroup>,
 
-    /// The network of the box this build runs for, if the box has no
-    /// classifier leaf and is not a host-address box (NET-155): an
-    /// own-address box, or a box with no network. A build that needs the
-    /// network attaches to it, so the box's egress verdict decides every
-    /// connection the build makes. A build that needs no network stays in
-    /// its empty namespace. `None` keeps the plan below.
+    /// The network of the box this build runs for, if the box has a network
+    /// namespace of its own or no network at all (NET-155). A build that
+    /// needs the network attaches to it, so the box's egress rules decide
+    /// every connection the build makes. A build that needs no network stays
+    /// in its empty namespace. `None` keeps the plan below.
     pub box_network: Option<BuildNetwork>,
 }
 
@@ -197,9 +195,9 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         &'b self,
         exec_base: &'b std::path::Path,
     ) -> Option<crate::SourcePlace<'b>> {
-        match (&self.classifier_leaf, &self.box_network) {
-            (Some(leaf), _) => Some(crate::SourcePlace::Leaf(leaf)),
-            (None, Some(network)) => Some(crate::SourcePlace::Network { network, exec_base }),
+        match (&self.box_network, &self.box_cgroup) {
+            (Some(network), _) => Some(crate::SourcePlace::Network { network, exec_base }),
+            (None, Some(cgroup)) => Some(crate::SourcePlace::Box(cgroup)),
             (None, None) => None,
         }
     }
@@ -534,9 +532,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         let _ = writer.flush().await;
     }
 
-    /// The sandbox configuration this build runs in. A build placed for a box
-    /// (NET-155) carries that box's classifier leaf, so its sandbox joins the
-    /// box's leaf and not the leaf of the process that starts it.
+    /// The sandbox configuration this build runs in.
     fn sandbox_config(
         &self,
         build: &BuildSpec,
@@ -568,8 +564,8 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         if let Some(id) = daemon_id {
             config = config.with_daemon_id(id.clone());
         }
-        if let Some(leaf) = &self.classifier_leaf {
-            config = config.with_classifier_leaf(leaf.clone());
+        if let Some(cgroup) = &self.box_cgroup {
+            config = config.with_box_cgroup(cgroup.clone());
         }
         // NET-155: a build that needs the network, for an own-address box,
         // runs on that box's network and under its egress verdict.
@@ -815,7 +811,7 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
-            classifier_leaf: None,
+            box_cgroup: None,
             box_network: None,
         }
     }
@@ -979,7 +975,7 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
-            classifier_leaf: None,
+            box_cgroup: None,
             box_network: None,
         };
         let opts = Options {
@@ -993,53 +989,5 @@ mod tests {
         let op = OpTracker::new_root();
         let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
         assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
-    }
-
-    /// NET-155: a spec build placed for a box runs its sandbox in that box's
-    /// classifier leaf. A build with no placement names no leaf, so its
-    /// sandbox stays in the cgroup of the process that starts it.
-    #[test]
-    fn spec_build_runs_in_the_given_classifier_leaf() {
-        let dg = graph_from(indoc! {r#"
-            let {BuildSpec, ..} = import "minimal.ncl" in
-            {
-                name = "downloads-at-build",
-                build_deps = [],
-                cmd = "curl https://example.invalid/",
-            } | BuildSpec
-        "#});
-        let bsr = *dg.by_name("downloads-at-build").unwrap();
-        let build = dg.get(&bsr).unwrap();
-        let fetcher = UnusedFetcher;
-        let leaf = sandbox::config::ClassifierLeaf::under(
-            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
-            "box-1",
-            sandbox::config::Verdict::Deny,
-        );
-
-        let mut placed = spec_build(&bsr, &fetcher);
-        placed.classifier_leaf = Some(leaf.clone());
-        let config = placed.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
-        assert_eq!(config.classifier_leaf, Some(leaf));
-
-        let unplaced = spec_build(&bsr, &fetcher);
-        let config = unplaced.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
-        assert_eq!(config.classifier_leaf, None);
-        assert!(config.network.is_none());
-
-        // An own-address box has no leaf. Its build runs on the box's own
-        // network when the build needs the network, and in an empty
-        // namespace when it does not.
-        let mut on_box_network = spec_build(&bsr, &fetcher);
-        on_box_network.box_network = Some(BuildNetwork::new(|| {
-            std::sync::Arc::new(sandbox::NoNet) as std::sync::Arc<dyn sandbox::Network>
-        }));
-        let config =
-            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
-        assert_eq!(config.classifier_leaf, None);
-        assert!(config.network.is_some());
-        let config =
-            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), false, false, None);
-        assert!(config.network.is_none());
     }
 }

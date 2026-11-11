@@ -389,14 +389,29 @@ impl Root {
     /// The box a cgroup path belongs to; see [`Self::box_of_pid`].
     #[must_use]
     pub fn box_of_cgroup(&self, cgroup: &str) -> Option<String> {
-        let below = cgroup
-            .strip_prefix(self.name.as_str())?
-            .strip_prefix('/')?
-            .strip_prefix(BOXES)?
-            .strip_prefix('/')?;
-        let name = below.split('/').next()?;
-        (!name.is_empty()).then(|| name.to_owned())
+        box_below(&self.name, cgroup).map(str::to_owned)
     }
+
+    /// The root as `/proc/<pid>/cgroup` spells it, with no trailing slash:
+    /// empty for the real cgroup root.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// The name of the box cgroup that `cgroup` is, below the root named `root`:
+/// both as `/proc/<pid>/cgroup` spells them. `None` for a cgroup that is not
+/// a box cgroup of that root.
+#[must_use]
+pub fn box_below<'a>(root: &str, cgroup: &'a str) -> Option<&'a str> {
+    let below = cgroup
+        .strip_prefix(root)?
+        .strip_prefix('/')?
+        .strip_prefix(BOXES)?
+        .strip_prefix('/')?;
+    let name = below.split('/').next()?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// The directory name of a box's cgroup: the id, when it is a plain name.
@@ -796,6 +811,20 @@ mod tests {
         );
         assert_eq!(unit_of("/non-systemd"), None);
         assert_eq!(unit_of("/"), None);
+    }
+
+    #[test]
+    fn a_box_cgroup_is_the_one_directly_below_boxes() {
+        let root = "/user.slice/user-1000.slice/user@1000.service/app.slice/run-r1.scope";
+        assert_eq!(box_below(root, &format!("{root}/boxes/b1")), Some("b1"));
+        assert_eq!(box_below(root, &format!("{root}/supervisor")), None);
+        assert_eq!(box_below(root, &format!("{root}/boxes")), None);
+        assert_eq!(box_below(root, &format!("{root}/boxes/")), None);
+        assert_eq!(box_below(root, &format!("{root}x/boxes/b1")), None);
+        assert_eq!(box_below(root, "/elsewhere/boxes/b1"), None);
+        // The real cgroup root, as a guest's daemon has it.
+        assert_eq!(box_below("", "/boxes/b1"), Some("b1"));
+        assert_eq!(box_below("", "/supervisor"), None);
     }
 
     #[test]

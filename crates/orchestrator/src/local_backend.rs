@@ -137,9 +137,9 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     pub(crate) ot: Option<OpTracker>,
     pub(crate) cancel: tokio_util::sync::CancellationToken,
-    /// The classifier leaf of the box these builds run for, if any
-    /// (NET-155). Every spec build this backend schedules runs in it.
-    pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The cgroup of the box these builds run for, if any. Every spec
+    /// build of this backend runs in it.
+    pub(crate) box_cgroup: Option<sandbox::cgroup::BoxCgroup>,
     /// The network of the own-address box these builds run for, if any
     /// (NET-155). Every spec build this backend schedules attaches to it.
     pub(crate) box_network: Option<op::BuildNetwork>,
@@ -227,7 +227,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 cpu_weight: Some(
                     ((3 * cost + 60 + depended_on_by * cost.max(1) * 25) as u64).min(10000),
                 ),
-                classifier_leaf: shared.backend.classifier_leaf.clone(),
+                box_cgroup: shared.backend.box_cgroup.clone(),
                 box_network: shared.backend.box_network.clone(),
             };
 
@@ -418,7 +418,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
         ot: Option<OpTracker>,
         cancel: tokio_util::sync::CancellationToken,
-        classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+        box_cgroup: Option<sandbox::cgroup::BoxCgroup>,
         box_network: Option<op::BuildNetwork>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
@@ -431,7 +431,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 num_concurrent_builds,
                 ot,
                 cancel,
-                classifier_leaf,
+                box_cgroup,
                 box_network,
             },
             graph,
@@ -440,10 +440,9 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         })
     }
 
-    /// The classifier leaf every spec build of this backend runs in, if the
-    /// builds run for a box (NET-155).
-    pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
-        self.classifier_leaf.as_ref()
+    /// The box cgroup every spec build of this backend runs in, if any.
+    pub fn box_cgroup(&self) -> Option<&sandbox::cgroup::BoxCgroup> {
+        self.box_cgroup.as_ref()
     }
 
     /// The network every spec build of this backend attaches to, if the

@@ -471,13 +471,11 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // the question is about.
     let mountinfo =
         std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
-    let delegated = sandbox::classifier::host_cgroup2_mounts(&mountinfo)
-        .into_iter()
-        .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
+    let delegated = cgroup2_mounted_with_nsdelegate(&mountinfo);
     match (failure, delegated) {
         (None, true) => tracing::info!(
             mountpoint = %cgroup2,
-            "mounted cgroup2 with nsdelegate for the per-box classifier tree"
+            "mounted cgroup2 with nsdelegate"
         ),
         (failure, _) => {
             let error = failure
@@ -485,8 +483,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
                 .unwrap_or_else(|| "the existing cgroup2 mount carries no nsdelegate".to_string());
             tracing::error!(
                 error = %error,
-                "mounting cgroup2 with nsdelegate: a broken guest image; \
-                 host-address boxes will be refused"
+                "mounting cgroup2 with nsdelegate failed: a broken guest image"
             );
         }
     }
@@ -1725,6 +1722,26 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
     } else {
         tracing::info!(target, fstype, "mounted pseudo filesystem");
     }
+}
+
+/// Whether the mount table `mountinfo` holds a cgroup2 mount at
+/// `sys/fs/cgroup` with the `nsdelegate` option.
+fn cgroup2_mounted_with_nsdelegate(mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        // `<ids> <root> <mount point> <options> ... - <fstype> <source> <super options>`
+        let Some((before, after)) = line.split_once(" - ") else {
+            return false;
+        };
+        let mount_point = before.split(' ').nth(4).unwrap_or_default();
+        let mut after = after.split(' ');
+        let fstype = after.next().unwrap_or_default();
+        let super_options = after.nth(1).unwrap_or_default();
+        fstype == "cgroup2"
+            && mount_point.ends_with("sys/fs/cgroup")
+            && super_options
+                .split(',')
+                .any(|option| option == "nsdelegate")
+    })
 }
 
 #[cfg(test)]

@@ -427,9 +427,6 @@ pub struct Injection {
     cwd: Option<PathBuf>,
     env: Option<BTreeMap<String, String>>,
     shim_exe: Option<PathBuf>,
-    /// The box's classifier leaf (NET-079), joined before the namespaces.
-    /// `None` on a host that places no box.
-    leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
 impl Injection {
@@ -449,7 +446,6 @@ impl Injection {
             cwd: None,
             env: None,
             shim_exe: None,
-            leaf: None,
         }
     }
 
@@ -481,22 +477,6 @@ impl Injection {
     /// path is unrunnable uses [`set_shim_exe`] instead.
     pub fn with_shim(mut self, shim_exe: impl Into<PathBuf>) -> Self {
         self.shim_exe = Some(shim_exe.into());
-        self
-    }
-
-    /// Joins the box's classifier leaf before joining its namespaces.
-    ///
-    /// The leaf is the cgroup the box's egress verdict is decided on, and the
-    /// one the injected process must share with the box it joins. The join is
-    /// the shim's own — and it happens *before* `setns`, the only place it
-    /// can: the box's cgroup namespace is rooted at its own leaf, and from
-    /// inside it that root is not writable — with `nsdelegate` mounted the
-    /// root's `cgroup.procs` is a delegation boundary, and the empty tmpfs
-    /// the box mounts over the tree it joined through leaves no path to
-    /// write a migration to at all. Writing the shim's pid from the daemon's
-    /// namespaces puts it, and the program it forks, in the leaf.
-    pub fn with_classifier_leaf(mut self, leaf: sandbox::config::ClassifierLeaf) -> Self {
-        self.leaf = Some(leaf);
         self
     }
 
@@ -547,9 +527,6 @@ impl Injection {
         }
         if let Some(cwd) = &self.cwd {
             cmd.arg("--chdir").arg(cwd);
-        }
-        if let Some(leaf) = &self.leaf {
-            cmd.arg("--classifier-leaf").arg(leaf.dir());
         }
         if let Some(env) = self.env {
             // The shim needs nothing from the daemon's environment — it holds
@@ -610,14 +587,6 @@ pub struct ShimArgs {
     #[arg(long)]
     chdir: Option<PathBuf>,
 
-    /// The classifier leaf of the box being joined, so the shim can move
-    /// itself into it **before** `setns` — the write has to happen from the
-    /// daemon's namespaces, where the leaf is reachable; see
-    /// [`Injection::with_classifier_leaf`]. Absent on a host that places no
-    /// box, whose injections join nothing but the namespaces.
-    #[arg(long)]
-    classifier_leaf: Option<PathBuf>,
-
     /// The program to run inside the session, followed by its arguments.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<OsString>,
@@ -666,47 +635,6 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // A wrong `--pidfd` yields a closed or unrelated descriptor, which fails
     // `setns` with EBADF/EINVAL rather than doing damage.
     let pidfd = unsafe { OwnedFd::from_raw_fd(args.pidfd) };
-
-    // NET-079: join the box's classifier leaf before its namespaces. This is
-    // the one write that has to happen *before* `setns`: the box's cgroup
-    // namespace is rooted at its own leaf, and from inside it that root is
-    // not writable — with `nsdelegate` mounted the root's `cgroup.procs` is
-    // a delegation boundary, and the empty tmpfs the box mounts over the
-    // tree it joined through leaves no path to write a migration to. Writing
-    // our pid here, from the daemon's own namespaces, moves this shim into
-    // the leaf, and the program forked below inherits it with everything
-    // else.
-    //
-    // Fatal for a deny leaf, advisory for any other: a process that stays
-    // out of a deny-all box's leaf is a process of a box whose declaration
-    // admits nothing running where nothing refuses its connections — the
-    // one placement failure a verdict cannot survive, so the injected run
-    // stops rather than silently run unenforced. Any other leaf is the
-    // cohort's identity alone, and a host that cannot place an injected
-    // process does not refuse it on that ground (NET-079's exception): it
-    // runs in the daemon's leaf instead, and the box's own processes are
-    // placed either way. This shim has no logger (it runs before any
-    // runtime is built), so the failure goes to the inherited stderr, which
-    // is the daemon's.
-    if let Some(leaf) = &args.classifier_leaf {
-        let leaf = sandbox::config::ClassifierLeaf::new(leaf);
-        if let Err(source) = sandbox::classifier::place_pid(&leaf.procs(), std::process::id()) {
-            if leaf.is_deny() {
-                eprintln!(
-                    "minimald: joining the deny-all box's classifier leaf {}: {source}",
-                    leaf.dir().display()
-                );
-                return Err(NsenterError::JoinDenyLeaf {
-                    leaf: leaf.dir().to_path_buf(),
-                    source,
-                });
-            }
-            eprintln!(
-                "minimald: joining the session's classifier leaf {}: {source}",
-                leaf.dir().display()
-            );
-        }
-    }
 
     // The daemon's procfs, opened before the join: the grace period below scans
     // it for live members of the injected group, by the pids and group ids this
@@ -809,23 +737,6 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
-        });
-
-        // The injected process takes the box's credentials — no_new_privs, the
-        // capabilities no box may hold dropped from the bounding set, every
-        // capability set cleared, and the box uid and gid — the same state the
-        // box's own processes exec with, so a process that joins a running box
-        // cannot be the hole that state was for. Joining the user namespace
-        // above granted this process a full capability set in it, which is
-        // what the drops run on; without them, a file capability or a setuid
-        // bit on a program in the box could hand the injected process a
-        // capability no box process may hold.
-        cmd.pre_exec(|| {
-            // SAFETY: `assume_box_credentials` only makes async-signal-safe
-            // syscalls and owns no state; this is the pre-exec moment it is
-            // for, in the box's user namespace with the capabilities joining
-            // it granted.
-            sandbox::assume_box_credentials()
         });
 
         // The profile the box's own processes run under. A process that joins
@@ -1666,53 +1577,6 @@ mod tests {
         assert!(
             matches!(resolved, Err(NsenterError::NoSessionLeader { .. })),
             "expected NoSessionLeader, got {resolved:?}"
-        );
-    }
-
-    /// The leaf an injection joins travels on the shim's argv, so the one
-    /// process that can write it — the shim, before it joins the namespaces
-    /// — knows where to go. Opt-in: a host that places no box sends no flag,
-    /// and the injection joins nothing but the namespaces.
-    #[test]
-    fn the_classifier_leaf_travels_on_the_shims_argv_when_one_is_set() {
-        let leaf =
-            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
-        let shim = tempfile::NamedTempFile::new().expect("a temp file to stand in for the shim");
-
-        let mut sleep = Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawning /bin/sleep");
-        let target = sleep.id();
-        let unplaced = Injection::new(target, "/bin/true", Vec::<&str>::new())
-            .with_shim(shim.path())
-            .command();
-        let placed = Injection::new(target, "/bin/true", Vec::<&str>::new())
-            .with_shim(shim.path())
-            .with_classifier_leaf(leaf.clone())
-            .command();
-
-        let _ = sleep.kill();
-        let _ = sleep.wait();
-
-        let argv = |cmd: std::process::Command| -> Vec<OsString> {
-            cmd.get_args().map(OsString::from).collect()
-        };
-        let bare = argv(unplaced.expect("building the command without a leaf"));
-        assert!(
-            !bare.contains(&OsString::from("--classifier-leaf")),
-            "a host that places no box sends no flag: {bare:?}"
-        );
-        let joined = argv(placed.expect("building the command with a leaf"));
-        let at = joined
-            .iter()
-            .position(|arg| arg == "--classifier-leaf")
-            .expect("the leaf is named on the shim's argv");
-        assert_eq!(
-            joined[at + 1],
-            OsString::from(leaf.dir().as_os_str()),
-            "the flag carries the leaf's directory, whose cgroup.procs the \
-             shim writes its pid to"
         );
     }
 }

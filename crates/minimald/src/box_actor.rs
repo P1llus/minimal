@@ -638,6 +638,9 @@ pub struct BoxActor {
     /// unused-field lint is silenced under test rather than threaded through.
     #[cfg_attr(test, allow(dead_code))]
     net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+    /// The box's cgroup, while it has one: every process that runs in or
+    /// for the box starts in it.
+    cgroup: Option<sandbox::cgroup::BoxCgroup>,
 
     /// The ports this box published at runtime with its own `min net expose`
     /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
@@ -870,6 +873,7 @@ impl BoxActor {
             minimal_cache_dir,
             daemon_ctx,
             net_switch,
+            cgroup: None,
             deny_all_opt_out,
             tracker: OpTracker::new_root(),
             inner,

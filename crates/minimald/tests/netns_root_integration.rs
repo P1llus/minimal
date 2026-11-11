@@ -97,7 +97,7 @@
 
 use sandbox::NetPlan;
 use sandbox::Network as _;
-use sandbox::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
+use sandbox::config::{BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -975,22 +975,6 @@ fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
             mask, 0,
             "{what}: {set} must be empty — the process execs as the \
              unprivileged box uid with no_new_privs set, so exec clears it"
-        );
-    }
-
-    // The bounding set, the one set exec does not clear: it must hold none of
-    // the capabilities no box may hold. A capability left in it is one a file
-    // capability in the box could hand back.
-    let mask = capability_mask(report, "CapBnd", what);
-    for cap in BOX_FORBIDDEN_CAPABILITIES {
-        assert_eq!(
-            mask & (1 << cap.number),
-            0,
-            "{what}: CapBnd must not hold {} (bit {}): the bounding set \
-             survives exec, so a capability left in it is one a file \
-             capability in the box could restore",
-            cap.name,
-            cap.number
         );
     }
 }

@@ -3307,17 +3307,10 @@ fn v4_word(word: &str) -> Option<Ipv4Addr> {
 }
 
 /// Whether a process whose cgroup v2 path is `cgroup` (the path after
-/// `0::` in `/proc/<pid>/cgroup`) sits in the boxes subtree, matched as the
-/// classifier's packet filter matches it: the cgroup's ancestor at level 2
-/// is `<tree root>/boxes` (NET-078's cohort identity, NET-079). The daemon's
-/// own leaf is a sibling of that subtree, so its sockets never match.
+/// `0::` in `/proc/<pid>/cgroup`) is in a box cgroup. The daemon's own
+/// cgroup is a sibling of the boxes, so its sockets never match.
 pub(crate) fn in_boxes_subtree(cgroup: &str) -> bool {
-    let tree = Path::new(sandbox::classifier::TREE_ROOT)
-        .file_name()
-        .and_then(|name| name.to_str());
-    let mut levels = cgroup.trim().trim_start_matches('/').split('/');
-    tree.is_some_and(|tree| levels.next() == Some(tree))
-        && levels.next() == Some(sandbox::classifier::BOXES_DIR)
+    crate::box_cgroups::in_a_box(cgroup)
 }
 
 /// The TCP ports of the node's own network namespace that a process in the
@@ -6685,19 +6678,21 @@ mod tests {
     }
 
     /// NET-138: the in-VM daemon notices a listen or a close only for a
-    /// socket a process in the boxes subtree holds, matched as the
-    /// classifier matches the subtree, and never for a listener of its own
-    /// or one any process outside the subtree holds.
+    /// socket a process in a box cgroup holds, and never for a listener of
+    /// its own or one any process outside the boxes holds.
     #[test]
     fn listen_notice_only_for_box_cgroup_sockets() {
-        assert!(in_boxes_subtree("/minimald.slice/boxes/allow/web"));
-        assert!(in_boxes_subtree("/minimald.slice/boxes/deny/db\n"));
-        assert!(!in_boxes_subtree("/minimald.slice/daemon"));
+        crate::box_cgroups::with_root_name("/minimald.slice", notices_only_for_box_cgroup_sockets);
+    }
+
+    fn notices_only_for_box_cgroup_sockets() {
+        assert!(in_boxes_subtree("/minimald.slice/boxes/web"));
+        assert!(in_boxes_subtree("/minimald.slice/boxes/db\n"));
+        assert!(!in_boxes_subtree("/minimald.slice/supervisor"));
+        assert!(!in_boxes_subtree("/minimald.slice/boxes"));
         assert!(!in_boxes_subtree("/minimald.slice"));
-        assert!(!in_boxes_subtree("/boxes/allow/web"));
-        assert!(!in_boxes_subtree(
-            "/other.slice/minimald.slice/boxes/allow/web"
-        ));
+        assert!(!in_boxes_subtree("/boxes/web"));
+        assert!(!in_boxes_subtree("/other.slice/minimald.slice/boxes/web"));
         assert!(!in_boxes_subtree("/"));
 
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -6726,18 +6721,13 @@ mod tests {
         let own_pid = 10;
         // A box process listens on 8080 and 3000, and holds the established
         // socket too.
-        fake_process(
-            root,
-            20,
-            "/minimald.slice/boxes/allow/web",
-            &[101, 102, 106],
-        );
+        fake_process(root, 20, "/minimald.slice/boxes/web", &[101, 102, 106]);
         // The daemon's own listener, in its own leaf.
-        fake_process(root, own_pid, "/minimald.slice/daemon", &[105]);
+        fake_process(root, own_pid, "/minimald.slice/supervisor", &[105]);
         // A box process inherited the daemon's 6666 listener: still the
         // daemon's own.
-        fake_process(root, 21, "/minimald.slice/boxes/deny/db", &[103]);
-        fake_process(root, own_pid + 1, "/minimald.slice/daemon", &[103]);
+        fake_process(root, 21, "/minimald.slice/boxes/db", &[103]);
+        fake_process(root, own_pid + 1, "/minimald.slice/supervisor", &[103]);
         // A process outside the minimald tree listens on 7777.
         fake_process(root, 30, "/init.scope", &[104]);
 

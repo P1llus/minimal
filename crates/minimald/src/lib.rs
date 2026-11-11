@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 mod attach_shell;
 mod audit;
 mod box_actor;
+pub mod box_cgroups;
 mod box_manager;
 pub mod box_ops;
 pub mod box_runtime;

@@ -41,7 +41,8 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
-use sandbox::config::{ClassifierLeaf, Config, SandboxMapped};
+use sandbox::cgroup::BoxCgroup;
+use sandbox::config::{Config, SandboxMapped};
 use sandbox::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -252,12 +253,9 @@ pub struct EnvArgs {
     /// [`SetupForPackages`]: graph::SetupForPackages
     include_package_attr_wiring: bool,
 
-    /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
-    /// decided on, and the one every process of the box is placed in.
-    /// `None` on a host that places no box — the tree the privileged step
-    /// installs is absent — whose environments launch exactly as they did
-    /// before the classifier existed, never refused on that ground.
-    classifier_leaf: Option<ClassifierLeaf>,
+    /// The box's cgroup, which every process of the box runs in. `None`
+    /// where the daemon has no cgroup root.
+    box_cgroup: Option<BoxCgroup>,
 
     /// The proxy's root certificate, PEM-encoded, that [`Env::build`] adds
     /// to the box's own trust store (BEP-011). `None` for a box that gets
@@ -290,7 +288,7 @@ impl EnvArgs {
             session,
             session_id: None,
             include_package_attr_wiring: true,
-            classifier_leaf: None,
+            box_cgroup: None,
             root_certificate: None,
         }
     }
@@ -376,13 +374,11 @@ impl EnvArgs {
         self
     }
 
-    /// Places this environment's box in `leaf`, its own classifier leaf
-    /// (NET-079) — the cgroup its egress verdict is decided on and the one
-    /// every process of the box is placed in. The leaf must already exist:
-    /// the launcher creates it before the spawn.
+    /// Runs the environment's box, and every build it starts, in `cgroup`.
+    /// The cgroup must already exist.
     #[must_use]
-    pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
-        self.classifier_leaf = Some(leaf);
+    pub fn with_box_cgroup(mut self, cgroup: BoxCgroup) -> Self {
+        self.box_cgroup = Some(cgroup);
         self
     }
 
@@ -484,13 +480,10 @@ impl Env {
     /// helper), assembles the rootfs, and spawns the command
     /// channel actor.
     pub async fn build(mut ctx: Context, mut graph: Graph, args: EnvArgs) -> std::io::Result<Self> {
-        // NET-155: the leaf the launcher created for this box places every
-        // package build this env starts — the missing packages below and the
-        // in-box installs later — so the box's egress verdict decides what
-        // they reach. It replaces any leaf the context carried, because the
-        // launch's leaf is the one the box runs in now.
-        if let Some(leaf) = args.classifier_leaf.clone() {
-            ctx = ctx.with_classifier_leaf(leaf);
+        // Every package build this env starts runs in the box's cgroup: the
+        // missing packages below and the in-box installs later.
+        if let Some(cgroup) = args.box_cgroup.clone() {
+            ctx = ctx.with_box_cgroup(cgroup);
         }
         // Resolve the requested package names to top-levels, then ensure the
         // helper's dependencies (`bash`, `socat`) are present.
@@ -515,29 +508,18 @@ impl Env {
             .all(|bsr| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
         if !all_built {
             tracing::trace!("missing local packages, building session env");
-            match ctx.classifier_leaf() {
-                Some(leaf) => tracing::info!(
-                    box_name = %args.name,
-                    leaf = %leaf.dir().display(),
-                    "starting the box's missing package builds in the box's classifier leaf",
-                ),
-                None if ctx.box_network().is_some() => tracing::info!(
-                    box_name = %args.name,
-                    "starting the box's missing package builds on the box's own network, \
-                     under the box's egress rules",
-                ),
-                None => tracing::info!(
-                    box_name = %args.name,
-                    "starting the box's missing package builds in the daemon's own cgroup, \
-                     with no per-box egress enforcement, because the box has none",
-                ),
-            }
+            tracing::info!(
+                box_name = %args.name,
+                in_box_cgroup = ctx.box_cgroup().is_some(),
+                on_box_network = ctx.box_network().is_some(),
+                "starting the box's missing package builds",
+            );
             // NET-155: a build the box's egress rules refused names the
             // destination and the box before the build's own error, as the
             // build side operation's does. The launch knows the box's name.
             let placement = crate::box_ops::BuildPlacement {
                 box_name: args.name.clone(),
-                leaf: ctx.classifier_leaf().cloned(),
+                cgroup: ctx.box_cgroup().cloned(),
                 network: ctx.box_network().cloned(),
             };
             let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
@@ -639,27 +621,14 @@ impl Env {
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
-        // NET-080: the box's own id, for the fetch records its installs
-        // produce — the leaf's name, the same id the tree's rules match,
-        // when the host placed it in one; else the session's name. Read
-        // before the leaf is moved into the sandbox config below.
+        // The box's id, for the fetch records its installs produce.
         let box_id = args
-            .classifier_leaf
+            .box_cgroup
             .as_ref()
-            .and_then(|leaf| {
-                leaf.dir()
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| args.name.clone());
-        // NET-079: the leaf the launcher created before this build, so the
-        // sandbox keeps the host's cgroup mounts out of a leaf-bearing box and
-        // names the leaf it entered on its launch log line. `None` on a host
-        // that places no box: the config above is the whole story, exactly as
-        // it was before the classifier existed.
-        let classifier_leaf = args.classifier_leaf.clone();
-        let config = match args.classifier_leaf {
-            Some(leaf) => config.with_classifier_leaf(leaf),
+            .map_or_else(|| args.name.clone(), |cgroup| cgroup.name().to_owned());
+        let box_cgroup = args.box_cgroup.clone();
+        let config = match args.box_cgroup {
+            Some(cgroup) => config.with_box_cgroup(cgroup),
             None => config,
         };
 
@@ -723,7 +692,7 @@ impl Env {
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
             box_id,
-            classifier_leaf,
+            box_cgroup,
             session_id: args.session_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
@@ -1486,14 +1455,12 @@ struct BoxChannel {
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
     /// NET-080: the box this channel's installs are made for, named the way
-    /// the classifier tree names it — the box's leaf when the host placed it
+    /// its cgroup names it — the box's id when it has a cgroup
     /// in one, else the session's name — so the daemon's own fetches are
     /// recorded with the box that asked for them.
     box_id: String,
-    /// The box's classifier leaf (NET-155): the in-box patched build runs in
-    /// it, so the box's egress verdict decides what the build can reach.
-    /// `None` on a host that places no box.
-    classifier_leaf: Option<ClassifierLeaf>,
+    /// The box's cgroup, which the in-box patched build runs in.
+    box_cgroup: Option<BoxCgroup>,
     /// The owning session's id ([`EnvArgs::with_session_id`]); `None` for
     /// an env built without one (tests).
     session_id: Option<boxes::SessionId>,
@@ -1848,25 +1815,12 @@ impl BoxChannel {
         // fetch is recorded as the daemon's own node-plane fetch, made for
         // the box that asked — so the one walk feeds both.
         let scope = install_scope(&new_graph, pkgs);
-        // NET-155: `Env::build` placed this context in the box's leaf, so
-        // the builds this install starts follow the box's egress verdict.
-        match self.ctx.classifier_leaf() {
-            Some(leaf) => tracing::info!(
-                box_name = %self.name,
-                leaf = %leaf.dir().display(),
-                "starting an in-box install's package builds in the box's classifier leaf",
-            ),
-            None if self.ctx.box_network().is_some() => tracing::info!(
-                box_name = %self.name,
-                "starting an in-box install's package builds on the box's own network, \
-                 under the box's egress rules",
-            ),
-            None => tracing::info!(
-                box_name = %self.name,
-                "starting an in-box install's package builds in the daemon's own cgroup, \
-                 with no per-box egress enforcement, because the box has none",
-            ),
-        }
+        tracing::info!(
+            box_name = %self.name,
+            in_box_cgroup = self.ctx.box_cgroup().is_some(),
+            on_box_network = self.ctx.box_network().is_some(),
+            "starting an in-box install's package builds",
+        );
         let progress = crate::sandbox_progress::SandboxProgress::new(
             self.ctx.op_tracker(),
             Some(scope.clone()),
@@ -2105,8 +2059,8 @@ impl BoxChannel {
         build_graph.top_levels = vec![bsr];
 
         let tapped = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        // NET-155: an own-address box has no leaf. Its build attaches to the
-        // box's own network, which the box's context carries.
+        // A box with a network namespace of its own builds on that network,
+        // which the box's context carries.
         let box_network = ctx.box_network().cloned();
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
@@ -2125,43 +2079,21 @@ impl BoxChannel {
 
             let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
-            // NET-155: the build runs in the box's own leaf, or on the own-
-            // address box's network, so the box's egress verdict decides what
-            // it can reach. A box with neither has no per-box enforcement,
-            // and its build runs in the daemon's own cgroup.
-            match &self.classifier_leaf {
-                Some(leaf) => tracing::info!(
-                    box_name = %self.name,
-                    package = %pkg_name,
-                    leaf = %leaf.dir().display(),
-                    "starting a package build for a box in the box's classifier leaf",
-                ),
-                None if box_network.is_some() => tracing::info!(
-                    box_name = %self.name,
-                    package = %pkg_name,
-                    leaf = "none",
-                    "starting a package build for a box on the box's own network, \
-                     under the box's egress rules",
-                ),
-                None => tracing::info!(
-                    box_name = %self.name,
-                    package = %pkg_name,
-                    leaf = "none",
-                    "starting a package build for a box in the daemon's own cgroup, \
-                     with no per-box egress enforcement, because the box has none",
-                ),
-            }
+            tracing::info!(
+                box_name = %self.name,
+                package = %pkg_name,
+                in_box_cgroup = self.box_cgroup.is_some(),
+                on_box_network = box_network.is_some(),
+                "starting a package build for a box",
+            );
             let res = op::PatchedBuild {
                 spec: &bsr,
                 remote_fetcher: &remote_storage,
                 stdout_writer: Some(Box::new(LineTap::new(stdout_writer, tapped.clone()))),
                 stderr_writer: Some(Box::new(LineTap::new(stderr_writer, tapped.clone()))),
                 remote_cache: remote_cache.as_ref(),
-                classifier_leaf: self.classifier_leaf.clone(),
-                box_network: match &self.classifier_leaf {
-                    Some(_) => None,
-                    None => box_network.clone(),
-                },
+                box_cgroup: self.box_cgroup.clone(),
+                box_network: box_network.clone(),
             }
             .run(&op::Options {
                 cache,
@@ -2188,7 +2120,7 @@ impl BoxChannel {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let failure = e.to_string();
             let refusal = patched_build_refusal(
-                build_denies_all(self.classifier_leaf.as_ref(), box_network.as_ref()),
+                build_denies_all(box_network.as_ref()),
                 pkg_name,
                 &self.name,
                 &failure,
@@ -3946,17 +3878,10 @@ fn source_host(rest: &str) -> Option<String> {
 }
 
 /// Whether the egress rules a box's package build runs under admit no
-/// destination (NET-155): the build runs in the deny subtree of the
-/// classifier tree, or on the network of an own-address box whose rules
-/// admit nothing. A build with neither runs under no rules of the box.
-pub(crate) fn build_denies_all(
-    leaf: Option<&ClassifierLeaf>,
-    network: Option<&op::BuildNetwork>,
-) -> bool {
-    match leaf {
-        Some(leaf) => leaf.is_deny(),
-        None => network.is_some_and(op::BuildNetwork::denies_all),
-    }
+/// destination (NET-155): the build runs on the network of a box whose rules
+/// admit nothing.
+pub(crate) fn build_denies_all(network: Option<&op::BuildNetwork>) -> bool {
+    network.is_some_and(op::BuildNetwork::denies_all)
 }
 
 /// The error line for an in-box patched build that the egress rules of its
@@ -6090,7 +6015,7 @@ exit $rc
                 .unwrap(),
             has_packages: HashSet::new(),
             box_id: "a session in a test".to_string(),
-            classifier_leaf: None,
+            box_cgroup: None,
             session_id: None,
             ot: None,
             session,

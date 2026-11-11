@@ -2,7 +2,6 @@ use crate::network::{NetPlan, Network};
 use crate::{Error, Sandbox};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -25,72 +24,21 @@ pub const BOX_UID: u32 = 1000;
 /// synthesized `group` entry is held to it by the same test.
 pub const BOX_GID: u32 = 1000;
 
-/// The most PTYs one box may hold at once. PTYs are a machine-wide pool: a
-/// devpts instance mounted without a per-instance `max=` draws from the one
-/// kernel-wide counter (`kernel.pty.max` minus `kernel.pty.reserve`), so a
-/// single box that opens PTYs until the kernel refuses starves every other
-/// box and the session host's own shells. The launch path remounts the box's
-/// `/dev/pts` with `max=<BOX_PTY_MAX>` (see `exec_box_program`), so each box
-/// is bounded by its own instance rather than the shared pool. 1024 is a
-/// working value: it leaves room for the PTYs a real session needs while
-/// keeping one box from exhausting the host. Only the guest VM raises
-/// `kernel.pty.max`; on a native Linux host the shared pool stays at the
-/// kernel default (4096 minus the 1024 reserve), so a few boxes at this cap
-/// can still exhaust it.
+/// The most PTYs one box may hold at once. PTYs are one pool for the machine
+/// (`kernel.pty.max` minus `kernel.pty.reserve`), so the box's devpts
+/// instance carries its own limit and one box cannot take them all. 1024
+/// leaves room for a real session. Only the guest VM raises `kernel.pty.max`;
+/// on a native host a few boxes at this limit can still exhaust the pool.
 pub const BOX_PTY_MAX: u32 = 1024;
 
-/// The data string the launch path remounts the box's `/dev/pts` with. A
-/// devpts remount resets every option it is not given to the kernel default
-/// (`ptmxmode=0000`, `mode=0600`), so the string restates the options the
-/// box's devpts was mounted with (`ptmxmode=0666,mode=620`, hakoniwa's devfs
-/// setup) and adds the per-instance `max=`. Without `ptmxmode=0666` the
-/// box's `/dev/ptmx` (a link to `pts/ptmx`) becomes unopenable for the box's
-/// unprivileged user, and no program in the box can open a PTY.
-pub const BOX_DEVPTS_REMOUNT_DATA: &std::ffi::CStr = c"ptmxmode=0666,mode=620,max=1024";
+/// The mount options of the box's devpts instance: a fresh instance with the
+/// usual modes, and the limit on how many PTYs the box may hold.
+pub const BOX_DEVPTS_OPTIONS: &str = "newinstance,ptmxmode=0666,mode=620,max=1024";
 
-/// A capability no box may hold: its kernel number (these are ABI, assigned
-/// once and never reused) and its name, for the launch log line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForbiddenCapability {
-    /// The capability's name, `CAP_NET_RAW` and friends.
-    pub name: &'static str,
-    /// The capability's number in the kernel's capability ABI.
-    pub number: u32,
-}
-
-/// The capabilities no box may hold, in the order the launch log line names
-/// them, `CAP_NET_RAW` first: it is the one that would let a box write packets
-/// whose source address is not the address its plan — and the relay's
-/// source-address check — say it has, which is the reach the escape bound is
-/// about. `CAP_NET_ADMIN` is on the same list for the same reason one layer
-/// up: it would let a box re-address its own interface, the address that
-/// identifies it.
-///
-/// The launch path drops these from the box's capability *bounding* set, the
-/// one capability set an exec does not clear, so a dropped capability cannot
-/// come back even if a file capability or a setuid bit would grant it — both
-/// of which the box's `no_new_privs` bit makes the kernel ignore anyway.
-pub const BOX_FORBIDDEN_CAPABILITIES: &[ForbiddenCapability] = &[
-    ForbiddenCapability {
-        name: "CAP_NET_RAW",
-        number: 13,
-    },
-    ForbiddenCapability {
-        name: "CAP_NET_ADMIN",
-        number: 12,
-    },
-];
-
-/// The forbidden capabilities as the sandbox launch log line names them, e.g.
-/// `CAP_NET_RAW, CAP_NET_ADMIN` — the bounding set every box is launched with.
-#[must_use]
-pub fn forbidden_capability_names() -> String {
-    BOX_FORBIDDEN_CAPABILITIES
-        .iter()
-        .map(|cap| cap.name)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+const _: () = assert!(
+    BOX_PTY_MAX == 1024,
+    "BOX_DEVPTS_OPTIONS spells the limit out"
+);
 
 /// Something in the FS that needs to be mapped into the sandbox.
 #[derive(Debug)]
@@ -225,158 +173,6 @@ impl WdSetup {
     }
 }
 
-/// The cohort subtree a box whose declaration admits no destination lives
-/// in (NET-079): the packet-filter rule that refuses a deny-all box's
-/// connections matches this subtree, so a leaf anywhere else — directly
-/// under the cohort, or under [`ALLOW_DIR`] — is decided by a rule that does
-/// not name it.
-pub const DENY_DIR: &str = "deny";
-
-/// The cohort subtree every other box lives in (NET-079): a box that
-/// declared nothing, or declared a list, keeps the shipped allow-all — the
-/// verdict its leaf is decided on is `allow`, and its traffic is one of the
-/// cohort's (NET-078), never the node plane's.
-pub const ALLOW_DIR: &str = "allow";
-
-/// Which cohort subtree a box's leaf lives in (NET-079): the classifier's
-/// answer to "what does this box's declaration admit?", spelled as the one
-/// path component that picks the subtree — `deny` for a declaration that
-/// admits no destination, `allow` for every other box, whatever it declared.
-///
-/// Decided once, from the declaration, at the box's launch: a declaration is
-/// fixed at create (tightening is recreate), so the verdict is a property of
-/// the leaf the box is placed in rather than something a launch or a stop
-/// edits. `sandbox` knows the *name* of the verdict and nothing about the
-/// declarations that map onto it — the mapping lives where the declaration
-/// does, in the daemon, so this crate never learns what an egress section is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// The box's declaration admits no destination; its leaf is under
-    /// [`DENY_DIR`], and the rule that refuses its connections matches.
-    Deny,
-    /// Every other box; its leaf is under [`ALLOW_DIR`], and only the
-    /// cohort's identity (NET-078) is carried on its traffic.
-    Allow,
-}
-
-impl Verdict {
-    /// The cohort subtree this verdict's leaves live in — the one path
-    /// component that places a leaf: `<tree>/boxes/<dir_name>/<box-id>`.
-    #[must_use]
-    pub fn dir_name(self) -> &'static str {
-        match self {
-            Self::Deny => DENY_DIR,
-            Self::Allow => ALLOW_DIR,
-        }
-    }
-}
-
-/// The classifier leaf a box is placed in: the cgroup its egress verdict is
-/// decided on (NET-079, design §4.1), and the one no process of the box may
-/// leave or let another box join.
-///
-/// A *path*, not a kernel handle. The daemon creates the leaf before the
-/// spawn; the box's first process joins it in its own pre-exec closure,
-/// *before* it unshares the cgroup namespace, so the leaf becomes the
-/// namespace's root — the cgroup every view the box can ever mount starts at,
-/// and the only one it can reach. This option is how the rest of the sandbox
-/// learns the box has one: the launch log names the leaf, and the sandbox
-/// binds the leaf's tree into the box so the join has a path to write.
-///
-/// The path is resolved in the *daemon's* namespaces, where the leaf is
-/// created; inside the box it is reached through the tree bound at the
-/// conventional cgroup mountpoint — see [`Self::tree_root`] and
-/// [`Self::relative_dir`], which name the two halves of that.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClassifierLeaf {
-    /// The leaf's directory in the daemon's classifier tree, e.g.
-    /// `<tree>/boxes/<deny|allow>/<box-id>` — never `<tree>/boxes/<box-id>`:
-    /// a leaf directly under the cohort sits outside both subtrees, so the
-    /// deny rule's match on [`DENY_DIR`] would silently miss it (NET-079).
-    dir: PathBuf,
-}
-
-impl ClassifierLeaf {
-    /// A leaf at `dir`, e.g. `<tree>/boxes/<deny|allow>/<box-id>`.
-    #[must_use]
-    pub fn new<P: Into<PathBuf>>(dir: P) -> Self {
-        Self { dir: dir.into() }
-    }
-
-    /// The leaf for `box_id` under `root`'s cohort, in the subtree `verdict`
-    /// picks — the spelling the daemon's own placement creates, so a caller
-    /// that knows the verdict can name the leaf without duplicating the
-    /// layout: `<root>/boxes/<deny|allow>/<sanitized box-id>`, one level
-    /// below the cohort in either subtree, never the cohort itself.
-    #[must_use]
-    pub fn under(root: &Path, box_id: &str, verdict: Verdict) -> Self {
-        Self::new(crate::classifier::box_leaf(root, box_id, verdict))
-    }
-
-    /// The leaf's directory in the daemon's classifier tree.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// The leaf's `cgroup.procs`: writing a pid here moves that process into
-    /// the leaf. A box's first process writes its own in its pre-exec
-    /// closure, before it unshares the cgroup namespace; an injected process
-    /// writes its own before it joins the box's namespaces, where the root's
-    /// own `cgroup.procs` is no longer writable.
-    #[must_use]
-    pub fn procs(&self) -> PathBuf {
-        self.dir.join("cgroup.procs")
-    }
-
-    /// The tree this leaf belongs to — `dir`'s parent's parent's parent, since
-    /// every leaf is `<tree>/<BOXES_DIR>/<deny|allow>/<box-id>`. The daemon
-    /// resolves the leaf through it, and the sandbox binds *it* into the box
-    /// at the conventional cgroup mountpoint, so the box's own join goes
-    /// through the tree it is a leaf of — which the box then covers, so no
-    /// process it runs is left a cgroup path at all.
-    #[must_use]
-    pub fn tree_root(&self) -> PathBuf {
-        self.dir
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .map_or_else(|| self.dir.clone(), Path::to_path_buf)
-    }
-
-    /// The leaf's path under its [`tree_root`](Self::tree_root) —
-    /// `<BOXES_DIR>/<deny|allow>/<box-id>`. The box joins its leaf through
-    /// the tree bound at the conventional mountpoint, so this is the one
-    /// spelling of the leaf that resolves *inside* the box, before its cgroup
-    /// namespace is unshared onto the leaf.
-    #[must_use]
-    pub fn relative_dir(&self) -> PathBuf {
-        self.dir
-            .strip_prefix(self.tree_root())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| self.dir.clone())
-    }
-
-    /// Whether this leaf sits in the [`DENY_DIR`] subtree — i.e. whether the
-    /// box it places was declared deny-all. A leaf's verdict is a property of
-    /// the path the daemon placed it at ([`Verdict::dir_name`]), so this reads
-    /// it back off the path rather than being told: the caller that knows a
-    /// leaf's *directory* (an argv option, a log line) knows its box's verdict
-    /// without a second field to keep in step.
-    ///
-    /// A path whose parent is neither subtree — a leaf squatted directly
-    /// under the cohort, or a directory that is not a leaf at all — answers
-    /// `false`: it is not a deny-all box's leaf, so nothing about it warrants
-    /// the fatal handling that spelling carries.
-    #[must_use]
-    pub fn is_deny(&self) -> bool {
-        self.dir
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == OsStr::new(DENY_DIR))
-    }
-}
-
 /// Describes the setup of a sandbox.
 #[derive(Debug)]
 pub struct Config {
@@ -444,22 +240,11 @@ pub struct Config {
     /// to the PID when not set.
     pub daemon_id: Option<String>,
 
-    /// The classifier leaf this box is placed in, when the host has one for
-    /// it. See [`ClassifierLeaf`]: set by the daemon (which creates the leaf
-    /// and moves the box's processes into it), `None` on a host that cannot
-    /// decide per box — where the box runs unenforced rather than being
-    /// refused (NET-079's exception).
-    pub classifier_leaf: Option<ClassifierLeaf>,
-
-    /// Whether the box's classifier cover is forced onto its tmpfs fallback —
-    /// the branch the design takes only where the kernel refuses the
-    /// read-only cgroup2 mount of the namespace root. A test knob
-    /// ([`Self::with_forced_cover_fallback`]), never set in production: on a
-    /// host whose kernel does mount cgroup2 inside a box's user namespace, it
-    /// is the only way to exercise the recorded-fallback branch
-    /// deterministically — the branch every launch takes on a host whose
-    /// kernel refuses that mount.
-    pub(crate) force_cover_fallback: bool,
+    /// The cgroup of the box this sandbox runs in or for. Every process of
+    /// the sandbox starts in it, and the box's cgroup namespace is rooted
+    /// there. `None` runs the sandbox in the cgroup of the process that
+    /// starts it.
+    pub box_cgroup: Option<crate::cgroup::BoxCgroup>,
 }
 
 /// A command to be run in the sandbox.
@@ -657,8 +442,7 @@ impl Config {
             },
             cpu_weight: None,
             daemon_id: None,
-            classifier_leaf: None,
-            force_cover_fallback: false,
+            box_cgroup: None,
         }
     }
 
@@ -817,27 +601,10 @@ impl Config {
         self
     }
 
-    /// Places this box in `leaf`, its classifier leaf: the cgroup its egress
-    /// verdict is decided on (NET-079).
-    ///
-    /// The daemon creates the leaf before the spawn and sets this so the
-    /// sandbox layer can keep the host's cgroup mount out of the box's mount
-    /// namespace and name the leaf in the launch log. The placement itself —
-    /// writing the box's processes into [`ClassifierLeaf::procs`] — stays with
-    /// the daemon, which owns the pids to move and the leaf's lifetime.
-    pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
-        self.classifier_leaf = Some(leaf);
-        self
-    }
-
-    /// Forces a leaf-bearing box's cover onto its recorded tmpfs fallback,
-    /// skipping the design's read-only cgroup2 mount of the namespace root.
-    /// Test-only, so a host whose kernel *does* allow that mount can still
-    /// exercise the fallback branch deterministically: the branch the box
-    /// tests assert per cover, split by the cover the box reports it took.
-    #[cfg(test)]
-    pub(crate) fn with_forced_cover_fallback(mut self) -> Self {
-        self.force_cover_fallback = true;
+    /// Runs the sandbox in `cgroup`, the cgroup of the box it belongs to.
+    #[must_use]
+    pub fn with_box_cgroup(mut self, cgroup: crate::cgroup::BoxCgroup) -> Self {
+        self.box_cgroup = Some(cgroup);
         self
     }
 
@@ -1077,24 +844,6 @@ fn fit_box_name(name: &str, budget: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_devpts_remount_keeps_the_box_ptmx_open_and_caps_at_box_pty_max() {
-        let data = BOX_DEVPTS_REMOUNT_DATA.to_str().expect("ASCII options");
-        let opts: Vec<&str> = data.split(',').collect();
-        assert!(
-            opts.contains(&"ptmxmode=0666"),
-            "a remount without ptmxmode resets it to 0000 and the box cannot open /dev/ptmx"
-        );
-        assert!(
-            opts.contains(&"mode=620"),
-            "the box's slave mode survives the remount"
-        );
-        assert!(
-            opts.contains(&format!("max={BOX_PTY_MAX}").as_str()),
-            "the remount caps the instance at BOX_PTY_MAX"
-        );
-    }
 
     #[test]
     fn a_box_name_within_budget_is_kept() {
@@ -1358,96 +1107,6 @@ mod tests {
             synth_number(own_group, 2, "the group entry's gid"),
             BOX_GID,
             "the synthesized group entry must name the gid every box execs as"
-        );
-    }
-
-    /// The classifier leaf option carries the leaf's `cgroup.procs` path — the
-    /// file a pid is written to, to move it into the leaf — and is off unless
-    /// the daemon sets it, so a host that cannot decide per box keeps
-    /// launching boxes (NET-079's exception) rather than refusing them.
-    #[test]
-    fn a_classifier_leaf_names_its_procs_file_and_is_opt_in() {
-        assert!(
-            session_config().classifier_leaf.is_none(),
-            "a box with no leaf configured must launch as it did before the \
-             classifier existed"
-        );
-
-        // The depth the verdict's subtrees add (NET-079): a leaf is
-        // `<tree>/boxes/<deny|allow>/<box-id>`, never `<tree>/boxes/<box-id>`.
-        let config = session_config().with_classifier_leaf(ClassifierLeaf::new(
-            "/sys/fs/cgroup/minimald.slice/boxes/deny/b1",
-        ));
-        let leaf = config
-            .classifier_leaf
-            .as_ref()
-            .expect("with_classifier_leaf sets the option");
-
-        assert_eq!(
-            leaf.dir(),
-            Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b1"),
-            "the leaf's directory is the placement the daemon created"
-        );
-        assert_eq!(
-            leaf.procs(),
-            Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b1/cgroup.procs"),
-            "the leaf's migration target is its own cgroup.procs, so the \
-             daemon and an injected process write the same file"
-        );
-        assert_eq!(
-            leaf.tree_root(),
-            Path::new("/sys/fs/cgroup/minimald.slice"),
-            "the tree is three levels up from the leaf: cohort, then the \
-             verdict's subtree, then the leaf"
-        );
-        assert_eq!(
-            leaf.relative_dir(),
-            Path::new("boxes/deny/b1"),
-            "the leaf's spelling inside the box names the subtree its verdict \
-             picked, so the join the box's own closure makes goes through the \
-             one cgroup its verdict is decided on"
-        );
-
-        // The per-verdict constructor spells the same leaf from the tree and
-        // the session's name, in either subtree — the layout lives in one
-        // place, not in every caller that names a leaf. The name goes through
-        // the same sanitize as the placement, so its separators are dropped.
-        let root = Path::new("/sys/fs/cgroup/minimald.slice");
-        for (verdict, dir) in [
-            (super::Verdict::Deny, "deny"),
-            (super::Verdict::Allow, "allow"),
-        ] {
-            assert_eq!(
-                ClassifierLeaf::under(root, "a session", verdict).dir(),
-                &Path::new("/sys/fs/cgroup/minimald.slice")
-                    .join("boxes")
-                    .join(dir)
-                    .join("asession"),
-                "a {dir} leaf is one level below the cohort, in its verdict's \
-                 subtree: the sanitize the placement performs is the \
-                 constructor's, so no caller can spell a leaf the cohort owns"
-            );
-        }
-    }
-
-    /// A leaf's verdict reads back off its path: the caller that knows the
-    /// directory knows which subtree its box was placed in — the spelling the
-    /// injection shim's fatal join is keyed on (a deny-all box's leaf cannot
-    /// be joined non-fatally, NET-079).
-    #[test]
-    fn a_leaf_is_deny_only_when_its_parent_is_the_deny_subtree() {
-        assert!(
-            ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b1").is_deny(),
-            "a leaf in the deny subtree belongs to a deny-all box"
-        );
-        assert!(
-            !ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b1").is_deny(),
-            "a leaf in the allow subtree is every other box"
-        );
-        assert!(
-            !ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/b1").is_deny(),
-            "a leaf squatted directly under the cohort is in neither subtree, \
-             so it is not a deny-all box's leaf however it got there"
         );
     }
 }
