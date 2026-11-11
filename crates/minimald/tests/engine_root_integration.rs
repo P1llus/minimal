@@ -612,7 +612,11 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     // leads to the host relay, which dials a port only once the user has
     // exposed it.
     let named = daemon.exec("names", "getent hosts host.min.internal");
-    assert!(named.contains("100.64.255.254"), "{named}");
+    // The alias is the last host address of the daemon's virtual network.
+    assert!(
+        named.starts_with("100.64.") && named.contains(".254 "),
+        "{named}"
+    );
     assert!(daemon.connect("names", "127.0.0.1", port).contains(REFUSED));
     let closed = daemon.greeting("names", "host.min.internal", port);
     assert!(!closed.contains("hello"), "{closed}");
