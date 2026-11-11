@@ -98,6 +98,16 @@ artifacts:
     @[ -f {{kernel}} ] || scripts/fetch-prebuilt.sh kernel {{kernel}} {{arch}}
     @[ -f {{rootfs}} ] || scripts/fetch-prebuilt.sh rootfs {{rootfs}} {{arch}}
 
+# Overwrites .scratch/vmlinuz. `artifacts` then leaves it alone, because it only
+# fetches a missing file. The source tree and the vmlinux with BTF stay in
+# .scratch/guest-kernel.
+#
+# Build the guest kernel from source with BTF (scripts/build-guest-kernel.sh).
+[linux]
+guest-kernel:
+    @mkdir -p {{scratch}}
+    scripts/build-guest-kernel.sh {{kernel}} {{scratch}}/guest-kernel
+
 # Not on the dev stack's path any more — see `libkrun-static`. Kept because
 # nightly-tests.yml still builds against the upstream package, and this is how
 # you reproduce that locally.
