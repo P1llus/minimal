@@ -593,8 +593,10 @@ const fn verdict_code(verdict: Verdict) -> u8 {
 
 /// The compiler never hands over more than [`RULES_MAX`] slots.
 fn rules_value(slots: &[Slot]) -> Rules {
-    let mut out = Rules::default();
-    out.count = u16::try_from(slots.len().min(RULES_MAX)).unwrap_or(0);
+    let mut out = Rules {
+        count: u16::try_from(slots.len().min(RULES_MAX)).unwrap_or(0),
+        ..Rules::default()
+    };
     for (dst, slot) in out.r.iter_mut().zip(slots) {
         let (action, endpoint) = action_code(slot.action);
         *dst = Rule {

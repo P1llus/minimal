@@ -244,3 +244,72 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         flows.len()
     );
 }
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_rule_that_names_no_protocol_does_not_end_the_list() {
+    let Some(mut h) =
+        Harness::start("cases::parity::a_rule_that_names_no_protocol_does_not_end_the_list")
+    else {
+        return;
+    };
+    // The compiler refuses such a rule. The programs must still not read
+    // it as the end of a list, so the entry is written by hand: a rule
+    // that matches nothing, then a deny.
+    let base = BasePolicy {
+        before: Vec::new(),
+        protected: Vec::new(),
+        defaults: Defaults {
+            egress: Verdict::Allow,
+            ingress: Verdict::Allow,
+            bind: Verdict::Allow,
+        },
+        endpoints: Vec::new(),
+        source_check: false,
+        addrs: BoxAddrs::default(),
+    };
+    let policy = BoxPolicy {
+        rules: vec![BoxRule {
+            action: BoxAction::Allow,
+            protocols: Protocols::TCP,
+            ports: PortRange::ALL,
+            to: Target::Net(h.v4_group(1).parse().expect("prefix")),
+        }],
+        deny: vec![h.v4_group(1).parse().expect("prefix")],
+        ..BoxPolicy::default()
+    };
+    let options = Options {
+        refuse_errno: u16::try_from(REFUSED).expect("errno"),
+        log_flows: false,
+    };
+    let mut compiled = compile(&base, &policy, options).expect("compile");
+    // Pruning dropped nothing: the allow is TCP only, the deny is all.
+    let entry = compiled.nets.first_mut().expect("one entry");
+    assert_eq!(entry.rules.len(), 2);
+    entry.rules.first_mut().expect("the allow").protocols = Protocols::NONE;
+    compiled.rules.first_mut().expect("the allow").protocols = Protocols::NONE;
+
+    let id = h.new_box("e");
+    let compiled = std::sync::Arc::new(compiled);
+    h.handles
+        .apply(id, std::sync::Arc::clone(&compiled))
+        .expect("apply");
+    let to = IpAddr::V4(h.v4(1, 1));
+    let result = h.probe("e", &["udp", &to.to_string(), "9"]);
+    assert!(
+        kernel_denies(&result),
+        "the deny behind the empty rule decides: {result}"
+    );
+    let flow = Flow {
+        direction: Direction::Egress,
+        protocol: Protocol::Udp,
+        remote: to,
+        port: 9,
+        local: None,
+    };
+    let decision = compiled.evaluate(&flow, None);
+    assert_eq!(
+        (decision.verdict, decision.rule),
+        (FlowVerdict::Deny, Some(1))
+    );
+}

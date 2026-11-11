@@ -293,9 +293,9 @@ fn tcp_from(src: &str, to: SocketAddr, timeout: Duration) -> std::io::Result<Str
 
 /// Sends `count` datagrams as fast as it can and reports how many the
 /// engine refused.
-fn flood(to: SocketAddr, count: &str) -> std::io::Result<String> {
+fn flood(to: SocketAddr, count: usize) -> std::io::Result<String> {
     let sock = UdpSocket::bind(unspecified(&to))?;
-    let refused = (0..count.parse::<usize>().expect("count"))
+    let refused = (0..count)
         .filter(|_| sock.send_to(b"x", to).is_err())
         .count();
     Ok(refused.to_string())
@@ -336,13 +336,13 @@ pub fn recv_sockets(channel: BorrowedFd<'_>) -> std::io::Result<Vec<OwnedFd>> {
 
 /// Creates sockets in this process's cgroup and hands them to whoever
 /// holds the other end of standard input.
-fn make_sockets(kind: &str, count: &str) -> std::io::Result<String> {
+fn make_sockets(kind: &str, count: usize) -> std::io::Result<String> {
     let kind = if kind == "tcp" {
         libc::SOCK_STREAM
     } else {
         libc::SOCK_DGRAM
     };
-    let socks = (0..count.parse::<usize>().expect("count"))
+    let socks = (0..count)
         .map(|_| raw_socket(libc::AF_INET, kind, 0))
         .collect::<std::io::Result<Vec<_>>>()?;
     send_sockets(std::io::stdin().as_fd(), &socks)?;
@@ -544,12 +544,10 @@ fn root_request_abandoned(path: &str) -> String {
         connect(conn.as_raw_fd(), &UnixAddr::new(path)?)?;
         let iov = [std::io::IoSlice::new(request.as_bytes())];
         sendmsg::<()>(conn.as_raw_fd(), &iov, &[], MsgFlags::empty(), None)?;
-        // Keep the socket open to the end of the process.
-        std::mem::forget(conn);
-        Ok(())
+        Ok(conn)
     });
     match sent {
-        Ok(()) => format!("ok pid={}", std::process::id()),
+        Ok(_conn) => format!("ok pid={}", std::process::id()),
         Err(e) => format!("err {e}"),
     }
 }
@@ -597,8 +595,8 @@ pub fn run() {
         ["hold-udp", ip, port] => return hold_udp(addr(ip, port)),
         ["serve-tcp", ip, port] => return serve_tcp(addr(ip, port)),
         ["serve-udp", ip, port] => return serve_udp(addr(ip, port)),
-        ["flood", ip, port, count] => report(flood(addr(ip, port), count)),
-        ["make-sockets", kind, count] => report(make_sockets(kind, count)),
+        ["flood", ip, port, count] => report(flood(addr(ip, port), count.parse().expect("count"))),
+        ["make-sockets", kind, count] => report(make_sockets(kind, count.parse().expect("count"))),
         ["use-socket", kind, ip, port] => report(use_socket(kind, addr(ip, port))),
         ["accept-bind", ip] => report(accept_bind(ip.parse().expect("address"))),
         ["loader-request", socket, boxes] => loader_request(socket, boxes),

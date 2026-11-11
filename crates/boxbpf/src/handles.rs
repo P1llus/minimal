@@ -2,6 +2,10 @@
 //!
 //! Nothing here needs privilege. A process that was handed these maps by
 //! the loader uses them exactly like one that loaded the programs itself.
+//!
+//! An engine has one set of handles, and nothing else writes its maps. So
+//! what the handles wrote is their record of what the maps hold: they keep
+//! it per box and never read a policy back from the kernel.
 
 use std::{
     collections::HashMap as StdHashMap,

@@ -162,8 +162,7 @@ fn a_box_is_held_to_its_share_of_the_maps() {
     let error = h
         .handles
         .install(id, twenty)
-        .err()
-        .expect("twenty entries where eight are allowed");
+        .expect_err("twenty entries where eight are allowed");
     assert!(
         matches!(
             error,
@@ -218,8 +217,7 @@ fn a_box_is_held_to_its_share_of_the_maps() {
     let error = h
         .handles
         .pin(id, addr(3), "n.test", Duration::from_secs(60))
-        .err()
-        .expect("a third pin");
+        .expect_err("a third pin");
     assert!(matches!(error, Error::PinLimit { limit: 2 }), "{error}");
     let usage = h.handles.usage(id).expect("usage");
     assert_eq!((usage.pins, usage.pins_refused), (2, 1));
@@ -275,8 +273,7 @@ fn a_reconfigure_that_fails_leaves_the_old_policy_and_nothing_else() {
     let error = h
         .handles
         .reconfigure(&mut y, bigger.clone())
-        .err()
-        .expect("the map is full");
+        .expect_err("the map is full");
     assert!(
         matches!(error, Error::Map { name: "rules4", .. }),
         "{error}"

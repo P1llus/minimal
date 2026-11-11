@@ -121,8 +121,9 @@ pub(crate) const MAPS: [&str; 9] = [
     "events",
 ];
 
-/// How many entries each map holds. The hash maps are allocated in full at
-/// load, so these bound the engine's memory as well as its capacity.
+/// How many entries each map holds. Most of the hash maps are allocated in
+/// full at load, so these bound the engine's memory as well as its
+/// capacity. What one box may take of them is in [`crate::Limits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapSizes {
     pub boxes: u32,
@@ -143,7 +144,7 @@ impl Default for MapSizes {
             boxes: 1024,
             rule_entries: 16384,
             pins: 16384,
-            name_sets: 4096,
+            name_sets: 16384,
             endpoints: 4096,
             flows: 65536,
             event_bytes: 1 << 18,
