@@ -125,6 +125,18 @@ pub const IO_URING_SETUP: Syscall = Syscall {
     compat: Some(425),
 };
 
+/// `ioctl(2)`. The 32-bit ABIs of both architectures number it 54.
+pub const IOCTL: Syscall = Syscall {
+    name: "ioctl",
+    native: Some(libc::SYS_ioctl as u32),
+    compat: Some(54),
+};
+
+/// The `ioctl` requests that put input into a terminal's queue as if it had
+/// been typed: `TIOCSTI`, and `TIOCLINUX`, whose selection paste does the
+/// same on a virtual console.
+const TERMINAL_INJECTION: &[u32] = &[0x5412, 0x541c];
+
 /// `socketcall(2)`, the 32-bit multiplexer for the socket calls. Its
 /// arguments sit behind a pointer a filter cannot read.
 pub const SOCKETCALL: Syscall = Syscall {
@@ -157,12 +169,25 @@ const FAMILIES: &[u32] = &[
 /// - A 32-bit program's `socketcall` fails with `ENOSYS` for the two
 ///   sub-calls that create sockets, so its libc falls back to the direct
 ///   syscalls the rules above judge.
+/// - `ioctl` fails with `EPERM` for the requests that inject input into a
+///   terminal. A box that shares a terminal with what runs after it could
+///   otherwise type commands there. The kernel reads the request as 32
+///   bits, and so does the rule: a condition compares the low half of its
+///   argument.
 pub static BOX: Profile = Profile {
     rules: &[
         Rule {
             syscalls: &[IO_URING_SETUP],
             when: &[],
             action: Action::Errno(libc::ENOSYS),
+        },
+        Rule {
+            syscalls: &[IOCTL],
+            when: &[Cond {
+                arg: 1,
+                cmp: Cmp::In(TERMINAL_INJECTION),
+            }],
+            action: Action::Errno(libc::EPERM),
         },
         Rule {
             syscalls: &[SOCKETCALL],
@@ -620,6 +645,26 @@ mod tests {
         );
     }
 
+    /// `ioctl` is refused for the requests that inject terminal input, on
+    /// both ABIs, and allowed for every other request.
+    #[test]
+    fn terminal_injection_is_refused() {
+        let program = box_program();
+        for (arch, abi) in [(arch::NATIVE, Abi::Native), (arch::COMPAT, Abi::Compat)] {
+            let ioctl = |request: u32| Call {
+                arch,
+                nr: IOCTL.number(abi).unwrap(),
+                args: [0, request, 0, 0, 0, 0],
+            };
+            for request in [libc::TIOCSTI as u32, libc::TIOCLINUX as u32] {
+                assert_eq!(evaluate(program, ioctl(request)), errno(libc::EPERM));
+            }
+            for request in [libc::TIOCGWINSZ as u32, libc::TIOCSCTTY as u32, 0] {
+                assert_eq!(evaluate(program, ioctl(request)), ALLOW);
+            }
+        }
+    }
+
     /// The number a tracer sets to cancel a syscall is allowed on both
     /// ABIs, and is no x32 call.
     #[test]
@@ -871,6 +916,41 @@ mod tests {
         );
     }
 
+    /// Under the installed profile `TIOCSTI` and `TIOCLINUX` fail with
+    /// `EPERM`, with whatever sits in the upper half of the request, which
+    /// the kernel does not read. Another `ioctl` runs.
+    #[test]
+    fn the_kernel_refuses_terminal_injection() {
+        let report = under_the_box_profile(|| {
+            let (reader, _writer) = std::io::pipe().expect("a pipe");
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&reader);
+            let byte = b'x';
+            let mut pending: libc::c_int = -1;
+            let ioctl = |request: u64, arg: *const libc::c_void| {
+                // SAFETY: `ioctl` on a pipe with a pointer that outlives the
+                // call. The filter or the pipe refuses each request.
+                outcome(unsafe { libc::syscall(libc::SYS_ioctl, fd, request, arg) })
+            };
+            let byte_ptr = (&raw const byte).cast::<libc::c_void>();
+            [
+                ioctl(libc::TIOCSTI as u64, byte_ptr),
+                ioctl(libc::TIOCLINUX as u64, byte_ptr),
+                ioctl(0xdead_beef_0000_0000 | libc::TIOCSTI as u64, byte_ptr),
+                ioctl(0x1_0000_0000 | libc::TIOCLINUX as u64, byte_ptr),
+                // No terminal, so the kernel's own answer is `ENOTTY`.
+                ioctl(libc::TIOCGWINSZ as u64, byte_ptr),
+                ioctl(libc::FIONREAD as u64, (&raw mut pending).cast()),
+            ]
+        })
+        .expect("the probe ran under the profile");
+        let refused = libc::EPERM as u8;
+        assert_eq!(
+            report,
+            [refused, refused, refused, refused, libc::ENOTTY as u8, 0],
+            "TIOCSTI, TIOCLINUX, each again with a dirty upper half, TIOCGWINSZ, FIONREAD"
+        );
+    }
+
     /// A call of syscall -1 under the installed profile returns `ENOSYS`,
     /// as it does for a tracer that cancelled a syscall.
     #[test]
@@ -913,6 +993,8 @@ int main(void) {
     a[0] = (unsigned long)-1; a[1] = 0; a[2] = 0;
     printf("socketcall_getsockname=%d\n", syscall(102, 6, a) == 0 ? 0 : errno);
     say("io_uring_setup", syscall(425, 4, 0));
+    printf("ioctl_tiocsti=%d\n", syscall(54, 0, 0x5412, "x") == 0 ? 0 : errno);
+    printf("ioctl_tioclinux=%d\n", syscall(54, 0, 0x541c, "x") == 0 ? 0 : errno);
     return 0;
 }
 "#;
@@ -977,6 +1059,8 @@ int main(void) {
             // A sub-call that creates nothing reaches the kernel.
             ("socketcall_getsockname", libc::EBADF),
             ("io_uring_setup", libc::ENOSYS),
+            ("ioctl_tiocsti", libc::EPERM),
+            ("ioctl_tioclinux", libc::EPERM),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value))
