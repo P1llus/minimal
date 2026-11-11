@@ -405,6 +405,8 @@ fn main() -> Result<(), MainError> {
     // `sessions.manager.message` roots: `Shutdown` and the reaper's
     // `GetRecord`). Bounded, so a stuck task cannot hold the exit.
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    #[cfg(target_os = "linux")]
+    minimald::box_cgroups::kill_helpers();
     mlog::otel::shutdown(std::time::Duration::from_secs(5));
     // The guest's forwarded records (TEL-034): give the sender a moment to
     // write the spans that just ended to the host before the VM goes down.

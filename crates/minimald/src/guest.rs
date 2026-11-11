@@ -642,7 +642,9 @@ fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
         ));
     }
     let fs_blocks = device_bytes.saturating_sub(MKFS_MARGIN_BYTES) / EXT4_BLOCK_BYTES;
-    let status = std::process::Command::new("mkfs.ext4")
+    let mut command = std::process::Command::new("mkfs.ext4");
+    crate::box_cgroups::place_helper(&mut command);
+    let status = command
         .arg("-F")
         .arg("-q")
         .args(["-b", &EXT4_BLOCK_BYTES.to_string()])
@@ -666,10 +668,9 @@ pub const STATE_VOLUME_MOUNTPOINT: &str = "/var/lib/minimal";
 /// Exit codes 0–2 mean no errors / errors corrected; ≥ 4 means uncorrected
 /// problems remain, which is an error here.
 fn run_e2fsck(device: &str) -> std::io::Result<()> {
-    let status = std::process::Command::new("e2fsck")
-        .arg("-p")
-        .arg(device)
-        .status()?;
+    let mut command = std::process::Command::new("e2fsck");
+    crate::box_cgroups::place_helper(&mut command);
+    let status = command.arg("-p").arg(device).status()?;
     match status.code() {
         Some(code) if code < 4 => Ok(()),
         _ => Err(std::io::Error::other(format!(

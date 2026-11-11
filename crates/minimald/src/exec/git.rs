@@ -89,6 +89,7 @@ pub(super) async fn handle_git_receive(
             // repo, and make sure its configured to checkout
             // the ref it recieves.
             let mut init = tokio::process::Command::new("git");
+            crate::box_cgroups::place_helper(init.as_std_mut());
             init.arg("init").current_dir(paths.working.as_utf8_path());
             for name in git_repo_location_env() {
                 init.env_remove(name);

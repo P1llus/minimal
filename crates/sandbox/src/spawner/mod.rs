@@ -294,7 +294,12 @@ impl Spawner {
         let (ours, theirs) = UnixStream::pair()?;
         let fresh = match &self.inner.backend {
             Backend::Process { exe, terminal } => {
-                let process = spawner_process(exe, *terminal, &theirs)?;
+                let helpers = self
+                    .inner
+                    .root
+                    .as_ref()
+                    .map(|root| root.dir().join(crate::cgroup::HELPERS));
+                let process = spawner_process(exe, *terminal, &theirs, helpers.as_deref())?;
                 Connection::open(ours, Some(process), Some(self.lost()))?
             }
             Backend::Thread => {
@@ -429,6 +434,7 @@ fn spawner_process(
     exe: &Path,
     terminal: Terminal,
     socket: &UnixStream,
+    helpers: Option<&Path>,
 ) -> io::Result<std::process::Child> {
     let fd = socket.as_raw_fd();
     let mut command = std::process::Command::new(exe);
@@ -437,6 +443,11 @@ fn spawner_process(
         .arg(SPAWNER_MODE)
         .arg(exe)
         .stdin(std::process::Stdio::null());
+    // The cgroup of the caller's helper programs, which the spawner ends
+    // when the caller is gone.
+    if let Some(helpers) = helpers {
+        command.arg(helpers);
+    }
     // SAFETY: the closure makes direct syscalls between fork and exec.
     unsafe {
         command.pre_exec(move || {

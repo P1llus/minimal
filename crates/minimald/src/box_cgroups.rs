@@ -89,6 +89,26 @@ pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf, guest: b
     }
 }
 
+/// Makes `command` start in the cgroup for the daemon's helper programs
+/// and not beside the daemon: a helper works on input a box controls, and
+/// the policy loader trusts every process in the daemon's own cgroup.
+/// Without a cgroup root there is no loader either, and the command is left
+/// as it is.
+pub(crate) fn place_helper(command: &mut std::process::Command) {
+    if let Some(root) = root() {
+        root.helpers().place(command);
+    }
+}
+
+/// Ends every helper program, at the daemon's clean stop.
+pub fn kill_helpers() {
+    if let Some(root) = root()
+        && let Err(error) = root.helpers().kill()
+    {
+        tracing::warn!(%error, "ending the daemon's helper programs");
+    }
+}
+
 /// The daemon's cgroup root, if it has one.
 pub(crate) fn root() -> Option<&'static Root> {
     ROOT.get().and_then(Option::as_ref)

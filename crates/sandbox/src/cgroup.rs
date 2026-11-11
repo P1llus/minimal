@@ -27,11 +27,78 @@ use std::time::{Duration, Instant};
 /// Where cgroup v2 is mounted.
 pub const MOUNT: &str = "/sys/fs/cgroup";
 
-/// The child of the root that holds the daemon and its helpers.
+/// The child of the root that holds the daemon and its spawner, and
+/// nothing else: the policy loader trusts whoever runs here.
 pub const SUPERVISOR: &str = "supervisor";
+
+/// The child of the root for the daemon's other children: programs that
+/// work on input a box controls, such as the virtual network's switch and
+/// `git`. They are neither box processes nor trusted like the daemon.
+pub const HELPERS: &str = "helpers";
 
 /// The child of the root that holds one cgroup per box.
 pub const BOXES: &str = "boxes";
+
+/// The cgroup of the daemon's helper programs.
+#[derive(Debug, Clone)]
+pub struct Helpers {
+    dir: Arc<OwnedFd>,
+    /// `cgroup.procs`, held open so a forked child can write to it with
+    /// one system call.
+    procs: Arc<OwnedFd>,
+}
+
+impl Helpers {
+    fn over(dir: OwnedFd) -> io::Result<Self> {
+        let procs = open_in(dir.as_fd(), "cgroup.procs", libc::O_WRONLY)?;
+        Ok(Self {
+            dir: Arc::new(dir),
+            procs: Arc::new(procs.into()),
+        })
+    }
+
+    /// Makes `command` start in this cgroup: the child moves itself in
+    /// before it execs, so the program never runs anywhere else.
+    pub fn place(&self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+
+        let procs = Arc::clone(&self.procs);
+        // SAFETY: the closure makes one `write` between fork and exec, on
+        // a descriptor the closure keeps alive.
+        unsafe {
+            command.pre_exec(move || {
+                // "0" names the writing process.
+                if libc::write(procs.as_raw_fd(), c"0".as_ptr().cast(), 1) == 1 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+    }
+
+    /// Kills every helper.
+    ///
+    /// # Errors
+    ///
+    /// When the kernel refuses the write to `cgroup.kill`.
+    pub fn kill(&self) -> io::Result<()> {
+        kill(self.dir.as_fd())
+    }
+
+    /// The pids in the cgroup.
+    ///
+    /// # Errors
+    ///
+    /// When `cgroup.procs` cannot be read.
+    pub fn procs(&self) -> io::Result<Vec<u32>> {
+        use std::io::Read as _;
+
+        let mut text = String::new();
+        open_in(self.dir.as_fd(), "cgroup.procs", libc::O_RDONLY)?.read_to_string(&mut text)?;
+        Ok(text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    }
+}
 
 /// Where this process can keep its box cgroups.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +350,7 @@ pub struct Root {
     /// The `boxes` cgroup, open: what box cgroups are made in and removed
     /// from.
     boxes: Arc<OwnedFd>,
+    helpers: Helpers,
     /// The root as `/proc/<pid>/cgroup` spells it, with no trailing slash:
     /// empty for the real cgroup root.
     name: String,
@@ -323,7 +391,8 @@ impl Root {
             })?;
         let supervisor = dir.join(SUPERVISOR);
         let boxes = dir.join(BOXES);
-        for child in [&supervisor, &boxes] {
+        let helpers = dir.join(HELPERS);
+        for child in [&supervisor, &boxes, &helpers] {
             match fs::create_dir(child) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -362,9 +431,14 @@ impl Root {
         let boxes_fd: OwnedFd = fs::File::open(&boxes)
             .map_err(|e| named(e, "opening", &boxes))?
             .into();
+        let helpers_fd: OwnedFd = fs::File::open(&helpers)
+            .map_err(|e| named(e, "opening", &helpers))?
+            .into();
+        let helpers = Helpers::over(helpers_fd).map_err(|e| named(e, "opening", &helpers))?;
         Ok(Self {
             dir: dir.to_path_buf(),
             boxes: Arc::new(boxes_fd),
+            helpers,
             name,
             controllers: Controllers {
                 cpu: has("cpu"),
@@ -378,6 +452,12 @@ impl Root {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The cgroup for the daemon's helper programs.
+    #[must_use]
+    pub fn helpers(&self) -> &Helpers {
+        &self.helpers
     }
 
     /// The `supervisor` cgroup as `/proc/<pid>/cgroup` spells it.
@@ -404,6 +484,8 @@ impl Root {
     /// When `boxes` cannot be listed. A cgroup that cannot be removed is
     /// logged and left.
     pub fn sweep(&self, limit: Duration) -> io::Result<Vec<String>> {
+        // Helpers an earlier daemon left running serve nobody now.
+        self.helpers.kill()?;
         let mut swept = Vec::new();
         for entry in fs::read_dir(self.boxes())? {
             let entry = entry?;
@@ -1419,5 +1501,38 @@ mod tests {
         let reused = root.create_box("again").unwrap();
         assert!(reused.procs().unwrap().is_empty());
         assert_eq!(stale.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn a_helper_starts_in_the_helpers_cgroup_and_dies_with_it() {
+        let Some(root) =
+            delegated_root("cgroup::tests::a_helper_starts_in_the_helpers_cgroup_and_dies_with_it")
+        else {
+            return;
+        };
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300");
+        root.helpers().place(&mut command);
+        let mut helper = command.spawn().unwrap();
+        let cgroup = fs::read_to_string(format!("/proc/{}/cgroup", helper.id())).unwrap();
+        assert_eq!(cgroup.trim(), format!("0::{}/{HELPERS}", root.name()));
+        assert_eq!(root.helpers().procs().unwrap(), vec![helper.id()]);
+        // Not beside the daemon, where the policy loader would serve it.
+        assert_ne!(cgroup.trim(), format!("0::{}", root.supervisor_name()));
+
+        root.helpers().kill().unwrap();
+        let status = helper.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+        // A daemon start ends helpers an earlier daemon left.
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300");
+        root.helpers().place(&mut command);
+        let mut left = command.spawn().unwrap();
+        root.sweep(Duration::from_secs(5)).unwrap();
+        left.wait().unwrap();
+        assert!(root.helpers().procs().unwrap().is_empty());
     }
 }

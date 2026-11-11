@@ -1384,6 +1384,7 @@ impl Exec for TokioExec {
     fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
+            crate::box_cgroups::place_helper(cmd.as_std_mut());
             cmd.arg("-c")
                 .arg(&self.argv)
                 .current_dir(<DaemonAbsPath as AsRef<std::path::Path>>::as_ref(&self.cwd))

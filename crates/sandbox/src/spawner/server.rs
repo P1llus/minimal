@@ -78,6 +78,7 @@ struct Server {
 pub(crate) fn main(mut args: impl Iterator<Item = OsString>) -> ! {
     title::set_comm(c"minimal-spawner");
     let exe = args.next().map(PathBuf::from);
+    let helpers = args.next().map(PathBuf::from);
     // SAFETY: the process that started this one put the socket on this
     // descriptor, and nothing else here owns it.
     let sock = unsafe { UnixStream::from_raw_fd(SOCKET_FD) };
@@ -85,6 +86,11 @@ pub(crate) fn main(mut args: impl Iterator<Item = OsString>) -> ! {
     // SAFETY: `fcntl` on the descriptor just adopted.
     unsafe { libc::fcntl(SOCKET_FD, libc::F_SETFD, libc::FD_CLOEXEC) };
     serve(sock, exe, true);
+    // The process this spawner worked for is gone, however it went. Its
+    // helper programs have nobody to serve and nobody else to end them.
+    if let Some(helpers) = helpers {
+        let _gone = std::fs::write(helpers.join("cgroup.kill"), "1");
+    }
     std::process::exit(0)
 }
 

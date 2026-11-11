@@ -1024,6 +1024,7 @@ impl SwitchClient {
         }
 
         let mut cmd = Command::new(&self.binary);
+        crate::box_cgroups::place_helper(cmd.as_std_mut());
         cmd.arg("-config")
             .arg(self.config_path())
             .arg("-listen")

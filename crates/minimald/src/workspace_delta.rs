@@ -302,6 +302,8 @@ fn is_same_dir(a: &Path, b: &Path) -> bool {
 /// it finishes; nothing awaits it.
 async fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
+    #[cfg(target_os = "linux")]
+    crate::box_cgroups::place_helper(&mut cmd);
     cmd.arg("-C").arg(root).args(args);
     let task = crate::traced::spawn_blocking(move || cmd.output());
     let out = tokio::time::timeout(WALK_TIMEOUT, task)

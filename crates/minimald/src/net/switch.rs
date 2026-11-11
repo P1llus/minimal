@@ -294,7 +294,9 @@ pub async fn move_tap_into_netns(
         // their failures only on stderr — "Cannot open network namespace" and
         // "Cannot find device" are both exit 255 — and an exit code alone has
         // already cost one diagnosis here.
-        let out = tokio::process::Command::new(trusted_program(program))
+        let mut command = tokio::process::Command::new(trusted_program(program));
+        crate::box_cgroups::place_helper(command.as_std_mut());
+        let out = command
             .args(rest)
             .env("PATH", TRUSTED_EXEC_PATH)
             .output()
