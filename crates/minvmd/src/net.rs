@@ -1,69 +1,19 @@
-//! Per-host gvproxy switch supervision and per-PTask switch attachment for
-//! `minvmd` (R1.4, R1.5, R1.8).
+//! The VM's network on the host: gvproxy's process, the uplink that carries
+//! the VM's frames to it, the forwards published into the VM, and the door
+//! that carries single streams out of it.
 //!
-//! On DM1/DM3/DM4 a libkrun VM runs `minimald`; `minvmd` supervises exactly one
-//! gvproxy process per host VM ([`GvproxySupervisor`]) that serves every own-IP
-//! PTask as a switch client. `minvmd` owns the gvproxy **process** lifecycle
-//! only; the in-guest `minimald` performs the per-PTask attach (R1.5) — a tap in
-//! the PTask netns plus an async TAP↔gvproxy relay over the vsock shuttle — and
-//! assigns IPs from the switch subnet. The host switch starts with an empty
-//! `dhcpStaticLeases` table; the guest assigns PTask IPs statically.
+//! minvmd runs one gvproxy per VM ([`GvproxySupervisor`], [`HostGvproxy`]).
+//! The VM has one network device. Its backend is a socket whose other end
+//! minvmd pumps to gvproxy ([`uplink`]), without reading a frame.
 //!
-//! The gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
-//! established that the attachment is **not** an SCM_RIGHTS fd-pass but a bare
-//! `POST /connect` HTTP upgrade on gvproxy's control socket followed by raw
-//! Ethernet frames framed with a 2-byte little-endian length prefix (the
-//! HyperKit protocol). `minvmd`'s role is to write the gvproxy `-config` YAML
-//! carrying the subnet, gateway, NAT alias, and `dhcpStaticLeases`
-//! ([`render_gvproxy_config`]) — the NAT alias, DNS zone and leases are
-//! YAML-only, so the subnet travels in the same file. Opening the per-PTask
-//! tap and running the TAP↔gvproxy relay happen in the guest `minimald` over
-//! the vsock shuttle (see the `shuttle` module); this module owns only the
-//! switch process.
+//! The VM host protects the host. It decides which host ports forward into
+//! the VM ([`publish`]), and it keeps gvproxy's API closed inside the virtual
+//! network with a token ([`GvproxyConfig::write_token`]). It does not filter
+//! what the VM sends: per-box network policy belongs to the kernel that runs
+//! the boxes, inside the VM.
 //!
-//! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
-//! sequence the vmm child uses ([`GvproxySupervisor::stop`], R1.4) and runs a
-//! background tokio task that detects an unexpected gvproxy exit, emits a
-//! `tracing::error!`, and fires the [`SwitchExit`] notification returned from
-//! [`GvproxyConfig::spawn`] (R1.4 detection half). The datapath can be lost
-//! while the gvproxy process itself keeps running — an unlinked switch socket,
-//! a wedged accept loop — so the supervisor also runs a periodic liveness
-//! monitor ([`monitor_switch_datapath`], every
-//! [`DEFAULT_DATAPATH_CHECK_INTERVAL`]) that probes the switch socket and
-//! emits a `tracing::warn!` naming it when connections stop being accepted
-//! (NET-023). Every switch lifecycle event
-//! — spawn, stop, attach (with assigned IP), detach — is emitted as a structured
-//! `tracing` event (R1.8). This module contains no `println!`/`eprintln!`.
-//!
-//! Supervision is async: [`GvproxyConfig::spawn`] and [`GvproxySupervisor::stop`]
-//! run within a tokio runtime (the async networking layer the spec mandates),
-//! so neither blocks a worker thread during teardown.
-//!
-//! Between the guest's shuttle and the switch socket sits the **host-side
-//! egress gate** ([`egress_gate`], NET-081): started on the same dedicated
-//! runtime as the switch by [`HostGvproxy::spawn`], before readiness is
-//! reported, it decides every frame leaving the VM against the host-side table
-//! of published namespaces ([`crate::box_registry`], NET-138) — per source
-//! address, by the rules the namespace's row compiled from its declaration —
-//! and relays only what its verdict admits on to the switch. The node
-//! plane's own traffic — the in-VM daemon's registry and cache fetches
-//! (NET-080) — is decided by the baseline set the helper enumerates
-//! ([`NodePlaneBaseline`], NET-130), beside the boxes' rows, once its phase
-//! is in force ([`NodeBaselinePhase`]); announced, the shipped posture, the
-//! run path's allow-all interim node row still decides it. A frame whose
-//! source is an address the plan could never hand to a box never leaves the
-//! VM; an address the plan could hand out but no namespace holds is the
-//! announced interim's — admitted, and warned as such, until the
-//! creator-side registration (T66, #1711) supplies the rows the per-box
-//! default binds to ([`egress_gate`] carries the phase and its reasons). The
-//! gate lives and dies with the switch runtime it was started on.
-//!
-//! The Box Egress Proxy's host leg is separate from all of that
-//! (`switch::bep_host`, NET-132): a userspace smoltcp stack over a
-//! channel-backed device, standing in for the proxy's listener on the
-//! switch's plan. The switch runtime starts it once the switch socket is up
-//! and stops it with the switch; the leg that carries a box's connection to
-//! the proxy's listener is wired when the proxy's own work lands.
+//! gvproxy is started again when it dies. Supervision is async on a thread
+//! of its own, because the rest of the supervisor is synchronous.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -76,7 +26,6 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
-use minimald_rpc::IpProto;
 use tracing::Instrument as _;
 // gvproxy-switch primitives live in the shared `switch` crate. Re-exported so
 // `minvmd::net::{SwitchSubnet, MacAddr, …}` keeps working.
@@ -84,31 +33,34 @@ pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
-pub(crate) mod dns_pins;
-pub(crate) mod drop_limiter;
-pub(crate) mod egress_gate;
-pub use egress_gate::EgressGate;
 pub mod answerer;
-mod forward_revoke;
+pub mod bep_stub;
 pub(crate) mod gvproxy_api;
+pub(crate) mod host_exposures;
 pub(crate) mod proxy_reclaim;
-mod shuttle;
+pub(crate) mod publish;
 mod stale_gvproxy;
 pub(crate) mod uplink;
-pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 #[cfg_attr(not(minvmd_libkrun), allow(unused_imports))]
 pub(crate) use stale_gvproxy::reap_stale_gvproxy;
-mod baseline;
-pub(crate) mod host_exposures;
-pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
-pub use switch::bep_host::{BepBoxSource, BepWire};
-pub use switch::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
-// The Box Egress Proxy's stand-in acceptor (NET-132): test and e2e only —
-// the supervisor binds it behind `MINVMD_BEP_STUB` and nothing on a
-// production boot ever listens at the proxy socket path. `pub` for the
-// same reachability reason `control` is: the stub build the `minimal` CLI
-// links must not see it as dead code.
-pub mod bep_stub;
+
+/// The file name of the stream door's socket in the VM's host directory. The
+/// VMM child connects to it for the guest, so it has that child's access.
+pub const GUEST_STREAM_SOCK_FILE: &str = "guest-stream.sock";
+
+/// The file name of gvproxy's `-listen` socket in the VM's host directory.
+const SWITCH_SOCK_FILE: &str = "gvproxy-switch.sock";
+
+/// The path of gvproxy's `-listen` socket for this VM: beside the bridge
+/// socket, in the directory only this user can reach.
+///
+/// # Errors
+///
+/// The error of resolving the bridge socket's path.
+pub fn resolve_switch_sock() -> io::Result<PathBuf> {
+    let uds = crate::sock::resolve_uds_path()?;
+    Ok(uds.with_file_name(SWITCH_SOCK_FILE))
+}
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
@@ -697,25 +649,6 @@ async fn monitor_switch_datapath(
     }
 }
 
-/// The environment variable that listed the host exposures before the
-/// `[host-exposures]` table of the client `config.toml` replaced it.
-const RETIRED_HOST_EXPOSURE_ENV: &str = "MINVMD_HOST_EXPOSURE_PORTS";
-
-/// Logs a warning when the retired host-exposure variable is set. `minvmd`
-/// ignores its value, and only the `[host-exposures]` table opens a port.
-fn warn_retired_host_exposure_env(value: Option<std::ffi::OsString>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    tracing::warn!(
-        variable = RETIRED_HOST_EXPOSURE_ENV,
-        value = %value.to_string_lossy(),
-        "ignored MINVMD_HOST_EXPOSURE_PORTS: host.min.internal opens only the ports \
-         that the [host-exposures] table of the client config.toml lists"
-    );
-    true
-}
-
 /// Deliver `signal` to the process referred to by `pidfd` via
 /// `pidfd_send_signal(2)`. A pidfd is bound to the exact process instance
 /// opened at spawn, so this call returns `ESRCH` after the process exits
@@ -770,27 +703,17 @@ fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
     }
 }
 
-/// A host gvproxy switch owned by `minvmd`'s synchronous supervisor, running on
-/// its own dedicated current-thread tokio runtime.
+/// A host gvproxy owned by `minvmd`'s synchronous supervisor, running on a
+/// thread with its own current-thread tokio runtime.
 ///
-/// `minvmd`'s `run`/`boot` supervisor is synchronous, but [`GvproxyConfig::spawn`]
-/// and [`GvproxySupervisor::stop`] need a tokio runtime (background exit-detection
-/// and timer-driven teardown). [`HostGvproxy::spawn`] stands up a single-threaded
-/// runtime on a dedicated thread, spawns + supervises gvproxy there, and keeps
-/// the runtime alive for the VM's lifetime. [`HostGvproxy::stop`] (or `Drop`)
-/// tears gvproxy down and joins the thread.
-///
-/// The switch is started with an **empty** static-lease table: the guest's
-/// per-PTask shuttle configures each PTask's switch IP statically (the spike's
-/// static-lease recipe), so `minvmd` does not need to own the per-PTask address
-/// book — gvproxy still provides the subnet gateway and the host-loopback NAT
-/// alias from the config YAML.
+/// gvproxy runs for the VM's life. When it exits by itself it is started
+/// again, and `on_restart` is called once the new one accepts connections.
+/// [`HostGvproxy::stop`] (or `Drop`) stops it and joins the thread.
 #[derive(Debug)]
 #[must_use = "dropping HostGvproxy stops the host gvproxy switch"]
 pub struct HostGvproxy {
-    /// Channel that tells the runtime thread to stop the switch and exit.
+    /// Tells the runtime thread to stop gvproxy and exit.
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    /// The runtime thread; joined on [`stop`](Self::stop) / `Drop`.
     thread: Option<std::thread::JoinHandle<()>>,
     /// PID of the running gvproxy. It changes when gvproxy is started again.
     pid: Arc<std::sync::atomic::AtomicU32>,
@@ -802,58 +725,31 @@ pub struct HostGvproxy {
 pub type OnSwitchRestart = Arc<dyn Fn() + Send + Sync>;
 
 impl HostGvproxy {
-    /// Spawn and supervise the host gvproxy switch on a dedicated runtime,
-    /// with the host-side egress gate (NET-081) in front of it.
-    ///
-    /// `binary` is the gvproxy binary; `switch_sock` is the host `-listen` UNIX
-    /// socket the gate relays admitted frames to (see
-    /// [`resolve_switch_sock`]); `datapath_check_interval` is the cadence of
-    /// the periodic liveness probe that warns on a lost switch datapath
-    /// ([`DEFAULT_DATAPATH_CHECK_INTERVAL`]; NET-023 — keep it under a
-    /// minute); `registry` is the host-side table of published namespaces
-    /// ([`crate::box_registry`]) the gate decides every frame leaving the VM
-    /// by. One value wires both halves: the switch is configured with the
-    /// registry's subnet, and the gate gets the registry's read-only view, so
-    /// the rows a frame is decided by can never be compiled against an
-    /// address plan the switch does not serve — a drift that would leave the
-    /// daemon's own frames dropped as an unknown source. The registry is
-    /// borrowed, not taken: the caller keeps holding it as the registration
-    /// surface, and the view the gate holds shares its rows, so every later
-    /// registration reaches the running gate. The gate binds the socket
-    /// beside `switch_sock` ([`resolve_gate_sock`]) and is started before
-    /// readiness is reported,
-    /// so the guest that boots next meets a listening gate, never an open
-    /// switch; a gate that cannot bind its socket is a host that cannot
-    /// enforce egress, so the bring-up fails rather than booting wide open.
-    /// Blocks only until gvproxy is spawned
-    /// and its PID known; supervision continues on the background runtime.
+    /// Starts gvproxy for `subnet` on `switch_sock` and supervises it.
+    /// Returns once the socket accepts connections.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error if the runtime cannot be built, the config cannot
-    /// be written, the gate socket cannot be bound, or the gvproxy binary
-    /// cannot be launched.
+    /// The I/O error if the runtime cannot be built, the config or token
+    /// cannot be written, the binary cannot be launched, or the socket does
+    /// not come up.
     #[tracing::instrument(name = "net.switch.start", skip_all, fields(otel.status_code = tracing::field::Empty))]
     pub fn spawn(
         binary: PathBuf,
         switch_sock: PathBuf,
         datapath_check_interval: Duration,
-        registry: &crate::box_registry::BoxRegistry,
-        wire: BepWire,
-        boxes: Arc<dyn BepBoxSource>,
+        subnet: SwitchSubnet,
         on_restart: OnSwitchRestart,
     ) -> io::Result<Self> {
-        // A switch that fails to start exports its span with an error status
-        // (TEL-035), as `vm.boot` does.
+        // A switch that fails to start exports its span with an error status,
+        // as `vm.boot` does.
         let span = tracing::Span::current();
         let failed = crate::telemetry::ErrorUnlessOk::new(&span);
         let started = Self::spawn_inner(
             binary,
             switch_sock,
             datapath_check_interval,
-            registry,
-            wire,
-            boxes,
+            subnet,
             on_restart,
         );
         if started.is_ok() {
@@ -866,48 +762,12 @@ impl HostGvproxy {
         binary: PathBuf,
         switch_sock: PathBuf,
         datapath_check_interval: Duration,
-        registry: &crate::box_registry::BoxRegistry,
-        wire: BepWire,
-        boxes: Arc<dyn BepBoxSource>,
+        subnet: SwitchSubnet,
         on_restart: OnSwitchRestart,
     ) -> io::Result<Self> {
         let config = GvproxyConfig::new(binary, switch_sock)
             .with_datapath_check_interval(datapath_check_interval)
-            // The switch serves the registry's address plan — the same subnet
-            // its rows were compiled against — so a lease the gate checks a
-            // frame's source by is one the switch actually routes.
-            .with_subnet(registry.subnet());
-        let subnet = registry.subnet();
-        let table = registry.table();
-        // The host-side DNS admission table (NET-081 deciding NET-066/067):
-        // one entry per registered box that declared `allow_dns_hosts`,
-        // filled from the DNS replies the gate's ingress leg observes toward
-        // a box and read by the verdict's pin arm for the one drop class a
-        // DNS-declaring row's address rules cannot carry. Built empty here —
-        // pins exist only from replies a box received — for the same plan the
-        // rows were compiled against, and handed to the gate, which keeps it
-        // for the switch runtime's lifetime: the table's entries are keyed by
-        // the rows' switch addresses and retired beside the withdrawal report
-        // that ends each row (NET-133), so the table itself needs no lifetime
-        // of its own beyond the gate's.
-        let pins = dns_pins::DnsPins::new(subnet);
-        // The node-plane baseline set: the helper's built-in enumeration of
-        // the categories the in-VM daemon's own traffic may reach (NET-130),
-        // built from the same address plan the rows were compiled against.
-        // In force, the gate decides a frame from the daemon's own address
-        // by it, beside the boxes' rows; announced — the shipped posture —
-        // the allow-all interim node row still does, and the gate's
-        // start-up line names the posture deciding. The host exposures the
-        // alias is opened at — none unless the client `config.toml` names
-        // ports in `[host-exposures]` — are the live table: the gate reads
-        // it again when the file changes, so an added entry opens its port
-        // and a removed one closes it, with no restart (NET-161).
-        // The retired variable no longer opens a port. Say so in the daemon
-        // log, so an operator who still sets it sees why the alias stays
-        // closed at its ports (NET-159).
-        warn_retired_host_exposure_env(std::env::var_os(RETIRED_HOST_EXPOSURE_ENV));
-        let baseline = NodePlaneBaseline::built_in(subnet)
-            .with_host_exposures(host_exposures::HostExposures::client_config());
+            .with_subnet(subnet);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
         let shared_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -927,7 +787,8 @@ impl HostGvproxy {
                     }
                 };
                 runtime.block_on(async move {
-                    // Empty lease table: the guest assigns PTask IPs statically.
+                    // The lease table is empty: the guest configures every
+                    // address statically.
                     let (mut switch, mut exit) = match config.clone().spawn(&[]) {
                         Ok(pair) => pair,
                         Err(e) => {
@@ -935,59 +796,24 @@ impl HostGvproxy {
                             return;
                         }
                     };
-                    let pid = switch.pid();
                     let sock = switch.switch_socket().to_path_buf();
-                    let _gate = match EgressGate::spawn(
-                        shuttle::gate_sock_beside(&sock),
-                        sock.clone(),
-                        table,
-                        pins,
-                        baseline,
-                    ) {
-                        Ok(gate) => gate,
-                        Err(e) => {
-                            switch.stop().await;
-                            drop(ready_tx.send(Err(e)));
-                            return;
-                        }
-                    };
-                    // Wait for gvproxy to bind its `-listen` switch socket before
-                    // reporting ready, so a caller never treats a switch that died
-                    // during startup (or never bound) as network-ready. A dead
-                    // gvproxy never binds, so the timeout surfaces it as an error.
+                    // A gvproxy that died during startup never binds, and the
+                    // timeout reports it as an error.
                     if let Err(e) = wait_for_switch_socket(&sock, SWITCH_SOCKET_READY_TIMEOUT).await
                     {
                         switch.stop().await;
                         drop(ready_tx.send(Err(e)));
                         return;
                     }
-                    let mut bep_peer = match BepPeer::spawn(&sock, subnet, wire, boxes).await {
-                        Ok(peer) => Some(peer),
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to start box egress proxy peer");
-                            switch.stop().await;
-                            drop(ready_tx.send(Err(e)));
-                            return;
-                        }
-                    };
-                    if ready_tx.send(Ok(pid)).is_err() {
-                        // Caller went away before learning the PID; tear down.
-                        if let Some(peer) = bep_peer.take() {
-                            peer.shutdown().await;
-                        }
+                    if ready_tx.send(Ok(switch.pid())).is_err() {
+                        // The caller went away before learning the PID.
                         switch.stop().await;
                         return;
                     }
-                    // gvproxy runs for the VM's life. When it dies it is
-                    // started again: the guest's NIC stays up through the
-                    // pump, and the forwards are bound again by the caller.
                     let mut stop_rx = stop_rx;
                     loop {
                         tokio::select! {
                             _ = &mut stop_rx => {
-                                if let Some(peer) = bep_peer.take() {
-                                    peer.shutdown().await;
-                                }
                                 switch.stop().await;
                                 break;
                             }
@@ -997,7 +823,6 @@ impl HostGvproxy {
                                     code = status.and_then(|s| s.code()),
                                     "host gvproxy switch exited unexpectedly; starting it again",
                                 );
-                                drop(bep_peer.take());
                                 drop(switch);
                                 let Some(restarted) =
                                     respawn(&config, &sock, &mut stop_rx).await
@@ -1011,9 +836,9 @@ impl HostGvproxy {
                                     "host gvproxy switch is up again",
                                 );
                                 let on_restart = Arc::clone(&on_restart);
+                                let span = crate::telemetry::vm_task("net.switch.restarted");
                                 // The caller's work makes blocking calls to
                                 // the new gvproxy.
-                                let span = crate::telemetry::vm_task("net.switch.restarted");
                                 drop(tokio::task::spawn_blocking(move || {
                                     span.in_scope(|| on_restart());
                                 }));
@@ -1021,7 +846,6 @@ impl HostGvproxy {
                         }
                     }
                     let _ = std::fs::remove_file(config.token_path());
-                    drop(_gate);
                 });
             })?;
 
@@ -1038,7 +862,7 @@ impl HostGvproxy {
                 let _ = thread.join();
                 Err(e)
             }
-            // The runtime thread panicked before reporting; surface a clear error.
+            // The runtime thread panicked before reporting.
             Err(_) => {
                 let _ = thread.join();
                 Err(io::Error::other(
@@ -1048,7 +872,7 @@ impl HostGvproxy {
         }
     }
 
-    /// The PID of the supervised gvproxy process.
+    /// The PID of the running gvproxy process.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid.load(Ordering::Acquire)
@@ -1061,8 +885,7 @@ impl HostGvproxy {
 
     fn shutdown(&mut self) {
         if let Some(stop_tx) = self.stop_tx.take() {
-            // A failed send means the runtime thread already exited (e.g. gvproxy
-            // crashed); nothing more to signal.
+            // A failed send means the runtime thread already exited.
             let _ = stop_tx.send(());
         }
         if let Some(thread) = self.thread.take()
@@ -1113,84 +936,11 @@ impl Drop for HostGvproxy {
     }
 }
 
-/// VM-wide egress policy stub (R2.5 / Unit 2), aligned with the per-PTask egress
-/// types: a VM may restrict all of its traffic to the listed subnets, DNS
-/// hosts, and protocols. An empty policy ([`VmEgressPolicy::allow_all`]) imposes
-/// no restriction (absent egress defaults to allow-all). Enforcement lands in
-/// Unit 2; this type fixes the wire shape `minvmd` will configure on gvproxy.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VmEgressPolicy {
-    allow_subnets: Vec<String>,
-    allow_dns_hosts: Vec<String>,
-    allow_protocols: Vec<IpProto>,
-}
-
-impl VmEgressPolicy {
-    /// An empty allow-all policy (no egress restriction).
-    #[must_use]
-    pub fn allow_all() -> Self {
-        Self::default()
-    }
-
-    /// Restrict egress to the given CIDR subnets.
-    #[must_use]
-    pub fn with_subnets(mut self, subnets: impl IntoIterator<Item = String>) -> Self {
-        self.allow_subnets = subnets.into_iter().collect();
-        self
-    }
-
-    /// Restrict egress to the given DNS hostnames.
-    #[must_use]
-    pub fn with_dns_hosts(mut self, hosts: impl IntoIterator<Item = String>) -> Self {
-        self.allow_dns_hosts = hosts.into_iter().collect();
-        self
-    }
-
-    /// Restrict egress to the given IP protocols.
-    #[must_use]
-    pub fn with_protocols(mut self, protocols: impl IntoIterator<Item = IpProto>) -> Self {
-        self.allow_protocols = protocols.into_iter().collect();
-        self
-    }
-
-    /// Whether this policy imposes no restriction (every field empty).
-    #[must_use]
-    pub fn is_allow_all(&self) -> bool {
-        self.allow_subnets.is_empty()
-            && self.allow_dns_hosts.is_empty()
-            && self.allow_protocols.is_empty()
-    }
-
-    /// The allowed egress subnets.
-    #[must_use]
-    pub fn allow_subnets(&self) -> &[String] {
-        &self.allow_subnets
-    }
-
-    /// The allowed egress DNS hostnames.
-    #[must_use]
-    pub fn allow_dns_hosts(&self) -> &[String] {
-        &self.allow_dns_hosts
-    }
-
-    /// The allowed egress protocols.
-    #[must_use]
-    pub fn allow_protocols(&self) -> &[IpProto] {
-        &self.allow_protocols
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     use tracing_subscriber::fmt::MakeWriter;
-
-    #[test]
-    fn retired_host_exposure_env_is_warned_when_set() {
-        assert!(!warn_retired_host_exposure_env(None));
-        assert!(warn_retired_host_exposure_env(Some("8080".into())));
-    }
 
     fn spawn_sleep() -> Child {
         // A long-lived child to stand in for gvproxy in supervision tests.
@@ -1367,9 +1117,7 @@ mod tests {
             recording_gvproxy(dir.path()),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            &empty_box_registry(),
-            idle_bep_wire(dir.path()),
-            Arc::new(NoBoxes),
+            SwitchSubnet::default(),
             Arc::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
             }),
@@ -1656,36 +1404,6 @@ mod tests {
         );
     }
 
-    /// An empty host-side box registry for the supervision tests: no frames
-    /// flow through a stand-in switch, so the rows are not what these tests
-    /// are about — only that the switch runtime starts the gate with the
-    /// registry's view of them (and is configured with its subnet).
-    fn empty_box_registry() -> crate::box_registry::BoxRegistry {
-        crate::box_registry::BoxRegistry::new(SwitchSubnet::default())
-    }
-
-    /// The pool's box source for the supervision tests: no box rides the
-    /// stand-in switch, so no share of the pool is owed. The wiring beside
-    /// it names the same throwaway acceptor socket the peer would dial — no
-    /// acceptor listens there, which is the acceptor-down answer the peer
-    /// gives and nothing these tests observe either way.
-    struct NoBoxes;
-
-    impl BepBoxSource for NoBoxes {
-        fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
-            Vec::new()
-        }
-    }
-
-    /// The delivery wiring the supervision tests hand the switch runtime:
-    /// an acceptor path nothing listens at and a token nothing presents.
-    fn idle_bep_wire(dir: &std::path::Path) -> BepWire {
-        BepWire::new(
-            dir.join("gvproxy-bep.sock"),
-            [0u8; switch::bep_host::TOKEN_LEN],
-        )
-    }
-
     #[test]
     fn host_gvproxy_spawns_supervises_and_stops() {
         // A stay-alive script stands in for gvproxy: HostGvproxy::spawn only
@@ -1701,9 +1419,7 @@ mod tests {
             stayalive_gvproxy(dir.path()),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            &empty_box_registry(),
-            idle_bep_wire(dir.path()),
-            Arc::new(NoBoxes),
+            SwitchSubnet::default(),
             Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
@@ -1731,9 +1447,7 @@ mod tests {
             stayalive_gvproxy(dir.path()),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            &empty_box_registry(),
-            idle_bep_wire(dir.path()),
-            Arc::new(NoBoxes),
+            SwitchSubnet::default(),
             Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
@@ -1754,51 +1468,11 @@ mod tests {
             PathBuf::from("/nonexistent/definitely/not/gvproxy"),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            &empty_box_registry(),
-            idle_bep_wire(dir.path()),
-            Arc::new(NoBoxes),
+            SwitchSubnet::default(),
             Arc::new(|| {}),
         )
         .expect_err("spawning a missing binary must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    }
-
-    /// NET-081: the switch runtime starts the egress gate on the socket beside
-    /// the switch socket, and it is listening before the runtime reports the
-    /// switch ready — so the guest that boots next can only ever reach the
-    /// switch through it.
-    #[test]
-    fn host_gvproxy_starts_the_gate_beside_the_switch_socket() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let sock = dir.path().join("gvproxy-switch.sock");
-        let _switch_listener =
-            std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
-        let gvproxy = HostGvproxy::spawn(
-            stayalive_gvproxy(dir.path()),
-            sock.clone(),
-            DEFAULT_DATAPATH_CHECK_INTERVAL,
-            &empty_box_registry(),
-            idle_bep_wire(dir.path()),
-            Arc::new(NoBoxes),
-            Arc::new(|| {}),
-        )
-        .expect("spawn host gvproxy");
-
-        // The gate socket exists beside the switch socket (the very path
-        // resolve_gate_sock names from the same UDS dir) and accepts a
-        // connection before stop() — i.e. before the VM ever boots.
-        let gate_sock = dir.path().join("gvproxy-gate.sock");
-        assert_eq!(
-            gate_sock,
-            shuttle::gate_sock_beside(&sock),
-            "the gate binds the socket named beside the switch socket"
-        );
-        assert!(
-            std::os::unix::net::UnixStream::connect(&gate_sock).is_ok(),
-            "the gate is listening before the switch runtime reports ready"
-        );
-
-        gvproxy.stop();
     }
 
     /// NET-081/NET-138: the switch the gate guards is configured with the
@@ -1808,7 +1482,7 @@ mod tests {
     /// which is the only way a node row can keep matching the switch it
     /// leaves frames on.
     #[test]
-    fn host_gvproxy_serves_the_registrys_subnet() {
+    fn host_gvproxy_serves_the_subnet_it_is_given() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let sock = dir.path().join("gvproxy-switch.sock");
         let _switch_listener =
@@ -1818,14 +1492,11 @@ mod tests {
         // the coincidence.
         let subnet =
             SwitchSubnet::new(Ipv4Addr::new(100, 80, 0, 0), 16).expect("a /16 is a valid plan");
-        let registry = crate::box_registry::BoxRegistry::new(subnet);
         let gvproxy = HostGvproxy::spawn(
             stayalive_gvproxy(dir.path()),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            &registry,
-            idle_bep_wire(dir.path()),
-            Arc::new(NoBoxes),
+            subnet,
             Arc::new(|| {}),
         )
         .expect("spawn host gvproxy");
@@ -1839,17 +1510,5 @@ mod tests {
             "the switch serves the registry's subnet, not a default one, got: {yaml}"
         );
         gvproxy.stop();
-    }
-
-    #[test]
-    fn vm_egress_policy_allow_all_by_default() {
-        assert!(VmEgressPolicy::allow_all().is_allow_all());
-        let policy = VmEgressPolicy::allow_all()
-            .with_subnets(["10.0.0.0/8".to_string()])
-            .with_protocols([IpProto::Tcp]);
-        assert!(!policy.is_allow_all());
-        assert_eq!(policy.allow_subnets(), ["10.0.0.0/8"]);
-        assert_eq!(policy.allow_protocols(), [IpProto::Tcp]);
-        assert!(policy.allow_dns_hosts().is_empty());
     }
 }

@@ -2399,3 +2399,172 @@ fn retire_without_an_end_is_refused_at_decode() {
         other => panic!("decoded as {other:?}"),
     }
 }
+
+#[test]
+fn guest_door_requests_round_trip() {
+    let box_id = BoxId::mint();
+    let publish = GuestDoorRequest::PublishPort(PublishPortRequest {
+        box_id,
+        external: 8080,
+        internal: 80,
+        proto: IpProto::Tcp,
+        origin: PublishOrigin::Declared,
+    });
+    let wire = serde_json_lenient::to_string(&publish).expect("serialize");
+    assert!(wire.contains(r#""verb":"publish_port""#), "{wire}");
+    assert!(wire.contains(r#""origin":"declared""#), "{wire}");
+    assert_eq!(round_trip(&publish), publish);
+    // The request names no host address, and a line that tries to is not
+    // a publish.
+    let with_address = wire.replacen('{', r#"{"local":"0.0.0.0:80","#, 1);
+    assert!(serde_json_lenient::from_str::<GuestDoorRequest>(&with_address).is_err());
+    // A guest door verb is not a host door verb, and the other way round.
+    assert!(serde_json_lenient::from_str::<BoxControlRequest>(&wire).is_err());
+    let host_verb = serde_json_lenient::to_string(&BoxControlRequest::AnswererStatus).unwrap();
+    assert!(serde_json_lenient::from_str::<GuestDoorRequest>(&host_verb).is_err());
+
+    for request in [
+        GuestDoorRequest::UnpublishPort(UnpublishPortRequest {
+            box_id,
+            external: 8080,
+            proto: IpProto::Tcp,
+        }),
+        GuestDoorRequest::EndBox(EndBoxRequest { box_id }),
+        GuestDoorRequest::BoxStanding(BoxStandingRequest { box_id }),
+    ] {
+        assert_eq!(round_trip(&request), request);
+    }
+}
+
+#[test]
+fn guest_door_replies_round_trip() {
+    let box_id = BoxId::mint();
+    let listener = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 64, 2), 8080);
+    let mut replies = vec![
+        GuestDoorReply::Published {
+            listener,
+            box_id,
+            internal: 80,
+            proto: IpProto::Tcp,
+            state: ForwardState::Waiting,
+        },
+        GuestDoorReply::Unpublished {
+            listener,
+            closed: 2,
+        },
+        GuestDoorReply::BoxEnded {
+            ended: true,
+            box_id,
+            forwards_unbound: 3,
+            still_bound: 0,
+        },
+        GuestDoorReply::BoxStanding {
+            box_id,
+            standing: true,
+        },
+        GuestDoorReply::Error {
+            error: "no".to_string(),
+        },
+    ];
+    for refusal in [
+        PublishRefusal::UnknownBox,
+        PublishRefusal::HostIpBox,
+        PublishRefusal::InvalidPort,
+        PublishRefusal::NotDeclared,
+        PublishRefusal::Denied,
+        PublishRefusal::NoRange,
+        PublishRefusal::OutOfRange {
+            range: (3000, 3999),
+        },
+        PublishRefusal::AskNeedsExpose,
+        PublishRefusal::Ask {
+            refused: AskRefused::Cancelled,
+            cause: Some(AskCancelCause::GuestClosed),
+        },
+        PublishRefusal::ListenerHeld,
+        PublishRefusal::PortInUse,
+        PublishRefusal::BoxCap,
+        PublishRefusal::RateExceeded,
+        PublishRefusal::LedgerFull,
+        PublishRefusal::SwitchUnavailable,
+        PublishRefusal::NotPublished,
+        PublishRefusal::DeclaredPort,
+    ] {
+        assert!(!refusal.to_string().is_empty());
+        replies.push(GuestDoorReply::PublishRefused {
+            refusal,
+            box_id,
+            external: 8080,
+            proto: IpProto::Tcp,
+        });
+    }
+    for reply in replies {
+        assert_eq!(round_trip(&reply), reply);
+    }
+    let wire = serde_json_lenient::to_string(&GuestDoorReply::PublishRefused {
+        refusal: PublishRefusal::OutOfRange {
+            range: (3000, 3999),
+        },
+        box_id,
+        external: 4000,
+        proto: IpProto::Tcp,
+    })
+    .unwrap();
+    assert!(wire.contains(r#""reply":"publish_refused""#), "{wire}");
+    assert!(wire.contains(r#""reason":"out_of_range""#), "{wire}");
+    // The text a port already in use is refused with is the text clients
+    // look for.
+    assert!(
+        PublishRefusal::PortInUse
+            .to_string()
+            .contains("address already in use")
+    );
+}
+
+#[test]
+fn stream_door_header_and_reply_round_trip() {
+    let box_id = BoxId::mint();
+    let proxy = StreamOpen {
+        box_id,
+        purpose: StreamPurpose::CredentialProxy {
+            source_port: 51234,
+            destination: "140.82.112.3:443".parse().unwrap(),
+        },
+    };
+    let wire = serde_json_lenient::to_string(&proxy).unwrap();
+    assert!(wire.contains(r#""kind":"credential_proxy""#), "{wire}");
+    assert!(wire.len() < STREAM_OPEN_MAX);
+    assert_eq!(
+        serde_json_lenient::from_str::<StreamOpen>(&wire).unwrap(),
+        proxy
+    );
+
+    let host = StreamOpen {
+        box_id,
+        purpose: StreamPurpose::HostPort { port: 5432 },
+    };
+    let wire = serde_json_lenient::to_string(&host).unwrap();
+    assert_eq!(
+        serde_json_lenient::from_str::<StreamOpen>(&wire).unwrap(),
+        host
+    );
+    // A header cannot name a host address for the stream to land at.
+    let with_address = wire.replace(r#""port":5432"#, r#""port":5432,"address":"10.0.0.1""#);
+    assert!(serde_json_lenient::from_str::<StreamOpen>(&with_address).is_err());
+    let with_top_level = wire.replacen('{', r#"{"host":"10.0.0.1","#, 1);
+    assert!(serde_json_lenient::from_str::<StreamOpen>(&with_top_level).is_err());
+
+    assert_eq!(
+        serde_json_lenient::to_string(&StreamReply::Open).unwrap(),
+        r#"{"stream":"open"}"#
+    );
+    assert_eq!(
+        serde_json_lenient::to_string(&StreamReply::Refused {
+            reason: StreamRefusal::PortNotExposed
+        })
+        .unwrap(),
+        r#"{"stream":"refused","reason":"port_not_exposed"}"#
+    );
+    // One port per purpose, clear of the other vsock ports.
+    assert!(![7350, 7351, 7352, 7353].contains(&VM_HOST_STREAM_PORT));
+}

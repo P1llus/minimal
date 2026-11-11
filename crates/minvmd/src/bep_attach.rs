@@ -318,7 +318,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Instant;
 
-    use crate::net::egress_gate::test_support::capture_log;
+    use crate::test_support::capture_log;
 
     use super::*;
 

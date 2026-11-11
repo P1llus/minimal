@@ -2604,12 +2604,7 @@ impl HostAddressAnswer {
 /// when the node's last running host-address box ends. A hold that names
 /// no session cannot be matched to a running box, so it answers NODATA.
 fn host_address_answers(registry: &BoxRegistry) -> BTreeMap<String, HostAddressAnswer> {
-    let running: BTreeSet<boxes::SessionId> = registry
-        .table()
-        .host_ip_boxes()
-        .iter()
-        .map(|rules| rules.session_id())
-        .collect();
+    let running: BTreeSet<boxes::SessionId> = registry.resident_host_ip_boxes();
     let mirrored = registry.node_mirror().mirrored_address();
     let answers: BTreeMap<String, HostAddressAnswer> = registry
         .held_name_owners()
@@ -5161,7 +5156,6 @@ mod tests {
             .register_client_box(crate::box_registry::ClientBoxSpec {
                 name: "web".into(),
                 ingress_ports: vec![],
-                egress: None,
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
@@ -5201,7 +5195,6 @@ mod tests {
         let spec = |name: &str| crate::box_registry::ClientBoxSpec {
             name: name.into(),
             ingress_ports: vec![],
-            egress: None,
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
@@ -5296,7 +5289,6 @@ mod tests {
             .register_client_box(crate::box_registry::ClientBoxSpec {
                 name: "web".into(),
                 ingress_ports: vec![],
-                egress: None,
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
@@ -7755,7 +7747,7 @@ mod tests {
             "a held name whose box is not running answers NODATA",
         );
 
-        assert!(registry.admit_host_ip_box(web, None));
+        assert!(registry.admit_host_ip_box(web, false));
         assert_nodata(
             &ask_a(&answerer, "web"),
             "a running box whose node's binds are not mirrored answers NODATA",
@@ -7849,8 +7841,8 @@ mod tests {
         registry.node_mirror().set_range_probe(true);
         registry.hold_box_name("web", Some(web));
         registry.hold_box_name("api", Some(api));
-        assert!(registry.admit_host_ip_box(web, None));
-        assert!(registry.admit_host_ip_box(api, None));
+        assert!(registry.admit_host_ip_box(web, false));
+        assert!(registry.admit_host_ip_box(api, false));
 
         let own = answerer(registry.clone());
         assert_eq!(a_answer(&ask_a(&own, "web")), node);

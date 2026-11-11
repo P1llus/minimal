@@ -141,12 +141,9 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
-    // deep in the VMM child; catch it here with a clear error instead. The
-    // egress gate's socket (NET-081) is bridged by the same mechanism the
-    // switch socket is, so it carries the same limit.
+    // deep in the VMM child; catch it here with a clear error instead.
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
-    crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
         // The caller's root covers its whole wait: the hand-off ends when this
@@ -383,43 +380,30 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
-/// The supervisor's box registry: it feeds the proxy attachments, compiles
-/// under the operator's deny-all opt-out, persists to `registry_file`, and
-/// sends a live box's revocation to the Box Egress Proxy control socket under
-/// the home directory (BEP-043). Only this start path sets that socket.
+/// The supervisor's box registry: it feeds the proxy attachments, persists
+/// to `registry_file`, and sends a destroyed box's revocation to the
+/// credential proxy's control socket under the home directory.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn supervisor_registry(
     proxy_attachments: crate::bep_attach::Attachments,
-    egress_deny_all_opt_out: bool,
     registry_file: std::path::PathBuf,
 ) -> crate::box_registry::BoxRegistry {
     crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
         .feeding_proxy_attachments(proxy_attachments)
-        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
         .with_proxy_control(crate::box_registry::home_proxy_control())
         .persisting_to(registry_file)
 }
 
-/// The production binder of the node's mirrored binds (NET-138): it asks the
-/// host switch (gvproxy's forwarder, on the switch socket) to listen at the
-/// node's reserved-range address on the host and forward to the same port at
-/// the guest node's own address, and to undo it.
-///
-/// Each bind goes through the egress gate's publish ledger at the node's
-/// switch address ([`crate::net::egress_gate::MirrorLedger`]), noted before
-/// the expose. So the gate tracks the connections the forward carries and
-/// admits the node's replies on them. An unbind closes the listener first,
-/// then drops the note and resets the connections the gate tracked at that
-/// port, and no other port's.
+/// The production binder of the node's mirrored binds: each bind is one of
+/// minvmd's own forwards in the publish ledger, from the node's
+/// reserved-range address on the host to the same port at the guest node's
+/// address.
 #[derive(Debug)]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 struct SwitchMirrorBinder {
-    /// gvproxy's `-listen` socket, which serves the forwarder verbs.
-    switch_sock: std::path::PathBuf,
+    publisher: crate::net::publish::Publisher,
     /// The guest node's own switch address: where each forward dials.
     node: std::net::Ipv4Addr,
-    /// The table the running egress gate leaves its ledger on.
-    table: crate::box_registry::BoxTable,
 }
 
 impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
@@ -429,61 +413,32 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         port: u16,
     ) -> Result<(), crate::box_registry::MirrorBindError> {
         use crate::box_registry::MirrorBindError;
-        use crate::net::gvproxy_api::ExposeError;
-        let ledger = self
-            .table
-            .mirror_ledger()
-            .ok_or_else(|| MirrorBindError::Failed("the egress gate is not running".to_string()))?;
-        let noted = ledger
-            .note_bind(address, port, self.node)
-            .map_err(|refused| MirrorBindError::Failed(refused.to_string()))?;
-        let api = crate::net::gvproxy_api::SwitchApi::new(self.switch_sock.clone());
-        let result = match api.expose(
-            std::net::SocketAddrV4::new(address, port),
-            std::net::SocketAddrV4::new(self.node, port),
-            minimald_rpc::IpProto::Tcp,
-        ) {
-            Ok(()) | Err(ExposeError::AlreadyBound) => Ok(()),
-            Err(ExposeError::AddressInUse) => Err(MirrorBindError::Occupied),
-            Err(error @ ExposeError::Refused { .. }) => {
-                Err(MirrorBindError::Failed(error.to_string()))
-            }
-            Err(error @ ExposeError::Unanswered(_)) => {
-                Err(MirrorBindError::Unanswered(error.to_string()))
-            }
-        };
-        if noted
-            && matches!(
-                result,
-                Err(MirrorBindError::Occupied | MirrorBindError::Failed(_))
-            )
-        {
-            ledger.forget_bind(address, port, self.node);
-        }
-        result
+        use crate::net::publish::NodeBindError;
+        self.publisher
+            .bind_node(std::net::SocketAddrV4::new(address, port), self.node, port)
+            .map_err(|error| match error {
+                NodeBindError::Occupied => MirrorBindError::Occupied,
+                NodeBindError::Unanswered(text) => MirrorBindError::Unanswered(text),
+                other => MirrorBindError::Failed(other.to_string()),
+            })
     }
 
     fn unbind(&self, address: std::net::Ipv4Addr, port: u16) -> crate::box_registry::MirrorUnbind {
         use crate::box_registry::MirrorUnbind;
         use crate::net::gvproxy_api::UnexposeError;
-        let api = crate::net::gvproxy_api::SwitchApi::new(self.switch_sock.clone());
-        match api.unexpose(
-            std::net::SocketAddrV4::new(address, port),
-            minimald_rpc::IpProto::Tcp,
-        ) {
-            Ok(_) => {}
-            Err(error @ UnexposeError::Refused { .. }) => {
-                return MirrorUnbind::Refused(error.to_string());
-            }
+        match self
+            .publisher
+            .unbind_node(std::net::SocketAddrV4::new(address, port))
+        {
+            // gvproxy closes the connections the forward carried.
+            Ok(closed) => MirrorUnbind::Undone {
+                connections_reset: closed as usize,
+            },
+            Err(error @ UnexposeError::Refused { .. }) => MirrorUnbind::Refused(error.to_string()),
             Err(error @ UnexposeError::Unanswered(_)) => {
-                return MirrorUnbind::Unanswered(error.to_string());
+                MirrorUnbind::Unanswered(error.to_string())
             }
         }
-        let connections_reset = self.table.mirror_ledger().map_or(0, |ledger| {
-            ledger.forget_bind(address, port, self.node);
-            ledger.reset_port(self.node, port)
-        });
-        MirrorUnbind::Undone { connections_reset }
     }
 }
 
@@ -701,78 +656,33 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
-    // The host-side table of published namespaces (NET-138): the rows the
-    // egress gate (NET-081) decides every frame leaving the VM by, filled in
-    // this process on the host — never from anything the guest says. Held for
-    // the supervisor's lifetime as the registration surface (the client-driven
-    // path is a later task); published here with the one row the host itself
-    // can name: the guest node's own namespace, the daemon's root-netns tap,
-    // whose reach is the allow-all interim until the node-plane baseline set is
-    // enumerated (NET-130). Its address is this host's derivation from the
-    // registry's subnet, and the switch is configured with that same subnet
-    // below — one value handed to both, so the row's lease and the switch's
-    // address plan cannot drift apart. The daemon therefore keeps the egress
-    // it had before the gate existed, its own package fetches above all.
-    //
-    // An own-address box's row is not one this process names on its own:
-    // the activating client registers the box over the control socket below
-    // (T66, #1711), and the registry hands out its switch address, so the
-    // row stands before the box's first frame. A frame from an address no
-    // row holds is dropped, unconditionally (NET-085), and the egress
-    // default is in force (`UNREGISTERED_SOURCE_PHASE`, egress_gate): a row
-    // with no egress section reaches nothing outside itself, unless the
-    // operator set `MINVMD_EGRESS_DENY_ALL_OPT_OUT` when this process
-    // started (NET-077), and a publish at an address no row holds is
-    // refused.
-    //
-    // The proxy's attachment table (NET-133): one attachment per box, held
-    // by this process for the VM's life. The registry is its one writer —
-    // every box row it publishes is an attachment issued ahead of the row,
-    // so the proxy holds the box before its first connection could arrive,
-    // and every retirement takes the attachment with it — and the stand-in
-    // acceptor below is handed the same table, so a delivered connection is
-    // attributed only to a live box it holds an attachment for. Issued and
-    // withdrawn for every boot, whatever binds at the proxy's socket: the
-    // table and its one line per attachment are the host's own state, ready
-    // for the acceptor that reads them.
+    // The box table: what each box's creator registered with this host, and
+    // the addresses the host handed out. The credential proxy's attachment
+    // table is fed from it.
     let proxy_attachments = crate::bep_attach::Attachments::new();
-    // The operator's deny-all opt-out (NET-077), read once here as the VMM
-    // child reads it for the boot line: the registry compiles a client box
-    // with no `egress` section by it, so the host gate keeps the default the
-    // guest daemon was handed.
-    let egress_deny_all_opt_out = crate::vm::egress_deny_all_opt_out_from_env();
-    tracing::info!(
-        egress_deny_all_opt_out,
-        "host-side egress default opt-out for undeclared boxes"
-    );
-    // The client boxes' registrations persist in this VM's state dir
-    // (NET-138): a supervisor restarted under a session's live box reloads
-    // its row detached, for the box to attach again or its creator to
-    // resume inside the grace — never from anything the guest reports.
     let boxes = supervisor_registry(
         proxy_attachments.clone(),
-        egress_deny_all_opt_out,
         state_dir.dir().join(crate::box_registry::REGISTRY_FILE),
     );
-    // The node's own proxy port is resolved once before the VM boots — the
-    // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
-    // or the default-first probe, so a VM sharing a host with a native daemon
-    // still lands on the default proxy port when it is free — and the one
-    // resolved port is written twice: handed to the guest through the VMM
-    // child's env onto the kernel command line, and declared as the node
-    // row's own publish. The daemon's setup publishes it at its address
-    // (NET-025); the port it publishes is the port the guest binds. The
-    // assignment owns the port's host-wide reservation for this VM's life
-    // (T93): two supervisors booting at the same moment contend for it in
-    // the kernel, and the kernel releases it when this supervisor stops,
-    // exits or crashes — never a pid file, never a stale entry to clean.
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
     // A stale gvproxy from a killed supervisor still holds the hostname
-    // proxy's default port bound, so the reaper runs before the port draw:
-    // drawing first would hand the proxy an ephemeral port for no reason.
-    // The reaper's own guard still fails the start when the matching
-    // gvproxy belongs to a live minvmd.
+    // proxy's port bound, so it is reaped before the port is drawn.
     let (gvproxy_binary, switch_sock) = reap_stale_gvproxy_before_port_draw()?;
+    let control_sock = crate::control::resolve_control_sock()
+        .context("resolving the box-registration control socket's path")?;
+    // Every forward into the VM is decided and bound by the publisher. It
+    // needs only the path of gvproxy's socket, so it exists before gvproxy
+    // does. With no gvproxy there is no virtual network and no publisher.
+    let publisher = switch_sock.as_ref().map(|sock| {
+        crate::net::publish::Publisher::start(
+            crate::net::gvproxy_api::SwitchApi::new(sock.clone()),
+            boxes.clone(),
+            Some(crate::control::audit_log_path(&control_sock)),
+        )
+    });
+    // The node's hostname proxy port: the operator's override or the
+    // default-first probe. The assignment holds the port's host-wide
+    // reservation for this VM's life.
     let mut node_port =
         assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
     boxes
@@ -839,18 +749,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // is its pre-acquisition value, and the CLI treats it as "nothing to
     // say yet" rather than a verdict.
     let answerer_status = crate::net::answerer::AnswererStatus::starting();
-    // A box's row goes with its shuttle connection: the gate reports which
-    // addresses each relay carried at the relay's end, and this drainer thread
-    // detaches those rows and withdraws them once their grace passes with no
-    // relay carrying them again, for the life of the process (NET-133,
-    // NET-138). Each
-    // withdrawal hands the box's published address back to the machine's
-    // answerer, as the creator's withdrawal does, unless a live row or a
-    // registration in flight under the name owns it — so a session ended
-    // daemon-side frees its address rather than holding it until this
-    // process exits.
-    let drainer_answerer = answerer_status.clone();
-    boxes.spawn_withdrawal_drainer(move |name| drainer_answerer.release_address(name));
+    boxes.spawn_upkeep();
     // The hostname proxy's publish state (T93): the cell the supervisor
     // writes a failed start's cause into and the control socket below
     // serves, so the CLI's surfaces read *why* the proxy is not serving
@@ -876,12 +775,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // no unregistered source, so a VM booted without it would run boxes
     // that reach nothing — the supervisor exits naming the socket instead.
     let (_control, guest_report_door) = bind_box_doors(
-        &crate::control::resolve_control_sock()
-            .context("resolving the box-registration control socket's path")?,
+        &control_sock,
         &boxes,
         &answerer_status,
         &proxy_publish,
-        &bep_listening,
+        publisher.clone(),
     )?;
 
     // The guest telemetry door (TEL-034): bound only with telemetry on,
@@ -963,132 +861,54 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         );
     }
 
-    // Spawn + supervise the host gvproxy switch before the VMM child boots, so
-    // its `-listen` switch socket exists when the gate relays into it for the
-    // guest shuttle. The switch runtime starts the gate on the socket beside
-    // the switch socket — the one libkrun bridges the shuttle's vsock port to
-    // — before reporting ready, so the guest that boots next can only reach
-    // the switch through it, decided per source address against `boxes`.
-    // The guest's root netns (the daemon) attaches a primary tap for egress,
-    // and own-IP PTasks attach further taps; both are L2 clients on this one
-    // switch, both through the gate. The handle lives for the VM's lifetime
-    // and stops gvproxy on drop (after the VMM child exits below), taking the
-    // gate with it.
+    // gvproxy, the VM's virtual network, is started before the VM. The
+    // handle lives for the VM's life. With no gvproxy binary the VM boots
+    // with no network device.
     //
-    // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
-    // lanes that exercise only the vsock bridge) we warn and boot without
-    // egress rather than failing the VM — the daemon then has no network, the
-    // pre-existing behaviour.
-    // The reaper above decided whether the binary is installed: a switch
-    // socket comes back only when it is, so the decision is made once.
-    // The Box Egress Proxy's process, when this boot started one. Declared
-    // before the switch so the switch drops first: no delivery is in
-    // flight when the proxy is stopped.
+    // The credential proxy's process is declared first so gvproxy drops
+    // first.
     let mut _bep_proxy: Option<BepProxy> = None;
-    // The reclaim watcher's copy (NET-150): it asks this switch to publish
-    // the preferred proxy port once that port is free.
-    let reclaim_switch_sock = switch_sock.clone();
-    let _gvproxy = match (gvproxy_binary, switch_sock) {
+    let _bep_stub;
+    let gvproxy = match (gvproxy_binary, switch_sock.clone()) {
         (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
-            // The stale gvproxy of a killed supervisor was reaped above,
-            // before the node proxy port was drawn, so it can no longer
-            // hold the hostname proxy's default port; this block only
-            // clears the sockets it left behind. The reaper's argv match
-            // and live-minvmd guard are the reaper's own (above).
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
-            // The gate binds the socket beside the switch socket, so a stale
-            // file from a prior run must go or the bind fails EEXIST — the
-            // same discipline the switch socket gets.
-            let gate_sock =
-                crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
-            crate::sock::remove_stale_socket(&gate_sock)
-                .context("removing stale egress gate socket")?;
-            // ── The Box Egress Proxy's delivery wiring (NET-132) ─────────────
-            // One token per boot, minted like the marker nonce above: the
-            // proof a delivered connection belongs to this boot, written
-            // ahead of every delivery's header. The peer receives it
-            // in-process, in the wire below; the stand-in acceptor — a
-            // test/e2e surface, never a production one — receives the same
-            // bytes over its start-up channel, so a same-uid host process
-            // that finds the socket's path can never hold the token too.
-            let token: [u8; switch::bep_host::TOKEN_LEN] = {
-                let mut buf = [0u8; switch::bep_host::TOKEN_LEN];
+            // One token per boot proves to the credential proxy that a
+            // delivered connection comes from this supervisor.
+            let token: [u8; bep::listener::TOKEN_LEN] = {
+                let mut buf = [0u8; bep::listener::TOKEN_LEN];
                 std::fs::File::open("/dev/urandom")
                     .and_then(|mut f| f.read_exact(&mut buf))
-                    .context("reading /dev/urandom for the box egress proxy token")?;
+                    .context("reading /dev/urandom for the credential proxy token")?;
                 buf
             };
-            // The proxy's unix socket, named beside the switch and gate
-            // sockets the same way: the one path every delivered flow dials.
-            // On a production boot `bep serve` listens there (below). When
-            // nothing does, nothing binds the pool either (`bep_box_source`
-            // below), so a box's connection to the proxy's address is
-            // reset, the acceptor-down answer the pool is specified to give.
             let proxy_sock = switch_sock.with_file_name("gvproxy-bep.sock");
-            // MINVMD_BEP_STUB is the e2e lane's flag and nothing else's: it
-            // is what puts a stand-in acceptor at the path the wire names,
-            // so the lane can read what a delivery presents — and the bind
-            // below is what decides, through the handle it leaves, whether
-            // the pool is partitioned by the table's box rows at all. The
-            // handle is underscore-bound: its serving thread owns the
-            // socket and outlives this block for the daemon's life, and
-            // the supervisor has nothing further to ask of it.
+            // MINVMD_BEP_STUB puts a stand-in acceptor at the proxy's
+            // socket, for tests on hosts where the proxy does not run.
             let stub_enabled = std::env::var_os("MINVMD_BEP_STUB").is_some();
-            let _bep_stub = if stub_enabled {
+            _bep_stub = if stub_enabled {
                 let (start_tx, start_rx) = std::sync::mpsc::channel();
-                match crate::net::bep_stub::spawn(proxy_sock.clone(), start_rx) {
-                    Ok(stub) => {
-                        let _ = start_tx.send(crate::net::bep_stub::StubStart {
-                            token,
-                            daemon_pid: std::process::id(),
-                            attachments: proxy_attachments.clone(),
-                        });
-                        tracing::info!(
-                            sock = %proxy_sock.display(),
-                            "box egress proxy stand-in acceptor up (test/e2e surface)"
-                        );
-                        Some(stub)
-                    }
-                    Err(error) => {
-                        // Fail the boot, the same argument the
-                        // switch-spawn failure beside this block makes: a
-                        // boot under the flag exists to be probed through
-                        // the stand-in, and a boot without one leaves the
-                        // lane waiting on a socket that never comes —
-                        // every probe below it failing in terms of an
-                        // acceptor that was never there. The bind happens
-                        // on the calling thread precisely so this is where
-                        // its failure surfaces.
-                        return Err(error)
-                            .context("binding the box egress proxy stand-in acceptor");
-                    }
-                }
+                let stub = crate::net::bep_stub::spawn(proxy_sock.clone(), start_rx)
+                    .context("binding the credential proxy stand-in acceptor")?;
+                let _ = start_tx.send(crate::net::bep_stub::StubStart {
+                    token,
+                    daemon_pid: std::process::id(),
+                    attachments: proxy_attachments.clone(),
+                });
+                tracing::info!(
+                    sock = %proxy_sock.display(),
+                    "credential proxy stand-in acceptor up (test surface)"
+                );
+                Some(stub)
             } else {
                 None
             };
-            // ── The Box Egress Proxy itself (BEP-015) ───────────────────────
-            // A production boot starts `bep serve` on the socket the wire
-            // names, with this boot's token on its standard input: the
-            // proxy is the acceptor, and the token reaches no file and no
-            // argv. The stand-in replaces it under its flag, so the two
-            // never contend for the path. `bep` keeps its keys in the macOS
-            // Keychain and runs nowhere else, so another host starts
-            // nothing. Best-effort, like a missing gvproxy: a boot without
-            // the proxy still runs boxes, without a credentialed lane.
+            // The proxy keeps its keys in the macOS Keychain and runs
+            // nowhere else. A boot without it still runs boxes.
             if !stub_enabled && cfg!(target_os = "macos") {
                 _bep_proxy = start_bep_proxy(&proxy_sock, &token, &boxes);
             }
-            // The wire the peer carries: the acceptor's socket, this boot's
-            // token, and the per-source cap that is each registered box's
-            // share of the pool. The default cap is the recorded working
-            // value (spec NET-132), named here so the two cannot drift.
-            let wire = switch::bep_host::BepWire::new(proxy_sock, token)
-                .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
-            // The stand-in binds before it returns, so it listens for the
-            // boot's life. The proxy listens only once its watcher sees its
-            // socket, and stops with its exit.
             let proxy_listening = if _bep_stub.is_some() {
                 Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     true,
@@ -1096,69 +916,48 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             } else {
                 _bep_proxy.as_ref().map(BepProxy::listening)
             };
-            // The guest door answers the in-VM daemon's proxy-listening
-            // read from the same flag the delivery wiring reads (BEP-062).
             if let Some(listening) = &proxy_listening {
                 bep_listening.attach(std::sync::Arc::clone(listening));
             }
-            let mirror_switch_sock = switch_sock.clone();
+            let on_restart: crate::net::OnSwitchRestart = match publisher.clone() {
+                Some(publisher) => std::sync::Arc::new(move || publisher.reapply()),
+                None => std::sync::Arc::new(|| {}),
+            };
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
-                &boxes,
-                wire,
-                bep_box_source(proxy_listening, boxes.table(), proxy_attachments.clone()),
-                std::sync::Arc::new(|| {}),
+                boxes.subnet(),
+                on_restart,
             ) {
                 Ok(gvproxy) => {
-                    let subnet = boxes.subnet();
-                    // The node's mirrored binds go through this switch
-                    // (NET-138). Every registry clone shares one mirror, so
-                    // the clone the binder is set on is dropped at once.
-                    drop(boxes.clone().with_mirror_binder(std::sync::Arc::new(
-                        SwitchMirrorBinder {
-                            switch_sock: mirror_switch_sock,
-                            node: subnet.daemon_ip(),
-                            table: boxes.table(),
-                        },
-                    )));
-                    tracing::info!(
-                        pid = gvproxy.pid(),
-                        proxy_ip = %subnet.box_egress_proxy_address(),
-                        proxy_mac = %subnet.bep_mac(),
-                        "host gvproxy switch up; box egress proxy peer started",
-                    );
+                    // The node's mirrored binds go through the publisher.
+                    // Every registry clone shares one mirror, so the clone
+                    // the binder is set on is dropped at once.
+                    if let Some(publisher) = publisher.clone() {
+                        drop(boxes.clone().with_mirror_binder(std::sync::Arc::new(
+                            SwitchMirrorBinder {
+                                publisher,
+                                node: boxes.subnet().daemon_ip(),
+                            },
+                        )));
+                    }
+                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
                     Some(gvproxy)
                 }
-                // An own-IP VM cannot work without the switch: fail loudly. A
-                // non-own-IP production boot tolerates a switch that will not
-                // come up (same as a missing binary below) — sessions still
-                // run, without guest egress. The stand-in's flag carries the
-                // same argument as own-IP: it is the e2e lane's and nothing
-                // else's, and a boot under it exists to be probed through
-                // this switch. Worse, the stand-in is bound before the switch
-                // is spawned, so a degraded boot looks healthy to a lane that
-                // waits on the stand-in's socket — every probe below it then
-                // fails in terms of a peer that was never there. Fail here,
-                // where the cause is and the error names it, not three steps
-                // later in a box's blank answer.
                 Err(error) if crate::cmd::own_ip_requested() || stub_enabled => {
                     return Err(error).context("spawning host gvproxy switch");
                 }
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        "failed to spawn host gvproxy switch; booting without \
-                         guest egress"
+                        "failed to spawn host gvproxy switch; booting without a network"
                     );
                     None
                 }
             }
         }
         (binary, None) if crate::cmd::own_ip_requested() => {
-            // An own-IP VM cannot work without the switch: fail loudly rather
-            // than booting a session that silently has no network.
             bail!(
                 "own-IP VM requested but the gvproxy binary was not found at {}; \
                  set MINVMD_GVPROXY_BIN to the gvproxy binary",
@@ -1166,16 +965,86 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             );
         }
         (binary, None) => {
-            // Non-own-IP boots (e.g. the boot/session e2e lanes) tolerate a
-            // missing gvproxy: warn and boot without guest egress.
+            _bep_stub = None;
             tracing::warn!(
                 path = %binary.display(),
-                "gvproxy binary not found; booting without guest egress \
+                "gvproxy binary not found; booting without a network \
                  (set MINVMD_GVPROXY_BIN to enable networking)"
             );
             None
         }
     };
+    // Only a running gvproxy gives the VM a network device and a publisher
+    // something to bind on.
+    let network = match (&gvproxy, &switch_sock, &publisher) {
+        (Some(_), Some(switch_sock), Some(publisher)) => {
+            Some((switch_sock.clone(), publisher.clone()))
+        }
+        _ => None,
+    };
+
+    // The node's hostname proxy is published by this process, before the VM
+    // boots: a forward from the host's loopback at the node's port to the
+    // same port at the guest node. A port another program took since the
+    // draw is drawn again, without a boot. A pinned port that is held, or a
+    // draw that ran out of tries, leaves the proxy down, and the watcher
+    // below publishes the port once it is free.
+    let mut proxy_down_at_start = false;
+    if let Some((_, publisher)) = &network {
+        let node = boxes.subnet().daemon_ip();
+        let mut tries = 0usize;
+        loop {
+            tries += 1;
+            let listener =
+                std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, node_port.port);
+            match publisher.bind_node(listener, node, node_port.port) {
+                Ok(()) => {
+                    proxy_publish.set_serving(node_port.port);
+                    break;
+                }
+                Err(crate::net::publish::NodeBindError::Occupied)
+                    if !node_port.configured && tries < crate::control::PUBLISH_TRIES =>
+                {
+                    tracing::warn!(
+                        port = node_port.port,
+                        "the hostname proxy's port was taken since it was drawn; drawing another"
+                    );
+                    // The reservation is released first: a second take in
+                    // this process would contend with it.
+                    drop(node_port);
+                    node_port = assign_node_proxy_port(&ports_dir)
+                        .context("redrawing the node's proxy port")?;
+                    boxes
+                        .try_register_node_namespace(node_port.port)
+                        .context("publishing the node namespace's row after a redraw")?;
+                }
+                Err(error) => {
+                    let holder = port_holder(node_port.port).map(|(_, holder)| holder);
+                    tracing::warn!(
+                        port = node_port.port,
+                        holder = holder.as_deref().unwrap_or("unnamed"),
+                        %error,
+                        tries,
+                        "the VM starts with the hostname proxy down; retrying its port while the VM runs"
+                    );
+                    proxy_publish.set_down(
+                        node_port.port,
+                        ProxyDownCause::PortHeldAfterStart { holder },
+                    );
+                    // The watcher's check takes the reservation again when
+                    // the port frees.
+                    node_port.reservation = None;
+                    proxy_down_at_start = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        tracing::warn!(
+            port = node_port.port,
+            "no virtual network: the hostname proxy is not published"
+        );
+    }
 
     // R2.5: record whether the data volume image pre-exists this boot, before
     // the VMM child provisions it — a later boot failure is fatal for a
@@ -1184,317 +1053,126 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     let volume_path = crate::volume::resolve_data_volume_path();
     let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
 
-    // The gate over the marker socket, for the supervisor's life (T93): the
-    // guest's boot beacon and its proxy publish reports — success or the
-    // terminal address-in-use refusal — travel the one existing control path
-    // from inside a microVM to this daemon, the boot-marker channel, and the
-    // gate owns the listener so a report that arrives after READY finds it
-    // still accepting. `read_ready_beacon` reads the beacon's own first
-    // line, so the gate peeks a connection's first line without consuming it
-    // and hands the whole stream to the beacon reader when it is one.
+    // The guest's boot beacon arrives on the marker socket.
     let ready_timeout: Duration = crate::cmd::ready_timeout();
     let known_hosts_path = crate::cmd::default_vm_known_hosts_path();
-    let marker_events = spawn_marker_gate(listener, known_hosts_path);
-    // The marker socket's file outlives the first beacon now: the gate keeps
-    // accepting, so the path is this guard's to remove, at every exit this
-    // supervisor can take after the gate starts.
+    let beacon = spawn_beacon_reader(listener, known_hosts_path);
     let _marker_socket = MarkerSocketFile(marker_sock_path.clone());
 
     let exe = std::env::current_exe().context("resolving current executable path")?;
-    let mut child;
-    let mut child_pid;
-    let mut uplink: Option<crate::net::uplink::Uplink> = None;
-    // How many times this start has asked the guest to publish the hostname
-    // proxy (T93): the first boot plus every redraw an address-in-use
-    // publish forced. The bound is [`crate::control::PUBLISH_TRIES`], and it
-    // is the loop below that counts.
-    let mut publish_tries: usize = 0;
-    // The port whose publish the start left unconfirmed (T93), when it did:
-    // the guest's late report, if it ever comes, confirms it after the loop.
-    let mut unconfirmed_port = None;
-    // Whether the start brought the VM up with its proxy down on a held
-    // port (NET-021): the held-port watcher then owns the publish.
-    let mut proxy_down_at_start = false;
-    loop {
-        // This boot's publish generation (T93): drawn fresh for every boot,
-        // handed beside the port, and echoed by the guest in every publish
-        // report, so a report is told apart from a killed boot's even when
-        // both boots were handed the same port.
-        let publish_generation = draw_publish_generation();
-        tracing::info!(
-            generation = publish_generation,
-            "drew the boot's publish generation"
-        );
-        // `vm.boot`: from spawning the VMM child to the guest's READY beacon,
-        // one span per boot (a T93 redraw boots again under a fresh one). The
-        // child and, through the boot line, the guest daemon inherit it as
-        // their parent (`telemetry::forward_trace`), so the guest's boot
-        // spans land under it in the same trace.
-        let boot_span = tracing::info_span!(
-            "vm.boot",
-            vm = %crate::state::vm_name(),
-            otel.status_code = tracing::field::Empty,
-        )
-        .entered();
-        // Every return from here to READY (the spawn's `?`, the lifecycle
-        // lock, read and write `?`s, the `bail!` on a lifecycle changed
-        // during spawn, a failed wait) exports `vm.boot` with an error
-        // status (TEL-035), as `minvmd boot` does; reaching READY clears it.
-        let boot_failed = crate::telemetry::ErrorUnlessOk::new(&boot_span);
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("__krun-vmm");
-        // Forward the state-dir override and VM name so the VMM child resolves the
-        // same per-VM state dir this supervisor does.
-        crate::state::forward_identity(&mut cmd);
-        crate::telemetry::forward_trace(&mut cmd);
-        alive_lock.inherit_into(&mut cmd);
-        // The VM's network device. Its backend socket is made per boot: the
-        // child inherits one end and the pump below takes the other. No
-        // gvproxy means no device, and the VM boots without a network.
-        let uplink_ends = match (&_gvproxy, &reclaim_switch_sock) {
-            (Some(_), Some(_)) => {
-                let ends = crate::net::uplink::prepare()
-                    .context("creating the VM's uplink socket pair")?;
-                ends.inherit_into(&mut cmd);
-                Some(ends)
-            }
-            _ => None,
-        };
-        // The guest report door's path travels the same way the marker
-        // socket's does: the child is the process that owns the libkrun
-        // context, so it is the one that registers the door's vsock port at
-        // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the door the
-        // supervisor bound before the first boot, which is what the env
-        // names. A redraw hands the same door to the fresh boot.
-        let (name, path) = &guest_report_door;
-        cmd.env(name, path);
-        if let Some(path) = guest_telemetry_door.as_ref() {
-            cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
+    // `vm.boot`: from spawning the VMM child to the guest's READY beacon. The
+    // child and, through the boot line, the guest daemon inherit it as their
+    // parent, so the guest's boot spans land under it in the same trace.
+    let boot_span = tracing::info_span!(
+        "vm.boot",
+        vm = %crate::state::vm_name(),
+        otel.status_code = tracing::field::Empty,
+    )
+    .entered();
+    // Every return from here to READY exports `vm.boot` with an error
+    // status. Reaching READY clears it.
+    let boot_failed = crate::telemetry::ErrorUnlessOk::new(&boot_span);
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("__krun-vmm");
+    // The VMM child resolves the same per-VM state dir this supervisor does.
+    crate::state::forward_identity(&mut cmd);
+    crate::telemetry::forward_trace(&mut cmd);
+    alive_lock.inherit_into(&mut cmd);
+    // The VM's network device. The child inherits one end of its backend
+    // socket and the pump below takes the other. No gvproxy means no
+    // device, and the VM boots without a network.
+    let uplink_ends = match &network {
+        Some(_) => {
+            let ends =
+                crate::net::uplink::prepare().context("creating the VM's uplink socket pair")?;
+            ends.inherit_into(&mut cmd);
+            Some(ends)
         }
-        cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
-            // The node's proxy port travels to the guest through the VMM child's
-            // env: the child is a separate process (like the marker socket path),
-            // and its backend appends it to the kernel command line, where the
-            // kernel hands unrecognized `KEY=VALUE` tokens to init as env vars.
-            // The explicit `.env` also shadows any inherited operator override
-            // under the same name, so the child carries exactly this resolution —
-            // the same port the node row registered. On a redraw (T93) this is
-            // the one line that moves: the fresh boot publishes on the port the
-            // fresh draw reserved, handed the same way. No answerer port rides:
-            // the in-VM daemon starts no answerer on a VM-backed host
-            // (NET-138), and the host answerer serves the zone.
-            .env(crate::vm::NODE_PROXY_PORT_ENV, node_port.port.to_string())
-            .env(
-                crate::vm::PUBLISH_GENERATION_ENV,
-                publish_generation.to_string(),
-            );
-
-        // Fork the VMM child and record its pid under one hold of the
-        // lifecycle write lock, so a stopper never sees a lifecycle whose
-        // child exists but is not recorded. A concurrent `stop` during
-        // Starting signals the pid it reads here. A stop signal's boot abort
-        // (`stop::graceful_stop_from_signal`) takes the same lock, writes
-        // `Stopped`, and keeps the lock until it has ended the process: it
-        // either reads this child's pid and signals it, or holds the lock
-        // first, and then this boot never forks.
-        {
-            let mut lock = state_dir
-                .lifecycle_lock()
-                .context("opening lifecycle lock")?;
-            let _guard = lock.write().context("acquiring lifecycle write lock")?;
-            let state = state_dir.read_state().context("reading state")?;
-            // A concurrent stop might have already reset us to Stopped; bail
-            // before a child exists.
-            if !matches!(state.lifecycle, Lifecycle::Starting) {
-                bail!(
-                    "lifecycle changed to {:?} before spawn; aborting",
-                    state.lifecycle
-                );
-            }
-            child = cmd
-                .spawn()
-                .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
-            child_pid = child.id();
-            tracing::info!(pid = child_pid, "VMM child spawned");
-            if let (Some(ends), Some(switch_sock)) = (uplink_ends, &reclaim_switch_sock) {
-                // A boot that was redrawn left its pump at end of file.
-                if let Some(old) = uplink.take() {
-                    crate::net::uplink::Uplink::finish(old);
-                }
-                uplink = Some(
-                    ends.start(switch_sock.clone())
-                        .context("starting the VM's uplink pump")?,
-                );
-            }
-            state_dir
-                .write_state(&State {
-                    lifecycle: Lifecycle::Starting,
-                    vmm_pid: Some(child_pid),
-                    ..State::stopped()
-                })
-                .context("writing Starting state with vmm_pid")?;
-        }
-
-        // Wait for the guest to write `READY\n` on the marker socket. The wait
-        // is env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB
-        // VM can take ~20s+ to reach userspace, so a fixed 5s was too short.
-        // A publish report inside the wait is this boot's own when it carries
-        // this boot's generation — kept, and handed to the watch below, since
-        // nothing in the channel orders a report after READY — and a killed
-        // boot's straggler otherwise, skipped rather than mistaken for a
-        // beacon.
-        let early_report = match wait_boot_beacon(
-            &marker_events,
-            ready_timeout,
-            publish_generation,
-            &volume_path,
-            volume_preexisted,
-        ) {
-            Ok(early_report) => early_report,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
-                return Err(e);
-                // guard drops here → StartingGuard resets state to Stopped (R4.6)
-            }
-        };
-        boot_failed.ok();
-        drop(boot_span);
-
-        // T93: watch what became of the port this start reserved. The guest
-        // reports the publish's outcome over the marker channel — served, or
-        // refused for address-in-use (a terminal report: the guest has
-        // stopped retrying, so nothing else will say it) — and the watch is
-        // what makes the outcome a checked fact: the report is re-probed
-        // host-side before any decision reads it. A boot with no host
-        // switch never publishes at all, and its report never comes, so the
-        // watch is skipped and the degraded boot's story stays the warn the
-        // switch's own absence already logged.
-        publish_tries += 1;
-        let decision = if let Some(gvproxy) = &_gvproxy {
-            // The processes this supervisor spawned for this VM: the switch
-            // that carries the guest's publish to the host's loopback, and
-            // the VMM child. A listener on the port with one of these pids
-            // is this VM's own publish, whatever the report did.
-            let own_pids = [gvproxy.pid(), child_pid];
-            let outcome = watch_proxy_publish(
-                node_port.port,
-                &marker_events,
-                &own_pids,
-                publish_generation,
-                early_report,
-            );
-            crate::control::decide_publish(!node_port.configured, publish_tries, outcome)
-        } else {
-            tracing::warn!(
-                port = node_port.port,
-                "no host switch: the hostname proxy cannot publish; the VM boots degraded"
-            );
-            crate::control::PublishDecision::Up
-        };
-        match decision {
-            crate::control::PublishDecision::Up => break,
-            crate::control::PublishDecision::UpUnconfirmed { port } => {
-                // No report, and no holder the host could vouch for: the VM
-                // comes up, and the status read says the publish is
-                // unconfirmed rather than letting the surfaces call it
-                // serving.
-                tracing::warn!(
-                    port,
-                    "the hostname proxy's publish is unconfirmed: no report from the \
-                     guest and no listener this VM's own forwarder holds; the VM comes \
-                     up and its publish is shown as unconfirmed until a report arrives"
-                );
-                proxy_publish.set_unconfirmed(port);
-                unconfirmed_port = Some((port, publish_generation));
-                break;
-            }
-            crate::control::PublishDecision::Redraw { port } => {
-                // A drawn port, taken: draw again under the same reservation
-                // discipline and ask the guest to publish again — the fresh
-                // boot's first act is the publish, and the redraw is bounded
-                // by the tries the decision counts.
-                tracing::warn!(
-                    port,
-                    "the hostname proxy's publish was refused for address-in-use; \
-                     redrawing the node port and asking the guest to publish again"
-                );
-                let _ = child.kill();
-                let _ = child.wait();
-                // Release this VM's own reservation before the re-draw: a
-                // second open's flock contends with the held fd even in this
-                // process, so the refused port, freed meanwhile, would read
-                // as another VM's reservation and be skipped.
-                drop(node_port);
-                node_port = assign_node_proxy_port(&ports_dir)
-                    .context("redrawing the node's proxy port after a refused publish")?;
-                // A row the redraw cannot publish fails the start, which
-                // discards a fresh volume image like every other failed boot.
-                if let Err(error) = boxes.try_register_node_namespace(node_port.port) {
-                    crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
-                    return Err(error)
-                        .context("publishing the node namespace's row after a redraw");
-                }
-                continue;
-            }
-            crate::control::PublishDecision::FailStart { port, cause, .. } => {
-                // NET-021: a held port no longer fails the start. That is
-                // a pin another program holds, or a draw whose tries ran
-                // out. The VM starts with its proxy down, the cause names
-                // the holder the host can see, and the held-port watcher
-                // below publishes the port once it frees. The VM host
-                // daemon stays up, so `min ls` reads the cause from it for
-                // as long as the port stays held.
-                let holder = port_holder(port).map(|(_, holder)| holder);
-                let reason = match cause {
-                    ProxyDownCause::RedrawsRanOut => "every drawn port was taken",
-                    _ => "the port is held",
-                };
-                tracing::warn!(
-                    port,
-                    holder = holder.as_deref().unwrap_or("unnamed"),
-                    reason,
-                    publish_tries,
-                    "the VM starts with the hostname proxy down; retrying its port while the VM runs"
-                );
-                proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
-                // The watcher's check takes the reservation again when the
-                // port frees. A second take in this process contends with
-                // the held one, so this one goes first.
-                node_port.reservation = None;
-                proxy_down_at_start = true;
-                break;
-            }
-        }
+        None => None,
+    };
+    // The child owns the libkrun context, so it maps the guest doors' vsock
+    // ports to the sockets this supervisor bound.
+    let (name, path) = &guest_report_door;
+    cmd.env(name, path);
+    if let Some(path) = guest_telemetry_door.as_ref() {
+        cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
     }
+    cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
+        // The node's proxy port reaches the guest on the kernel command
+        // line, through the child's env. The explicit `.env` also shadows
+        // an inherited operator override under the same name.
+        .env(crate::vm::NODE_PROXY_PORT_ENV, node_port.port.to_string());
 
-    // NET-150: the proxy serves on the handed port. When that port is a
-    // substitute — the preferred one was held at the start — a watcher
-    // takes the preferred port back once it is free, and the switch then
-    // publishes both. A pinned port never moved, and a boot with no host
-    // switch publishes nothing, so neither gets a watcher.
-    let _proxy_reclaim = match (&_gvproxy, &reclaim_switch_sock) {
-        // NET-021, NET-022: no port serves. The watcher retries the held
-        // port with backoff, publishes it when it frees, and clears the
-        // proxy-down cause, so `min ls` stops naming it.
-        (Some(_), Some(switch_sock)) if proxy_down_at_start => {
+    // Fork the VMM child and record its pid under one hold of the lifecycle
+    // write lock, so a stopper never sees a lifecycle whose child exists but
+    // is not recorded. A stop signal's boot abort takes the same lock,
+    // writes `Stopped`, and keeps the lock until it has ended the process.
+    let mut child;
+    let child_pid;
+    {
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
+        let _guard = lock.write().context("acquiring lifecycle write lock")?;
+        let state = state_dir.read_state().context("reading state")?;
+        // A concurrent stop might have already reset us to Stopped.
+        if !matches!(state.lifecycle, Lifecycle::Starting) {
+            bail!(
+                "lifecycle changed to {:?} before spawn; aborting",
+                state.lifecycle
+            );
+        }
+        child = cmd
+            .spawn()
+            .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+        child_pid = child.id();
+        tracing::info!(pid = child_pid, "VMM child spawned");
+        state_dir
+            .write_state(&State {
+                lifecycle: Lifecycle::Starting,
+                vmm_pid: Some(child_pid),
+                ..State::stopped()
+            })
+            .context("writing Starting state with vmm_pid")?;
+    }
+    let uplink = match (uplink_ends, &network) {
+        (Some(ends), Some((switch_sock, _))) => Some(
+            ends.start(switch_sock.clone())
+                .context("starting the VM's uplink pump")?,
+        ),
+        _ => None,
+    };
+
+    // Wait for the guest's READY beacon. The wait is configurable
+    // (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can take 20 s to
+    // reach userspace.
+    if let Err(e) = wait_boot_beacon(&beacon, ready_timeout, &volume_path, volume_preexisted) {
+        let _ = child.kill();
+        let _ = child.wait();
+        crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+        return Err(e);
+        // guard drops here → StartingGuard resets state to Stopped
+    }
+    boot_failed.ok();
+    drop(boot_span);
+
+    // When the hostname proxy serves on a substitute port because the
+    // preferred one was held, a watcher takes the preferred port back once
+    // it is free, and the proxy is then published on both. When no port
+    // serves, a watcher retries the held port with backoff.
+    let _proxy_reclaim = match &network {
+        Some((_, publisher)) if proxy_down_at_start => {
             let recorded = proxy_publish.clone();
             Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
                 node_port.port,
                 crate::net::proxy_reclaim::HeldPortBackoff::default(),
                 proxy_reclaim_check(ports_dir.clone()),
-                proxy_reclaim_publisher(
-                    switch_sock.clone(),
-                    boxes.subnet().daemon_ip(),
-                    boxes.table(),
-                ),
+                proxy_reclaim_publisher(publisher.clone(), boxes.subnet().daemon_ip()),
                 move |port| crate::net::proxy_reclaim::mark_serving(&recorded, port),
             ))
         }
-        (Some(_), Some(switch_sock)) => {
-            proxy_publish.set_serving(node_port.port);
-            (node_port.port != node_port.preferred && !node_port.configured).then(|| {
+        Some((_, publisher)) => (node_port.port != node_port.preferred && !node_port.configured)
+            .then(|| {
                 let recorded = proxy_publish.clone();
                 crate::net::proxy_reclaim::spawn_reclaim_watcher(
                     node_port.preferred,
@@ -1504,112 +1182,12 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                         proxy_publish.clone(),
                         proxy_reclaim_check(ports_dir.clone()),
                     ),
-                    proxy_reclaim_publisher(
-                        switch_sock.clone(),
-                        boxes.subnet().daemon_ip(),
-                        boxes.table(),
-                    ),
+                    proxy_reclaim_publisher(publisher.clone(), boxes.subnet().daemon_ip()),
                     move |preferred| recorded.add_preferred(preferred),
                 )
-            })
-        }
-        _ => None,
+            }),
+        None => None,
     };
-
-    // T93: an unconfirmed publish stays unconfirmed until the guest's report
-    // says otherwise. The marker channel is the supervisor's to drain from
-    // here on — nothing past the start reads it — so a late serving report
-    // for the port clears the state, and a late refusal says the port is
-    // held after all.
-    // Only a report the running boot sent counts: its own generation, or —
-    // from a guest too old to echo one — none.
-    // NET-021: a late refusal starts the held-port watcher, as a start that
-    // found the port held does. These slots hold the port's reservation and
-    // that watcher for the VM's life, because the supervisor returns only
-    // when the VM stops. The report thread releases the reservation first, so
-    // the watcher's own check can take it again when the port frees.
-    let late_reservation = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let late_watcher = std::sync::Arc::new(std::sync::Mutex::new(None));
-    if let Some((port, generation)) = unconfirmed_port {
-        let proxy_publish = proxy_publish.clone();
-        *late_reservation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = node_port.reservation.take();
-        let late_reservation = std::sync::Arc::clone(&late_reservation);
-        let late_watcher = std::sync::Arc::clone(&late_watcher);
-        let held_switch = reclaim_switch_sock
-            .clone()
-            .filter(|_| _gvproxy.is_some())
-            .map(|switch_sock| {
-                (
-                    proxy_reclaim_check(ports_dir.clone()),
-                    proxy_reclaim_publisher(switch_sock, boxes.subnet().daemon_ip(), boxes.table()),
-                )
-            });
-        // The watcher's lines carry `vm` through a span of its own: it may
-        // outlive READY, and keeping the start phase's span would keep that
-        // phase from exporting (`telemetry::vm_task`).
-        let vm_scope = crate::telemetry::vm_task("proxy.publish.watch");
-        std::thread::spawn(move || {
-            let _vm_scope = vm_scope.entered();
-            for event in marker_events {
-                if event.is_straggler_for(generation, true) {
-                    continue;
-                }
-                match event {
-                    MarkerEvent::ProxyServing(published, reported) if published == port => {
-                        tracing::info!(
-                            port,
-                            report_generation = %report_generation_field(reported),
-                            boot_generation = generation,
-                            "the guest's late report confirms the hostname proxy's publish"
-                        );
-                        proxy_publish.confirm(port);
-                        return;
-                    }
-                    MarkerEvent::ProxyPortHeld(held, reported) if held == port => {
-                        // The VM stays up: the cause says so, and names the
-                        // holder the host can see now, so the surfaces never
-                        // recycle the start failure's words for a VM that
-                        // started.
-                        let holder = port_holder(port).map(|(_, holder)| holder);
-                        tracing::warn!(
-                            port,
-                            holder = holder.as_deref().unwrap_or("unnamed"),
-                            report_generation = %report_generation_field(reported),
-                            boot_generation = generation,
-                            "the guest's late report says the hostname proxy's port is held"
-                        );
-                        proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
-                        let Some((check, publisher)) = held_switch else {
-                            return;
-                        };
-                        drop(
-                            late_reservation
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take(),
-                        );
-                        let recorded = proxy_publish.clone();
-                        *late_watcher
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
-                                port,
-                                crate::net::proxy_reclaim::HeldPortBackoff::default(),
-                                check,
-                                publisher,
-                                move |port| {
-                                    crate::net::proxy_reclaim::mark_serving(&recorded, port)
-                                },
-                            ));
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
 
     // ── Phase 2: Starting → Running (under lock) ────────────────────────────
     let started_at = SystemTime::now()
@@ -1680,7 +1258,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     let status = child.wait().context("waiting for VMM child")?;
     // The child held the last copy of the VM end, so the pump is at end of
     // file now.
-    if let Some(uplink) = uplink.take() {
+    if let Some(uplink) = uplink {
         uplink.finish();
     }
     // The VM is gone, so the guest telemetry door's connection ends: let
@@ -1693,6 +1271,12 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // The VM is gone, so no answer to a pending ask can still matter: each
     // is cancelled and audited before the supervisor exits (NET-045).
     crate::control::stop_pending_asks(&boxes);
+    // gvproxy does not exit when its client goes away, so it is stopped
+    // here. The reclaim watcher goes first: it publishes through gvproxy.
+    drop(_proxy_reclaim);
+    if let Some(gvproxy) = gvproxy {
+        gvproxy.stop();
+    }
     // The one-per-stop line (NET-055): the supervisor observes every stop of
     // its VM — `min stop`, `minvmd stop`, a guest poweroff, a crash — as the
     // VMM child exiting, and it is the line's only witness: the `minvmd stop`
@@ -2152,87 +1736,6 @@ fn start_bep_proxy(
             );
             None
         }
-    }
-}
-
-/// The box source the peer's pool is partitioned by:
-/// [`CredentialedBoxes`] when an acceptor was started at the wire's path,
-/// and [`switch::bep_host::NoBoxes`] — no row, no share, no socket — when
-/// none was.
-///
-/// A socket in the pool is a lane onto the host for the box whose share
-/// holds it. The gate decides who may reach the proxy's address
-/// (NET-134, T45, #1885): `egress::proxy_lane_admits` refuses a frame to
-/// it from a row that declared no credentialed upstream. The shares follow
-/// the same declaration (§7.1), so a row with no lane holds no socket. A
-/// production boot that started `bep serve` registers rows, and the proxy
-/// admits only a delivery with this boot's token. A production boot with
-/// no proxy hands the peer an empty source and the pool binds nothing — a
-/// box's connection to the proxy's address meets the stack's own reset.
-/// The stand-in's boot (`MINVMD_BEP_STUB`, the e2e lane's flag and nothing
-/// else's) registers rows too. The caller passes the acceptor's own
-/// `listening` flag — not whether a flag asked for one — so the pool is
-/// never partitioned by a path nothing listens on.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn bep_box_source(
-    listening: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    table: crate::box_registry::BoxTable,
-    attachments: crate::bep_attach::Attachments,
-) -> std::sync::Arc<dyn switch::bep_host::BepBoxSource> {
-    match listening {
-        Some(listening) => std::sync::Arc::new(CredentialedBoxes {
-            boxes: crate::box_registry::RegisteredBoxes::new(table.clone(), attachments),
-            table,
-            listening,
-        }),
-        None => std::sync::Arc::new(switch::bep_host::NoBoxes),
-    }
-}
-
-/// The registered box rows that declared a credentialed upstream, while
-/// the acceptor listens. The pool polls the addresses every stack turn, so
-/// a proxy that starts listening late grows the shares within a turn, and
-/// one that exits takes them away.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-struct CredentialedBoxes {
-    boxes: crate::box_registry::RegisteredBoxes,
-    table: crate::box_registry::BoxTable,
-    listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl switch::bep_host::BepBoxSource for CredentialedBoxes {
-    fn box_switch_addresses(&self) -> Vec<std::net::Ipv4Addr> {
-        if !self.listening.load(std::sync::atomic::Ordering::SeqCst) {
-            return Vec::new();
-        }
-        let declared: std::collections::HashSet<std::net::Ipv4Addr> = self
-            .table
-            .rows()
-            .iter()
-            .filter(|row| row.declares_credentialed_upstream())
-            .map(|row| row.switch_addr())
-            .collect();
-        self.boxes
-            .box_switch_addresses()
-            .into_iter()
-            .filter(|addr| declared.contains(addr))
-            .collect()
-    }
-
-    fn box_id_for_source(&self, source: std::net::Ipv4Addr) -> Option<crate::bep_attach::BoxId> {
-        // The cohort's address answers the reserved cohort id only while
-        // the acceptor listens and a lane member is resident (BEP-084).
-        if self.cohort_source() == Some(source) {
-            return Some(switch::bep_host::COHORT_BOX_ID);
-        }
-        self.boxes.box_id_for_source(source)
-    }
-
-    fn cohort_source(&self) -> Option<std::net::Ipv4Addr> {
-        if !self.listening.load(std::sync::atomic::Ordering::SeqCst) {
-            return None;
-        }
-        self.boxes.cohort_source()
     }
 }
 
@@ -2868,46 +2371,21 @@ pub(crate) fn proxy_reclaim_check(
     }
 }
 
-/// The reclaim watcher's publish (NET-150): asks the switch at `switch_sock`
-/// to listen on `127.0.0.1:<preferred>` and forward to the guest proxy at
-/// `node`'s `<substitute>` port.
-///
-/// The forward is noted in the egress gate's publish ledger first, as the
-/// node mirror's binds are ([`SwitchMirrorBinder`]), so the gate tracks the
-/// connections it carries and admits the replies on them. A gate that is
-/// not running, or a ledger that refuses the note, publishes nothing. The
-/// switch's `proxy already running` answer counts as success only when the
-/// ledger already held this same forward. Otherwise some other forward
-/// holds the listener, and the attempt fails. A note this attempt made goes
-/// when the expose fails.
+/// The reclaim watchers' publish: binds `preferred` on the host's loopback
+/// to `substitute` at the guest node, as one of minvmd's own forwards.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn proxy_reclaim_publisher(
-    switch_sock: std::path::PathBuf,
+    publisher: crate::net::publish::Publisher,
     node: std::net::Ipv4Addr,
-    table: crate::box_registry::BoxTable,
 ) -> impl FnMut(u16, u16) -> Result<(), String> + Send + 'static {
     move |preferred, substitute| {
-        let listener = std::net::Ipv4Addr::LOCALHOST;
-        let ledger = table
-            .mirror_ledger()
-            .ok_or_else(|| "the egress gate is not running".to_string())?;
-        let noted = ledger
-            .note_forward(listener, preferred, node, substitute)
-            .map_err(|refused| refused.to_string())?;
-        let api = crate::net::gvproxy_api::SwitchApi::new(switch_sock.clone());
-        let result = match api.expose(
-            std::net::SocketAddrV4::new(listener, preferred),
-            std::net::SocketAddrV4::new(node, substitute),
-            minimald_rpc::IpProto::Tcp,
-        ) {
-            Ok(()) => Ok(()),
-            Err(crate::net::gvproxy_api::ExposeError::AlreadyBound) if !noted => Ok(()),
-            Err(error) => Err(error.to_string()),
-        };
-        if noted && result.is_err() {
-            ledger.forget_bind(listener, preferred, node);
-        }
-        result
+        publisher
+            .bind_node(
+                std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, preferred),
+                node,
+                substitute,
+            )
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -3121,102 +2599,6 @@ fn fallback_port(
 // the supervisor's life, classifying each connection by the first line it
 // peeks, handing each event to the supervisor over one channel.
 
-/// The first line of the guest's terminal publish refusal (T93): the port
-/// named on the line after it could not be published because something held
-/// it. Pinned beside its guest-side twin (minimald's
-/// `PROXY_PORT_HELD_BEACON`); the guest's report is a terminal fact, so the
-/// two names must agree for the watch below to see it.
-#[cfg(any(minvmd_libkrun, test))]
-const PROXY_PORT_HELD_LINE: &str = "PROXY_PORT_HELD";
-
-/// The first line of the guest's publish report (T93): the port named on the
-/// line after it is serving. Pinned beside its guest-side twin (minimald's
-/// `PROXY_SERVING_BEACON`).
-#[cfg(any(minvmd_libkrun, test))]
-const PROXY_SERVING_LINE: &str = "PROXY_SERVING";
-
-/// One classified connection off the marker socket (T93): the boot beacon —
-/// `READY` or `MOUNT_FAILED` — or one of the guest's publish reports. A
-/// report carries the publish generation the guest echoed from its boot
-/// line, or `None` from a guest too old to echo one.
-#[cfg(any(minvmd_libkrun, test))]
-#[derive(Debug, PartialEq, Eq)]
-enum MarkerEvent {
-    /// The boot beacon, exactly as [`crate::cmd::read_ready_beacon`] leaves
-    /// it: `Ok(Ready)`, `Ok(MountFailed)`, or the reason the line was none
-    /// of them.
-    Beacon(Result<crate::cmd::BootBeacon, String>),
-    /// The guest published the hostname proxy: it is serving on the port.
-    ProxyServing(u16, Option<u64>),
-    /// The guest's publish was refused for address-in-use: the port is
-    /// taken, and the guest has stopped retrying — the terminal report.
-    ProxyPortHeld(u16, Option<u64>),
-}
-
-#[cfg(any(minvmd_libkrun, test))]
-impl MarkerEvent {
-    /// Whether this event is a publish report some other boot sent
-    /// ([`report_fate`]); a beacon never is.
-    fn is_straggler_for(&self, boot_generation: u64, after_ready: bool) -> bool {
-        match self {
-            Self::Beacon(..) => false,
-            Self::ProxyServing(_, reported) | Self::ProxyPortHeld(_, reported) => {
-                report_fate(*reported, boot_generation, after_ready) == ReportFate::Straggler
-            }
-        }
-    }
-}
-
-/// What becomes of one publish report the running boot's watch reads (T93).
-#[cfg(any(minvmd_libkrun, test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReportFate {
-    /// The running boot's own report: handed to the publish decision.
-    Keep,
-    /// Another boot's report — a killed boot's, from a redraw or an earlier
-    /// start: dropped with a line naming both generations.
-    Straggler,
-}
-
-/// Whose report this is, by the publish generation the guest echoed
-/// (T93). The port cannot tell: a killed boot and the next one are often
-/// handed the same port — the preferred one, across starts — while the
-/// generation is drawn fresh for every boot. A report carrying this boot's
-/// generation is this boot's, before or after READY, since nothing in the
-/// marker channel orders a report after the beacon; any other generation is
-/// a straggler. A report with no generation comes from a guest too old to
-/// echo one: before READY it is a straggler and after READY it is kept —
-/// the behaviour that guest was built against, so mixed versions do not
-/// regress.
-#[cfg(any(minvmd_libkrun, test))]
-fn report_fate(reported: Option<u64>, boot_generation: u64, after_ready: bool) -> ReportFate {
-    match reported {
-        Some(generation) if generation == boot_generation => ReportFate::Keep,
-        Some(_) => ReportFate::Straggler,
-        None if after_ready => ReportFate::Keep,
-        None => ReportFate::Straggler,
-    }
-}
-
-/// A fresh publish generation for one boot (T93): a discriminator, not a
-/// secret, so it need only be distinct per boot, within a start and across
-/// starts. `RandomState` seeds from the OS's
-/// randomness once per thread and steps per instance; the pid and the clock
-/// folded in keep two supervisors apart even if their seeds met.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn draw_publish_generation() -> u64 {
-    use std::hash::{BuildHasher as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u32(std::process::id());
-    hasher.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    );
-    hasher.finish()
-}
-
 /// Bind the host's two box doors beside each other before the guest boots
 /// (T66, T94, NET-138): the box-registration control socket at
 /// `control_sock_path`, whose accept loop's handle the caller holds for the
@@ -3239,7 +2621,7 @@ fn bind_box_doors(
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
     proxy_publish: &crate::control::ProxyPublishStatus,
-    bep_listening: &crate::control::BepListening,
+    publisher: Option<crate::net::publish::Publisher>,
 ) -> Result<(
     std::thread::JoinHandle<()>,
     (&'static str, std::path::PathBuf),
@@ -3258,21 +2640,16 @@ fn bind_box_doors(
             control_sock_path.display()
         )
     })?;
-    let guest_report_door = guest_report_door_env(
-        control_sock_path,
-        boxes,
-        answerer,
-        proxy_publish,
-        bep_listening,
-    )
-    .with_context(|| {
-        format!(
-            "binding the guest report door at {}",
-            control_sock_path
-                .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
-                .display()
-        )
-    })?;
+    let guest_report_door =
+        guest_report_door_env(control_sock_path, boxes, answerer, proxy_publish, publisher)
+            .with_context(|| {
+                format!(
+                    "binding the guest report door at {}",
+                    control_sock_path
+                        .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
+                        .display()
+                )
+            })?;
     Ok((control, guest_report_door))
 }
 
@@ -3296,34 +2673,65 @@ fn guest_report_door_env(
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
     proxy_publish: &crate::control::ProxyPublishStatus,
-    bep_listening: &crate::control::BepListening,
+    publisher: Option<crate::net::publish::Publisher>,
 ) -> std::io::Result<(&'static str, std::path::PathBuf)> {
-    let door = crate::control::spawn_guest_reports_door_with_proxy(
+    let door = crate::control::spawn_guest_door(
         control_sock_path,
         boxes.clone(),
         answerer.clone(),
         proxy_publish.clone(),
-        bep_listening.clone(),
+        publisher,
     )?;
     Ok((crate::control::GUEST_REPORT_SOCK_ENV, door))
 }
 
-/// Parses one publish report's lines (T93): the verb, the port, and the
-/// publish generation the guest echoed — an empty third line, which is what
-/// a guest too old to echo one leaves, is `None`. `None` overall when the
-/// report is malformed: an unknown verb, a port that is not one, or a
-/// generation that does not parse.
-#[cfg(any(minvmd_libkrun, test))]
-fn parse_publish_report(verb: &str, port: &str, generation: &str) -> Option<MarkerEvent> {
-    let port = port.trim().parse::<u16>().ok()?;
-    let generation = match generation.trim() {
-        "" => None,
-        raw => Some(raw.parse::<u64>().ok()?),
+/// Reads the guest's boot beacon from the first connection on the marker
+/// socket, on a thread of its own.
+#[cfg(minvmd_libkrun)]
+fn spawn_beacon_reader(
+    listener: std::os::unix::net::UnixListener,
+    known_hosts_path: std::path::PathBuf,
+) -> std::sync::mpsc::Receiver<Result<crate::cmd::BootBeacon, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let beacon = listener
+            .accept()
+            .map_err(|e| format!("accept on READY-marker socket: {e}"))
+            .and_then(|(stream, _)| {
+                crate::cmd::read_ready_beacon(
+                    &mut std::io::BufReader::new(stream),
+                    &known_hosts_path,
+                )
+            });
+        let _ = tx.send(beacon);
+    });
+    rx
+}
+
+/// Waits for the boot beacon, and turns a failed mount or a timeout into the
+/// boot's error.
+#[cfg(minvmd_libkrun)]
+fn wait_boot_beacon(
+    beacon: &std::sync::mpsc::Receiver<Result<crate::cmd::BootBeacon, String>>,
+    ready_timeout: std::time::Duration,
+    volume_path: &std::path::Path,
+    volume_preexisted: bool,
+) -> Result<()> {
+    let Ok(beacon) = beacon.recv_timeout(ready_timeout) else {
+        return Err(anyhow::anyhow!(
+            "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
+            ready_timeout.as_secs(),
+            crate::cmd::READY_TIMEOUT_ENV,
+        ));
     };
-    match verb.trim() {
-        PROXY_PORT_HELD_LINE => Some(MarkerEvent::ProxyPortHeld(port, generation)),
-        PROXY_SERVING_LINE => Some(MarkerEvent::ProxyServing(port, generation)),
-        _ => None,
+    match beacon {
+        Ok(crate::cmd::BootBeacon::Ready) => Ok(()),
+        Ok(crate::cmd::BootBeacon::MountFailed { reason }) => Err(crate::cmd::mount_failed_error(
+            &reason,
+            volume_path,
+            volume_preexisted,
+        )),
+        Err(e) => Err(anyhow::anyhow!("boot failed: {e}")),
     }
 }
 
@@ -3341,366 +2749,8 @@ impl Drop for MarkerSocketFile {
     }
 }
 
-/// Accepts on the marker socket for the supervisor's life, classifying each
-/// connection into one [`MarkerEvent`] for the supervisor's one channel
-/// (T93). A report whose port does not parse is warned and dropped: the
-/// reports are a courtesy the decisions never hang on, and a malformed one
-/// fails nothing on its own.
-#[cfg(minvmd_libkrun)]
-fn spawn_marker_gate(
-    listener: std::os::unix::net::UnixListener,
-    known_hosts_path: std::path::PathBuf,
-) -> std::sync::mpsc::Receiver<MarkerEvent> {
-    let (events, events_rx) = std::sync::mpsc::channel::<MarkerEvent>();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                return; // the listener closed: the supervisor is gone
-            };
-            let event =
-                classify_marker_connection(&mut std::io::BufReader::new(stream), &known_hosts_path);
-            match event {
-                Some(event) => {
-                    if events.send(event).is_err() {
-                        return; // the supervisor is gone
-                    }
-                }
-                None => continue,
-            }
-        }
-    });
-    events_rx
-}
-
-/// Classifies one marker connection by peeking its first line without
-/// consuming it (T93): [`crate::cmd::read_ready_beacon`] reads the beacon's
-/// own first line, so the gate may only peek. A publish report consumes its
-/// two lines here — verb, then port — and anything else is handed to the
-/// beacon reader whole. A report's third line is the publish generation,
-/// absent from an older guest's report ([`parse_publish_report`]). `None` is
-/// a report that did not parse: warned here, dropped, and the connection
-/// over with.
-#[cfg(minvmd_libkrun)]
-fn classify_marker_connection(
-    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
-    known_hosts_path: &std::path::Path,
-) -> Option<MarkerEvent> {
-    use std::io::BufRead as _;
-    let peeked = reader.fill_buf().ok()?;
-    if peeked.starts_with(PROXY_PORT_HELD_LINE.as_bytes())
-        || peeked.starts_with(PROXY_SERVING_LINE.as_bytes())
-    {
-        let mut verb = String::new();
-        let mut port = String::new();
-        let mut generation = String::new();
-        let _ = reader.read_line(&mut verb);
-        let _ = reader.read_line(&mut port);
-        // The guest half-closes after its report, so an older guest's
-        // two-line report ends here at EOF with the line left empty.
-        let _ = reader.read_line(&mut generation);
-        let event = parse_publish_report(&verb, &port, &generation);
-        if event.is_none() {
-            tracing::warn!(
-                verb = verb.trim(),
-                port = port.trim(),
-                generation = generation.trim(),
-                "a malformed publish report arrived on the marker socket; ignoring it"
-            );
-        }
-        event
-    } else {
-        Some(MarkerEvent::Beacon(crate::cmd::read_ready_beacon(
-            reader,
-            known_hosts_path,
-        )))
-    }
-}
-
-/// Waits for this boot's READY beacon, the env-configurable bound around it
-/// (T93's redraws reuse it: every fresh boot is a boot). A publish report
-/// carrying this boot's generation ([`report_fate`]) is this boot's own —
-/// the guest's publish drive runs beside its boot path, and nothing in the
-/// marker channel orders the report after READY — so it is kept and
-/// returned for the publish watch; any other report is a killed boot's
-/// straggler, skipped with a line, never mistaken for the beacon.
-#[cfg(minvmd_libkrun)]
-fn wait_boot_beacon(
-    events: &std::sync::mpsc::Receiver<MarkerEvent>,
-    ready_timeout: std::time::Duration,
-    boot_generation: u64,
-    volume_path: &std::path::Path,
-    volume_preexisted: bool,
-) -> Result<Option<crate::control::GuestPublish>> {
-    let Ok(BootBeaconWait {
-        beacon,
-        early_report,
-    }) = await_boot_beacon(events, ready_timeout, boot_generation)
-    else {
-        return Err(anyhow::anyhow!(
-            "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
-            ready_timeout.as_secs(),
-            crate::cmd::READY_TIMEOUT_ENV,
-        ));
-    };
-    match beacon {
-        Ok(crate::cmd::BootBeacon::Ready) => Ok(early_report),
-        Ok(crate::cmd::BootBeacon::MountFailed { reason }) => Err(crate::cmd::mount_failed_error(
-            &reason,
-            volume_path,
-            volume_preexisted,
-        )),
-        Err(e) => Err(anyhow::anyhow!("boot failed: {e}")),
-    }
-}
-
-/// What the READY wait read ([`await_boot_beacon`]): the boot beacon, and
-/// this boot's own publish report when it arrived first.
-#[cfg(any(minvmd_libkrun, test))]
-#[derive(Debug)]
-struct BootBeaconWait {
-    beacon: Result<crate::cmd::BootBeacon, String>,
-    early_report: Option<crate::control::GuestPublish>,
-}
-
-/// The channel half of [`wait_boot_beacon`]: reads events until the beacon,
-/// keeping the first report this boot sent ([`report_fate`], before READY)
-/// and skipping every straggler. `Err` when the bound expires first.
-#[cfg(any(minvmd_libkrun, test))]
-fn await_boot_beacon(
-    events: &std::sync::mpsc::Receiver<MarkerEvent>,
-    ready_timeout: std::time::Duration,
-    boot_generation: u64,
-) -> Result<BootBeaconWait, std::sync::mpsc::RecvTimeoutError> {
-    let deadline = std::time::Instant::now() + ready_timeout;
-    let mut early_report = None;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match events.recv_timeout(remaining)? {
-            MarkerEvent::Beacon(beacon) => {
-                return Ok(BootBeaconWait {
-                    beacon,
-                    early_report,
-                });
-            }
-            event if event.is_straggler_for(boot_generation, false) => {
-                log_straggler(
-                    &event,
-                    boot_generation,
-                    "while waiting for the READY marker",
-                );
-            }
-            event => {
-                if early_report.is_none() {
-                    early_report = publish_report_of(event, boot_generation);
-                }
-            }
-        }
-    }
-}
-
-/// One line per dropped straggler report (T93): the port it names, the
-/// generation it carried, and this boot's generation, so the log says whose
-/// report was skipped and why.
-#[cfg(any(minvmd_libkrun, test))]
-fn log_straggler(event: &MarkerEvent, boot_generation: u64, when: &str) {
-    if let MarkerEvent::ProxyServing(port, reported) | MarkerEvent::ProxyPortHeld(port, reported) =
-        event
-    {
-        tracing::warn!(
-            port,
-            report_generation = %report_generation_field(*reported),
-            boot_generation,
-            when,
-            "skipped a publish report another boot sent"
-        );
-    }
-}
-
-/// How a publish report's generation reads in the log (T93): the
-/// generation the guest echoed, or `absent` for a report that carried none —
-/// a word, never a number, so a token-less report cannot pass for one.
-#[cfg(any(minvmd_libkrun, test))]
-fn report_generation_field(reported: Option<u64>) -> String {
-    reported.map_or_else(|| "absent".to_owned(), |generation| generation.to_string())
-}
-
-/// A kept publish report as the decision reads it, re-probed host-side and
-/// logged (T93), so the daemon's log names the outcome the supervisor
-/// *checked* for the port, not only the one the guest claimed — and the
-/// generation the report carried beside this boot's, so a report that lost
-/// its generation on the way is visible, not silently kept. `None` for a
-/// beacon.
-#[cfg(any(minvmd_libkrun, test))]
-fn publish_report_of(
-    event: MarkerEvent,
-    boot_generation: u64,
-) -> Option<crate::control::GuestPublish> {
-    match event {
-        MarkerEvent::ProxyServing(published, reported) => {
-            tracing::info!(
-                port = published,
-                port_answers = loopback_answers(published),
-                report_generation = %report_generation_field(reported),
-                boot_generation,
-                "the guest published the hostname proxy; re-probed the port"
-            );
-            Some(crate::control::GuestPublish::Serving { port: published })
-        }
-        MarkerEvent::ProxyPortHeld(held, reported) => {
-            tracing::info!(
-                port = held,
-                port_answers = loopback_answers(held),
-                report_generation = %report_generation_field(reported),
-                boot_generation,
-                "the guest's publish was refused for address-in-use; re-probed the port"
-            );
-            Some(crate::control::GuestPublish::PortHeld { port: held })
-        }
-        MarkerEvent::Beacon(..) => None,
-    }
-}
-
-/// How long the supervisor waits for the guest's publish reports after the
-/// READY beacon (T93). The reports settle within the guest's own first
-/// publish attempt — the proxy task starts with the daemon's serve loop,
-/// and its expose rides the shuttle — so this is only the bound that keeps
-/// a guest that never reports (a degraded boot whose publish keeps its
-/// existing backoff) from stalling the start; a healthy boot's report ends
-/// the watch early.
-#[cfg(minvmd_libkrun)]
-const PUBLISH_WATCH_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How much longer the watch waits for the guest's report when the bound
-/// expired with the port answering but its holder unnameable (T93): a short
-/// grace, because ambiguity alone must never redraw, and the report is the
-/// one voice that can settle it.
-#[cfg(minvmd_libkrun)]
-const NO_REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Watches what became of the port this start reserved (T93): the guest's
-/// report — serving, or refused for address-in-use — or, at the bound, the
-/// supervisor's own identification of the port's holder. Whichever report
-/// arrives is re-probed host-side and the check logged, so the daemon's log
-/// names the publish outcome the supervisor *checked* for the port, not only
-/// the one the guest claimed; and nothing the guest says changes which port
-/// is reserved — the report names a fact, the reservation is the
-/// supervisor's own and moves only by its own decision. Only this boot's
-/// report counts ([`report_fate`]): `early_report` is the one the READY
-/// wait already kept, and the watch reads it first.
-///
-/// With no report at the bound, the holder decides
-/// ([`crate::control::NoReportHolder`]): a listener whose pid is one of
-/// `own_pids` — the processes this supervisor spawned for this VM — is this
-/// VM's own late publish; any other named pid is another process holding
-/// the port; and a listener the host will not name earns a short grace
-/// ([`NO_REPORT_GRACE`]) for the report before the watch calls it unknown.
-#[cfg(minvmd_libkrun)]
-fn watch_proxy_publish(
-    port: u16,
-    events: &std::sync::mpsc::Receiver<MarkerEvent>,
-    own_pids: &[u32],
-    boot_generation: u64,
-    early_report: Option<crate::control::GuestPublish>,
-) -> crate::control::GuestPublish {
-    use crate::control::{GuestPublish, NoReportHolder, classify_no_report_holder};
-    // This boot's report, when it beat READY: the READY wait already kept
-    // and re-probed it.
-    if let Some(reported) = early_report {
-        return reported;
-    }
-    if let Some(reported) = await_publish_report(events, PUBLISH_WATCH_BOUND, boot_generation) {
-        return reported;
-    }
-    let port_answers = loopback_answers(port);
-    let holder_found = if port_answers {
-        port_holder(port)
-    } else {
-        None
-    };
-    let holder = classify_no_report_holder(
-        port_answers,
-        holder_found.as_ref().map(|(pid, _)| *pid),
-        own_pids,
-    );
-    let holder_named = holder_found.as_ref().map(|(_, named)| named.as_str());
-    match holder {
-        NoReportHolder::OwnForwarder => tracing::warn!(
-            port,
-            holder = holder_named.unwrap_or(""),
-            "the guest's publish report was late: this VM's own forwarder holds \
-             the port, so the publish landed"
-        ),
-        NoReportHolder::Foreign => tracing::warn!(
-            port,
-            holder = holder_named.unwrap_or(""),
-            "the publish watch expired without the guest's report and another \
-             process holds the port"
-        ),
-        NoReportHolder::NotAnswering => tracing::warn!(
-            port,
-            "the publish watch expired without the guest's report and nothing \
-             answers on the port"
-        ),
-        NoReportHolder::Unknown => {
-            tracing::warn!(
-                port,
-                grace_secs = NO_REPORT_GRACE.as_secs(),
-                "the publish watch expired without the guest's report and the \
-                 port's holder cannot be named; waiting a short grace for the report"
-            );
-            if let Some(reported) = await_publish_report(events, NO_REPORT_GRACE, boot_generation) {
-                return reported;
-            }
-        }
-    }
-    GuestPublish::NoReport { port, holder }
-}
-
-/// The guest's publish report, if one arrives inside `bound` (T93): served,
-/// or refused for address-in-use, each re-probed and logged
-/// ([`publish_report_of`]). A report another boot sent ([`report_fate`],
-/// after READY) is skipped with a line, and so is a beacon inside the wait —
-/// a straggler from a redraw's killed boot, since this boot's beacon is
-/// already read. `None` at the bound.
-#[cfg(any(minvmd_libkrun, test))]
-fn await_publish_report(
-    events: &std::sync::mpsc::Receiver<MarkerEvent>,
-    bound: std::time::Duration,
-    boot_generation: u64,
-) -> Option<crate::control::GuestPublish> {
-    let deadline = std::time::Instant::now() + bound;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match events.recv_timeout(remaining) {
-            Ok(MarkerEvent::Beacon(..)) => continue,
-            Ok(event) if event.is_straggler_for(boot_generation, true) => {
-                log_straggler(&event, boot_generation, "while watching the publish");
-            }
-            Ok(event) => return publish_report_of(event, boot_generation),
-            Err(_) => return None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    // BEP-043: the daemon's start path sends a live box's revocation to the
-    // proxy's control socket under the home directory.
-    #[test]
-    fn supervisor_registry_sends_revocations_to_the_home_proxy() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = super::supervisor_registry(
-            crate::bep_attach::Attachments::new(),
-            false,
-            dir.path().join("registry.json"),
-        );
-        assert_eq!(
-            registry.proxy_control(),
-            crate::box_registry::home_proxy_control().as_deref()
-        );
-        assert!(registry.proxy_control().is_some());
-    }
-
     #[cfg(not(minvmd_libkrun))]
     use super::*;
 
@@ -3799,158 +2849,7 @@ mod tests {
         std::process::ExitStatus::from_raw(code << 8)
     }
 
-    /// The marker channel as the gate feeds it: every event already sent,
-    /// the sender dropped, so a wait reads them in order and then ends.
-    fn marker_channel(
-        events: Vec<super::MarkerEvent>,
-    ) -> std::sync::mpsc::Receiver<super::MarkerEvent> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        for event in events {
-            tx.send(event).unwrap();
-        }
-        rx
-    }
-
-    fn ready() -> super::MarkerEvent {
-        super::MarkerEvent::Beacon(Ok(crate::cmd::BootBeacon::Ready))
-    }
-
     const WAIT: std::time::Duration = std::time::Duration::from_millis(200);
-
-    #[test]
-    fn a_publish_refusal_before_ready_is_not_dropped() {
-        // T93: the guest's publish drive runs beside its boot path, so this
-        // boot's refusal can reach the marker channel before READY. It
-        // carries this boot's generation, so the READY wait keeps it, the
-        // watch reads it, and the decision redraws the drawn port instead
-        // of calling the publish unconfirmed.
-        let (port, generation) = (7654, 41);
-        let events = marker_channel(vec![
-            super::MarkerEvent::ProxyPortHeld(port, Some(generation)),
-            ready(),
-        ]);
-        let wait = super::await_boot_beacon(&events, WAIT, generation).unwrap();
-        assert_eq!(wait.beacon, Ok(crate::cmd::BootBeacon::Ready));
-        let outcome = wait.early_report;
-        assert_eq!(
-            outcome,
-            Some(crate::control::GuestPublish::PortHeld { port })
-        );
-        assert_eq!(
-            crate::control::decide_publish(true, 1, outcome.unwrap()),
-            crate::control::PublishDecision::Redraw { port },
-            "a drawn port the guest found taken is redrawn"
-        );
-    }
-
-    #[test]
-    fn a_killed_boots_report_with_the_same_port_is_dropped() {
-        // A killed boot and the next one are often handed the same port, so
-        // only the generation tells them apart: the killed boot's report is
-        // skipped before READY and after it, and the watch proceeds to this
-        // boot's own report.
-        let (port, killed, current) = (7654, 7, 8);
-        let events = marker_channel(vec![
-            super::MarkerEvent::ProxyPortHeld(port, Some(killed)),
-            ready(),
-            super::MarkerEvent::ProxyPortHeld(port, Some(killed)),
-            super::MarkerEvent::ProxyServing(port, Some(current)),
-        ]);
-        let wait = super::await_boot_beacon(&events, WAIT, current).unwrap();
-        assert_eq!(wait.beacon, Ok(crate::cmd::BootBeacon::Ready));
-        assert_eq!(
-            wait.early_report, None,
-            "the killed boot's report is dropped"
-        );
-        assert_eq!(
-            super::await_publish_report(&events, WAIT, current),
-            Some(crate::control::GuestPublish::Serving { port }),
-            "the watch skips the straggler and reads this boot's report"
-        );
-    }
-
-    #[test]
-    fn an_older_guests_tokenless_report_counts_only_after_ready() {
-        // A guest too old to echo a generation: before READY its report is
-        // a straggler, after READY it is the running boot's — today's
-        // behaviour, so mixed versions do not regress.
-        let port = 7654;
-        let events = marker_channel(vec![
-            super::MarkerEvent::ProxyServing(port, None),
-            ready(),
-            super::MarkerEvent::ProxyPortHeld(port, None),
-        ]);
-        let wait = super::await_boot_beacon(&events, WAIT, 3).unwrap();
-        assert_eq!(wait.early_report, None);
-        assert_eq!(
-            super::await_publish_report(&events, WAIT, 3),
-            Some(crate::control::GuestPublish::PortHeld { port })
-        );
-    }
-
-    #[test]
-    fn report_fate_keeps_only_the_running_boots_reports() {
-        use super::{ReportFate, report_fate};
-        assert_eq!(report_fate(Some(5), 5, false), ReportFate::Keep);
-        assert_eq!(report_fate(Some(5), 5, true), ReportFate::Keep);
-        assert_eq!(report_fate(Some(4), 5, false), ReportFate::Straggler);
-        assert_eq!(report_fate(Some(4), 5, true), ReportFate::Straggler);
-        assert_eq!(report_fate(None, 5, false), ReportFate::Straggler);
-        assert_eq!(report_fate(None, 5, true), ReportFate::Keep);
-    }
-
-    #[test]
-    fn a_publish_report_parses_with_its_generation() {
-        assert_eq!(
-            super::parse_publish_report("PROXY_PORT_HELD\n", "7654\n", "123\n"),
-            Some(super::MarkerEvent::ProxyPortHeld(7654, Some(123)))
-        );
-        assert_eq!(
-            super::parse_publish_report("PROXY_SERVING\n", "7654\n", "123\n"),
-            Some(super::MarkerEvent::ProxyServing(7654, Some(123)))
-        );
-    }
-
-    #[test]
-    fn a_publish_report_without_a_generation_still_parses() {
-        // An older guest's two-line report: the third read meets EOF.
-        assert_eq!(
-            super::parse_publish_report("PROXY_PORT_HELD\n", "7654\n", ""),
-            Some(super::MarkerEvent::ProxyPortHeld(7654, None))
-        );
-        assert_eq!(
-            super::parse_publish_report("PROXY_SERVING\n", "7654\n", ""),
-            Some(super::MarkerEvent::ProxyServing(7654, None))
-        );
-    }
-
-    #[test]
-    fn a_malformed_publish_report_is_rejected() {
-        assert_eq!(super::parse_publish_report("PROXY_SERVING", "x", ""), None);
-        assert_eq!(
-            super::parse_publish_report("PROXY_SERVING", "7654", "x"),
-            None
-        );
-        assert_eq!(super::parse_publish_report("PROXY_ELSE", "7654", ""), None);
-    }
-
-    #[test]
-    fn a_report_generation_logs_as_its_number_or_absent() {
-        assert_eq!(super::report_generation_field(Some(41)), "41");
-        assert_eq!(
-            super::report_generation_field(Some(u64::MAX)),
-            u64::MAX.to_string()
-        );
-        assert_eq!(super::report_generation_field(None), "absent");
-    }
-
-    #[test]
-    fn every_boot_draws_its_own_publish_generation() {
-        assert_ne!(
-            super::draw_publish_generation(),
-            super::draw_publish_generation()
-        );
-    }
 
     #[test]
     fn detach_poll_ready_predicate_wins_over_child_exit() {
@@ -4437,57 +3336,6 @@ mod tests {
         }
     }
 
-    /// NET-021: a pin another program holds does not fail the start. The
-    /// assignment hands the guest the pin with no reservation, so the VM
-    /// starts and the held-port watcher can take the reservation once the
-    /// port frees. A refused publish on the pin brings the VM up with its
-    /// proxy down, never a start failure. A pin on the port the node keeps
-    /// for its DNS service still fails, naming the variable to change.
-    #[test]
-    fn held_configured_port_starts_the_vm_with_the_proxy_down() {
-        let ports = tempfile::tempdir().expect("a test reservation dir");
-        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let pin = held.local_addr().unwrap().port();
-        let assigned =
-            super::configured_node_port(ports.path(), pin).expect("a held pin starts the VM");
-        assert_eq!(assigned.port, pin, "the guest is handed the pin");
-        assert_eq!(assigned.preferred, pin);
-        assert!(assigned.configured);
-        assert!(
-            assigned.skipped.is_none(),
-            "a held pin is not a substitute port"
-        );
-        assert!(
-            assigned.reservation.is_none(),
-            "the watcher takes the reservation when the port frees"
-        );
-        // The publish on the held pin is refused: the decision is the one
-        // the boot loop turns into a VM with its proxy down.
-        assert!(matches!(
-            crate::control::decide_publish(
-                false,
-                1,
-                crate::control::GuestPublish::PortHeld { port: pin }
-            ),
-            crate::control::PublishDecision::FailStart { port, .. } if port == pin
-        ));
-        // Once the holder exits, the watcher's check passes and takes the
-        // reservation.
-        drop(held);
-        assert!(super::proxy_reclaim_check(ports.path().to_path_buf())(pin).is_some());
-
-        let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
-        let err = super::configured_node_port(ports.path(), reserved)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(crate::vm::NODE_PROXY_PORT_ENV)
-                && err.contains(&reserved.to_string())
-                && err.contains("DNS service"),
-            "a pin on the reserved port names the variable, got: {err}"
-        );
-    }
-
     /// A preferred port something holds is skipped with `bind refused`, and
     /// the same draw hands it back once the holder releases it. This pins
     /// only the draw's half of the reap-before-draw fix: the order of the
@@ -4798,329 +3646,6 @@ mod tests {
         );
     }
 
-    /// NET-132/T69: a boot with no acceptor binds no pool socket. The
-    /// supervisor hands the peer an empty box source — rows registered or
-    /// not, the node namespace's row included — and the pool a peer would
-    /// build holds nothing. A listening acceptor (`bep serve`, or the
-    /// stand-in under its flag) is what registers rows, and only the rows
-    /// that declared a credentialed upstream (NET-134).
-    #[tokio::test]
-    async fn production_wiring_leaves_pool_len_zero_with_rows_registered() {
-        let subnet = switch::SwitchSubnet::default();
-        let attachments = crate::bep_attach::Attachments::new();
-        let registry = crate::box_registry::BoxRegistry::new(subnet)
-            .feeding_proxy_attachments(attachments.clone());
-        registry.register_node_namespace(7654);
-        registry
-            .register_client_box(crate::box_registry::ClientBoxSpec {
-                name: "box-a".to_string(),
-                ingress_ports: Vec::new(),
-                egress: None,
-                credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
-                dynamic_ingress: None,
-                dynamic_allowed_range: None,
-            })
-            .expect("the plan has a switch address to hand out");
-        // A box with no credentialed lane: the gate refuses its frames to
-        // the proxy's address, so it holds no share either.
-        registry
-            .register_client_box(crate::box_registry::ClientBoxSpec {
-                name: "box-b".to_string(),
-                ingress_ports: Vec::new(),
-                egress: None,
-                credentialed_upstream: None,
-                dynamic_ingress: None,
-                dynamic_allowed_range: None,
-            })
-            .expect("the plan has a switch address to hand out");
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let wire = switch::bep_host::BepWire::new(
-            dir.path().join("proxy.sock"),
-            [0u8; switch::bep_host::TOKEN_LEN],
-        )
-        .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
-
-        // The production wiring: rows sit in the table — the node
-        // namespace's and a client box's — and still buy no share.
-        let mut lane = switch::bep_host::test_util::TestLane::new(
-            subnet,
-            wire.clone(),
-            super::bep_box_source(None, registry.table(), attachments.clone()),
-        );
-        for _ in 0..2 {
-            lane.step().await;
-        }
-        assert_eq!(
-            lane.pool_len(),
-            0,
-            "a production boot binds no pool socket, rows registered or not"
-        );
-
-        // An acceptor that is not listening yet binds nothing either.
-        let listening = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut acceptor_lane = switch::bep_host::test_util::TestLane::new(
-            subnet,
-            wire,
-            super::bep_box_source(
-                Some(std::sync::Arc::clone(&listening)),
-                registry.table(),
-                attachments,
-            ),
-        );
-        for _ in 0..2 {
-            acceptor_lane.step().await;
-        }
-        assert_eq!(
-            acceptor_lane.pool_len(),
-            0,
-            "no share binds to a path nothing listens on"
-        );
-
-        // Once it listens, the rows that declared a lane get shares: one
-        // declared box, one share. The undeclared box and the node
-        // namespace's row add none.
-        listening.store(true, std::sync::atomic::Ordering::SeqCst);
-        for _ in 0..2 {
-            acceptor_lane.step().await;
-        }
-        assert_eq!(
-            acceptor_lane.pool_len(),
-            switch::bep_host::DEFAULT_PER_SOURCE_CAP,
-            "a listening acceptor registers the declared boxes' shares, and \
-             only theirs"
-        );
-
-        // An acceptor that exits takes the shares with it.
-        listening.store(false, std::sync::atomic::Ordering::SeqCst);
-        for _ in 0..2 {
-            acceptor_lane.step().await;
-        }
-        assert_eq!(
-            acceptor_lane.pool_len(),
-            0,
-            "the shares go when the acceptor stops listening"
-        );
-    }
-
-    /// A registry with one box that declares a credentialed upstream and
-    /// one that does not, and the [`super::CredentialedBoxes`] source over it.
-    fn credentialed_boxes_with_two_rows(
-        listening: bool,
-    ) -> (
-        super::CredentialedBoxes,
-        std::net::Ipv4Addr,
-        std::net::Ipv4Addr,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        let attachments = crate::bep_attach::Attachments::new();
-        let registry = crate::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
-            .feeding_proxy_attachments(attachments.clone());
-        let spec = |name: &str, credentialed: bool| crate::box_registry::ClientBoxSpec {
-            name: name.to_string(),
-            ingress_ports: Vec::new(),
-            egress: None,
-            credentialed_upstream: credentialed.then(boxes::CredentialedUpstream::default),
-            dynamic_ingress: None,
-            dynamic_allowed_range: None,
-        };
-        let declared = registry
-            .register_client_box(spec("box-lane", true))
-            .expect("the plan has a switch address to hand out")
-            .switch_addr();
-        let undeclared = registry
-            .register_client_box(spec("box-no-lane", false))
-            .expect("the plan has a switch address to hand out")
-            .switch_addr();
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(listening));
-        let table = registry.table();
-        let source = super::CredentialedBoxes {
-            boxes: crate::box_registry::RegisteredBoxes::new(table.clone(), attachments),
-            table,
-            listening: std::sync::Arc::clone(&flag),
-        };
-        (source, declared, undeclared, flag)
-    }
-
-    /// NET-134: while the proxy listens, a registered row that declared no
-    /// credentialed upstream gets no share.
-    #[test]
-    fn credentialed_boxes_skip_a_row_without_a_credentialed_upstream() {
-        use switch::bep_host::BepBoxSource as _;
-        let (source, _declared, undeclared, _flag) = credentialed_boxes_with_two_rows(true);
-        assert!(
-            !source.box_switch_addresses().contains(&undeclared),
-            "a row with no credentialed upstream holds no share"
-        );
-    }
-
-    /// NET-134: while the proxy listens, a registered row that declared a
-    /// credentialed upstream gets its share, and it is the only one.
-    #[test]
-    fn credentialed_boxes_share_a_row_with_a_credentialed_upstream() {
-        use switch::bep_host::BepBoxSource as _;
-        let (source, declared, _undeclared, _flag) = credentialed_boxes_with_two_rows(true);
-        assert_eq!(
-            source.box_switch_addresses(),
-            vec![declared],
-            "the declared row gets its share, and only it"
-        );
-    }
-
-    /// No row gets a share while the proxy does not listen, and the shares
-    /// follow the flag when it changes.
-    #[test]
-    fn credentialed_boxes_share_nothing_while_not_listening() {
-        use switch::bep_host::BepBoxSource as _;
-        let (source, declared, _undeclared, flag) = credentialed_boxes_with_two_rows(false);
-        assert!(
-            source.box_switch_addresses().is_empty(),
-            "no row holds a share while nothing listens"
-        );
-        flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(source.box_switch_addresses(), vec![declared]);
-        flag.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            source.box_switch_addresses().is_empty(),
-            "the shares go when the proxy stops listening"
-        );
-    }
-
-    /// T94: the guest report door's bridge is one step. Binding the door
-    /// and answering the env the VMM child registers the door's vsock port
-    /// from happen together, so the door is bound only once the bridge is
-    /// up: the pair names a live socket at the door's own file name beside
-    /// the control socket, and a bind that cannot happen answers no env at
-    /// all — no boot bridges a door it did not bind (the boot fails on it,
-    /// [`super::bind_box_doors`]).
-    #[test]
-    fn guest_report_door_bound_only_behind_its_bridge() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
-        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let answerer = crate::net::answerer::AnswererStatus::starting();
-        let proxy_publish = crate::control::ProxyPublishStatus::new();
-
-        // The bound half: the pair names the door's path under its env.
-        let (name, door) = super::guest_report_door_env(
-            &control_sock,
-            &boxes,
-            &answerer,
-            &proxy_publish,
-            &Default::default(),
-        )
-        .expect("the guest report door binds beside the control socket");
-        assert_eq!(
-            name,
-            crate::control::GUEST_REPORT_SOCK_ENV,
-            "the env the child registers the door's vsock port from is the \
-             report door's own name"
-        );
-        assert_eq!(
-            door,
-            control_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE),
-            "the env names the guest door's own socket beside the control socket"
-        );
-        assert!(
-            std::os::unix::net::UnixStream::connect(&door).is_ok(),
-            "the door the env names is a live socket the child can register: {}",
-            door.display()
-        );
-
-        // The refused half: a path that cannot carry the door refuses the
-        // bind, and with it the env — the boot loop hands the child
-        // nothing, and no bridge comes up over a door that never bound.
-        let blocked = tempfile::tempdir().expect("tempdir");
-        let blocked_sock = blocked.path().join(crate::control::CONTROL_SOCK_FILE);
-        std::fs::write(
-            blocked_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE),
-            "not a socket",
-        )
-        .expect("seeding the blocking file");
-        assert!(
-            super::guest_report_door_env(
-                &blocked_sock,
-                &boxes,
-                &answerer,
-                &proxy_publish,
-                &Default::default()
-            )
-            .is_err(),
-            "a guest-door path held by a non-socket file refuses the bind, and \
-             the env the child would register it from"
-        );
-    }
-
-    /// #1790: a door that cannot bind is the supervisor's startup error,
-    /// never a warning the VM boots past. A non-socket file at the control
-    /// socket's path refuses the control bind, and one at the guest door's
-    /// path refuses the door's; each error names the path it could not
-    /// bind and the cause.
-    #[test]
-    fn box_door_bind_failure_is_a_startup_error() {
-        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let answerer = crate::net::answerer::AnswererStatus::starting();
-        let proxy_publish = crate::control::ProxyPublishStatus::new();
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
-        std::fs::write(&control_sock, "not a socket").expect("seeding the blocking file");
-        let error = super::bind_box_doors(
-            &control_sock,
-            &boxes,
-            &answerer,
-            &proxy_publish,
-            &Default::default(),
-        )
-        .expect_err("a control socket path held by a non-socket file fails the startup");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains(&format!(
-                "binding the box-registration control socket at {}",
-                control_sock.display()
-            )) && message.contains("is not a socket"),
-            "the error names the control socket and the cause: {message}"
-        );
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
-        let door = control_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE);
-        std::fs::write(&door, "not a socket").expect("seeding the blocking file");
-        let error = super::bind_box_doors(
-            &control_sock,
-            &boxes,
-            &answerer,
-            &proxy_publish,
-            &Default::default(),
-        )
-        .expect_err("a guest door path held by a non-socket file fails the startup");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains(&format!(
-                "binding the guest report door at {}",
-                door.display()
-            )),
-            "the error names the guest report door: {message}"
-        );
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
-        let (_control, (name, door)) = super::bind_box_doors(
-            &control_sock,
-            &boxes,
-            &answerer,
-            &proxy_publish,
-            &Default::default(),
-        )
-        .expect("both doors bind on a clear path");
-        assert_eq!(name, crate::control::GUEST_REPORT_SOCK_ENV);
-        assert!(
-            std::os::unix::net::UnixStream::connect(&control_sock).is_ok()
-                && std::os::unix::net::UnixStream::connect(&door).is_ok(),
-            "both doors are live sockets once the startup binds them"
-        );
-    }
-
     /// BEP-015: the supervisor starts `bep serve` on the wire's socket, with
     /// this boot's token as 64 hex digits on standard input and never in
     /// argv. Its output lands in the log beside the socket, and dropping the
@@ -5392,7 +3917,6 @@ mod tests {
                 .register_client_box(crate::box_registry::ClientBoxSpec {
                     name: name.to_string(),
                     ingress_ports: Vec::new(),
-                    egress: None,
                     credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
@@ -5482,77 +4006,6 @@ mod tests {
             }
         });
         requests
-    }
-
-    // NET-138: the production binder asks the switch to listen at the
-    // node's address and forward to the same port at the guest node. A port
-    // the host already holds is a collision, never another port.
-    #[test]
-    fn switch_mirror_binder_exposes_at_the_node_address_only() {
-        use crate::box_registry::{MirrorBindError, MirrorBinder as _};
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let sock = dir.path().join("switch.sock");
-        let requests = fake_switch(
-            &sock,
-            vec![
-                (200, ""),
-                (
-                    500,
-                    "listen tcp 127.0.64.9:8080: bind: address already in use\n",
-                ),
-                (500, "proxy already running\n"),
-                (200, ""),
-            ],
-        );
-        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-        let _entered = runtime.enter();
-        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
-        let binder = super::SwitchMirrorBinder {
-            switch_sock: sock.clone(),
-            node,
-            table: registry.table(),
-        };
-        let address = std::net::Ipv4Addr::new(127, 0, 64, 9);
-        assert!(
-            binder.bind(address, 8080).is_err(),
-            "no bind is made while no egress gate tracks its connections"
-        );
-        let ledger =
-            crate::net::egress_gate::TestMirrorLedger::attach(&registry.table(), sock.clone());
-        assert_eq!(binder.bind(address, 8080), Ok(()));
-        assert_eq!(
-            ledger.dials(address, 8080),
-            Some(node),
-            "the bind is noted in the gate's ledger at the node's switch address"
-        );
-        let expose = requests.recv().expect("the expose");
-        assert!(expose.starts_with("POST /services/forwarder/expose HTTP/1.1\r\n"));
-        assert!(expose.ends_with(
-            r#"{"local":"127.0.64.9:8080","remote":"192.168.127.2:8080","protocol":"tcp"}"#
-        ));
-        assert_eq!(binder.bind(address, 8080), Err(MirrorBindError::Occupied));
-        requests.recv().expect("the second expose");
-        assert_eq!(
-            binder.bind(address, 8080),
-            Ok(()),
-            "a forward the switch already holds is the goal state"
-        );
-        requests.recv().expect("the third expose");
-        assert_eq!(
-            binder.unbind(address, 8080),
-            crate::box_registry::MirrorUnbind::Undone {
-                connections_reset: 0
-            }
-        );
-        let unexpose = requests.recv().expect("the unexpose");
-        assert!(unexpose.starts_with("POST /services/forwarder/unexpose HTTP/1.1\r\n"));
-        assert!(unexpose.ends_with(r#"{"local":"127.0.64.9:8080","protocol":"tcp"}"#));
-        assert_eq!(
-            ledger.dials(address, 8080),
-            None,
-            "the unbind drops the note"
-        );
     }
 
     // NET-138: the upkeep opens the node's mirror only while the whole-range
