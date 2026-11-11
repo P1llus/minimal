@@ -120,9 +120,6 @@ pub enum Command {
     Bug(diag::BugArgs),
     /// Collect diagnostic bundles and send them for diagnosis
     Diag(diag::DiagArgs),
-    /// WireGuard mesh: join, leave, and inspect remote-access state
-    #[cfg(feature = "remote-access")]
-    Mesh(MeshArgs),
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
@@ -1310,59 +1307,6 @@ pub struct StartOverrideArgs {
     /// take it
     #[arg(long = "loadout", value_name = "NAME")]
     pub loadout: Vec<String>,
-}
-
-/// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
-/// UC2b). The mesh lets a laptop, or another host's PTasks, reach this host's
-/// PTasks over an encrypted tunnel.
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Args)]
-pub struct MeshArgs {
-    #[command(subcommand)]
-    pub command: MeshCommand,
-}
-
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Subcommand)]
-pub enum MeshCommand {
-    /// Enrol this machine into a remote minimald's WireGuard mesh
-    ///
-    /// v1 uses manual key exchange: this records the target and prints the
-    /// steps to swap public keys. Once enrolled you can reach the remote
-    /// host's own-IP PTasks by their switch IPs over the tunnel.
-    ///
-    /// Example:
-    ///
-    ///   min mesh join mesh.example.com:51820
-    #[command(verbatim_doc_comment)]
-    Join(MeshJoinArgs),
-    /// Leave the WireGuard mesh and drop this machine's local enrolment
-    ///
-    /// Removes the local enrolment record written by `min mesh join`.
-    /// Peer entries on the remote minimald must be removed there (manual v1).
-    ///
-    /// Example:
-    ///
-    ///   min mesh leave
-    #[command(verbatim_doc_comment)]
-    Leave,
-    /// Show this minimald's mesh status: public key, advertised subnets, peers
-    ///
-    /// Queries the local minimald for its WireGuard public key, the switch
-    /// subnets it advertises to the mesh, and each peer's last handshake.
-    ///
-    /// Example:
-    ///
-    ///   min mesh status
-    #[command(verbatim_doc_comment)]
-    Status,
-}
-
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Args)]
-pub struct MeshJoinArgs {
-    /// Address of the remote minimald exposing the mesh (`host:port`)
-    pub address: String,
 }
 
 // Shared arguments for all subcommands.

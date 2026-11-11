@@ -494,7 +494,6 @@ fn resolve_paths(global: &GlobalArgs) -> DiagPaths {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf(),
-        mesh_enrolment: crate::mesh_enrolment_path(global),
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
 }
@@ -1198,100 +1197,6 @@ mod tests {
         assert!(
             files.contains_key("state/listing.txt"),
             "bundle must contain state listing"
-        );
-    }
-
-    /// `cmd_bug` with a state dir that has a `mesh-enrolment` file collects
-    /// it under `config/mesh-enrolment`.
-    #[tokio::test]
-    async fn cmd_bug_collects_mesh_enrolment() {
-        let state = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            state.path().join("mesh-enrolment"),
-            b"mesh enrolment data\n",
-        )
-        .unwrap();
-
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let out = out_dir.path().join("diag.tar.zst");
-
-        let global = GlobalArgs {
-            minimal_dir: Some(state.path().to_path_buf()),
-            ..Default::default()
-        };
-        let args = BugArgs {
-            output: Some(out.clone()),
-            no_guest: true,
-            guest_timeout_secs: 60,
-            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
-            upload: false,
-            portal: PortalArgs {
-                context: None,
-                security: false,
-                endpoint: DEFAULT_ENDPOINT.to_string(),
-            },
-        };
-
-        cmd_bug(&global, args).await.unwrap();
-
-        let files = unpack(&out, "r").await;
-        assert!(
-            files.contains_key("config/mesh-enrolment"),
-            "bundle must contain mesh-enrolment under config/"
-        );
-        assert_eq!(
-            &files["config/mesh-enrolment"][..],
-            b"mesh enrolment data\n",
-            "mesh-enrolment must be captured verbatim"
-        );
-    }
-
-    /// `cmd_bug` with no `mesh-enrolment` file omits it without error: an
-    /// un-enrolled install is a normal state, not a finding.
-    #[tokio::test]
-    async fn cmd_bug_missing_mesh_enrolment_is_absent_not_error() {
-        let state = tempfile::TempDir::new().unwrap();
-        // No mesh-enrolment file.
-
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let out = out_dir.path().join("diag.tar.zst");
-
-        let global = GlobalArgs {
-            minimal_dir: Some(state.path().to_path_buf()),
-            ..Default::default()
-        };
-        let args = BugArgs {
-            output: Some(out.clone()),
-            no_guest: true,
-            guest_timeout_secs: 60,
-            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
-            upload: false,
-            portal: PortalArgs {
-                context: None,
-                security: false,
-                endpoint: DEFAULT_ENDPOINT.to_string(),
-            },
-        };
-
-        cmd_bug(&global, args).await.unwrap();
-
-        let files = unpack(&out, "r").await;
-        assert!(
-            !files.contains_key("config/mesh-enrolment"),
-            "an un-enrolled install must not produce a mesh-enrolment entry"
-        );
-        let manifest: serde_json_lenient::Value =
-            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
-        // Scoped to mesh-enrolment on purpose: the manifest's error list is
-        // fed by every host collector (net, procs, power read the live
-        // system), and this test's subject is only the missing-enrolment
-        // handling. An error from an unrelated collector must not fail it.
-        let errors = manifest["errors"].as_array().unwrap();
-        assert!(
-            !errors
-                .iter()
-                .any(|e| e.to_string().contains("mesh-enrolment")),
-            "missing mesh-enrolment must not be recorded as an error: {errors:?}"
         );
     }
 

@@ -453,12 +453,6 @@ pub struct ServerState {
     /// does; reported beside it so the host-resolver recipe can name the
     /// port to point at.
     zone_answerer_port: Option<u16>,
-
-    /// The running WireGuard mesh peer, when one is configured (Unit 4). Only
-    /// present under the `networking-wg` feature; the `GetMeshStatus` RPC reads
-    /// it through [`ServerStateHandle::mesh_status`].
-    #[cfg(feature = "networking-wg")]
-    mesh: Option<Arc<crate::net::wg::MeshHandle>>,
 }
 
 impl ServerState {
@@ -595,8 +589,6 @@ impl ServerState {
             proxy_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
-            #[cfg(feature = "networking-wg")]
-            mesh: None,
         })
     }
 }
@@ -905,35 +897,6 @@ impl ServerStateHandle {
     /// Returns the daemon ID.
     pub async fn daemon_id(&self) -> String {
         self.0.lock().await.daemon_id.clone()
-    }
-
-    /// Builds the current WireGuard mesh status for the `GetMeshStatus` RPC
-    /// (R4.6). On a build without the `networking-wg` feature, or with no mesh
-    /// configured, this reports `configured = false`.
-    pub async fn mesh_status(&self) -> minimald_rpc::MeshStatus {
-        #[cfg(feature = "networking-wg")]
-        {
-            let s = self.0.lock().await;
-            // A populated mesh slot is not proof the mesh is live: the pump can
-            // exit on a fatal socket error without clearing the slot, leaving a
-            // frozen, stale snapshot. Treat a dead pump as unconfigured so
-            // `GetMeshStatus` never advertises stale peer state.
-            match s.mesh.as_deref() {
-                Some(mesh) if mesh.is_alive() => crate::net::wg::status_response(Some(mesh)),
-                _ => minimald_rpc::MeshStatus::unconfigured(),
-            }
-        }
-        #[cfg(not(feature = "networking-wg"))]
-        {
-            minimald_rpc::MeshStatus::unconfigured()
-        }
-    }
-
-    /// Installs a running mesh handle. Used by the daemon's mesh-join path and,
-    /// in tests, to stand up a configured mesh for the `GetMeshStatus` RPC.
-    #[cfg(feature = "networking-wg")]
-    pub async fn set_mesh(&self, mesh: Arc<crate::net::wg::MeshHandle>) {
-        self.0.lock().await.mesh = Some(mesh);
     }
 }
 

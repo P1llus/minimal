@@ -28,8 +28,6 @@ pub struct DiagPaths {
     pub state: PathBuf,
     /// `<cache>/minimal`.
     pub cache: PathBuf,
-    /// Where `min mesh join` writes its enrolment file.
-    pub mesh_enrolment: PathBuf,
     /// The invoking directory (disk-full there breaks the bundle write).
     pub cwd: PathBuf,
 }
@@ -158,18 +156,6 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
 
     // The retired reverse proxy's client certificate, key and CA are not
     // collected, and their absence is not recorded either (NET-109).
-
-    // Mesh enrolment holds only a host:port endpoint. No-follow like every
-    // other content read: it ships verbatim, so a symlink here would
-    // exfiltrate an arbitrary file byte-for-byte.
-    match read_string_nofollow(&paths.mesh_enrolment).await {
-        Ok(content) => {
-            w.add_bytes("config/mesh-enrolment", content.as_bytes(), Redaction::None)
-                .await?
-        }
-        Err(e) if is_not_found(&e) => {}
-        Err(e) => w.skip("config/mesh-enrolment", format!("unreadable: {e:#}")),
-    }
     Ok(())
 }
 
@@ -1218,7 +1204,6 @@ mod tests {
             config: state.join("config"),
             state: state.to_path_buf(),
             cache: state.join("cache"),
-            mesh_enrolment: state.join("enrolment"),
             cwd: state.to_path_buf(),
         }
     }
@@ -1704,7 +1689,6 @@ mod tests {
             config: tmp.path().join("config"),
             state: state.clone(),
             cache: tmp.path().join("cache"),
-            mesh_enrolment: tmp.path().join("mesh"),
             cwd: tmp.path().to_path_buf(),
         };
         let out = tmp.path().join("bundle.tar.zst");
@@ -1733,7 +1717,6 @@ mod tests {
             config: PathBuf::from("/c"),
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/k"),
-            mesh_enrolment: PathBuf::from("/m"),
             cwd: PathBuf::from("/w"),
         };
         assert_eq!(spool_dir(&paths, None), PathBuf::from("/s/telemetry/spool"));

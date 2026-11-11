@@ -36,7 +36,6 @@ bitrot
 Bool
 boolean
 booleans
-boringtun
 btrfs
 build_deps
 Buildkite
@@ -483,7 +482,6 @@ wakeups
 wasmtime
 webproxy
 webserver
-wireguard
 wordmark
 workspace
 worktree

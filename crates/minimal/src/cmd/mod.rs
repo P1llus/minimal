@@ -176,8 +176,6 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             diag::DiagCommand::Upload(_) => "diag upload",
             diag::DiagCommand::Delete(_) => "diag delete",
         },
-        #[cfg(feature = "remote-access")]
-        Some(Command::Mesh(_)) => "mesh",
         Some(Command::Proxy(_)) => "proxy",
         Some(Command::Auth(AuthArgs { command })) => match command {
             AuthCommand::Login(_) => "auth login",
@@ -460,12 +458,6 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
             diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
             diag::DiagCommand::Delete(args) => diag::cmd_diag_delete(args).await,
-        },
-        #[cfg(feature = "remote-access")]
-        Some(Command::Mesh(MeshArgs { command })) => match command {
-            MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
-            MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
-            MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
         Some(Command::Auth(AuthArgs { command })) => match command {

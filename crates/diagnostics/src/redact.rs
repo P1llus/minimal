@@ -33,11 +33,11 @@ const ENV_TABLE_NAMES: &[&str] = &["vars", "vars_lenient", "env", "environment"]
 
 /// Returns true when a key looks like it names secret material.
 ///
-/// `public_key` is exempt (`public_key`, `wg_public_key` must survive
-/// redaction — mesh diagnostics depend on them), but only the `public_key`
-/// token itself: a key that pairs it with a sensitive marker
-/// (`public_key_token`, `private_public_key`) stays sensitive. Removing the
-/// exempt token before the marker scan keeps that fail-closed.
+/// `public_key` is exempt (a public key is not a secret and must survive
+/// redaction), but only the `public_key` token itself: a key that pairs it
+/// with a sensitive marker (`public_key_token`, `private_public_key`) stays
+/// sensitive. Removing the exempt token before the marker scan keeps that
+/// fail-closed.
 pub fn is_sensitive_key(key: &str) -> bool {
     let stripped = key.to_ascii_lowercase().replace("public_key", "");
     SENSITIVE_KEY_PARTS

@@ -85,11 +85,6 @@ mod integration_naming_convention {
     //! `minvmd`'s guard for when to add an integration harness vs. a full-system
     //! e2e script.
 
-    /// Files intentionally NOT auto-discovered: `mesh_uc7` is the mothballed
-    /// WireGuard mesh proof (feature `networking-wg`, off by default, no CI lane
-    /// runs it), so it deliberately keeps a non-convention name.
-    const ALLOWLIST: &[&str] = &["mesh_uc7.rs"];
-
     #[test]
     fn every_integration_test_binary_ends_in_integration() {
         let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
@@ -100,15 +95,13 @@ mod integration_naming_convention {
             .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
             .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
             // `_root_integration.rs` also ends in `_integration.rs`, so both variants pass.
-            .filter(|name| {
-                !name.ends_with("_integration.rs") && !ALLOWLIST.contains(&name.as_str())
-            })
+            .filter(|name| !name.ends_with("_integration.rs"))
             .collect();
         assert!(
             offenders.is_empty(),
             "every integration test in crates/minimald/tests/ must end in `_integration.rs` \
-             (root harnesses in `_root_integration.rs`) so the native lane auto-discovers it, \
-             or be added to ALLOWLIST if deliberately un-run; offenders: {offenders:?}"
+             (root harnesses in `_root_integration.rs`) so the native lane auto-discovers it; \
+             offenders: {offenders:?}"
         );
     }
 }

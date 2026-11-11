@@ -18,8 +18,7 @@ name: CI (Linux native)
 # over the gvproxy switch) run here in the `minimald-root-integration` job (sudo + a
 # userspace gvproxy switch, no KVM), auto-discovered by the `_root_integration`
 # binary-name convention. The `networking-proxy` (mTLS reverse proxy) feature
-# tests and the WireGuard mesh (`networking-wg`) proof are deliberately NOT run
-# in this lane — see the note on the tests job.
+# tests are deliberately NOT run in this lane — see the note on the tests job.
 on:
   push:
     branches: ["main", "release/**"]
@@ -103,11 +102,10 @@ jobs:
     # this lane's aggregator, then drops it.
     #
     # Deliberately absent (owner decision): the `--features networking-proxy`
-    # (mTLS reverse proxy) and `--features networking-wg` (WireGuard mesh) test
-    # steps that ci.yml's `test` job still carries, and the WireGuard mesh
-    # proof (crates/minimald/tests/mesh_uc7.rs). The network-namespace proofs
-    # (crates/minimald/tests/netns_root_integration.rs) run in the `minimald-root-integration`
-    # job below. The rest stay in-tree and runnable locally, just not CI-covered.
+    # (mTLS reverse proxy) test step that ci.yml's `test` job still carries. The
+    # network-namespace proofs (crates/minimald/tests/netns_root_integration.rs)
+    # run in the `minimald-root-integration` job below. The rest stay in-tree and
+    # runnable locally, just not CI-covered.
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
@@ -180,9 +178,7 @@ jobs:
     # switch-attach wiring. They create tap devices and configure network
     # namespaces, which needs CAP_NET_ADMIN, so they run under sudo; #[ignore] +
     # gated on MINIMALD_NETNS_TEST so they run only here. Needs unprivileged
-    # userns + sudo (tap/netns) and a userspace gvproxy — no KVM. The WireGuard
-    # mesh proof (networking-wg) stays out: its feature is off, so it compiles to
-    # nothing and its file name does not match the convention.
+    # userns + sudo (tap/netns) and a userspace gvproxy — no KVM.
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest

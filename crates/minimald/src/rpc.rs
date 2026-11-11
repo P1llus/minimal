@@ -3,10 +3,10 @@ use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
     CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
-    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetSessionScreen, GetVersion, GetVersionResponse, ListSessions,
-    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetSessionPolicy,
+    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
+    GetSessionScreen, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
     RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
     Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
@@ -2113,15 +2113,6 @@ async fn serve_get_session_screen(
         .await
 }
 
-async fn serve_get_mesh_status(
-    s: ServerStateHandle,
-    c: RuChannel<Msg>,
-) -> Result<(), ConnectionError> {
-    GetMeshStatus
-        .handle_channel(c, async |_req| Ok(s.mesh_status().await))
-        .await
-}
-
 /// Serves [`CLEAN_CACHE_SUBSYSTEM`]: runs a cache clean and streams its
 /// progress back as newline-delimited [`CleanCacheUpdate`]s.
 ///
@@ -3369,7 +3360,6 @@ pub async fn handle_ssh_rpc(
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
-        | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
@@ -3463,7 +3453,6 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
-        GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
         STREAM_WORKSPACE_HOOK_SCRIPTS => {

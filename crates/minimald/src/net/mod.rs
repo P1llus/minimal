@@ -47,11 +47,6 @@ pub(crate) mod relay;
 pub(crate) mod resolver;
 pub(crate) mod spec;
 
-// WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
-// default build carries no WireGuard code (R4.7).
-#[cfg(feature = "networking-wg")]
-pub mod wg;
-
 use std::collections::VecDeque;
 use std::io;
 use std::net::Ipv4Addr;
