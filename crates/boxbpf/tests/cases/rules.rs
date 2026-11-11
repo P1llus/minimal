@@ -212,3 +212,53 @@ fn rules_by_prefix_port_and_protocol_for_both_families() {
     );
     assert_eq!(stats.ev_lost, 0);
 }
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn the_unspecified_destination_is_judged_as_the_address_the_kernel_dials() {
+    let Some(mut h) = Harness::start(
+        "cases::rules::the_unspecified_destination_is_judged_as_the_address_the_kernel_dials",
+    ) else {
+        return;
+    };
+    let mut events = h.handles.take_events().expect("event source");
+    let port = servers::banner().to_string();
+
+    // Everything but loopback.
+    let no_loopback = BoxPolicy {
+        deny: vec![
+            "127.0.0.0/8".parse().expect("prefix"),
+            "::1/128".parse().expect("prefix"),
+        ],
+        ..BoxPolicy::default()
+    };
+    let live = h.install("d", host_ip(), no_loopback);
+    // The kernel dials loopback for these. The system call says no at
+    // once. Judged as written they would pass it and time out on the wire.
+    for to in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+        assert_eq!(h.probe("d", &["tcp", to, &port, "700"]), refused(), "{to}");
+        assert_eq!(h.probe("d", &["udp", to, &port]), refused(), "{to}");
+    }
+    let seen = Harness::drain(&mut events);
+    assert!(
+        seen.iter().any(|e| e.box_id == live.id().0
+            && e.hook == Hook::Connect4
+            && e.reason == Reason::Rule
+            && e.dst == IpAddr::from([127, 0, 0, 1])),
+        "{seen:?}"
+    );
+    assert!(seen.iter().all(|e| e.hook != Hook::Egress), "{seen:?}");
+
+    // A socket bound to an address dials that address, and is judged so.
+    let only_group_1 = BoxPolicy {
+        allow: vec![h.v4_group(1).parse().expect("prefix")],
+        ..BoxPolicy::default()
+    };
+    h.install("b", host_ip(), only_group_1);
+    let own = h.v4(1, 1).to_string();
+    assert_eq!(
+        h.probe("b", &["tcp-from", &own, "0.0.0.0", &port]),
+        "ok connected"
+    );
+    assert_eq!(h.probe("b", &["tcp", "0.0.0.0", &port, "700"]), refused());
+}

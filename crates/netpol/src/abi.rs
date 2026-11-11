@@ -65,8 +65,11 @@ pub struct BoxCfg {
     pub _pad: u8,
     pub refuse_errno: u16,
     pub _pad2: u16,
+    /// All zero: the box has no address of that kind.
     pub addr4: [u8; 4],
     pub addr6: [u8; 16],
+    /// The box's link-local address.
+    pub ll6: [u8; 16],
 }
 
 #[repr(C)]
@@ -350,10 +353,14 @@ pub enum Reason {
     /// The kernel had no memory to remember which box a new socket
     /// belongs to.
     NoMemory,
+    /// A bind to port 0. The kernel picks the port, as it does for a
+    /// socket that never binds, and no rule is asked. The programs report
+    /// no event for it: this is the evaluator's reason.
+    EphemeralPort,
 }
 
 impl Reason {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::NoConfig,
         Self::Rule,
         Self::SetRule,
@@ -364,6 +371,7 @@ impl Reason {
         Self::NotSteered,
         Self::NoEndpoint,
         Self::NoMemory,
+        Self::EphemeralPort,
     ];
 
     #[must_use]
@@ -379,6 +387,7 @@ impl Reason {
             Self::NotSteered => 8,
             Self::NoEndpoint => 9,
             Self::NoMemory => 10,
+            Self::EphemeralPort => 11,
         }
     }
 
@@ -399,6 +408,7 @@ impl Reason {
             Self::NotSteered => "BP_R_NOT_STEERED",
             Self::NoEndpoint => "BP_R_NO_ENDPOINT",
             Self::NoMemory => "BP_R_NO_MEMORY",
+            Self::EphemeralPort => "BP_R_EPHEMERAL_PORT",
         }
     }
 }
@@ -477,7 +487,7 @@ fn constants(out: &mut String) {
 }
 
 layouts! {
-    BoxCfg = "bp_box_cfg", 36 { flags, generation, default_action, refuse_errno, addr4, addr6 }
+    BoxCfg = "bp_box_cfg", 52 { flags, generation, default_action, refuse_errno, addr4, addr6, ll6 }
     Rule = "bp_rule", 12 { prio, proto_mask, action, port_lo, port_hi, endpoint }
     Rules = "bp_rules", 388 { count, r }
     Rule4Key = "bp_rule4_key", 24 { prefixlen, box_id, generation, dir, addr }
@@ -662,6 +672,7 @@ pub fn box_cfg(compiled: &Compiled, generation: u32) -> BoxCfg {
         _pad2: 0,
         addr4: c.addrs.v4.map_or([0; 4], |a| a.octets()),
         addr6: c.addrs.v6.map_or([0; 16], |a| a.octets()),
+        ll6: c.addrs.link_local6.map_or([0; 16], |a| a.octets()),
     }
 }
 
@@ -787,7 +798,7 @@ mod tests {
     #[test]
     fn asserts_cover_every_struct_and_constant() {
         let c = c_static_asserts();
-        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 36,"));
+        assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 52,"));
         assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
         assert!(c.contains("BP_ABI_VERSION == 3"));

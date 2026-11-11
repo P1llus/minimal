@@ -72,12 +72,32 @@ static __always_inline void sa_set(struct bpf_sock_addr *ctx, __u8 sf, __u8 fami
 	}
 }
 
+/*
+ * The kernel sends a flow to 0.0.0.0 or :: to this host: an IPv4 socket
+ * bound to an address dials that address, anything else dials loopback.
+ * The flow is judged as the address it will reach. Judged as written it
+ * would pass a deny of loopback here and time out at the packet hook, and
+ * miss a redirect.
+ */
+static __always_inline void to_this_host(const struct bpf_sock_addr *ctx, __u8 sf, struct flow *f)
+{
+	if (f->family == 4 && !f->addr[0]) {
+		__u32 bound = sf == 4 ? ctx->sk->src_ip4 : 0;
+
+		f->addr[0] = bound ? bound : bpf_htonl(0x7f000001);
+	} else if (f->family == 6 && !(f->addr[0] | f->addr[1] | f->addr[2] | f->addr[3])) {
+		f->addr[3] = bpf_htonl(1);
+	}
+}
+
 static __always_inline void sa_flow(const struct bpf_sock_addr *ctx, __u8 sf, __u8 dir,
 				    struct flow *f)
 {
 	f->dir = dir;
 	f->pbit = proto_bit(ctx->protocol);
 	f->family = sa_get(ctx, sf, f->addr);
+	if (dir == BP_DIR_EGRESS)
+		to_this_host(ctx, sf, f);
 	/* A ping socket can only send echo requests, and the type is not in
 	 * the sockaddr. */
 	if (f->pbit == BP_P_ICMP)

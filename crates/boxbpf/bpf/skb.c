@@ -167,25 +167,45 @@ static __always_inline int addr_eq(const __u32 *a, const __u32 *b)
 	return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
 }
 
-/* Sources a box with BP_F_CHECK_SRC may use besides its own address: loopback,
- * and for IPv6 the unspecified and link-local addresses the kernel's
- * neighbour discovery sends from. */
+#define ICMPV6_MLD_REPORT   131
+#define ICMPV6_MLD_DONE     132
+#define ICMPV6_ROUTER_SOL   133
+#define ICMPV6_NEIGHBOUR_SOL 135
+#define ICMPV6_MLD2_REPORT  143
+
+/*
+ * Sources a box with BP_F_CHECK_SRC may use: its own addresses and loopback.
+ * A box can bind any link-local address (IPV6_FREEBIND needs no privilege),
+ * so of those only its own passes. The unspecified IPv6 address passes for
+ * what the kernel sends before the interface has an address: duplicate
+ * address detection and the multicast reports that go with it.
+ */
 static __always_inline int src_ok(const struct bp_box_cfg *cfg, const struct pkt *p)
 {
 	__u32 own[4];
 
 	if (p->family == 4)
-		return p->saddr[0] == cfg->addr4 ||
+		return (cfg->addr4 && p->saddr[0] == cfg->addr4) ||
 		       (p->saddr[0] & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
+	if (!(p->saddr[0] | p->saddr[1] | p->saddr[2])) {
+		if (p->saddr[3] == bpf_htonl(1))
+			return 1;
+		if (!p->saddr[3])
+			return p->pbit == BP_P_ICMP && !p->later_frag &&
+			       (p->icmp_type == ICMPV6_MLD_REPORT ||
+				p->icmp_type == ICMPV6_MLD_DONE ||
+				p->icmp_type == ICMPV6_ROUTER_SOL ||
+				p->icmp_type == ICMPV6_NEIGHBOUR_SOL ||
+				p->icmp_type == ICMPV6_MLD2_REPORT);
+	}
 	/* Word compares: older clang turns a memcmp builtin into a call, which
-	 * BPF does not have. */
+	 * BPF does not have. An all-zero config address matches nothing here:
+	 * the unspecified source was dealt with above. */
 	__builtin_memcpy(own, cfg->addr6, 16);
 	if (addr_eq(p->saddr, own))
 		return 1;
-	if ((p->saddr[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000))
-		return 1;
-	return p->saddr[0] == 0 && p->saddr[1] == 0 && p->saddr[2] == 0 &&
-	       (p->saddr[3] == 0 || p->saddr[3] == bpf_htonl(1));
+	__builtin_memcpy(own, cfg->ll6, 16);
+	return addr_eq(p->saddr, own);
 }
 
 static __always_inline int to_endpoint(const struct bp_endpoint *ep, const struct pkt *p)

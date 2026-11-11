@@ -39,7 +39,9 @@ const PATTERNS: [&str; 5] = [
     "x.a.example.com",
     "other.org",
 ];
-const ADDRS: [&str; 14] = [
+const ADDRS: [&str; 16] = [
+    "0.0.0.0",
+    "::",
     "169.254.169.254",
     "fe80::1",
     "10.1.2.3",
@@ -308,7 +310,7 @@ proptest! {
         let mut d = Deployment::new(NodeKind::Guest, mode);
         d.transport_ipv6 = transport_ipv6;
         if mode == Mode::OwnIp {
-            d.addrs = BoxAddrs { v4: Some(Ipv4Addr::new(10, 1, 2, 3)), v6: None };
+            d.addrs = BoxAddrs { v4: Some(Ipv4Addr::new(10, 1, 2, 3)), ..BoxAddrs::default() };
             d.network = Some(VirtualNetwork {
                 subnet: "10.1.0.0/16".parse().unwrap(),
                 gateway: "10.1.0.1".parse().unwrap(),

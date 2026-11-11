@@ -269,10 +269,25 @@ pub fn sendto_fd(sock: &OwnedFd, to: SocketAddr) -> std::io::Result<String> {
     check(sent).map(|_| "sent".to_owned())
 }
 
+/// A local address to bind: `address`, or `address%interface` for a
+/// link-local one.
+fn local(src: &str) -> SocketAddr {
+    let (address, scope) = src.split_once('%').unwrap_or((src, ""));
+    match address.parse::<IpAddr>().expect("address") {
+        IpAddr::V6(a) if !scope.is_empty() => {
+            let name = std::ffi::CString::new(scope).expect("interface name");
+            // SAFETY: name is a valid C string.
+            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            SocketAddr::V6(std::net::SocketAddrV6::new(a, 0, 0, index))
+        }
+        a => SocketAddr::new(a, 0),
+    }
+}
+
 /// TCP connect from a chosen local address.
-fn tcp_from(src: IpAddr, to: SocketAddr, timeout: Duration) -> std::io::Result<String> {
+fn tcp_from(src: &str, to: SocketAddr, timeout: Duration) -> std::io::Result<String> {
     let sock = raw_socket(family_of(&to), libc::SOCK_STREAM, 0)?;
-    bind_fd(&sock, SocketAddr::new(src, 0))?;
+    bind_fd(&sock, local(src))?;
     connect_fd(&sock, to, timeout)
 }
 
@@ -459,11 +474,9 @@ pub fn run() {
     let args: Vec<&str> = spec.split(' ').collect();
     let result = match args.as_slice() {
         ["tcp", ip, port, rest @ ..] => report(tcp(addr(ip, port), millis(rest.first(), 2000))),
-        ["tcp-from", src, ip, port, rest @ ..] => report(tcp_from(
-            src.parse().expect("address"),
-            addr(ip, port),
-            millis(rest.first(), 1500),
-        )),
+        ["tcp-from", src, ip, port, rest @ ..] => {
+            report(tcp_from(src, addr(ip, port), millis(rest.first(), 1500)))
+        }
         ["udp", ip, port, rest @ ..] => {
             let to = addr(ip, port);
             let wait = millis(rest.first(), 0);

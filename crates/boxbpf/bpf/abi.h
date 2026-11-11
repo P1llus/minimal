@@ -52,8 +52,9 @@ struct bp_box_cfg {
 	__u8  _pad;
 	__u16 refuse_errno; /* for a refused system call; 0 means EPERM */
 	__u16 _pad2;
-	__u32 addr4;
+	__u32 addr4;     /* the box's addresses; all zero: none of that kind */
 	__u8  addr6[16];
+	__u8  ll6[16];   /* its link-local address */
 };
 
 #define BP_RULES_MAX 32
@@ -216,6 +217,7 @@ struct bp_ev_hdr {
 #define BP_R_NOT_STEERED 8 /* packet to a redirect destination no system-call hook rewrote */
 #define BP_R_NO_ENDPOINT 9 /* redirect without an endpoint address of the flow's family */
 #define BP_R_NO_MEMORY   10 /* no memory to remember which box a new socket belongs to */
+#define BP_R_EPHEMERAL_PORT 11 /* never in an event: the evaluator's reason for a bind to port 0 */
 
 struct bp_ev_net {
 	struct bp_ev_hdr hdr;

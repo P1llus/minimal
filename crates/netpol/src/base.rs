@@ -54,6 +54,9 @@ impl Mode {
 pub struct BoxAddrs {
     pub v4: Option<Ipv4Addr>,
     pub v6: Option<Ipv6Addr>,
+    /// The link-local address of the box's interface. The kernel sends
+    /// neighbour discovery from it, so the source check must know it.
+    pub link_local6: Option<Ipv6Addr>,
 }
 
 /// The virtual network a box, or the node of a `host_ip` box, sits on.
@@ -125,7 +128,11 @@ impl Deployment {
         Self {
             node,
             mode,
-            addrs: BoxAddrs { v4: None, v6: None },
+            addrs: BoxAddrs {
+                v4: None,
+                v6: None,
+                link_local6: None,
+            },
             network: None,
             transport_ipv6: false,
             host_exposures: Vec::new(),
@@ -174,7 +181,11 @@ impl BasePolicy {
             },
             endpoints: Vec::new(),
             source_check: false,
-            addrs: BoxAddrs { v4: None, v6: None },
+            addrs: BoxAddrs {
+                v4: None,
+                v6: None,
+                link_local6: None,
+            },
         }
     }
 }

@@ -142,6 +142,9 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         IpAddr::V6(h.v6(0x0201)),
         "::1".parse().expect("address"),
         "fd77::1".parse().expect("address"),
+        // The kernel dials loopback for these two.
+        "0.0.0.0".parse().expect("address"),
+        "::".parse().expect("address"),
     ];
     let mut flows = Vec::new();
     for remote in remotes {
@@ -164,7 +167,7 @@ fn kernel_and_evaluator_agree_on_a_table_of_flows() {
         "::1".parse().expect("address"),
     ] {
         for protocol in [Protocol::Tcp, Protocol::Udp] {
-            for port in [18200, 18210, 18211] {
+            for port in [18200, 18210, 18211, 0] {
                 flows.push(Flow {
                     direction: Direction::Bind,
                     protocol,

@@ -1,6 +1,6 @@
 //! Judging a flow in Rust, the way the kernel programs judge it.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,8 +56,27 @@ pub fn canonical(addr: IpAddr) -> IpAddr {
     }
 }
 
-const fn is_link_local6(a: Ipv6Addr) -> bool {
-    a.segments()[0] & 0xffc0 == 0xfe80
+/// ICMPv6 types a host sends before it has an address to send from:
+/// multicast listener reports and done, router solicitation, and the
+/// neighbour solicitation of duplicate address detection.
+const fn sent_unaddressed(icmp_type: u16) -> bool {
+    matches!(icmp_type, 131..=133 | 135 | 143)
+}
+
+/// Where the kernel sends a flow to the unspecified address: this host. An
+/// IPv4 socket bound to an address dials that address, anything else
+/// dials loopback.
+fn dialled(remote: IpAddr, local: Option<IpAddr>) -> IpAddr {
+    match (remote, local.map(canonical)) {
+        (IpAddr::V4(a), Some(IpAddr::V4(bound)))
+            if a.is_unspecified() && !bound.is_unspecified() =>
+        {
+            IpAddr::V4(bound)
+        }
+        (IpAddr::V4(a), _) if a.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        (IpAddr::V6(a), _) if a.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        _ => remote,
+    }
 }
 
 fn first_match(slots: &[Slot], flow: &Flow, below: Option<u16>) -> Option<Slot> {
@@ -69,16 +88,17 @@ fn first_match(slots: &[Slot], flow: &Flow, below: Option<u16>) -> Option<Slot> 
 }
 
 impl Compiled {
-    /// Whether a packet from `local` passes the source check.
-    fn source_ok(&self, local: IpAddr) -> bool {
+    /// Whether a packet of `flow` from `local` passes the source check:
+    /// from one of the box's own addresses or loopback. The unspecified
+    /// IPv6 address passes for what a host sends before it has an address.
+    fn source_ok(&self, local: IpAddr, flow: &Flow) -> bool {
+        let own = &self.config.addrs;
         match local {
-            IpAddr::V4(a) => self.config.addrs.v4 == Some(a) || a.is_loopback(),
-            IpAddr::V6(a) => {
-                self.config.addrs.v6 == Some(a)
-                    || a.is_loopback()
-                    || a.is_unspecified()
-                    || is_link_local6(a)
+            IpAddr::V4(a) => own.v4 == Some(a) || a.is_loopback(),
+            IpAddr::V6(a) if a.is_unspecified() => {
+                flow.protocol == Protocol::Icmp && sent_unaddressed(flow.port)
             }
+            IpAddr::V6(a) => own.v6 == Some(a) || own.link_local6 == Some(a) || a.is_loopback(),
         }
     }
 
@@ -89,13 +109,27 @@ impl Compiled {
     /// The kernel judges new flows only: a TCP segment after the SYN, a UDP
     /// packet to a peer the other direction admitted, and an ICMP echo reply
     /// pass without a verdict.
+    ///
+    /// Two cases are judged as the kernel acts on them. An egress flow to
+    /// `0.0.0.0` or `::` is judged as the address the kernel dials for it.
+    /// A bind to port 0 asks for an ephemeral port and is not judged.
     #[must_use]
     pub fn evaluate(&self, flow: &Flow, pinned: Option<SetId>) -> Decision {
-        let remote = canonical(flow.remote);
+        let mut remote = canonical(flow.remote);
+        if flow.direction == Direction::Egress {
+            remote = dialled(remote, flow.local);
+        }
+        if flow.direction == Direction::Bind && flow.port == 0 {
+            return Decision {
+                verdict: FlowVerdict::Allow,
+                rule: None,
+                reason: Reason::EphemeralPort,
+            };
+        }
         if flow.direction == Direction::Egress
             && self.config.source_check
             && let Some(local) = flow.local
-            && !self.source_ok(canonical(local))
+            && !self.source_ok(canonical(local), flow)
         {
             return Decision {
                 verdict: FlowVerdict::Deny,
@@ -169,7 +203,8 @@ impl Compiled {
 ///
 /// Returns the position and action of the first matching rule, or `None`
 /// and the default. This is the reference [`Compiled::evaluate`] is tested
-/// against.
+/// against. It reads a flow the same way: the unspecified destination is
+/// the address the kernel dials, and a bind to port 0 is not judged.
 #[must_use]
 pub fn evaluate_ordered(
     rules: &[Rule],
@@ -178,7 +213,13 @@ pub fn evaluate_ordered(
     flow: &Flow,
     name: Option<&str>,
 ) -> (Option<usize>, Action) {
-    let remote = canonical(flow.remote);
+    if flow.direction == Direction::Bind && flow.port == 0 {
+        return (None, Action::Allow);
+    }
+    let mut remote = canonical(flow.remote);
+    if flow.direction == Direction::Egress {
+        remote = dialled(remote, flow.local);
+    }
     let around: Vec<&Prefix> = protected
         .iter()
         .filter(|range| flow.direction == Direction::Egress && range.contains(remote))
@@ -382,7 +423,103 @@ mod tests {
         assert_eq!(c.evaluate(&flow, None).reason, Reason::SourceAddress);
         flow.local = Some("127.0.0.1".parse().unwrap());
         assert_eq!(c.evaluate(&flow, None).verdict, FlowVerdict::Allow);
-        flow.local = Some("fe80::1".parse().unwrap());
-        assert_eq!(c.evaluate(&flow, None).verdict, FlowVerdict::Allow);
+    }
+
+    #[test]
+    fn a_link_local_source_must_be_the_box_s_own() {
+        let mut b = base();
+        b.source_check = true;
+        b.addrs.v6 = Some("fd00:99::2".parse().unwrap());
+        b.addrs.link_local6 = Some("fe80::99:2".parse().unwrap());
+        b.defaults.egress = Verdict::Allow;
+        let c = compile(&b, &BoxPolicy::default(), Options::default()).unwrap();
+        let from = |local: &str, protocol, port| {
+            let mut flow = egress(protocol, "fd00:99::9", port);
+            flow.local = Some(local.parse().unwrap());
+            c.evaluate(&flow, None).reason
+        };
+        assert_eq!(from("fe80::99:2", Protocol::Udp, 53), Reason::Default);
+        assert_eq!(from("fd00:99::2", Protocol::Udp, 53), Reason::Default);
+        assert_eq!(from("::1", Protocol::Udp, 53), Reason::Default);
+        // Another host's link-local address, which a box can bind.
+        assert_eq!(from("fe80::99:3", Protocol::Udp, 53), Reason::SourceAddress);
+        assert_eq!(
+            from("fe80::99:3", Protocol::Icmp, 135),
+            Reason::SourceAddress
+        );
+        // The unspecified address: duplicate address detection and the
+        // multicast reports before it, nothing else.
+        for icmp_type in [131, 132, 133, 135, 143] {
+            assert_eq!(from("::", Protocol::Icmp, icmp_type), Reason::Default);
+        }
+        assert_eq!(from("::", Protocol::Icmp, 128), Reason::SourceAddress);
+        assert_eq!(from("::", Protocol::Icmp, 136), Reason::SourceAddress);
+        assert_eq!(from("::", Protocol::Udp, 53), Reason::SourceAddress);
+    }
+
+    #[test]
+    fn a_box_without_an_ipv4_address_sends_nothing_from_the_unspecified_one() {
+        let mut b = base();
+        b.source_check = true;
+        b.addrs.v6 = Some("fd00:99::2".parse().unwrap());
+        b.defaults.egress = Verdict::Allow;
+        let c = compile(&b, &BoxPolicy::default(), Options::default()).unwrap();
+        let mut flow = egress(Protocol::Udp, "10.99.0.1", 67);
+        flow.local = Some("0.0.0.0".parse().unwrap());
+        assert_eq!(c.evaluate(&flow, None).reason, Reason::SourceAddress);
+    }
+
+    #[test]
+    fn the_unspecified_destination_is_judged_as_what_the_kernel_dials() {
+        let policy = BoxPolicy {
+            deny: vec!["127.0.0.0/8".parse().unwrap(), "::1/128".parse().unwrap()],
+            allow: vec!["10.1.0.0/16".parse().unwrap()],
+            default: Some(Verdict::Allow),
+            ..BoxPolicy::default()
+        };
+        let c = compile(&base(), &policy, Options::default()).unwrap();
+        for to in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let d = c.evaluate(&egress(Protocol::Tcp, to, 80), None);
+            assert_eq!(
+                (d.verdict, d.reason),
+                (FlowVerdict::Deny, Reason::Rule),
+                "{to}"
+            );
+        }
+        // An IPv4 socket bound to an address dials that address.
+        let mut bound = egress(Protocol::Tcp, "0.0.0.0", 80);
+        bound.local = Some("10.1.2.3".parse().unwrap());
+        let d = c.evaluate(&bound, None);
+        assert_eq!((d.verdict, d.rule), (FlowVerdict::Allow, Some(2)));
+        // A bind to the unspecified address is a wildcard bind, not a flow
+        // to loopback.
+        let wildcard = Flow {
+            direction: Direction::Bind,
+            ..egress(Protocol::Tcp, "0.0.0.0", 8080)
+        };
+        assert_eq!(c.evaluate(&wildcard, None).reason, Reason::Default);
+    }
+
+    #[test]
+    fn a_bind_to_port_zero_is_not_judged() {
+        let mut b = base();
+        b.defaults.bind = Verdict::Deny;
+        b.before.push(Rule::new(
+            Direction::Bind,
+            Target::Any,
+            Action::Deny,
+            Origin::OtherEndpoints,
+        ));
+        let c = compile(&b, &BoxPolicy::default(), Options::default()).unwrap();
+        let bind = |port| Flow {
+            direction: Direction::Bind,
+            ..egress(Protocol::Tcp, "127.0.0.1", port)
+        };
+        let d = c.evaluate(&bind(0), None);
+        assert_eq!(
+            (d.verdict, d.rule, d.reason),
+            (FlowVerdict::Allow, None, Reason::EphemeralPort)
+        );
+        assert_eq!(c.evaluate(&bind(8080), None).verdict, FlowVerdict::Deny);
     }
 }
