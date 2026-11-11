@@ -221,9 +221,9 @@ impl VmConfig {
         );
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
-        // the one line that says what the guest was told to boot with — a
-        // missing or mistyped parameter (`ipv6.disable=1` among them) is
-        // diagnosable from the host before the guest says anything.
+        // the one line that says what the guest was told to boot with, so a
+        // missing or mistyped parameter shows on the host before the guest
+        // says anything.
         // The telemetry tokens by name only (TEL-040): minvmd's info log is
         // exported and spooled when telemetry is on.
         tracing::info!(
@@ -995,8 +995,7 @@ mod tests {
 
     #[test]
     fn kernel_cmdline_without_a_host_filter_is_the_base_boot_line() {
-        // The base line exactly: console plus IPv6 disabled, no empty token,
-        // no trailing space.
+        // The base line exactly: no empty token, no trailing space.
         assert_eq!(kernel_cmdline(None, None, false), "console=hvc0");
     }
 
@@ -1032,8 +1031,8 @@ mod tests {
     #[test]
     fn kernel_cmdline_skips_a_filter_containing_whitespace() {
         // The kernel would split these into separate boot tokens, silently
-        // corrupting the line, so the whole value is dropped — the base line
-        // still boots, IPv6 disabled.
+        // corrupting the line, so the whole value is dropped and the base
+        // line still boots.
         assert_eq!(
             kernel_cmdline(Some("info, russh=debug"), None, false),
             "console=hvc0"
@@ -1518,7 +1517,7 @@ mod tests {
             "MINIMAL_TELEMETRY=1".to_string(),
             "MINIMAL_OTEL_FILTER=info,minimald::net=debug".to_string(),
         ];
-        // Relative to the base line, which upstream owns (it gained ipv6.disable=1).
+        // Relative to the base line.
         assert_eq!(
             with_guest_env(kernel_cmdline(Some("info"), None, false), &tokens),
             format!(
