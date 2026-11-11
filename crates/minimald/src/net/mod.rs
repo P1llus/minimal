@@ -50,6 +50,13 @@ pub(crate) mod door;
 // Whether a box's network policy can be enforced on this host.
 pub(crate) mod endpoints;
 pub(crate) mod engine;
+#[allow(
+    dead_code,
+    reason = "no caller until the engine reports listening sockets"
+)]
+pub(crate) mod listens;
+#[allow(dead_code, reason = "no caller until the guest wires its own network")]
+pub(crate) mod nl;
 #[allow(dead_code, reason = "no caller until own_ip runs on the engine")]
 pub(crate) mod publish;
 #[allow(dead_code, reason = "no caller until boxes have a host relay endpoint")]

@@ -120,6 +120,9 @@ tracing-opentelemetry.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core.workspace = true
+netlink-packet-route.workspace = true
+netlink-sys.workspace = true
 tokio-vsock.workspace = true
 vsock.workspace = true
 

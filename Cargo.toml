@@ -179,6 +179,10 @@ lzma-rs = "0.3"
 # LALRPOP grammar pre-generated, while a git checkout regenerates it in the
 # build script on every cold build (minutes, far longer under emulated cross
 # builds). Prefer waiting for a release over pinning a git rev again.
+# The guest daemon's bridge and the veth pairs of its boxes.
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.34"
+netlink-sys = "0.9"
 nickel-lang-core = { version = "0.19", default-features = false, features = ["format"] }
 
 opentelemetry-semantic-conventions = "0.33"
