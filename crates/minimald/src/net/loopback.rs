@@ -38,9 +38,14 @@ pub use ::switch::loopback::{RangeProbe, probe};
 #[cfg(any(test, feature = "test-support"))]
 static PROBE_STANDIN: std::sync::Mutex<Option<fn() -> RangeProbe>> = std::sync::Mutex::new(None);
 
+/// Serialises the tests that install a probe stand-in, and the tests whose
+/// creates must not see another test's.
+#[cfg(test)]
+pub(crate) static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Installs the probe a test wants the session-start path to see.
 ///
-/// The tests that use this take the probe-test mutex in rpc.rs's test module
+/// The tests that use this take [`PROBE_TEST_MUTEX`]
 /// for the whole install→create→assert→clear window: under libtest the tests
 /// of one binary share a process, and a concurrent create would read the
 /// stand-in too.

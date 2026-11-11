@@ -82,16 +82,6 @@ pub(crate) struct MockLauncher {
     /// observe network teardown; `None` for the plain mock (mirroring
     /// `HostNet`/`NoNet`).
     net_guard: Option<Box<dyn sandbox::NetGuard>>,
-    /// The placement outcome this mock launch reports (NET-079): seeded by
-    /// the session's test launcher from the daemon's one node fact —
-    /// `per_box` when the fact's cause says the tree is there to place a
-    /// leaf in (`fact_places_a_leaf`), `none` when it does not — so a test
-    /// that injects a classifier reading and re-reads the fact has the
-    /// launches it drives record each box's own placement outcome over it.
-    /// The mock has no sandbox, so it places nothing and models the
-    /// placement's outcome; the real launcher's placement-to-record mapping
-    /// is pinned where it is written, in this module's launch proofs.
-    host_ip_enforcement: Option<HostIpEnforcement>,
     /// The listen plan this mock launch carries in its [`Launched`], so a
     /// test can drive the host's listener watcher over the mock box the way
     /// a real launch drives one over a sandboxed box — and, left `None`,
@@ -114,26 +104,6 @@ impl MockLauncher {
         Self {
             net_guard: Some(net_guard),
             ..Default::default()
-        }
-    }
-
-    /// A mock whose launch carries `host_ip_enforcement` as its placement
-    /// outcome — the value the session's test launcher seeds from the
-    /// daemon's node fact, so a test's launches record each box's own
-    /// outcome over the fact a test's injected reading set.
-    pub(crate) fn with_host_ip_enforcement(host_ip_enforcement: HostIpEnforcement) -> Self {
-        Self {
-            host_ip_enforcement: Some(host_ip_enforcement),
-            ..Default::default()
-        }
-    }
-
-    /// This mock with `net_guard` attached as well, so a test can observe
-    /// the teardown of a host-address box's launch.
-    pub(crate) fn and_net_guard(self, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
-        Self {
-            net_guard: Some(net_guard),
-            ..self
         }
     }
 
@@ -180,7 +150,6 @@ impl BoxLauncher for MockLauncher {
 
     async fn launch(
         self,
-        _guest: bool,
         _session_id: boxes::SessionId,
         _name: String,
         _username: String,
@@ -252,9 +221,6 @@ impl BoxLauncher for MockLauncher {
             guard: (),
             net_guard: self.net_guard,
             tty_path,
-            // The mock has no sandbox, so no classifier placed it anywhere.
-            leaf: None,
-            host_ip_enforcement: self.host_ip_enforcement,
             // The plan the launch gathered, riding to the host the way a
             // real launch's plan rides: taken when the host builds.
             listen_plan: self.listen_plan,

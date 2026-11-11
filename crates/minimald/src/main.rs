@@ -843,130 +843,12 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         guest::apply_microvm_sysctls();
     }
 
-    // NET-079: the daemon's own classifier leaf, entered at start so its own
-    // traffic is decided as the daemon's (NET-080), never classed with a
-    // box's, and so the daemon sits in a *sibling* of every box leaf — never
-    // above them, where a controller it enabled could make the box leaves
-    // domain invalid (spike finding F). Each box then joins its own leaf in
-    // the sandbox's pre-exec closure and unshares its cgroup namespace onto
-    // it, which is what keeps a box out of every other leaf on the tree (see
-    // `sandbox::classifier`).
-    //
-    // In the guest this is pid 1, which mounts cgroup2 itself
-    // (`guest::enter_rootfs`) and so builds the tree here; a tree it could
-    // not build is a broken image, not a deployment state, and
-    // `box_runtime` refuses a host-address box on it (design §7.1).
-    // Natively the installer installs the tree and delegates it to this
-    // account, and entering it is a migration whose common ancestor this
-    // daemon can write only from *inside* the tree: the installer's `--pid`
-    // step or a `Delegate=yes` unit places it. A daemon left outside keeps
-    // running and places no box — `create_session_leaf` decides that per
-    // launch, by migrating a throwaway child, so no box is ever spawned into
-    // a join it dies making.
-    let tree_root = std::path::Path::new(sandbox::classifier::TREE_ROOT);
-    if let Err(e) = sandbox::classifier::enter_daemon_leaf(tree_root) {
-        if guest::is_microvm_daemon() {
-            tracing::error!(
-                error = %e,
-                tree = sandbox::classifier::TREE_ROOT,
-                "entering the daemon's own classifier leaf: this guest image \
-                 cannot decide per box, and host-address boxes will be refused"
-            );
-        } else {
-            tracing::warn!(
-                error = %e,
-                tree = sandbox::classifier::TREE_ROOT,
-                daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),
-                install = %sandbox::classifier::install_hint(),
-                "entering the daemon's own classifier leaf failed, so every \
-                 box launch now decides its placement by whether it can \
-                 migrate into the tree: enter it with the installer's --pid \
-                 step, or start the daemon from a Delegate=yes unit"
-            );
-        }
-    }
-
-    // NET-079: the empty leaves a daemon death left behind are swept here, at
-    // the next start, so a leaf named by a session's id is never mistaken for
-    // a leftover its next launch could take: a fresh launch finding one
-    // reports the collision. A leaf that still holds a session refuses its
-    // own removal and stays, which is the emptiness the sweep tests by.
-    match sandbox::classifier::sweep_box_leaves(tree_root) {
-        Ok(swept) if swept.is_empty() => {}
-        Ok(swept) => tracing::info!(
-            count = swept.len(),
-            leaves = ?swept
-                .iter()
-                .map(|leaf| leaf.display().to_string())
-                .collect::<Vec<_>>(),
-            "swept the empty classifier leaves a previous daemon left behind"
-        ),
-        Err(e) => tracing::debug!(
-            error = %e,
-            "sweeping the box cohort at start"
-        ),
-    }
-
-    // NET-079: the guest's own classifier boot, after the tree above exists
-    // and before the start-up decision reads it — the one host whose table this
-    // daemon loads itself, because its kernel is its image's alone and no
-    // person can run an installer inside a microVM. [`boot_guest_classifier`]
-    // runs it in the one order its halves can keep: loopback up first —
-    // nothing else in the boot has brought `lo` up by this point, and the
-    // probe's listener on 127.0.0.1 is a bind on an address a guest without
-    // its loopback up does not carry — then the listeners the effect probe
-    // connects to, held for the daemon's life because the probe's evidence
-    // is a port that is refused whenever a launch looks, not one the probe
-    // brings with it, then the load itself: the installer's table rendered
-    // for the tree this daemon just entered its own leaf of, checked with
-    // `nft -c`, loaded in one transaction, the presence marker written only
-    // once it loaded. The load logs its own outcome — check line and load
-    // line with the digest of the exact bytes it piped — and nothing here
-    // branches on it: the start-up decision after the bind
-    // (`read_host_ip_enforcement_fact`) is the fact's own reader, and a
-    // boot whose load failed reports the guest as unable to decide per box
-    // exactly as a native host without the step does.
-    if guest::is_microvm_daemon() {
-        // NET-078's two source identities are the guest's own address on a
-        // guest — the cohort and the node plane share it — but the render is
-        // told them as the two inputs they are, never left to assume.
-        let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
-        let render = minimald::net::classifier::GuestRender {
-            tree_root,
-            // The listener the deny subtree's DNS-port lookups are dstnat'd
-            // onto (NET-079): the guest's loopback answerer, which refuses
-            // every name outside the box zone and forwards the zone's A
-            // questions to the switch gateway alone.
-            answerer_address: minimald::net::guest_dns::LISTENER_ADDRESS,
-            answerer_port: minimald::net::guest_dns::LISTENER_PORT,
-            cohort_address: identity,
-            node_plane_address: identity,
-            ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
-            // BEP-083: the proxy's listener, whose address the table refuses
-            // to every box whose own leaf is not in the lane set.
-            proxy_listener: std::net::SocketAddrV4::new(
-                minimald::net::DEFAULT_SUBNET.box_egress_proxy_address(),
-                boxes::core::egress::PROXY_LISTENER_PORT,
-            ),
-            mountinfo_override: None,
-        };
-        minimald::net::classifier::boot_guest_classifier(
-            guest::bring_up_loopback,
-            minimald::net::classifier::hold_probe_listeners,
-            || {
-                minimald::net::classifier::load_guest_table(
-                    std::path::Path::new(minimald::net::classifier::GUEST_BASH),
-                    std::path::Path::new(minimald::net::classifier::GUEST_NFT),
-                    &render,
-                )
-            },
-        );
-        // NET-079: the guest's DNS listener, after the boot above brought the
-        // loopback up — its bind is on 127.0.0.1 — and after the table that
-        // steers the deny subtree's lookups onto it loaded. The daemon's own
-        // lookups are untouched: they are keyed by the cgroup the daemon runs
-        // in, which the deny subtree's rules never match.
-        minimald::net::guest_dns::start(minimald::net::DEFAULT_SUBNET).await;
+    // The guest's kernel leaves `lo` down, and the guest's own listeners
+    // bind on it.
+    if guest::is_microvm_daemon()
+        && let Err(e) = guest::bring_up_loopback()
+    {
+        tracing::error!(error = %e, "bringing up the guest's loopback interface");
     }
 
     // R1.5/R1.6: when the microVM config requested a data volume
@@ -1279,21 +1161,6 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "listening to socket"))?;
 
         tracing::info!("Started listening on {}", cli.listen_on());
-        request_daemon_placement(tree_root).await;
-        // gominimal/inbox#1054: a native daemon re-reads the fact each time
-        // its own cgroup changes, so a placement that lands after the
-        // start-up reading (`min finalize-install` under a running daemon, a
-        // late placer) reaches the creates that follow. The tree the daemon
-        // answers over, and its own mount table read live (no knob).
-        minimald::box_runtime::read_fact_and_watch_placement(
-            tree_root.to_path_buf(),
-            None,
-            minimald::guest::is_microvm_daemon(),
-            minimald::box_runtime::OWN_CGROUP_POLL,
-            sandbox::classifier::own_cgroup_path,
-            || read_host_ip_enforcement_fact(tree_root),
-        )
-        .await;
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
             "Run the following to debug the socket:\n\nssh \\\n\t{} \\\n\t{}",
@@ -1340,8 +1207,6 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         }
 
         tracing::info!("Started listening on vsock:{port_num}");
-        read_host_ip_enforcement_fact(tree_root);
-
         // `guest.ready`: the beacon to the host, a child of the host's
         // `vm.boot` when minvmd passed its `TRACEPARENT` on the boot line
         // (the guest's only environment; telemetry on only).
@@ -1362,162 +1227,6 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
-    }
-}
-
-/// NET-079: asks the placement unit `min finalize-install` installs to put
-/// this native daemon in its classifier leaf, once the listener the placer
-/// finds it by is bound, and waits for the placer to finish, so the
-/// start-up reading below is taken from where the placement left the
-/// daemon. A daemon already in its leaf (a `Delegate=yes` unit, or the
-/// entry at start) asks for nothing, and a host without the unit answers
-/// at once. Each outcome is one line in the daemon's log.
-async fn request_daemon_placement(tree_root: &std::path::Path) {
-    use minimald::net::classifier::{self, PlaceRequest};
-    if minimald::guest::is_microvm_daemon() || classifier::daemon_fetch_leaf(tree_root).is_some() {
-        return;
-    }
-    let request = minimald::traced::spawn_blocking(|| {
-        classifier::request_daemon_placement(
-            std::path::Path::new(paths::PLACE_REQUEST_SOCKET),
-            classifier::PLACE_REQUEST_WAIT,
-        )
-    })
-    .await;
-    match request {
-        // A closed connection is not a placement: systemd also closes one it
-        // will not serve (over the socket's `MaxConnections=`), and a placer
-        // can exit without finding this daemon. Only the leaf says whether
-        // the request placed it.
-        Ok(PlaceRequest::Answered) if classifier::daemon_fetch_leaf(tree_root).is_some() => {
-            tracing::info!(
-                socket = paths::PLACE_REQUEST_SOCKET,
-                "the placement unit placed this daemon in its classifier leaf"
-            )
-        }
-        Ok(PlaceRequest::Answered) => tracing::warn!(
-            socket = paths::PLACE_REQUEST_SOCKET,
-            "the placement unit closed this daemon's placement request without placing it, \
-             so it runs outside its classifier leaf"
-        ),
-        Ok(PlaceRequest::NoPlacer(e)) => tracing::info!(
-            socket = paths::PLACE_REQUEST_SOCKET,
-            error = %e,
-            "no placement unit answers on this host, so nothing placed this daemon at start"
-        ),
-        Ok(PlaceRequest::NoAnswer(e)) => tracing::warn!(
-            socket = paths::PLACE_REQUEST_SOCKET,
-            error = %e,
-            wait_secs = classifier::PLACE_REQUEST_WAIT.as_secs(),
-            "the placement unit did not finish placing this daemon in time"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "the placement request did not run"
-        ),
-    }
-}
-
-/// NET-079: the start-time fact this daemon answers every create with —
-/// whether this host can decide a host-address box's egress verdict per box,
-/// and why not when it cannot. Read with its probe attached, because the fact
-/// it rests on is the table's *effect* (design §7.4), and read again before
-/// each host-address launch.
-///
-/// It runs once the control socket is bound and the daemon has entered its
-/// own classifier leaf, never earlier. A native daemon is placed in the tree
-/// by the installer's `--pid` step or a `Delegate=yes` unit. A read taken
-/// before the daemon stands in its leaf finds no placement for the probe's
-/// child and reads the table as unreadable, which a host that decides per
-/// box is not. A create that still finds that cause re-reads the host itself
-/// (`box_manager`).
-///
-/// The one info line names the probe's outcome on every host. On a host
-/// that cannot decide per box it also names the cause, the command that
-/// ends it when one exists, and what this host does with the boxes.
-fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
-    let guest = minimald::guest::is_microvm_daemon();
-    // The placement is read once, for both the fact and the log lines: the
-    // placement unit answers asynchronously, so two reads could disagree.
-    let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
-    let in_leaf = minimald::net::classifier::daemon_in_leaf(tree_root);
-    // A membership read that failed for another reason than a missing leaf
-    // proves neither placement nor absence: it gets its own line, and never
-    // the absence line below.
-    let membership_unknown = matches!(
-        &in_leaf,
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound
-    );
-    if !guest
-        && let Err(e) = &in_leaf
-        && membership_unknown
-    {
-        tracing::warn!(
-            error = %e,
-            leaf = %daemon_leaf.display(),
-            "reading this daemon's classifier leaf membership failed, so whether \
-             it stands in its leaf is unknown. It counts as unplaced: a probe that \
-             cannot read the table is then reported as the daemon's placement, \
-             and a placed deny-all box is still refused"
-        );
-    }
-    let placed = matches!(in_leaf, Ok(true));
-    let unplaced = minimald::net::classifier::unplaced_over(&in_leaf);
-    // An unreadable probe read by a daemon outside its own leaf is that
-    // daemon's placement, not the table's: it places no box, so it refuses
-    // none, and its fact says so (gominimal/minimal#3067).
-    let classifier_decision = minimald::net::classifier::decide_now(
-        tree_root,
-        sandbox::classifier::own_mountinfo().as_deref(),
-        guest,
-    )
-    .over_daemon_placement(guest, unplaced);
-    // The daemon's node half of per-box egress enforcement: seeded here, so
-    // the daemon's first create answer already names this host, and
-    // refreshed by each host-address launch's own re-read.
-    minimald::box_runtime::set_host_ip_enforcement_fact(&classifier_decision);
-    // gominimal/inbox#1206: a native daemon outside its leaf on a host whose
-    // tree is installed is its own state, with its own remedy, so it gets
-    // its own line beside the probe's: the probe reads it only as a table
-    // whose effect could not be read.
-    // A host without the step has no leaf to miss, and its own cause says
-    // so; the line is for a daemon outside an installed tree's leaf.
-    if !guest
-        && unplaced
-        && !membership_unknown
-        && (daemon_leaf.is_dir()
-            || classifier_decision.cause()
-                == Some(minimald::net::classifier::Cause::DaemonNotPlaced))
-    {
-        tracing::warn!(
-            leaf = %daemon_leaf.display(),
-            daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),
-            pid = std::process::id(),
-            "this daemon is not in its classifier leaf, so it cannot decide a \
-             host-address box's egress verdict per box. Run min finalize-install to \
-             place it. It also reinstalls the unit that places the daemon at every \
-             start when that unit is missing or out of date."
-        );
-    }
-    match classifier_decision.cause() {
-        Some(cause) => tracing::info!(
-            tree = sandbox::classifier::TREE_ROOT,
-            daemon_placed = placed,
-            probe = "undecided",
-            cause = cause.detail(),
-            install = ?cause.install_command(),
-            host_ip_enforcement = "none",
-            "this host cannot decide a host-address box's egress verdict \
-             per box, so {}",
-            cause.host_ip_box_outcome(guest)
-        ),
-        None => tracing::info!(
-            tree = sandbox::classifier::TREE_ROOT,
-            daemon_placed = placed,
-            probe = "decided",
-            host_ip_enforcement = "per_box",
-            "this host decides a host-address box's egress verdict per box"
-        ),
     }
 }
 

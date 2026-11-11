@@ -115,8 +115,9 @@ pub(crate) fn own_address_build_network(
         boxes::EGRESS_DEFAULT_PHASE,
         deny_all_opt_out,
     );
-    let denies_all =
-        crate::net::classifier::verdict_of(egress.as_ref()) == sandbox::config::Verdict::Deny;
+    let denies_all = egress
+        .as_ref()
+        .is_some_and(boxes::EgressPolicy::admits_nothing);
     let admits_name = move |host: &str| crate::net::dns_gate::admits_name(egress.as_ref(), host);
     let record = record.clone();
     let switch = Arc::clone(switch);

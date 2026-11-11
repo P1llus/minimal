@@ -12,7 +12,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use crate::net::classifier::{record_node_plane_fetch, url_host, url_object};
+use common::fetchers::AnyUrl;
 use futures::{Stream, StreamExt as _};
 use ot::{OpId, OpSnapshot, OpStartHook, OpTracker, Operation, Progress};
 
@@ -221,27 +221,124 @@ fn record_fetch(record: &FetchRecord, scope: Option<&HashSet<String>>, op: &Oper
         Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
         _ => return,
     };
-    record_node_plane_fetch(&record.box_id, record.leaf, &host, &object);
+    tracing::info!(
+        host = %host,
+        box_id = %record.box_id,
+        object = %object,
+        "the daemon's own fetch is node-plane traffic, made in the daemon's own process and \
+         never the box's"
+    );
 }
 
-/// NET-080: the context the daemon's own fetches are recorded under — the
-/// facts an install knows when it starts, spelled once so each fetch's
-/// record is only the fetch's own: the box the fetch was made for, the host
-/// the configured remote cache is fetched from, the object each package in
-/// the install's scope is spelled as, and the leaf the daemon's own fetches
-/// leave from. The record is the daemon's evidence that a fetch a box's
-/// install triggered was the daemon's own node-plane traffic, never the
-/// box's, so it names the box — the way the classifier tree names it, by
-/// its leaf — that asked for the fetch it survived to make.
+/// The host a fetch location is fetched from, spelled for the two forms the
+/// configured remote cache takes: the mirror URL's own host, or the bucket
+/// a GCS location names. The mirror's host is read from the URL the
+/// newtype holds — its own `host_str` for the host, its own `port` for the
+/// port — never from a rendering of it: a `Debug` print is a formatting
+/// choice of the newtype's, and a spelling that changes with it changes
+/// which host the record names while nothing else does. The port rides the
+/// one rule every fetch kind's host field carries: a mirror on a
+/// non-default port is named with it, one on https's own default without.
+pub(crate) fn cache_host(location: &AnyUrl) -> String {
+    match location {
+        // The mirror is an https location, so the one port rule reads its
+        // scheme as https: 443 is the default it drops.
+        AnyUrl::Https(https) => {
+            host_field(https.host_str().unwrap_or_default(), https.port(), "https")
+        }
+        AnyUrl::Gcs(gcs) => gcs.bucket.clone(),
+    }
+}
+
+/// The host inside an authority: the authority minus any userinfo before
+/// the last `@`. A `FetchSource` URL may carry a credential in its userinfo
+/// (`https://<token>@github.com/…`), and the record is a log line a bundle
+/// keeps on disk, so no spelling it writes carries one; the host the fetch
+/// left for is the host, never the credential before it.
+fn authority_host(authority: &str) -> &str {
+    match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    }
+}
+
+/// The port a fetch record's host field carries, one rule for both
+/// spellings a fetch's host is read from — the configured cache's
+/// location and a source URL: the port the fetch's URL spells, kept when
+/// it is not the scheme's own default and dropped when it is (443 for
+/// `https`, 80 for `http`). A non-default port is the one way two
+/// fetches of the same host differ, so the record keeps it the same way
+/// for every fetch kind; a default port is a fact the scheme already
+/// says, so the field never carries it.
+fn kept_port(scheme: &str, port: Option<u16>) -> Option<u16> {
+    match (scheme, port) {
+        ("https", Some(443)) | ("http", Some(80)) => None,
+        (_, port) => port,
+    }
+}
+
+/// The host a fetch's record names — `host` with the port [`kept_port`]
+/// keeps — one spelling for both spellings the host is read from, so the
+/// field reads the same way whatever the fetch left for.
+fn host_field(host: &str, port: Option<u16>, scheme: &str) -> String {
+    match kept_port(scheme, port) {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    }
+}
+
+/// The host a URL names — its authority, between the scheme and the first
+/// path, query, or fragment delimiter, with any userinfo dropped and the
+/// port carried only as the one rule every fetch kind's host field
+/// carries it — which is where a `FetchSource` fetch leaves for. A
+/// spelling with no scheme (a local source tarball) names no host and
+/// crosses no network: the record's object still carries the whole
+/// spelling, so the fetch is read whole from the two fields.
+fn url_host(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return String::new();
+    };
+    let authority = authority_host(rest.split(['/', '?', '#']).next().unwrap_or_default());
+    // The port the authority spells after its last colon, when what
+    // follows that colon is one: the colons inside a bracketed IPv6
+    // literal are not a port, so an authority that spells none is the
+    // host whole.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, Some(port)),
+            Err(_) => (authority, None),
+        },
+        None => (authority, None),
+    };
+    host_field(host, port, scheme)
+}
+
+/// The object a `FetchSource` record names its fetch by: the URL's own
+/// spelling minus the parts that never belong in a log line — the userinfo
+/// before the last `@` (a credential), and the query and fragment after the
+/// path (a query is where a signed URL carries its signature). A spelling
+/// with no scheme (a local source tarball) names no host and crosses no
+/// network, and is the object whole: the way the record has always spelled
+/// a source it read off the operator's own disk.
+fn url_object(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let before_query = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = match before_query.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (before_query, String::new()),
+    };
+    format!("{scheme}://{}{path}", authority_host(authority))
+}
+
+/// What an install knows when it starts, so each fetch's record carries only
+/// the fetch's own facts: the box the fetch was made for, the host the
+/// configured remote cache is fetched from, and the object each package in
+/// the install's scope is spelled as.
 pub(crate) struct FetchRecord {
-    /// The requesting box, named the way the tree names it: its leaf's own
-    /// name when the host placed it in one, else the session's name.
+    /// The requesting box.
     pub(crate) box_id: String,
-    /// The leaf the daemon's own fetches are recorded as leaving from, where
-    /// this daemon stands in one; `None` where it does not — the record's
-    /// one fact about the host rather than the fetch, read once here so the
-    /// line claims it only where it holds.
-    pub(crate) leaf: Option<&'static str>,
     /// The host the daemon's cache fetches — packages and the index — leave
     /// for, spelled from the configured remote cache.
     pub(crate) cache_host: String,
@@ -732,14 +829,10 @@ mod tests {
         }
     }
 
-    /// One install's [`FetchRecord`]: the box the install belongs to, the leaf
-    /// its daemon's fetches leave from — a daemon standing in its own leaf, so
-    /// the record names it — the host its cache fetches leave for, and the
-    /// object its package is recorded as.
+    /// One install's [`FetchRecord`].
     fn fetch_record() -> FetchRecord {
         FetchRecord {
             box_id: "a session".to_string(),
-            leaf: Some(sandbox::classifier::DAEMON_LEAF),
             cache_host: "cache.minimal.dev".to_string(),
             objects: BTreeMap::from([("jq".to_string(), "jq (version 1.7.1)".to_string())]),
         }
@@ -795,10 +888,6 @@ mod tests {
         assert!(
             line.contains("INFO"),
             "the record is at the level a bundle's tail reads: {line}"
-        );
-        assert!(
-            line.contains("leaf=daemon"),
-            "the record names the leaf the fetch left from: {line}"
         );
         assert!(
             line.contains("box_id=a session"),
@@ -971,5 +1060,172 @@ mod tests {
         // The meter never saw it, and painting now records nothing more.
         assert_eq!(progress.line(&root.snapshot()), None);
         assert_eq!(records(&log).len(), 1);
+    }
+
+    /// NET-080: the host each fetch's record names, read from the location
+    /// the configured remote cache takes. The mirror's is the URL's own
+    /// host — the parsed host, with neither the path nor the scheme spelled
+    /// beside it, and the port carried only when it is not https's own
+    /// default, the one rule every fetch kind's host field keeps — and the
+    /// GCS location's is the bucket it names, the spelling `mctx` resolves
+    /// `gs://…` and a bare bucket name into. Both spellings are what a
+    /// person reading a bundle's daemon-log tail matches the fetch
+    /// against, so a host read out of a rendering of the URL rather than
+    /// out of the URL itself is a host the record can silently stop
+    /// naming.
+    #[test]
+    fn cache_host_reads_https_host_and_gcs_bucket() {
+        // The mirror's own non-default port, kept: a fetch to port 8443
+        // and one to the default are two different fetches, and the
+        // record's one port rule names them apart.
+        let mirror = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from(
+                "https://cache.example.com:8443/prefix/index.shisha",
+            )
+            .expect("the configured remote cache's mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&mirror),
+            "cache.example.com:8443",
+            "the mirror's host keeps its own non-default port: the path is \
+             never part of the host a fetch leaves for, but a port is"
+        );
+        // The scheme's own default, dropped by the same one rule the
+        // source-URL spelling below is read by: a default port is a fact
+        // the scheme already says, so the field never carries it.
+        let default = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from(
+                "https://cache.example.com:443/prefix/index.shisha",
+            )
+            .expect("the default-port mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&default),
+            "cache.example.com",
+            "the mirror's host drops https's own default port: 443 is what \
+             the scheme already says"
+        );
+        let bare = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from("https://cache.example.com/prefix/index.shisha")
+                .expect("the portless mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&bare),
+            "cache.example.com",
+            "a mirror that spells no port is named without one"
+        );
+        let ipv6 = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from("https://[::1]:8080/prefix/index.shisha")
+                .expect("the IPv6 mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&ipv6),
+            "[::1]:8080",
+            "host_str keeps an IPv6 mirror's brackets, so its port reads apart from the address"
+        );
+        assert_eq!(
+            cache_host(&ipv6),
+            url_host("https://[::1]:8080/prefix/index.shisha"),
+            "the cache and source spellings agree for the same IPv6 host"
+        );
+        let bucket = AnyUrl::Gcs(common::fetchers::GcsUrl {
+            bucket: "projects/_/buckets/minimal-cache".to_string(),
+            object: String::new(),
+        });
+        assert_eq!(
+            cache_host(&bucket),
+            "projects/_/buckets/minimal-cache",
+            "a GCS location's host is the bucket it names"
+        );
+    }
+
+    /// NET-080: the two spellings a `FetchSource` URL's record carries — the
+    /// host it names and the object it is recorded as — never carry the
+    /// parts of the URL that must not reach a log line. The record is an
+    /// INFO line a bundle's daemon-log tail keeps on disk, and a source URL
+    /// can carry a credential in its userinfo (`https://<token>@github.com/…`)
+    /// and a signature in its query (`?X-Amz-Signature=…`), so the host is
+    /// the URL's authority minus its userinfo and the object is its spelling
+    /// minus the userinfo, the query, and the fragment. The port rides the
+    /// one rule every fetch kind's host field keeps — kept when it is not
+    /// the scheme's own default, dropped when it is, the same rule the
+    /// cache's host is spelled by — and that rule is the host field's
+    /// alone: the object keeps the URL's own spelling. A source with no
+    /// scheme — a tarball off the operator's own disk — names no host and
+    /// crosses no network, and stays the object whole.
+    #[test]
+    fn url_host_and_object_carry_no_credentials() {
+        // A credential in the userinfo, before the host a GitHub source
+        // fetch actually leaves for.
+        let tokened = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz";
+        assert_eq!(
+            url_host(tokened),
+            "github.com",
+            "the host is the authority minus its userinfo, so the token never \
+             reaches the record: {}",
+            url_host(tokened)
+        );
+        assert_eq!(
+            url_object(tokened),
+            "https://github.com/example/example/archive/v1.tar.gz",
+            "the object is the URL minus its userinfo, so the token never \
+             reaches the record: {}",
+            url_object(tokened)
+        );
+        // A login pair, a port, a query, and a fragment: each is dropped or
+        // kept by what it is, not by where it sits.
+        let signed = "https://user:pass@mirror.example.com:8443/src/v2.tar.gz?X-Amz-Signature=deadbeef#fragment";
+        assert_eq!(
+            url_host(signed),
+            "mirror.example.com:8443",
+            "the host keeps the port and drops the login pair before it"
+        );
+        assert_eq!(
+            url_object(signed),
+            "https://mirror.example.com:8443/src/v2.tar.gz",
+            "the object keeps the host and port and drops the login pair, the \
+             query, and the fragment"
+        );
+        // Each scheme's own default port, dropped by the same one rule the
+        // cache's host is spelled by — while the object keeps the URL's
+        // whole spelling, because the port rule is the host field's.
+        let https_default = "https://mirror.example.com:443/src/v2.tar.gz";
+        assert_eq!(
+            url_host(https_default),
+            "mirror.example.com",
+            "the host drops https's own default port: 443 is what the scheme \
+             already says"
+        );
+        assert_eq!(
+            url_object(https_default),
+            "https://mirror.example.com:443/src/v2.tar.gz",
+            "the object keeps the URL's spelling whole minus what must not be \
+             logged: the port rule is the host field's alone"
+        );
+        let http_default = "http://mirror.example.com:80/src/v2.tar.gz";
+        assert_eq!(
+            url_host(http_default),
+            "mirror.example.com",
+            "the host drops http's own default port, the same one rule"
+        );
+        let http_kept = "http://mirror.example.com:8080/src/v2.tar.gz";
+        assert_eq!(
+            url_host(http_kept),
+            "mirror.example.com:8080",
+            "the host keeps http's non-default port the same way it keeps \
+             https's: one rule for every fetch kind"
+        );
+        // A URL with nothing to drop is spelled whole in both fields.
+        let plain = "https://example.com/src/v3.tar.gz";
+        assert_eq!(url_host(plain), "example.com");
+        assert_eq!(url_object(plain), "https://example.com/src/v3.tar.gz");
+        // A local source names no host and is the object whole.
+        let local = "../tarballs/v4.tar.gz";
+        assert_eq!(url_host(local), "", "a local source names no host");
+        assert_eq!(
+            url_object(local),
+            "../tarballs/v4.tar.gz",
+            "a local source stays the object whole"
+        );
     }
 }

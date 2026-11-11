@@ -19,6 +19,7 @@ use super::*;
 /// Var values are logged at `debug` (separate call) rather than
 /// `info` so an accidentally-inherited secret doesn't sit in the
 /// default log stream.
+#[cfg_attr(test, allow(dead_code))]
 pub(super) fn log_session_contents(
     session_name: &str,
     baseline_packages: &[&str],
@@ -120,17 +121,9 @@ pub(crate) trait BoxLauncher {
     /// of the session's environment. Dropped after [`Self::Process`].
     type Guard: BoxGuard;
 
-    /// Launches the session's shell, placing its host-address box in a
-    /// classifier leaf named by `session_id` when this host has one.
-    ///
-    /// `guest` is the daemon's own posture — whether this daemon is a
-    /// microVM's pid 1 — handed in per launch rather than read from
-    /// [`crate::guest`] inside, because the launch decision it scopes (a
-    /// guest refuses a host-address box it cannot place; a native host runs
-    /// it unenforced) is exactly what a launcher test has to be able to pose.
+    /// Launches the box's entrypoint.
     fn launch(
         self,
-        guest: bool,
         session_id: boxes::SessionId,
         name: String,
         username: String,
@@ -353,18 +346,6 @@ pub(crate) struct Launched<P, G> {
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     pub(super) tty_path: std::path::PathBuf,
-    /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
-    /// decided on, and the one every process of the session — injected ones
-    /// included — is placed in. `None` on a host that places no box: the tree
-    /// is absent, and while a native session then runs unenforced rather than
-    /// refused on that ground, a guest's host-address launch is refused
-    /// instead (design §7.1).
-    pub(super) leaf: Option<sandbox::config::ClassifierLeaf>,
-    /// What the launch decided about this box's egress verdict: enforced on
-    /// a leaf of its own, or unenforced on a host that could not decide per
-    /// box. Carried to the host's attributes so a session can say which it
-    /// runs under — the launch's own decision, not a re-derivation.
-    pub(super) host_ip_enforcement: Option<HostIpEnforcement>,
     /// The listen plan the launch gathered for the box it launched: the
     /// lease, the published address, the switch control channel, the gate
     /// and the publication set its watcher publishes through. `None` when
@@ -506,6 +487,7 @@ impl BoxOutputLog {
 /// `ls`/`cat`/etc, and `socat` for the `min` command bridge (the
 /// helper installed at `/usr/bin/min` speaks to `/run/minenv_sock`
 /// via `socat`).
+#[cfg_attr(test, allow(dead_code))]
 pub(super) const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
 
 /// Environment folded into a session shell at the launching attach, over and
@@ -749,6 +731,7 @@ pub(super) fn layer_session_env(
 
 /// The real [`BoxLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
     /// Env captured from the SSH channel that mints this shell; see
@@ -795,26 +778,6 @@ pub(crate) struct SandboxLauncher {
     /// is `Activating` — only the caller that mints the launch knows what it
     /// is for, which is why it travels on the launcher.
     pub(crate) for_hooks: bool,
-    /// The classifier tree this daemon places host-address boxes in: the
-    /// one the privileged step installs natively, and the guest's own boot
-    /// mounts for itself. A field of the launcher so the launch reads one
-    /// root for its leaf, its probe and its reclaim — and so the
-    /// unenforced-launch test can drive that whole path over a stand-in
-    /// tree it built, which the real tree's kernel-only facts would
-    /// otherwise make undrivable; production sets it from the same
-    /// constant every path reads.
-    pub(crate) classifier_root: std::path::PathBuf,
-    /// The mount table this launch reads the classifier tree's facts over,
-    /// as `/proc/self/mountinfo` spells it: `None` — every production path
-    /// and the start-up check alike — reads the daemon's own, live. A field
-    /// for the same reason [`Self::classifier_root`] is one: the two facts
-    /// of one launch answer over one tree and one mount table, and a
-    /// host's own mount table covers no stand-in tree, so a launch driven
-    /// over one would read every fact as unconfined and never reach the
-    /// placement it was driven to test. The field names which table
-    /// answers, it never fabricates one — no client or box input reaches
-    /// it, and production passes `None`.
-    pub(crate) classifier_mountinfo: Option<String>,
     /// The box's runtime publications, built fresh for the spawn this
     /// launcher is about to run: the one set this launch's listen plan and
     /// the session actor's runtime expose path both read, so a port the
@@ -852,12 +815,14 @@ pub(crate) struct SandboxLauncher {
 /// Reaping is synchronous (`kill` + `wait` are not async), so unlike
 /// [`sandbox::PlannedLaunch`] — which has to give a lease back, and spawns
 /// that release — this needs no runtime to do its work in `Drop`.
+#[cfg_attr(test, allow(dead_code))]
 pub(super) struct SpawnedProcessGuard {
     /// `None` once the process has been handed off — see
     /// [`Self::release`].
     process: Option<hakoniwa::Child>,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 impl SpawnedProcessGuard {
     fn new(process: hakoniwa::Child) -> Self {
         Self {
@@ -897,261 +862,6 @@ impl Drop for SpawnedProcessGuard {
     }
 }
 
-/// The box's classifier leaf during its launch, removed if the launch is
-/// abandoned before the leaf is handed off (NET-079).
-///
-/// The leaf is created before the spawn — the sandbox layer needs it to bind
-/// the tree into the box and root the box's cgroup namespace at the leaf — so
-/// every way out of [`SandboxLauncher::launch`] between that and the handoff
-/// into [`Launched`] has to account for a leaf with no box in it: an `Err`
-/// return
-/// for a build that failed, and — the one no `return` covers — the future's
-/// own `Drop`, which is what a teardown transition bounding its launch with
-/// a timeout (`box_actor::HOOK_LAUNCH_TIMEOUT`) takes. This guard owns the
-/// leaf until `release` hands it to the [`SandboxBackend`] that keeps it for
-/// the session's lifetime.
-///
-/// Declared *before* the [`SpawnedProcessGuard`] it shares the launch with,
-/// so an abandoned launch drops in the opposite order: the process is reaped
-/// first and the leaf removed after, because a cgroup that still holds a
-/// process refuses its removal.
-pub(super) struct BoxLeafGuard {
-    leaf: Option<sandbox::config::ClassifierLeaf>,
-}
-
-impl BoxLeafGuard {
-    fn new(leaf: sandbox::config::ClassifierLeaf) -> Self {
-        Self { leaf: Some(leaf) }
-    }
-
-    /// The leaf this guard owns, for the placement between the spawn and the
-    /// handoff.
-    fn get(&self) -> Option<&sandbox::config::ClassifierLeaf> {
-        self.leaf.as_ref()
-    }
-
-    /// Hand the leaf off, disarming the guard.
-    fn release(mut self) -> sandbox::config::ClassifierLeaf {
-        self.leaf
-            .take()
-            .expect("the leaf is taken only here, and this consumes the guard")
-    }
-}
-
-impl Drop for BoxLeafGuard {
-    fn drop(&mut self) {
-        let Some(leaf) = self.leaf.take() else {
-            return;
-        };
-        // The same shape the session-end teardown's `Drop` uses: this leaf's
-        // box was SIGKILLed and reaped by the [`SpawnedProcessGuard`] dropped
-        // just before it (the guard is declared after this one, so the launch's
-        // own drop order runs the process first), and a just-reaped box's
-        // cgroup can refuse its `rmdir` (`EBUSY`) for a few milliseconds while
-        // the kernel empties it. A single refusal would leak the leaf of an
-        // abandoned launch — a hook launch that timed out past its spawn, most
-        // notably — until the next same-id launch reclaimed it or the daemon
-        // restarted, so the removal is retried briefly before it is warned
-        // about.
-        if let Err(e) = remove_box_leaf_patiently(leaf.dir(), DROP_LEAF_REMOVAL_ATTEMPTS, |_| {
-            std::thread::sleep(DROP_LEAF_REMOVAL_PAUSE)
-        }) {
-            tracing::warn!(
-                leaf = %leaf.dir().display(),
-                error = %e,
-                "removing the classifier leaf of an abandoned launch"
-            );
-        }
-    }
-}
-
-/// The mount table a host-address launch answers over: the knob's when one
-/// was set, the daemon's own, read live, when none was — the knob's `None`
-/// is every production path ([`SandboxLauncher::classifier_mountinfo`]).
-///
-/// The distinction is not cosmetic. `None` handed through as "no table at
-/// all" makes [`sandbox::classifier::tree_is_real`] say a real tree is not
-/// real — it answers from the table — so a guest, whose own boot mounted the
-/// `nsdelegate` cgroup2 the tree sits on, would refuse every host-address
-/// box it launched as a broken image, while a native host without a tree
-/// kept running boxes unenforced: the one table read here is what both
-/// halves of the launch — the decision and the placement — answer over.
-pub(super) fn launch_mountinfo(knob: Option<String>) -> Option<String> {
-    knob.or_else(sandbox::classifier::own_mountinfo)
-}
-
-/// Reads the one line the box's pre-exec closure reported into the
-/// sandbox's `/run`, and says what it means: which cover the box took over
-/// the classifier tree the launch bound for its join, or the errno that
-/// killed the closure before the program ran — the `127` the spawn then
-/// reports, whose stderr is the session's own terminal and reaches no
-/// daemon log without this file.
-///
-/// Polled rather than awaited, and the file is taken away only once the
-/// box's fate is known: a `failed` line is written by the closure's own
-/// exit path, so nothing follows it and the removal is owed then; a `cover`
-/// line is written while the closure is still heading for its exec, and a
-/// closure that covered and then died past that point replaces its line —
-/// the removal before that would have dropped the `failed` line carrying
-/// the `127`'s diagnosis into a file nobody reads, so the watch goes on
-/// until the deadline even after a line was read. A report that never
-/// appears is itself a finding — a box that could not say what it did still
-/// ran — and it is warned, not debugged: a leaf-bearing box whose closure
-/// could not write `/run` is exactly the state this channel exists to
-/// catch. Runs off the launch's critical path (`crate::traced::spawn`ed), so
-/// a session is never held up by what its box did in its first
-/// milliseconds.
-///
-/// `watch` is how long the launch's own watch waits; [`CLOSURE_REPORT_WATCH`]
-/// is the production one, and a test drives the same code with a shorter
-/// one.
-pub(super) async fn report_box_closure(
-    report: std::path::PathBuf,
-    session: String,
-    watch: std::time::Duration,
-) {
-    let deadline = std::time::Instant::now() + watch;
-    // The lines this closure has left so far, so a replacement or an
-    // appended line is logged as the new finding it is rather than skipped
-    // as a repeat — and a line already said is not said twice.
-    let mut seen: Vec<String> = Vec::new();
-    loop {
-        match tokio::fs::read_to_string(&report).await {
-            Ok(content) => {
-                for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    if seen.iter().any(|s| s == line) {
-                        continue;
-                    }
-                    seen.push(line.to_string());
-                    if say_closure_line(line, &session) {
-                        // The box's fate is known: the closure died, and it
-                        // died having said so. The daemon owes the tree one
-                        // line per launch, not a file per session.
-                        let _ = tokio::fs::remove_file(&report).await;
-                        return;
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(
-                    session = %session,
-                    error = %e,
-                    "reading the box's closure report",
-                );
-                return;
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            if seen.is_empty() {
-                tracing::warn!(
-                    session = %session,
-                    report = %report.display(),
-                    "the box's pre-exec closure wrote no report into its /run \
-                     before the watch gave up: a leaf-bearing box that could not \
-                     say what it did over its classifier tree is exactly the \
-                     state this channel exists to catch — no line below names \
-                     its cover or its errno",
-                );
-            }
-            // The box's fate is known by the deadline either way: the closure
-            // writes within its first milliseconds, so the watch's whole
-            // window without a new line is a closure that execed — or one
-            // that never got to write, which the warn above just said. The
-            // removal is owed now, and the box's fate is the only thing that
-            // ever owed it.
-            let _ = tokio::fs::remove_file(&report).await;
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-
-/// How long a launch watches its box's closure report: the closure writes
-/// within its first milliseconds, so three seconds without a line it has not
-/// already read is a closure that has nothing more to say.
-pub(super) const CLOSURE_REPORT_WATCH: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Says what one line of the box's closure report means, and returns whether
-/// the line settles the box's fate: `true` for a `failed` line, which the
-/// closure writes on its way to `_exit(127)` and nothing follows; `false`
-/// for a `cover` line, which it writes while still heading for its exec.
-/// A cover line may carry a refused devpts remount after a `; `, since the
-/// report holds one line; each part is said on its own.
-pub(super) fn say_closure_line(line: &str, session: &str) -> bool {
-    if let Some((cover, devpts)) = line.split_once("; ") {
-        let settled = say_closure_line(cover, session);
-        return say_closure_line(devpts, session) || settled;
-    }
-    if line == "cover cgroup2" {
-        tracing::info!(
-            session = %session,
-            cover = "cgroup2",
-            "the box covered its bound classifier tree with the design's \
-             own cover: a read-only cgroup2 mount of its namespace root, \
-             so its own limit is readable where a runtime looks and no \
-             other cgroup is reachable",
-        );
-    } else if let Some(errno) = line.strip_prefix("cover tmpfs-fallback errno ") {
-        tracing::warn!(
-            session = %session,
-            cover = "tmpfs-fallback",
-            mount_errno = errno,
-            "the box's classifier cover fell back to an empty read-only \
-             tmpfs: the kernel refused the design's cgroup2 mount of the \
-             box's namespace root in its user namespace, so the box has \
-             no cgroup path to write a migration to, but none to read a \
-             limit from either — a recorded fallback, never the design's \
-             cover",
-        );
-    } else if line == "cover tmpfs-fallback forced" {
-        tracing::warn!(
-            session = %session,
-            cover = "tmpfs-fallback",
-            "the box's classifier cover was forced onto its recorded \
-             fallback — a launch in a test posture, never a production one",
-        );
-    } else if let Some(rest) = line.strip_prefix("devpts max=") {
-        let (max, errno) = rest.rsplit_once(" errno ").unwrap_or((rest, "unreported"));
-        tracing::warn!(
-            session = %session,
-            max,
-            errno,
-            "remounting the box's /dev/pts with a per-instance max failed; \
-             the box runs on the shared PTY pool",
-        );
-    } else if let Some(errno) = line.strip_prefix("lo-down errno ") {
-        tracing::warn!(
-            session = %session,
-            errno = errno,
-            "the box could not bring up the loopback interface of its own \
-             network namespace: it runs, but nothing in it can reach \
-             127.0.0.1 or ::1",
-        );
-    } else if let Some(failed) = line.strip_prefix("failed ") {
-        let (step, errno) = failed
-            .rsplit_once(" errno ")
-            .unwrap_or((failed, "unreported"));
-        tracing::error!(
-            session = %session,
-            step = %step,
-            errno = %errno,
-            "the box's pre-exec closure died before its program ran: the \
-             spawn reports this as exit 127, and this line is the only \
-             place a daemon log ever sees which step and which errno",
-        );
-        return true;
-    } else {
-        tracing::warn!(
-            session = %session,
-            report = %line,
-            "the box's pre-exec closure reported a line this daemon does \
-             not read",
-        );
-    }
-    false
-}
-
 impl BoxLauncher for SandboxLauncher {
     type Process = SandboxProcess;
 
@@ -1167,7 +877,6 @@ impl BoxLauncher for SandboxLauncher {
 
     async fn launch(
         self,
-        guest: bool,
         session_id: boxes::SessionId,
         name: String,
         username: String,
@@ -1182,13 +891,6 @@ impl BoxLauncher for SandboxLauncher {
         // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let policy = self.policy;
-        // NET-079: the cohort subtree this box's declaration places its leaf
-        // in, decided from the declaration before anything is reserved and
-        // before its first process exists — the same verdict the plan below
-        // resolves a deny-all box through, and the one the placement's own
-        // leaf is named by. The declaration is fixed at create, so a launch
-        // decides it once and a box is never re-verdicted mid-flight.
-        let classifier_verdict = crate::net::classifier::verdict_of(policy.egress.as_ref());
         // Whether the declaration lets a listen publish at all (NET-016):
         // `allow` with a range. Read now, before the policy moves into the
         // network plan, for the missing-listen-plan line below.
@@ -1197,12 +899,6 @@ impl BoxLauncher for SandboxLauncher {
                 && ingress.dynamic_allowed_range.is_some()
         });
         let network_mode = self.network_mode;
-        // The classifier tree this daemon places boxes in, moved out before
-        // the rest of `self` is consumed (see the field's doc).
-        let classifier_root = self.classifier_root;
-        // The mount table the launch's classifier facts answer over, moved
-        // out with it (see the field's doc).
-        let classifier_mountinfo = self.classifier_mountinfo;
         // BEP-011: the root this launch adds to the box's trust store, moved
         // out with them for the env build below.
         let root_certificate = self.root_certificate;
@@ -1234,227 +930,17 @@ impl BoxLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // NET-079: the classifier leaf this host-address box's egress verdict
-        // is decided on, decided *before anything is reserved* and before its
-        // first process exists. Scoped to the host-address box, the one that
-        // speaks with an address it did not lease: a none box has no traffic
-        // to decide and an own-IP box's verdict is its own, on the address
-        // it holds. The decision fails closed for the launch — a tree that
-        // is absent, or a daemon that cannot place a process in it, leaves
-        // the box unenforced rather than refused natively — and never reaches
-        // the box's own pre-exec closure, which is where an unplaceable join
-        // would die taking the leaf it cannot take. The guard owns the leaf
-        // until the handoff into `Launched`, so a launch abandoned anywhere
-        // in between leaves no leaf behind, and it drops after the process
-        // guard below so the box's processes are gone before their leaf is
-        // removed.
-        //
-        // Whether this host can decide per box is read fresh, per launch,
-        // from the table's *effect* (design §7.4) — the start reading is not
-        // kept, because a marker survives whatever emptied the table and the
-        // refusal does not, and a start reading would survive it the same
-        // way. The probe binds a listener, forks a child, and waits, so it
-        // runs on the blocking pool, and only a host-address launch reads
-        // one: no other mode has a verdict the cgroup decides, and the one
-        // over the same `classifier_root` the box is placed into, so both
-        // halves of this launch answer over one tree and one mount table.
-        // The whole decision is kept, not only its verdict bit: the refusal
-        // and the advice below say which box they are for out of the cause
-        // that produced it, so the launch's words and the start-up line
-        // name the same ground. The read itself is the one shared fact
-        // every host-address path answers over — [`re_read_classifier_fact`],
-        // the same read the create response answers over — and the knob's
-        // `None` — every production path — is the daemon's own mount table
-        // read live inside it, never "no table at all": a launch that
-        // answered over no table would read even a guest's `nsdelegate`
-        // cgroup2 as not real and refuse every host-address box in it as a
-        // broken image, so the live read and the decision share that one
-        // blocking hop, and the same one table is what the placement below
-        // answers over too.
-        let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
-            let (mountinfo, decision) = re_read_classifier_fact(
-                classifier_root.clone(),
-                classifier_mountinfo.clone(),
-                guest,
-            )
-            .await?;
-            // NET-079: the other half of what a host that decides per box
-            // refuses — the declaration's own rules. The create path refuses
-            // the same declaration over the same predicate while the fact
-            // says the host decides, but a box created before that was true —
-            // a create the fact read `none` on, or a record persisted before
-            // this gate existed — still lands here, and the launch is the
-            // last place that can refuse it before the box runs placed and
-            // looking decided while its rules go unenforced. Gated on the
-            // decision this launch has just re-read, not the node fact: the
-            // fact is what a display shows, the launch's own fresh read is
-            // what refuses a box. Refused *before* the leaf below is
-            // allocated — a box this launch refuses to run never lands in
-            // `boxes/allow` — and whatever the launch is for: a hook run of
-            // the same box would run the same rules unenforced, so it is
-            // refused on the same ground as any other launch. On a host that
-            // cannot decide per box the gate answers nothing — NET-079's
-            // exception is that host's to keep, and the refusal below is the
-            // other one's.
-            if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
-                network_mode,
-                decision.can_decide_per_box(),
-                policy.egress.as_ref(),
-            ) {
-                // The one typed error the create returns over the same
-                // rules: `InvalidInput`, not an `other` failure, so the
-                // refusal is the same machine-mode failure wherever a
-                // client meets it — the create's RPC arm keys on this
-                // kind, and the kind is what an `io::Error` carries to
-                // whatever downstream reads it. A launch hits the boxes
-                // the create's gate never saw — created before the host
-                // could decide per box, persisted from before the gate
-                // existed — so the two refusals must not read as two
-                // different failures of the same declaration.
-                let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
-                tracing::info!(
-                    session = %session_name,
-                    network_mode = %network_mode.word(),
-                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
-                    refusal = %refusal,
-                    "refusing a host-address box whose declaration names rules \
-                     this host's classifier cannot enforce"
-                );
-                return Err(refusal);
-            }
-            let leaf = create_session_leaf(
-                &classifier_root,
-                mountinfo.as_deref(),
-                guest,
-                &session_id,
-                &session_name,
-                classifier_verdict,
-                decision.can_decide_per_box(),
-            )
-            .await?;
-            (leaf, Some(decision))
-        } else {
-            (None, None)
-        };
-        let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
-
-        // What this launch's placement means for the box's egress record:
-        // the leaf itself, never the node fact re-read beside it — the
-        // record is this box's own launch outcome, and the reads lower it by
-        // the fact (`displayed_host_ip_enforcement`), so a leaf placed over
-        // a table that is not refusing shows `none` while the host cannot
-        // decide and `per_box` once it can again, without a relaunch. The
-        // declaration is the placement's other half: a box whose rules the
-        // classifier cannot enforce is recorded `none` even placed, so the
-        // record never promises `per_box` for rules no verdict enforces.
-        // The refusal and the advice below read the one decision.
-        let enforcement = host_ip_enforcement(network_mode, leaf.as_ref(), policy.egress.as_ref());
-
-        // A host-address box this host cannot give a verdict of its own is
-        // refused where the box's own declaration is the thing that cannot
-        // be honoured — never for a state a person could still fix from the
-        // host itself. In the guest that is every state: the tree and the
-        // table were the image's own boot's work, and there is no installer
-        // to run inside a microVM (design §7.1) — a box that cannot be
-        // placed has no leaf to decide on at all, and a deny-all box whose
-        // table is not loaded would run placed while nothing refuses its
-        // connections, a verdict that looks decided and is not. The first
-        // refusal names the broken image it is; the second names the
-        // interim, guest-side classifier enforcement not being available
-        // yet. Natively the same states keep NET-079's exception — the box
-        // runs unenforced and the log says so — except the one state where
-        // the step's own install is standing behind a refusal that is not
-        // in force: a deny-all box placed on either probe cause, refused
-        // rather than run on a refusal nothing here is making. A refused
-        // box never reaches the advisory below — the refusal is the only
-        // thing that launch says; the advisory is for the host-address
-        // boxes that run, the ones a verdict has nothing to enforce in
-        // yet.
-        if let Some(refusal) = refused_unenforced_host_address_box(
-            guest,
-            network_mode,
-            classifier_verdict,
-            leaf.is_some(),
-            decision.as_ref(),
-        ) {
-            tracing::error!(
-                session = %session_name,
-                network_mode = %network_mode.word(),
-                tree = %classifier_root.display(),
-                placed = leaf.is_some(),
-                refusal = %refusal,
-                "refusing a host-address box this host cannot decide an \
-                 egress verdict for"
-            );
-            return Err(io::Error::other(refusal));
-        }
-
-        // The advisory for that same state, on either kind of host, as a
-        // diagnostic record per launch — on the daemon's log stream, and
-        // nowhere else. This is not the session's stderr channel and not a
-        // field any client reads: the session reply and the CLI's start
-        // output are untouched by it, so a scripted `min session start`
-        // never sees this line. What a person in a session gets is the
-        // banner below, written onto the session's own pty — that banner is
-        // the in-session surface, and this record is its daemon-log twin,
-        // attributed to the session and carrying the decision in the
-        // machine spelling a reader greps for (`host_ip_enforcement`).
-        // Carrying the field out to a client — over the session reply, and
-        // surfaced by `min doctor` — is issue #1773, outside this task's
-        // layers.
-        //
-        // At the placement decision, not after the build: a launch that goes
-        // no further than this (a tree-less host, an env that fails to
-        // build) has still been told apart, and every launch is — the
-        // resolver-hook advisory this is modelled on (NET-122, design §7.1)
-        // advises on every session start, the install hint it carries is the
-        // answer to a host without the tree, and silencing every launch
-        // after the first takes the notice away from exactly the session a
-        // person is about to work in. In the guest the hint is not what the
-        // state means — there is no installer to run there — so the notice
-        // is the interim's own words, and the session that just started is
-        // told at its own start, both here in the daemon's log and in the
-        // pty banner below, never per daemon and never for a hook run.
-        //
-        // A launch minted for lifecycle hooks advises on neither surface: a
-        // hook run is not a session start, and its record would count one
-        // hook run as one. The placement itself is not gated with it.
-        let advise = advises_unenforced_placement(network_mode, leaf.as_ref(), decision.as_ref())
-            && !for_hooks;
-        if advise {
-            let notice = unenforced_placement_notice(guest, leaf.as_ref());
+        // Asked before anything is reserved or started for the box: a policy
+        // this host cannot enforce is refused, never run unenforced.
+        if let Err(refusal) = crate::net::engine::engine().can_enforce(network_mode, &policy) {
             tracing::info!(
                 session = %session_name,
-                host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
-                notice = %notice,
-                "the session's host-address box runs unenforced on this host",
+                network_mode = %network_mode.word(),
+                %refusal,
+                "refused a box whose network policy this host cannot enforce"
             );
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, refusal));
         }
-        // The banner is the advisory's in-box surface, and follows the
-        // advisory's rule (NET-079): a native daemon only — per-box
-        // enforcement is a native-host fact, and the guest's state is the
-        // interim's, said in the record above — only while the box declares
-        // egress, because a box that declared nothing asked for no
-        // enforcement, and only over a decision that names a cause: a box
-        // nothing placed on a host that decides per box runs unenforced for
-        // a reason the record above names (the placement's own failure),
-        // not one an install or an own-address start ends, so the advisory
-        // would hand out a command that changes nothing. Its text is the
-        // create reply's own, which carries none without a cause either, so
-        // the terminal the start printed into and the shell it opens say the
-        // same thing.
-        let banner = match (
-            advise && !guest,
-            policy.egress.as_ref(),
-            decision
-                .as_ref()
-                .and_then(crate::net::classifier::Decision::cause),
-        ) {
-            (true, Some(egress), Some(cause)) => {
-                Some(crate::net::classifier::advisory_text(cause, egress))
-            }
-            _ => None,
-        };
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
@@ -1470,7 +956,6 @@ impl BoxLauncher for SandboxLauncher {
             Some(policy),
             own_address.clone(),
             box_addresses,
-            decision,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
@@ -1633,14 +1118,6 @@ impl BoxLauncher for SandboxLauncher {
                     .without_package_attr_wiring()
                     .with_network(plan.clone())
                     .with_username(username);
-            // NET-079: the leaf created before this build, so the sandbox
-            // binds the tree into the box, joins the box's own first process
-            // to the leaf in its pre-exec closure, and names the leaf it
-            // entered on its launch log line. The guard keeps the leaf for the
-            // launch's duration; this copy travels into the config.
-            if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get).cloned() {
-                env_args = env_args.with_classifier_leaf(leaf);
-            }
             // BEP-011: the build writes the root into the box's own bundle
             // copy and hashed directory, and sets the trust variables.
             if let Some(pem) = root_certificate {
@@ -1688,40 +1165,6 @@ impl BoxLauncher for SandboxLauncher {
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
-            // NET-079: a host-address box this launch runs unenforced gets
-            // the advisory in the terminal itself — this banner is the
-            // in-session surface, the prose a person at the terminal reads;
-            // the record for that same decision went to the daemon's log at
-            // the placement decision, which no client reads (issue #1773
-            // tracks carrying it out). The person about to type in this
-            // session is the one whose egress is not being decided, and the
-            // state is the deployment's, not the session's, so the notice
-            // says what would change it. A guest's *refused* box never gets
-            // this far, its launch being refused (design §7.1) — but the
-            // guest's other host-address boxes do, and say the interim's
-            // words: a session started in a VM host that does not enforce
-            // per box yet is told so at its own start, like any host's.
-            // And never on a hook launch: its
-            // pty is read by nobody, and a hook run is not a session start.
-            if let Some(notice) = &banner {
-                // The same write the shell fallback notice uses, for the
-                // same reasons: onto the pty's slave, best-effort, CRLF on
-                // each of the advisory's two lines — see the comment there.
-                let text = notice
-                    .lines()
-                    .map(|line| format!("minimal: {line}\r\n"))
-                    .collect::<String>();
-                let written = pty.dup_slave_fd().and_then(|fd| {
-                    use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(text.as_bytes())
-                });
-                if let Err(e) = written {
-                    tracing::debug!(
-                        error = %e,
-                        "could not print the placement notice to the terminal"
-                    );
-                }
-            }
             // What the box runs first, from its spec (T42): the login shell,
             // or the spec's argv.
             let mut command = match &entrypoint {
@@ -1860,49 +1303,6 @@ impl BoxLauncher for SandboxLauncher {
         // cancelled future. `SpawnedProcessGuard` owns it until the
         // handoff at the bottom; an `Err` return or a drop reaps it.
         let mut process = SpawnedProcessGuard::new(process);
-
-        // The box's closure report, read off the launch's critical path: the
-        // cover it took over its bound classifier tree — the design's
-        // read-only cgroup2 mount of its namespace root, or the recorded
-        // tmpfs fallback with the errno that forced it — or the errno that
-        // killed the pre-exec closure before the program ran, which is the
-        // one place a `127` ever reaches a daemon log. Nothing in the session
-        // waits on it; the session is up while this reads.
-        if let Some(leaf) = leaf.as_ref() {
-            let report = env.closure_report_path(leaf);
-            let session = session_label.clone();
-            crate::traced::spawn(async move {
-                report_box_closure(report, session, CLOSURE_REPORT_WATCH).await
-            });
-        }
-
-        // NET-079: the box's supervisor is moved into its leaf right after the
-        // spawn, from the daemon's own namespaces where the leaf is
-        // reachable — the same place the shim later writes an injected
-        // process. The program placed itself already, in the pre-exec closure
-        // it ran inside the box, before it unshared the cgroup namespace onto
-        // the leaf; the supervisor is the one process that never ran that
-        // closure. Never fatal: a supervisor the host could not place runs in
-        // the daemon's leaf, at the cost of being classified as the daemon
-        // rather than its box.
-        if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get) {
-            let supervisor = process.get_mut().id();
-            match place_box_processes(leaf, supervisor) {
-                Ok(()) => tracing::info!(
-                    session = %session_label,
-                    leaf = %leaf.dir().display(),
-                    supervisor,
-                    "placed the session's box in its classifier leaf: the \
-                     supervisor here, the program in its own pre-exec closure",
-                ),
-                Err(e) => tracing::warn!(
-                    session = %session_label,
-                    leaf = %leaf.dir().display(),
-                    error = %e,
-                    "placing the session's supervisor in its classifier leaf",
-                ),
-            }
-        }
 
         // NET-070: the hostname proxy names a host-address box's connection by
         // its PID namespace when no holder runs in a classifier leaf.
@@ -2046,21 +1446,10 @@ impl BoxLauncher for SandboxLauncher {
             master,
             process: SandboxProcess::new(SandboxBackend {
                 child: process.release(),
-                // The backend owns the leaf from here: it is what the session
-                // is placed in, and its removal at session end is the last
-                // thing the box owes.
-                leaf: leaf_guard.take().map(BoxLeafGuard::release),
             }),
             guard: env,
             net_guard,
             tty_path,
-            // The launch's own placement outcome for this box, so the
-            // session can record it without re-deriving it from things a
-            // person never sees.
-            host_ip_enforcement: enforcement,
-            // The copy the host keeps, so every process injected into the
-            // session can join the same leaf.
-            leaf,
             // The box's listen plan, and with it the one handoff to the
             // host that runs the box: taken when the host builds, so a
             // cancelled launch's plan never reaches any host at all.

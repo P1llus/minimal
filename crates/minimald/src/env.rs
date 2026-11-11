@@ -760,24 +760,6 @@ impl Env {
         self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
     }
 
-    /// The host-side twin of the report file a leaf-bearing box's pre-exec
-    /// closure writes into its `/run`: the same file, through the sandbox's
-    /// read-write `/run` bind, named by the leaf. For the launch to read
-    /// after the spawn — which cover the box took over its classifier tree,
-    /// or the errno that killed the closure before the program ran — so it
-    /// is forwarded from the sandbox, which owns the directory the box's
-    /// `/run` is bound from and cannot have its path precomputed by a caller
-    /// (the base directory is named by [`Env::build`], per launch).
-    ///
-    /// [`Env::build`]: crate::env::Env::build
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn closure_report_path(
-        &self,
-        leaf: &sandbox::config::ClassifierLeaf,
-    ) -> std::path::PathBuf {
-        self.sandbox.closure_report_path(leaf)
-    }
-
     /// Holds the program of every command `container` spawns at a start gate
     /// until the returned gate is released; see [`sandbox::Sandbox::hold_start`].
     #[cfg_attr(test, allow(dead_code))]
@@ -2017,10 +1999,7 @@ impl BoxChannel {
             .collect();
         crate::sandbox_progress::FetchRecord {
             box_id: self.box_id.clone(),
-            leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
-                sandbox::classifier::TREE_ROOT,
-            )),
-            cache_host: crate::net::classifier::cache_host(
+            cache_host: crate::sandbox_progress::cache_host(
                 &self.ctx.daemon_context().config().remote_cache_url(),
             ),
             objects,

@@ -573,17 +573,6 @@ pub struct HostAttrs {
     /// When the last byte was sent to the process from a binding.
     pub(crate) stdin_last: Option<SystemTime>,
 
-    /// The launch's own placement outcome for this session's host-address
-    /// box (NET-079, design §7.2's "declared and enforced" attribute):
-    /// `PerBox` when the launch placed the box in a classifier leaf of its
-    /// own, `None` when the box ran with the host's address and no leaf —
-    /// the value the session records on the box's record, which the read
-    /// surfaces then show lowered by the host's current fact
-    /// ([`displayed_host_ip_enforcement`]), never the node fact re-read at
-    /// launch. Nothing for a none box or an own-IP box, whose verdicts are
-    /// decided on address leases rather than the host's cgroup tree.
-    pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
-
     /// The pid of the box's container supervisor, which a stop signals the
     /// box's processes from (BOX-013). `None` only for attrs no host
     /// reported.

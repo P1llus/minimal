@@ -153,14 +153,12 @@ impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
 }
 
 /// The real sandboxed child backend: a [`hakoniwa::Child`].
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct SandboxBackend {
     pub(super) child: hakoniwa::Child,
-    /// The box's classifier leaf (NET-079), removed when this backend — and
-    /// so the session's last process — is dropped: a leaf does not outlive the
-    /// box it decided.
-    pub(super) leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 impl SandboxBackend {
     /// Reduces `hakoniwa`'s account of an exit to the shared [`ExitReport`].
     fn report(s: hakoniwa::ExitStatus) -> ExitReport {
@@ -229,88 +227,21 @@ impl ProcessBackend for SandboxBackend {
 }
 
 impl Drop for SandboxBackend {
-    /// Tears the box down and removes its leaf (NET-079): a leaf does not
-    /// outlive the box it decided, and a [`hakoniwa::Child`] does not
-    /// terminate when dropped — without the kill, dropping a host that never
-    /// reaped its process would both orphan the sandbox and leave a leaf in
-    /// the tree with a process still in it.
-    ///
-    /// In the ordinary paths both are no-ops: `mainloop` reaps the process
-    /// before it returns (even on a kill — the loop's `wait()` at the
-    /// bottom), and `hakoniwa` caches the status so `wait` after a reap
-    /// returns it instead of blocking. The kill+wait here is for the paths
-    /// that skip all of that — an aborted loop future, most notably — where
-    /// SIGKILL is the bounded way out.
+    /// Ends the box if nothing has yet. A [`hakoniwa::Child`] does not
+    /// terminate when dropped, and a host loop that was aborted never
+    /// reaped its process. After a reap both calls return at once.
     fn drop(&mut self) {
-        let Some(leaf) = self.leaf.take() else {
-            return;
-        };
-        // `kill` and `wait` are independent: a process that already exited
-        // fails the kill with `ESRCH` but still needs reaping.
+        // A process that already exited refuses the kill and still needs
+        // the reap.
         if let Err(e) = self.child.kill() {
             tracing::warn!(error = %e, "killing session process at teardown");
         }
         if let Err(e) = self.child.wait() {
             tracing::warn!(error = %e, "reaping session process at teardown");
         }
-        // The leaf goes last, once nothing is in it — and outlasting the
-        // box's last moments, because a SIGKILLed box's cgroup can refuse
-        // its `rmdir` (`EBUSY`) for a few milliseconds after the reap while
-        // the kernel empties it. A refusal at the first try would leak the
-        // leaf until a later launch of the same session id reclaimed it or
-        // the daemon restarted, so the removal is retried briefly before it
-        // is warned about; a leaf that still refuses is a warn and an empty
-        // directory — named by its session's id, so no later session can be
-        // launched into it, and swept away at the next daemon start.
-        if let Err(e) = remove_box_leaf_patiently(leaf.dir(), DROP_LEAF_REMOVAL_ATTEMPTS, |_| {
-            std::thread::sleep(DROP_LEAF_REMOVAL_PAUSE)
-        }) {
-            tracing::warn!(
-                leaf = %leaf.dir().display(),
-                error = %e,
-                "removing the session's classifier leaf"
-            );
-        }
     }
-}
-
-/// How many times a teardown tries to remove the box's leaf before warning
-/// about a leak. One first try plus four retries.
-pub(super) const DROP_LEAF_REMOVAL_ATTEMPTS: usize = 5;
-
-/// The pause between those tries: long enough for the kernel to finish
-/// emptying a just-killed cgroup, short enough that a wedged teardown never
-/// parks on it — 4 × 20 ms after the first refusal.
-pub(super) const DROP_LEAF_REMOVAL_PAUSE: std::time::Duration =
-    std::time::Duration::from_millis(20);
-
-/// Removes the box's leaf, retrying while a just-reaped box's cgroup may
-/// still be dying: the `rmdir` of a cgroup the kernel has not finished
-/// emptying comes back `EBUSY` for a few milliseconds after the last
-/// process is reaped, and the removal is owed once — not indefinitely, so
-/// the attempts are counted and the last refusal is returned for the caller
-/// to warn.
-///
-/// `pause` is called with the number of the attempt that just failed —
-/// before the next try — and is the seam the test drives: production sleeps
-/// [`DROP_LEAF_REMOVAL_PAUSE`], a test clears the obstruction between two
-/// attempts and proves the retry is what healed the removal.
-pub(super) fn remove_box_leaf_patiently(
-    leaf: &std::path::Path,
-    attempts: usize,
-    mut pause: impl FnMut(usize),
-) -> io::Result<()> {
-    let attempts = attempts.max(1);
-    for attempt in 1..attempts {
-        if sandbox::classifier::remove_box_leaf(leaf).is_ok() {
-            return Ok(());
-        }
-        pause(attempt);
-    }
-    // The last attempt is the return, not another pause: its refusal is
-    // what the caller warns with.
-    sandbox::classifier::remove_box_leaf(leaf)
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) type SandboxProcess = HostProcess<SandboxBackend>;

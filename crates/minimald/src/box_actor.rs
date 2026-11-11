@@ -1692,15 +1692,9 @@ impl BoxActor {
                 format!("Its network settings are not valid: {error}."),
             )
         })?;
-        if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
-            started.network,
-            box_runtime::host_ip_enforcement_fact().can_decide_per_box(),
-            started.policy.egress.as_ref(),
-        ) {
-            return Err(crate::net::classifier::unenforceable_declaration_refusal(
-                &rules,
-            ));
-        }
+        crate::net::engine::engine()
+            .can_enforce(started.network, &started.policy)
+            .map_err(|refusal| std::io::Error::new(std::io::ErrorKind::InvalidInput, refusal))?;
         Ok(Some(spec))
     }
 
@@ -2971,8 +2965,7 @@ const EXIT_RECORD_WRITE_ATTEMPTS: u32 = 5;
 const EXIT_RECORD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Fails the next `n` exited-record writes of one box, so a test can pin the
-/// retry in `end_on_entrypoint_return`. Keyed by box id, as
-/// [`launch_record_seam`] is.
+/// retry in `end_on_entrypoint_return`. Keyed by box id.
 #[cfg(test)]
 pub(crate) mod exit_record_seam {
     use std::collections::HashMap;
@@ -3157,62 +3150,6 @@ pub(crate) mod resume_launch_seam {
     /// How long the actor of box `id` waits for the resume's hook launch.
     pub(super) fn timeout(id: &SessionId) -> Option<Duration> {
         get(id).map(|(_, timeout)| timeout)
-    }
-}
-
-/// The test seam for a launch whose outcome cannot be recorded (NET-079):
-/// a test names a session whose launch-record write fails, and gets back
-/// the flag the session's box's network teardown sets — the observable
-/// that the launch killed the box it could not record. Keyed by session
-/// id, so tests running beside each other in one process never fail each
-/// other's writes.
-#[cfg(test)]
-pub(crate) mod launch_record_seam {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    use boxes::SessionId;
-
-    static FAILING: Mutex<Option<HashMap<SessionId, Arc<AtomicBool>>>> = Mutex::new(None);
-
-    /// Makes every launch-record write for `id` fail, and returns the flag
-    /// its box's network teardown sets.
-    pub(crate) fn fail_writes_for(id: SessionId) -> Arc<AtomicBool> {
-        let torn_down = Arc::new(AtomicBool::new(false));
-        FAILING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(HashMap::new)
-            .insert(id, Arc::clone(&torn_down));
-        torn_down
-    }
-
-    pub(super) fn write_fails(id: &SessionId) -> bool {
-        FAILING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|failing| failing.contains_key(id))
-    }
-
-    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox::NetGuard>> {
-        let failing = FAILING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let torn_down = Arc::clone(failing.as_ref()?.get(&id)?);
-        Some(Box::new(TeardownFlag(torn_down)))
-    }
-
-    struct TeardownFlag(Arc<AtomicBool>);
-
-    impl sandbox::NetGuard for TeardownFlag {
-        fn teardown(
-            self: Box<Self>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-            self.0.store(true, Ordering::SeqCst);
-            Box::pin(async {})
-        }
     }
 }
 

@@ -484,12 +484,7 @@ pub(crate) fn attached_lease(
 /// because the host-side table's row is keyed by it. A task launch goes
 /// through [`task_network_for`] instead — the task's sandbox is not the box
 /// the registration named, and attaching it at the box's address would key
-/// its frames to the session's row. `decision` carries the verdict decision this launch itself
-/// read for the box before it reserved anything (NET-079) — the launch's own
-/// fresh fact, never another launch's, which a process-wide memo left a
-/// concurrent launch free to read in its place. A task launch passes `None`
-/// deliberately too: it places no classifier leaf, so there is no per-box
-/// verdict for its plan to follow.
+/// its frames to the session's row.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
@@ -497,28 +492,10 @@ pub(crate) fn network_for(
     policy: Option<boxes::BoxPolicy>,
     own_address: Option<OwnAddressReporter>,
     box_addresses: Option<boxes::BoxAddresses>,
-    decision: Option<crate::net::classifier::Decision>,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
             switch: Arc::clone(switch),
-            // NET-079: the subtree this box's declaration places its leaf
-            // in — deny when the declaration admits no destination, allow
-            // otherwise — selected here from the policy the launch passes,
-            // so the plan the box is built around is the one its own
-            // verdict decides.
-            verdict: host_address_verdict(policy.as_ref().and_then(|p| p.egress.as_ref())),
-            // NET-079: the decision this launch itself read, fresh before
-            // it — the box's own verdict fact, carried in rather than
-            // memoized, so the plan below follows this launch's reading and
-            // never a concurrent launch's.
-            decision,
-            // BEP-086: a box whose own spec declares a credentialed
-            // upstream with `dns` or `both` steering resolves through an
-            // answerer of its own on a VM host.
-            steering: steering_seed(identity, policy.as_ref()),
-            seams: SteeringSeams::default(),
-            answerer: std::sync::Mutex::new(None),
         }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
@@ -539,8 +516,8 @@ pub(crate) fn network_for(
 /// carrying the box's id and egress — never at the box's own address and
 /// never at one it draws. No task addresses is the plain draw, which only a
 /// native switch makes ([`SwitchClient::attach_task_slot`]). Every other
-/// mode is [`network_for`]'s, with no reporter, no handed box addresses and
-/// no classifier decision: a task owns no proxy route and places no leaf.
+/// mode is [`network_for`]'s, with no reporter and no handed box addresses:
+/// a task owns no proxy route.
 pub(crate) fn task_network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
@@ -558,145 +535,18 @@ pub(crate) fn task_network_for(
             task_slots: Some(task_addresses),
             reserved: std::sync::Mutex::new(None),
         }),
-        _ => network_for(mode, switch, identity, policy, None, None, None),
+        _ => network_for(mode, switch, identity, policy, None, None),
     }
 }
 
 /// A host-address box: it shares the daemon host's network namespace, so its
-/// plan is the sandbox layer's [`sandbox::HostNet`] — except on a VM host,
-/// where the namespace it shares is the *guest's* and the host's own resolver
-/// is unreachable from it. There the plan points the resolver at the node's
-/// DNS layer — the switch gateway, whose static `min.internal.` zone carries
-/// the `host` record (NET-003), reached through the daemon's own relay, which
-/// carries that layer for every lookup the guest's namespace sends — whatever
-/// the rootfs ships, and for every host-address box there, deny-all or not:
-/// the guest's table admits the gateway on DNS's port as a deny-all box's
-/// one carve-out. And on a native
-/// host under a deny-all declaration, the plan points the resolver at the
-/// box zone's answerer instead of the host's own (NET-079): the one
-/// destination the deny rule admits, where the box resolves exactly the
-/// names the box zone holds and nothing forwards upstream.
+/// plan is the sandbox layer's [`sandbox::HostNet`]. On a VM host the
+/// namespace it shares is the guest's, where the host's own resolver is
+/// unreachable, so there the plan names the node's DNS layer at the switch
+/// gateway, whose `min.internal.` zone carries the `host` record.
+#[derive(Debug)]
 struct HostIpAddressNetwork {
     switch: Arc<Mutex<SwitchClient>>,
-    /// The cohort subtree this box's declaration places its leaf in
-    /// (NET-079) — the deny subtree when the declaration admits no
-    /// destination. Decided before the box's first process exists, like the
-    /// leaf itself, because the plan is built before the spawn.
-    verdict: sandbox::config::Verdict,
-    /// The verdict decision this launch read before it reserved the plan
-    /// (NET-079) — carried in by the launch that builds the plan, so the
-    /// plan follows its own launch's reading and never a concurrent
-    /// launch's, which a process-wide memo let a later launch overwrite in
-    /// its place. `None` for a task launch: it places no classifier leaf,
-    /// so there is no per-box verdict for its plan to follow.
-    decision: Option<crate::net::classifier::Decision>,
-    /// The box's steered names (BEP-086), or `None` when the box's own
-    /// spec declares no credentialed upstream or its steering is not
-    /// `dns` or `both`.
-    steering: Option<SteeringSeed>,
-    /// Where the steering answerer binds, asks and fences. The defaults
-    /// are production's, and a test replaces them.
-    seams: SteeringSeams,
-    /// The steering answerer the plan started, until attach hands it to
-    /// the guard or abandon stops it.
-    answerer: std::sync::Mutex<Option<crate::net::dns::SteeringAnswerer>>,
-}
-
-/// What a host-address box's steering answerer is built from: the box's
-/// name for its log lines, and its steered names, the GitHub module's
-/// hosts and the host of each store-rule upstream its policy carries, as
-/// the switch's DNS gate steers them for an `own_ip` box.
-#[derive(Debug, Clone)]
-struct SteeringSeed {
-    box_label: String,
-    names: Vec<String>,
-}
-
-/// The steering seed for a box named `identity` with `policy`, or `None`
-/// when its own spec declares no credentialed upstream or its steering
-/// does not need a resolver (BEP-086). Only a box whose own spec steers
-/// gets one, so no other process of the shared namespace is steered.
-fn steering_seed(identity: &str, policy: Option<&boxes::BoxPolicy>) -> Option<SteeringSeed> {
-    let declaration = policy?.credentialed_upstream.as_ref()?;
-    if !declaration.bep.resolved_steering().needs_resolver() {
-        return None;
-    }
-    let names = bep::module::GITHUB
-        .hosts
-        .iter()
-        .map(|authority| authority.host.to_string())
-        .chain(declaration.store_upstream_hosts().map(str::to_string))
-        .collect();
-    Some(SteeringSeed {
-        box_label: identity.to_string(),
-        names,
-    })
-}
-
-/// The steering answerer's outside world (BEP-086): the port it binds,
-/// the node's resolver it forwards to, the proxy's listener state, and the
-/// `nft` that fences it. `None` is production's: the switch gateway's
-/// resolver and the switch's one listener state.
-#[derive(Debug, Clone)]
-struct SteeringSeams {
-    port: u16,
-    upstream: Option<std::net::SocketAddr>,
-    listener: Option<crate::net::dns::ProxyListenerState>,
-    nft: std::path::PathBuf,
-}
-
-impl Default for SteeringSeams {
-    fn default() -> Self {
-        Self {
-            port: crate::net::dns::STEERING_ANSWERER_PORT,
-            upstream: None,
-            listener: None,
-            nft: std::path::PathBuf::from(crate::net::classifier::GUEST_NFT),
-        }
-    }
-}
-
-/// The guard of a steered host-address box: it holds the steering
-/// answerer and its fence while the box runs, and removes both at
-/// teardown.
-struct SteeringGuard {
-    answerer: Option<crate::net::dns::SteeringAnswerer>,
-    nft: std::path::PathBuf,
-}
-
-impl NetGuard for SteeringGuard {
-    fn teardown(
-        self: Box<Self>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            let Some(answerer) = self.answerer else {
-                return;
-            };
-            let address = *answerer.bound().ip();
-            drop(answerer);
-            crate::net::classifier::unfence_steering_answerer(&self.nft, address).await;
-        })
-    }
-}
-
-impl std::fmt::Debug for HostIpAddressNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostIpAddressNetwork")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Which cohort subtree a host-address box's declaration places its leaf in
-/// (NET-079) — the deny subtree when the declaration admits no destination,
-/// the allow subtree otherwise. The leaf's *placement* is the session
-/// launcher's (a migration the daemon makes); what the provider selects is
-/// the subtree, because the plan it builds for the box is decided by the
-/// same verdict its connections are.
-///
-/// Pure over the declaration, so the verdict a box's plan is built around is
-/// pinned beside the plan it decides.
-fn host_address_verdict(declaration: Option<&boxes::EgressPolicy>) -> sandbox::config::Verdict {
-    crate::net::classifier::verdict_of(declaration)
 }
 
 impl Network for HostIpAddressNetwork {
@@ -704,187 +554,26 @@ impl Network for HostIpAddressNetwork {
     /// attached, so this never starts or stops a gvproxy process.
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
-            let shuttle = {
+            let (vm_host, subnet) = {
                 let s = self.switch.lock().await;
-                match s.transport() {
-                    crate::net::SwitchTransport::HostShuttle { cid, port } => Some((cid, port)),
-                    crate::net::SwitchTransport::LocalSpawn => None,
-                }
+                (
+                    matches!(
+                        s.transport(),
+                        crate::net::SwitchTransport::HostShuttle { .. }
+                    ),
+                    s.subnet(),
+                )
             };
-            let vm_host = shuttle.is_some();
             if !vm_host {
-                // A native deny-all box resolves through the box zone's
-                // answerer (NET-079), never through the host's own resolver:
-                // the host's resolver forwards any name upstream, so a
-                // deny-all box pointed at it would resolve everything
-                // outside through the one destination its connections are
-                // admitted to. The plan names the answerer's address — the
-                // one address the deny rule admits — and that is all
-                // `/etc/resolv.conf` can name: the answerer's port is the
-                // one the rule admits and the host's resolver hook names
-                // with its `port` directive (NET-122, design §7.1), and it
-                // stays the answerer's own, not the plan's.
-                if self.verdict == sandbox::config::Verdict::Deny {
-                    // Over a table that decides per box, the carve-out it
-                    // loaded must name the answerer actually serving: a
-                    // stale target, or no answerer at all, refuses the box
-                    // (NET-079), and the resolver is the live bind's own
-                    // address, never a constant.
-                    let live = crate::net::classifier::live_answerer();
-                    if let Some(decision) = self
-                        .decision
-                        .as_ref()
-                        .filter(|decision| decision.can_decide_per_box())
-                        && let Some(refusal) = crate::net::classifier::stale_carve_out_refusal(
-                            decision.carve_out(),
-                            live,
-                        )
-                    {
-                        return Err(NetworkError::new(std::io::Error::other(refusal)));
-                    }
-                    let answerer = match live {
-                        Some(std::net::SocketAddr::V4(bound)) => *bound.ip(),
-                        _ => crate::net::classifier::ANSWERER_ADDRESS,
-                    };
-                    return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![answerer])));
-                }
-                // Native host: the namespace the box shares is the host's own,
-                // so the sandbox layer's plan answers `host.min.internal` from
-                // `/etc/hosts` at the host's loopback.
+                // The namespace the box shares is the host's own, so
+                // `host.min.internal` answers from `/etc/hosts` at the
+                // host's loopback.
                 return sandbox::HostNet.plan().await;
             }
-            // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
-            // box shares is the guest's loopback, not the host's, and the host
-            // resolver `/etc/hosts` would complement is unreachable. The node's
-            // DNS layer answers the name at the gateway, and
-            // `Resolver::Nameservers` replaces whatever the rootfs ships.
-            //
-            // One path for every host-address box, deny-all or not and
-            // decided or not: the box's lookups leave the guest's namespace
-            // through the daemon's own relay, which carries the node's DNS
-            // layer ([`crate::net::switch::spawn_node_relay`]), so nothing
-            // reaches upstream except through it. A deny-all box in a guest
-            // that decides per box resolves through the same address — the
-            // table steers the deny subtree's lookups onto the guest's own
-            // DNS listener at that address's port 53 (NET-079), which
-            // refuses every name outside the zone — and reaches none of
-            // what it resolves; in a guest that decides nothing it is
-            // refused before a plan is ever asked for.
-            let subnet = { self.switch.lock().await.subnet() };
-            let ns = subnet.dns_server();
-            // BEP-086: a box whose own spec steers resolves through an
-            // answerer of its own, which answers its steered names with
-            // the proxy's address and forwards every other name to the
-            // node's DNS layer at the same gateway. Every other box keeps
-            // the gateway itself.
-            let (Some(seed), Some((cid, port))) = (self.steering.as_ref(), shuttle) else {
-                return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![ns])));
-            };
-            let listener = self.seams.listener.clone().unwrap_or_else(|| {
-                crate::net::dns::ProxyListenerState::for_switch(
-                    &crate::net::policy::ControlChannel::Vsock { cid, port },
-                )
-            });
-            let plan = crate::net::dns::SteeringPlan::new(
-                seed.box_label.clone(),
-                seed.names.iter().map(String::as_str),
-                subnet.box_egress_proxy_address(),
-                listener,
-                self.seams
-                    .upstream
-                    .unwrap_or_else(|| std::net::SocketAddr::new(ns.into(), 53)),
-            );
-            // Fail closed: a box whose steered names would reach real DNS
-            // is not started.
-            let answerer = crate::net::dns::SteeringAnswerer::start(plan, self.seams.port)
-                .await
-                .map_err(|error| {
-                    NetworkError::new(std::io::Error::other(format!(
-                        "cannot start the DNS answerer that sends this box's GitHub \
-                         lookups to the Box Egress Proxy: {error}"
-                    )))
-                })?;
-            let bound = answerer.bound();
-            // Fail closed: until attach knows the box's leaf, no leaf
-            // reaches the answerer. A box whose answerer cannot be closed
-            // is not started.
-            if let Err(error) = crate::net::classifier::close_steering_answerer(
-                &self.seams.nft,
-                *bound.ip(),
-                bound.port(),
-            )
-            .await
-            {
-                drop(answerer);
-                crate::net::classifier::unfence_steering_answerer(&self.seams.nft, *bound.ip())
-                    .await;
-                return Err(NetworkError::new(std::io::Error::other(format!(
-                    "cannot keep other processes away from the DNS answerer that sends \
-                     this box's GitHub lookups to the Box Egress Proxy: {error}"
-                ))));
-            }
-            let address = *bound.ip();
-            *self
-                .answerer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answerer);
-            Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![address])))
-        })
-    }
-
-    /// Fences the steering answerer the plan started to the box's own
-    /// leaf (BEP-086), and hands both to the guard. A box with no answerer
-    /// needs no wiring. A fence that cannot be set fails the attach: the
-    /// answerer stops and its closed fence goes, so no other process of
-    /// the guest can use it as a relay or read the box's steered answers.
-    fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
-        Box::pin(async move {
-            let answerer = self
-                .answerer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(bound) = answerer
-                .as_ref()
-                .map(crate::net::dns::SteeringAnswerer::bound)
-                && let Err(error) = crate::net::classifier::fence_steering_answerer(
-                    &self.seams.nft,
-                    *bound.ip(),
-                    bound.port(),
-                    spawned.netns_pid(),
-                )
-                .await
-            {
-                drop(answerer);
-                crate::net::classifier::unfence_steering_answerer(&self.seams.nft, *bound.ip())
-                    .await;
-                return Err(NetworkError::new(std::io::Error::other(format!(
-                    "cannot limit the DNS answerer that sends this box's GitHub lookups \
-                     to the Box Egress Proxy to this box alone: {error}"
-                ))));
-            }
-            Ok(Box::new(SteeringGuard {
-                answerer,
-                nft: self.seams.nft.clone(),
-            }) as Box<dyn NetGuard>)
-        })
-    }
-
-    /// Stops the steering answerer the plan started, and removes its
-    /// closed fence, when no attach follows.
-    fn abandon(&self) -> AbandonFuture<'_> {
-        let answerer = self
-            .answerer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        Box::pin(async move {
-            let Some(answerer) = answerer else {
-                return;
-            };
-            let address = *answerer.bound().ip();
-            drop(answerer);
-            crate::net::classifier::unfence_steering_answerer(&self.seams.nft, address).await;
+            // In a guest, 127.0.0.1 is the guest's loopback and the host's
+            // resolver is unreachable. The node's DNS layer answers at the
+            // gateway, and named servers replace whatever the rootfs ships.
+            Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![subnet.dns_server()])))
         })
     }
 }
@@ -1219,7 +908,7 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
             .plan()
             .await
             .unwrap();
@@ -1233,14 +922,14 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None, None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -1349,7 +1038,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -1385,7 +1074,6 @@ mod tests {
                     NetworkMode::OwnIp,
                     &switch,
                     &format!("p{i}"),
-                    None,
                     None,
                     None,
                     None,
@@ -1432,7 +1120,7 @@ mod tests {
 
         let subnet = crate::net::SwitchSubnet::default();
         let switch = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
             .plan()
             .await
             .expect("host-address plans do not fail");
@@ -1516,362 +1204,6 @@ mod tests {
         );
     }
 
-    /// NET-079 natively: over a table that decides per box, a deny-all box's
-    /// plan follows the live answerer bind — its resolver is the bind's own
-    /// address while the table's recorded carve-out names that bind, and the
-    /// plan refuses the box as a stale carve-out once it does not. A box that
-    /// is not deny-all is unaffected.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn carve_out_targets_live_answerer_bind_in_the_box_plan() {
-        use crate::net::classifier::{Decision, clear_live_answerer, set_live_answerer};
-
-        let deny_all = Some(boxes::BoxPolicy::new(
-            Some(boxes::EgressPolicy::deny_all()),
-            None,
-        ));
-        let native = Arc::new(Mutex::new(SwitchClient::new(
-            "/usr/bin/gvproxy",
-            "/run/minimal/gvproxy",
-        )));
-        let recorded = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7656);
-        let decision = Decision::decided().with_carve_out(Some(recorded));
-        let plan = |policy| {
-            network_for(
-                NetworkMode::HostNet,
-                &native,
-                "s",
-                policy,
-                None,
-                None,
-                Some(decision.clone()),
-            )
-        };
-
-        set_live_answerer(std::net::SocketAddr::V4(recorded));
-        let live = plan(deny_all.clone())
-            .plan()
-            .await
-            .expect("a carve-out naming the live bind plans the box");
-        assert_eq!(
-            live.resolver(),
-            &Resolver::Nameservers(vec![*recorded.ip()]),
-            "the resolver is the live bind's address"
-        );
-
-        set_live_answerer(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            7700,
-        ));
-        let stale = plan(deny_all.clone()).plan().await;
-        let refusal = stale.expect_err("a carve-out naming another bind is stale");
-        assert!(
-            refusal.to_string().contains("its name lookups would fail"),
-            "the plan refuses the box as a stale carve-out: {refusal}"
-        );
-
-        clear_live_answerer();
-        assert!(
-            plan(deny_all).plan().await.is_err(),
-            "no live answerer refuses the deny-all box"
-        );
-        assert!(
-            plan(None).plan().await.is_ok(),
-            "a box that is not deny-all is unaffected"
-        );
-    }
-
-    /// NET-079: on a native host, a deny-all host-address box resolves through
-    /// the box zone's answerer — the resolver Minimal owns for it, the one
-    /// destination its connections are admitted to — never through the host's
-    /// own resolver, which forwards any name upstream and would hand the box
-    /// everything outside through that one carve-out. A box that is not
-    /// deny-all keeps the host's resolver, and a deny-all box on a VM host
-    /// keeps the node's DNS layer: the answerer is this host's loopback, which
-    /// a box in the guest's namespace has no reach into.
-    #[tokio::test]
-    async fn host_ip_box_resolves_through_answerer() {
-        let deny_all = Some(boxes::BoxPolicy::new(
-            Some(boxes::EgressPolicy::deny_all()),
-            None,
-        ));
-        let native = Arc::new(Mutex::new(SwitchClient::new(
-            "/usr/bin/gvproxy",
-            "/run/minimal/gvproxy",
-        )));
-
-        let plan = network_for(
-            NetworkMode::HostNet,
-            &native,
-            "s",
-            deny_all.clone(),
-            None,
-            None,
-            None,
-        )
-        .plan()
-        .await
-        .expect("host-address plans do not fail");
-        assert_eq!(
-            plan.resolver(),
-            &Resolver::Nameservers(vec![crate::net::classifier::ANSWERER_ADDRESS]),
-            "a native deny-all box resolves through the zone's answerer"
-        );
-        assert_ne!(
-            plan.resolver(),
-            &Resolver::Host,
-            "never through the host's own resolver: it forwards any name upstream"
-        );
-
-        // The carve-out the table itself enforces for that resolver: the
-        // installer's rendered table steers the deny subtree's DNS
-        // lookups — the one port a box cannot be refused on, or nothing it
-        // asks ever resolves — onto the answerer's address and port, so the
-        // one destination a deny-all box's connections are admitted to is
-        // the one its resolver really is. The match carries no destination
-        // address (NET-079): a box asks the switch gateway like every other
-        // host-address box, and the steer is the carve-out. Read off the
-        // step's own `--print-ruleset` output, so what is pinned is what a
-        // host loads. 53 is DNS, spelled here because the constant that
-        // owns it (`dns_gate::DNS_PORT`) is private to its module.
-        let ruleset = crate::net::classifier::rendered_ruleset();
-        let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
-        let dnat = format!(
-            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" \
-             udp dport 53 dnat ip to {}:{}",
-            crate::net::classifier::ANSWERER_ADDRESS,
-            crate::net::answerer::ANSWERER_PORT,
-        );
-        assert_eq!(
-            dstnat,
-            [dnat.as_str()],
-            "the table retargets the deny subtree's DNS onto the answerer, and \
-             does nothing else at dstnat: the carve-out is one DNAT rule"
-        );
-
-        // A box that is not deny-all inherits the host's resolver: no verdict
-        // of its own, no carve-out to be routed through.
-        let plain = network_for(NetworkMode::HostNet, &native, "s", None, None, None, None)
-            .plan()
-            .await
-            .expect("host-address plans do not fail");
-        assert_eq!(plain.resolver(), &Resolver::Host);
-
-        // On a VM host the deny verdict alone changes nothing here: the
-        // namespace the box shares is the guest's, and — with no decision
-        // carried in — nothing decides per box, so the node's DNS layer
-        // answers it. The decided case is the test below.
-        let vm = counting_switch();
-        let guest_plan = network_for(NetworkMode::HostNet, &vm, "s", deny_all, None, None, None)
-            .plan()
-            .await
-            .expect("host-address plans do not fail");
-        assert_eq!(
-            guest_plan.resolver(),
-            &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()]),
-            "a VM host's deny-all box resolves through the node's DNS layer"
-        );
-    }
-
-    /// NET-079 on a VM host, with NET-003: a deny-all host-address box
-    /// resolves through the resolver Minimal owns for it, which on a
-    /// VM-backed host is the node's DNS layer at the switch gateway, the
-    /// same one every other host-address box there resolves through. In a
-    /// guest that decides per box, that address is the one the guest's
-    /// own table steers the deny subtree's lookups at: the dstnat rule
-    /// retargets its UDP-53 datagrams onto the guest's own DNS listener
-    /// (NET-079), which forwards the zone's A questions to the gateway
-    /// and refuses every name outside the zone, and the deny chain admits
-    /// the listener alone — the steer and the admission are one fact, so
-    /// the plan's nameserver and the table's carve-out cannot drift
-    /// apart. A guest that decided nothing (a boot whose check or load
-    /// failed, a table gone behind its marker, a probe that read no
-    /// refusal) gives the plan the same resolver; such a guest refuses
-    /// the deny-all box at launch anyway. The decision is a parameter
-    /// the launch passes in, so no reading of another launch can move
-    /// the box's resolver, and a box that is not deny-all resolves
-    /// through the same layer.
-    #[tokio::test]
-    async fn guest_deny_all_box_resolves_through_answerer_once_decided() {
-        use crate::net::classifier::{Cause, Decision};
-
-        let deny_all = Some(boxes::BoxPolicy::new(
-            Some(boxes::EgressPolicy::deny_all()),
-            None,
-        ));
-        let switch = counting_switch();
-        let subnet = crate::net::SwitchSubnet::default();
-        let node_layer = Resolver::Nameservers(vec![subnet.dns_server()]);
-        let plan = |policy, decision| {
-            network_for(
-                NetworkMode::HostNet,
-                &switch,
-                "s",
-                policy,
-                None,
-                None,
-                decision,
-            )
-        };
-
-        // Decided per box: the box resolves through the node's DNS layer.
-        let decided = plan(deny_all.clone(), Some(Decision::decided()))
-            .plan()
-            .await
-            .expect("host-address plans do not fail");
-        assert_eq!(
-            decided.resolver(),
-            &node_layer,
-            "a guest that decides per box resolves a deny-all box through the \
-             node's DNS layer at the gateway"
-        );
-
-        // And that address is the one the guest's own table steers the deny
-        // subtree's lookups at: the dstnat rule retargets its UDP-53
-        // datagrams onto the guest's own DNS listener, and the deny chain
-        // admits the listener alone — the listener the box's lookups are
-        // steered onto, at the port the plan's nameserver answers at.
-        let guest_ip = std::net::IpAddr::V4(subnet.daemon_ip());
-        let ruleset = String::from_utf8(crate::net::classifier::guest_ruleset(guest_ip, guest_ip))
-            .expect("the guest's render is text");
-        let deny_out = crate::net::classifier::chain_rules(&ruleset, "deny_out");
-        let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
-        let Resolver::Nameservers(nameservers) = decided.resolver() else {
-            panic!("the plan names its nameservers: {:?}", decided.resolver());
-        };
-        let listener_addr = crate::net::guest_dns::LISTENER_ADDRESS;
-        let listener_port = crate::net::guest_dns::LISTENER_PORT;
-        let steer = format!(
-            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" udp dport 53 dnat ip to \
-             {listener_addr}:{listener_port}"
-        );
-        assert_eq!(
-            dstnat,
-            [steer.as_str()],
-            "the guest's table steers the deny subtree's lookups onto the listener the \
-             plan's nameserver {nameservers:?} answers at: {dstnat:?}"
-        );
-        let listener = format!("ip daddr {listener_addr} udp dport {listener_port} accept");
-        assert!(
-            deny_out.contains(&listener.as_str()),
-            "the guest's table admits the listener the deny subtree's lookups are steered \
-             onto: {deny_out:?}"
-        );
-        for rule in deny_out.iter().filter(|rule| rule.ends_with("accept")) {
-            assert!(
-                rule.contains("ct direction reply") || rule == &listener,
-                "the listener and the reply direction are the whole carve-out: {deny_out:?}"
-            );
-        }
-
-        // Undecided, unread, and read again after a decided launch: the same
-        // resolver, whatever the launch read.
-        for (decision, why) in [
-            (
-                Some(Decision::undecidable(Cause::GuestTableNotLoaded)),
-                "a launch that read an undecidable cause",
-            ),
-            (None, "a launch that read no decision"),
-            (
-                Some(Decision::undecidable(Cause::GuestTableNotLoaded)),
-                "a later launch that read an undecidable cause",
-            ),
-        ] {
-            let other = plan(deny_all.clone(), decision)
-                .plan()
-                .await
-                .expect("host-address plans do not fail");
-            assert_eq!(
-                other.resolver(),
-                &node_layer,
-                "{why} resolves through the node's DNS layer"
-            );
-        }
-
-        // One path: a box that is not deny-all resolves through the same layer.
-        let plain = plan(None, Some(Decision::decided()))
-            .plan()
-            .await
-            .expect("host-address plans do not fail");
-        assert_eq!(
-            plain.resolver(),
-            &node_layer,
-            "a box that is not deny-all resolves through the same layer"
-        );
-    }
-
-    /// NET-079's cgroup half, as the provider selects it: a host-address box's
-    /// leaf is one level under the subtree its verdict picked — deny or allow
-    /// — never directly under the cohort, where the refusing rule's level
-    /// arithmetic would silently miss it and the box would run unenforced
-    /// while looking classified.
-    #[test]
-    fn host_ip_box_cannot_leave_its_cgroup() {
-        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
-        let root = tree.path();
-        let cohort = root.join(sandbox::classifier::BOXES_DIR);
-        let deny = cohort.join(sandbox::config::DENY_DIR);
-        let allow = cohort.join(sandbox::config::ALLOW_DIR);
-
-        for (declaration, expected, why) in [
-            (
-                Some(boxes::EgressPolicy::deny_all()),
-                sandbox::config::Verdict::Deny,
-                "a deny-all box",
-            ),
-            (
-                None,
-                sandbox::config::Verdict::Allow,
-                "a box with no egress section",
-            ),
-        ] {
-            // The subtree the declaration picks is the one the leaf is placed
-            // in — the same selection the launch's own placement makes.
-            let verdict = host_address_verdict(declaration.as_ref());
-            assert_eq!(verdict, expected, "{why} is classified by its declaration");
-            let leaf = sandbox::config::ClassifierLeaf::under(root, "a session", verdict);
-            assert_eq!(
-                leaf.dir().parent().and_then(std::path::Path::parent),
-                Some(cohort.as_path()),
-                "{why}'s leaf is one level under its subtree, one level under \
-                 the cohort: {}",
-                leaf.dir().display()
-            );
-            assert_eq!(
-                leaf.dir().parent(),
-                Some(match verdict {
-                    sandbox::config::Verdict::Deny => deny.as_path(),
-                    sandbox::config::Verdict::Allow => allow.as_path(),
-                }),
-                "{why}'s leaf is in the subtree its verdict picked"
-            );
-            assert!(
-                leaf.dir().parent() != Some(cohort.as_path()),
-                "no host-address leaf sits directly under the cohort: the deny \
-                 rule's match is on the subtree, and a leaf beside it is \
-                 outside both subtrees ({})",
-                leaf.dir().display()
-            );
-        }
-
-        // And the two subtrees are what the leaf is decided between: a
-        // deny-all box's leaf is in the deny subtree and no other box's is in
-        // it, the same arithmetic the refusing rule and the cohort's source
-        // identity are keyed on.
-        let deny_all = sandbox::config::ClassifierLeaf::under(
-            root,
-            "a session",
-            sandbox::config::Verdict::Deny,
-        );
-        assert_eq!(
-            deny_all.relative_dir(),
-            std::path::PathBuf::from(sandbox::classifier::BOXES_DIR)
-                .join(sandbox::config::DENY_DIR)
-                .join(sandbox::classifier::sanitize_box_id("a session")),
-            "the leaf's in-box spelling keeps the whole subtree path"
-        );
-    }
-
     /// NET-003 for every box kind: `host.min.internal` answers with the address
     /// that reaches the host's loopback — `127.0.0.1` from `/etc/hosts` for a
     /// box sharing the native host's namespace, the switch gateway's DNS zone
@@ -1886,7 +1218,7 @@ mod tests {
             "/usr/bin/gvproxy",
             "/run/minimal/gvproxy",
         )));
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
             .plan()
             .await
             .unwrap();
@@ -1902,7 +1234,7 @@ mod tests {
 
         // VM-host host-address: the node's DNS layer answers the same name.
         let vm = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None)
             .plan()
             .await
             .unwrap();
@@ -1925,354 +1257,6 @@ mod tests {
         assert!(
             own.hosts().is_empty(),
             "own-address boxes resolve the host through the zone, not /etc/hosts"
-        );
-    }
-
-    /// A grant policy: a credentialed upstream with `steering`, or with no
-    /// steering line, which resolves to `dns` (BEP-016).
-    fn grant_policy(steering: Option<boxes::core::bep::Steering>) -> boxes::BoxPolicy {
-        boxes::BoxPolicy {
-            credentialed_upstream: Some(boxes::CredentialedUpstream {
-                bep: boxes::core::bep::BepSettings {
-                    steering,
-                    ..boxes::core::bep::BepSettings::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// A host-address network over `switch` for a box with `policy`, with
-    /// the steering seams a test can drive: port 0, `upstream` as the
-    /// node's resolver, `listener` as the proxy's listener state.
-    fn host_ip_network(
-        switch: &Arc<Mutex<SwitchClient>>,
-        policy: Option<boxes::BoxPolicy>,
-        upstream: std::net::SocketAddr,
-        listener: &crate::net::dns::ProxyListenerState,
-    ) -> HostIpAddressNetwork {
-        HostIpAddressNetwork {
-            switch: Arc::clone(switch),
-            verdict: host_address_verdict(policy.as_ref().and_then(|p| p.egress.as_ref())),
-            decision: None,
-            steering: steering_seed("grant-box", policy.as_ref()),
-            seams: SteeringSeams {
-                port: 0,
-                upstream: Some(upstream),
-                listener: Some(listener.clone()),
-                nft: stand_in_nft("nft", "cat > /dev/null\n"),
-            },
-            answerer: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// A stand-in `nft` called `name` that runs `body` as a shell script,
-    /// in a scratch dir that lives as long as the test binary.
-    fn stand_in_nft(name: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        let dir = DIR.get_or_init(|| tempfile::tempdir().expect("a scratch dir"));
-        let path = dir.path().join(name);
-        if !path.exists() {
-            let staged = dir.path().join(format!(".{name}.{}", std::process::id()));
-            std::fs::write(&staged, format!("#!/bin/sh\n{body}")).unwrap();
-            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::fs::rename(&staged, &path).unwrap();
-        }
-        path
-    }
-
-    /// The real address the stand-in for the node's resolver gives every
-    /// A question.
-    const REAL_GITHUB: Ipv4Addr = Ipv4Addr::new(140, 82, 112, 3);
-
-    /// A stand-in for the node's resolver on loopback: it answers each A
-    /// question with [`REAL_GITHUB`], and counts the lookups it gets.
-    async fn real_resolver() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-        use hickory_proto::op::{Message, MessageType};
-        use hickory_proto::rr::{RData, Record, RecordType, rdata::A};
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&asked);
-        crate::traced::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let Ok(query) = Message::from_vec(&buf[..len]) else {
-                    continue;
-                };
-                let mut reply = query.clone();
-                reply.metadata.message_type = MessageType::Response;
-                for q in &query.queries {
-                    if q.query_type() == RecordType::A {
-                        reply.add_answer(Record::from_rdata(
-                            q.name().clone(),
-                            60,
-                            RData::A(A(REAL_GITHUB)),
-                        ));
-                    }
-                }
-                let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
-            }
-        });
-        (addr, asked)
-    }
-
-    /// Asks `server` for `name` of `rtype`, as a box's resolver would.
-    async fn ask(
-        server: std::net::SocketAddr,
-        name: &str,
-        rtype: hickory_proto::rr::RecordType,
-    ) -> hickory_proto::op::Message {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket
-            .send_to(&crate::net::answerer::encode_query(name, rtype), server)
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 4096];
-        let len = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf))
-            .await
-            .expect("the resolver answers")
-            .unwrap();
-        hickory_proto::op::Message::from_vec(&buf[..len]).unwrap()
-    }
-
-    /// The A addresses of `reply`.
-    fn a_answers(reply: &hickory_proto::op::Message) -> Vec<Ipv4Addr> {
-        reply
-            .answers
-            .iter()
-            .filter_map(|record| match &record.data {
-                hickory_proto::rr::RData::A(a) => Some(a.0),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// BEP-086, BEP-078, BEP-062: on a VM host a `host_ip` box whose own
-    /// spec declares a credentialed upstream, with no steering line or
-    /// with `dns` or `both`, resolves through a steering answerer of its
-    /// own. The plan names the answerer's loopback address, never the
-    /// gateway. The answerer gives a steered name's A lookup the proxy's
-    /// address while the proxy listens, NODATA for AAAA, HTTPS and SVCB,
-    /// and SERVFAIL while the proxy is down. It forwards every other name
-    /// to the node's resolver. Abandoning the launch stops the answerer.
-    #[tokio::test]
-    async fn host_ip_grant_box_steered_names_resolve_to_proxy() {
-        use boxes::core::bep::Steering;
-        use hickory_proto::op::ResponseCode;
-        use hickory_proto::rr::RecordType;
-
-        let subnet = crate::net::SwitchSubnet::default();
-        let proxy = subnet.box_egress_proxy_address();
-        let switch = counting_switch();
-        let (upstream, asked) = real_resolver().await;
-        for steering in [None, Some(Steering::Dns), Some(Steering::Both)] {
-            let listener = crate::net::dns::ProxyListenerState::down();
-            listener.set_live(true);
-            let net = host_ip_network(&switch, Some(grant_policy(steering)), upstream, &listener);
-            let plan = net
-                .plan()
-                .await
-                .expect("the steered plan starts its answerer");
-            let bound = net
-                .answerer
-                .lock()
-                .unwrap()
-                .as_ref()
-                .expect("the plan holds the answerer until attach")
-                .bound();
-            assert_eq!(
-                plan.resolver(),
-                &Resolver::Nameservers(vec![*bound.ip()]),
-                "{steering:?}: the box resolves through its own answerer"
-            );
-            assert_ne!(
-                *bound.ip(),
-                subnet.dns_server(),
-                "{steering:?}: not the gateway"
-            );
-            assert_eq!(
-                bound.ip().octets()[..2],
-                [127, 53],
-                "{steering:?}: a loopback address"
-            );
-            let server = std::net::SocketAddr::V4(bound);
-
-            let before = asked.load(std::sync::atomic::Ordering::SeqCst);
-            for name in ["github.com.", "API.GitHub.com.", "codeload.github.com."] {
-                let reply = ask(server, name, RecordType::A).await;
-                assert_eq!(
-                    reply.metadata.response_code,
-                    ResponseCode::NoError,
-                    "{name}"
-                );
-                assert_eq!(
-                    a_answers(&reply),
-                    vec![proxy],
-                    "{steering:?}: {name} is the proxy"
-                );
-            }
-            for rtype in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
-                let reply = ask(server, "github.com.", rtype).await;
-                assert_eq!(
-                    reply.metadata.response_code,
-                    ResponseCode::NoError,
-                    "{rtype}"
-                );
-                assert!(reply.answers.is_empty(), "{rtype} is NODATA");
-            }
-            assert_eq!(
-                asked.load(std::sync::atomic::Ordering::SeqCst),
-                before,
-                "{steering:?}: no steered name reaches real DNS"
-            );
-
-            listener.set_live(false);
-            let reply = ask(server, "github.com.", RecordType::A).await;
-            assert_eq!(
-                reply.metadata.response_code,
-                ResponseCode::ServFail,
-                "{steering:?}: SERVFAIL while the proxy is down"
-            );
-            assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), before);
-
-            // Every other name is the node's resolver's to answer.
-            let reply = ask(server, "example.com.", RecordType::A).await;
-            assert_eq!(
-                a_answers(&reply),
-                vec![REAL_GITHUB],
-                "{steering:?}: forwarded"
-            );
-            assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), before + 1);
-
-            // A datagram the answerer cannot read never reaches real DNS.
-            let steering_plan = crate::net::dns::SteeringPlan::new(
-                "grant-box",
-                ["github.com"],
-                proxy,
-                listener.clone(),
-                upstream,
-            );
-            assert_eq!(
-                steering_plan.verdict(b"\x00\x01not a dns message"),
-                crate::net::dns::SteeringVerdict::Drop
-            );
-            assert_eq!(
-                steering_plan.verdict(&vec![0u8; 5000]),
-                crate::net::dns::SteeringVerdict::Drop
-            );
-
-            net.abandon().await;
-            assert!(
-                net.answerer.lock().unwrap().is_none(),
-                "abandon stops the answerer"
-            );
-        }
-
-        // Fail closed: an answerer that cannot be closed to other leaves
-        // starts no box.
-        let listener = crate::net::dns::ProxyListenerState::down();
-        let mut net = host_ip_network(&switch, Some(grant_policy(None)), upstream, &listener);
-        net.seams.nft = stand_in_nft("refusing", "cat > /dev/null\nexit 1\n");
-        assert!(
-            net.plan().await.is_err(),
-            "a refused closed fence fails the plan"
-        );
-        assert!(net.answerer.lock().unwrap().is_none());
-
-        // Fail closed: a fence that cannot admit the box's own leaf fails
-        // the attach, and the answerer stops.
-        let net = host_ip_network(&switch, Some(grant_policy(None)), upstream, &listener);
-        net.plan()
-            .await
-            .expect("the steered plan starts its answerer");
-        assert!(
-            net.attach(Spawned::new(u32::MAX)).await.is_err(),
-            "a process with no box leaf cannot be fenced"
-        );
-        assert!(
-            net.answerer.lock().unwrap().is_none(),
-            "a failed attach stops the answerer"
-        );
-
-        // The plan the launch builds through `network_for` reads the same
-        // policy: a grant box gets a seed, a plain box none.
-        assert!(steering_seed("b", Some(&grant_policy(None))).is_some());
-        let seed = steering_seed("b", Some(&grant_policy(Some(Steering::Both)))).unwrap();
-        for authority in bep::module::GITHUB.hosts {
-            assert!(seed.names.iter().any(|name| name == authority.host));
-        }
-    }
-
-    /// BEP-086's unwanted case: a process of the shared namespace that is
-    /// not a steered grant box looks a steered name up through the node's
-    /// resolver and gets the real address. A `host_ip` box with no grant,
-    /// one with `proxy_env` or `off` steering, and one with no policy keep
-    /// the gateway and start no answerer. On a native host a grant box
-    /// starts none either. The steered box's answerer is fenced to its own
-    /// leaf, so no other leaf reaches it.
-    #[tokio::test]
-    async fn host_ip_lookup_outside_a_steered_box_resolves_real() {
-        use boxes::core::bep::Steering;
-        use hickory_proto::rr::RecordType;
-
-        let subnet = crate::net::SwitchSubnet::default();
-        let switch = counting_switch();
-        let (upstream, _asked) = real_resolver().await;
-        let listener = crate::net::dns::ProxyListenerState::down();
-        listener.set_live(true);
-        for (case, policy) in [
-            ("no policy", None),
-            ("no grant", Some(boxes::BoxPolicy::default())),
-            ("proxy_env", Some(grant_policy(Some(Steering::ProxyEnv)))),
-            ("off", Some(grant_policy(Some(Steering::Off)))),
-        ] {
-            let net = host_ip_network(&switch, policy, upstream, &listener);
-            let plan = net.plan().await.expect("host-address plans do not fail");
-            assert_eq!(
-                plan.resolver(),
-                &Resolver::Nameservers(vec![subnet.dns_server()]),
-                "{case}: the node's resolver at the gateway"
-            );
-            assert!(
-                net.answerer.lock().unwrap().is_none(),
-                "{case}: no answerer"
-            );
-        }
-        // The node's resolver answers a steered name with its real address.
-        let reply = ask(upstream, "github.com.", RecordType::A).await;
-        assert_eq!(a_answers(&reply), vec![REAL_GITHUB]);
-
-        // A native host has no proxy: a grant box there keeps the host's
-        // resolver and starts no answerer.
-        let native = Arc::new(Mutex::new(SwitchClient::new(
-            "/usr/bin/gvproxy",
-            "/run/minimal/gvproxy",
-        )));
-        let net = host_ip_network(&native, Some(grant_policy(None)), upstream, &listener);
-        let plan = net.plan().await.expect("host-address plans do not fail");
-        assert_eq!(plan.resolver(), &Resolver::Host);
-        assert!(
-            net.answerer.lock().unwrap().is_none(),
-            "native: no answerer"
-        );
-
-        // The steered box's answerer is fenced to the box's own leaf.
-        let fence = crate::net::classifier::render_steering_fence(
-            Ipv4Addr::new(127, 53, 0, 1),
-            53,
-            std::path::Path::new("minimald.slice/boxes/allow/grant"),
-        );
-        assert!(
-            fence.contains("socket cgroupv2 level 4 \"minimald.slice/boxes/allow/grant\" return"),
-            "{fence}"
-        );
-        assert!(
-            fence.contains("reject with icmpx admin-prohibited"),
-            "{fence}"
         );
     }
 }

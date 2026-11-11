@@ -138,13 +138,6 @@ impl BoxActor {
             session: session.downgrade(),
             // What this launch is for; see [`BoxActor::launch_host`].
             for_hooks,
-            // The classifier tree the privileged step installs natively and
-            // the guest's own boot mounts; see the field's doc.
-            classifier_root: std::path::PathBuf::from(sandbox::classifier::TREE_ROOT),
-            // The mount table the launch's classifier facts answer over is
-            // the daemon's own, read live on every launch; see the field's
-            // doc.
-            classifier_mountinfo: None,
             // The spawn's publication set, shared with the listen plan the
             // launch gathers; see the assignment above.
             publications: self.publications.clone(),
@@ -192,32 +185,7 @@ impl BoxActor {
         // its launch carries read the same set the way the real box's two
         // surfaces do.
         self.publications = Default::default();
-        // Mirror the production classifier half too, as the placement's
-        // outcome alone: a mock launch records what its own placement would
-        // — `per_box` when the fact's cause says this host has the step's
-        // tree to place a leaf in (the same inference the reads make over a
-        // launch that cannot tell them, `fact_places_a_leaf`), `none` when
-        // it does not — over the fact a test's injected reading sets, so
-        // the launches a test drives record each box's own outcome over the
-        // same fact the real launcher's per-launch read produces. The mock
-        // has no sandbox, so it models the placement's outcome, not the
-        // placement: which box a leaf goes to, and the mapping from a
-        // placement to the state it leaves the box in, are the production
-        // launcher's, pinned in session_host's launch proofs. A session
-        // that is not host-address keeps the plain mock — its verdict is
-        // decided on address leases, never on the host's cgroup tree, so
-        // there is no per-box outcome for its launches to record.
-        let launcher = if record.network == boxes::NetworkMode::HostNet {
-            let fact = crate::box_runtime::host_ip_enforcement_fact();
-            let placement = if crate::box_runtime::fact_places_a_leaf(fact.cause) {
-                minimald_rpc::HostIpEnforcement::PerBox
-            } else {
-                minimald_rpc::HostIpEnforcement::None
-            };
-            box_runtime::MockLauncher::with_host_ip_enforcement(placement)
-        } else {
-            box_runtime::MockLauncher::default()
-        };
+        let launcher = box_runtime::MockLauncher::default();
         // The spec the actor handed over, recorded so a test can see it,
         // and handed on: the mock starts its entrypoint as the real
         // launcher does.
@@ -266,12 +234,6 @@ impl BoxActor {
                 .published_address(),
             );
         }
-        // A session whose launch-record write a test fails also carries
-        // the guard that test watches, so the box's teardown is
-        // observable after the launch kills it.
-        Ok(match launch_record_seam::teardown_guard(record.id) {
-            Some(guard) => launcher.and_net_guard(guard),
-            None => launcher,
-        })
+        Ok(launcher)
     }
 }

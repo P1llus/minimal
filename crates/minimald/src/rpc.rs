@@ -28,7 +28,6 @@ use crate::{
     ChannelConfig,
     box_manager::BoxKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
-    net::classifier,
     server::ServerStateHandle,
 };
 
@@ -135,21 +134,7 @@ async fn serve_list_sessions(
             // has not come up pays nothing per list.
             let hostname_proxy_port = s.hostname_proxy_port().await;
             let zone_answerer_port = s.zone_answerer_port().await;
-            // NET-079: the per-box egress enforcement each entry shows — the
-            // box's own launch record, what the launch that produced this
-            // box decided about it, lowered by the daemon's one classifier
-            // fact and never raised above it. A box launched unenforced
-            // stays `none` here for its life, whatever a later launch of
-            // another box decided; only a host-address box that has not
-            // launched yet shows the fact alone. [`displayed_host_ip_enforcement`]
-            // shares the launch's own refusal gate, so a box the classifier
-            // refuses shows nothing here exactly as its launch refused it.
-            // A record that fails to read degrades to `None`: nothing said
-            // is the same silence the other surfaces read as "not a
-            // host-address session", so one unreadable record fails no
-            // listing.
             let in_microvm = s.in_microvm().await;
-            let fact = crate::box_runtime::host_ip_enforcement_fact();
             let opt_out = s.deny_all_opt_out().await;
             let records = futures::future::join_all(infos.iter().map(|i| async {
                 mngr.get_record(BoxKeyPredicate::Id(i.id))
@@ -158,20 +143,6 @@ async fn serve_list_sessions(
                     .flatten()
             }))
             .await;
-            let enforcement: Vec<_> = records
-                .iter()
-                .map(|record| {
-                    record.as_ref().map(|record| {
-                        crate::box_runtime::displayed_host_ip_enforcement(
-                            in_microvm,
-                            record.network,
-                            classifier::verdict_of(record.policy.egress.as_ref()),
-                            &fact,
-                            record.host_ip_enforcement,
-                        )
-                    })
-                })
-                .collect();
             // T110: each box's address and egress posture, from its record
             // and the hostname registry. A box with no fact for a field
             // leaves it `None`, so the listing shows `-` rather than an
@@ -212,8 +183,7 @@ async fn serve_list_sessions(
                 // client fills it host-side after the reply.
                 sessions: infos
                     .into_iter()
-                    .zip(enforcement)
-                    .map(|(i, host_ip_enforcement)| ListSessionsEntry {
+                    .map(|i| ListSessionsEntry {
                         // NET-129: the listing names the ports this box
                         // yields, from the same read the runtime facts use.
                         shared_port_collisions: shared_port_collisions_of(&mngr, i.id),
@@ -222,7 +192,8 @@ async fn serve_list_sessions(
                         project_path: Some(i.project_path),
                         status: i.status,
                         git: None,
-                        host_ip_enforcement: host_ip_enforcement.flatten(),
+                        // No box runs under per-box host enforcement in this version.
+                        host_ip_enforcement: None,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -486,22 +457,6 @@ async fn serve_create_session(
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
             let egress_counts = EgressRuleCounts::of(&req.config.policy);
-            // NET-079: the advisory and the enforcement the reply states are
-            // the fact the manager's create gated on, which it returns with
-            // the box's id (below): the create re-reads the host when the
-            // stored fact says the start-up probe could not read the table,
-            // and the reply must answer over that re-read. The launch that
-            // follows reads the host
-            // again for its own gate. Its refusal holds what the create said
-            // only for a box it places: a daemon outside its leaf places no
-            // box, so its deny-all box starts unenforced.
-            //
-            // Nothing is recorded at create: only a launch writes the
-            // outcome, on the daemon-owned record field. The one key a
-            // client might assert — the daemon's own `host_ip_enforcement`
-            // — is stripped here, unconditionally and for every network
-            // mode, because the reads answer over what the launch recorded
-            // and must not be handed one by whoever activated.
             let in_microvm = s.in_microvm().await;
             // NET-081's host-table rule: on a VM-backed node a box's
             // addresses are allocated host-side and handed in, so an
@@ -517,9 +472,6 @@ async fn serve_create_session(
                     error: refused.to_string(),
                 });
             }
-            // The declaration the reply's advisory reads, kept because the
-            // manager consumes the config.
-            let egress = req.config.policy.egress.clone();
             req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
             // The session remembers its creator, so an attach from another
@@ -535,36 +487,20 @@ async fn serve_create_session(
             // refused for a held name. Any other create takes `<name>`, and
             // a running box that holds it refuses the create.
             let fresh_instance = req.fresh_instance;
-            let created = mngr
-                .create_box_reporting_fact(req.config, spec, fresh_instance, ssh_username, creator)
-                .await;
+            let created = if fresh_instance {
+                mngr.create_fresh_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            } else {
+                mngr.create_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            };
             Ok(match created {
-                Ok((id, fact)) => {
+                Ok(id) => {
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
                     // the gating prompt) — see [`ConnectionHandle`] and the
                     // teardown reap in `server.rs`.
                     conn.record_created_session(id).await;
-                    // `fact` is the one this create's own gate read
-                    // (`create_host_ip_fact`). That read re-reads the host
-                    // when the start-up probe could not read the table, and
-                    // falls back to the stored fact only when the re-read
-                    // fails. The global fact is not read again here, because
-                    // another create or launch may have refreshed it since.
-                    let classifier_cause = fact.cause;
-                    let classifier_advisory = create_classifier_advisory(
-                        in_microvm,
-                        network,
-                        classifier_cause,
-                        egress.as_ref(),
-                    );
-                    let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
-                        in_microvm,
-                        network,
-                        classifier::verdict_of(egress.as_ref()),
-                        &fact,
-                        None,
-                    );
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
@@ -577,29 +513,6 @@ async fn serve_create_session(
                         fresh_instance,
                         "session created"
                     );
-                    // NET-079's observability: one info line per create
-                    // response that carries the advisory, naming the cause
-                    // it names and the per-box enforcement this create stated
-                    // for a host-address box — so the daemon's log,
-                    // the bundle's tail, carries what this reply told the
-                    // person in the terminal, beside the start line and each
-                    // launch's own record. The advisory rides as a field,
-                    // Debug-escaped, because the line a person copies their
-                    // command from must stay one line: the terminal gets the
-                    // two-line spelling, the log gets the same text whole.
-                    if let Some(advisory) = &classifier_advisory {
-                        tracing::info!(
-                            session_id = %id,
-                            classifier_cause = classifier_cause
-                                .map_or_else(|| "", classifier::Cause::detail),
-                            classifier_install = ?classifier_cause
-                                .and_then(classifier::Cause::install_command),
-                            host_ip_enforcement =
-                                ?host_ip_enforcement.map(|enforcement| enforcement.machine_str()),
-                            advisory = ?advisory,
-                            "session create carried the classifier advisory"
-                        );
-                    }
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
@@ -636,14 +549,10 @@ async fn serve_create_session(
                         // already chosen to keep the shipped default.
                         deny_all_opt_out: Some(s.deny_all_opt_out().await),
                         answerer_bound: zone_answerer_port.is_some(),
-                        // NET-079's half: the advisory the start prints, and
-                        // the enforcement the same derivation the reads
-                        // answer through states over this create's
-                        // declaration — the one message the activation path
-                        // spends on it.
-                        classifier_advisory,
-                        host_ip_enforcement: host_ip_enforcement
-                            .map(|enforcement| enforcement.machine_str().to_string()),
+                        // No advisory and no per-box host enforcement in
+                        // this version; the fields stay on the wire.
+                        classifier_advisory: None,
+                        host_ip_enforcement: None,
                     })
                 }
                 // BOX-163: a running box holds the name. The reply names the
@@ -739,34 +648,6 @@ fn refuse_unhanded_vm_box(
         ));
     }
     Ok(())
-}
-
-/// The advisory a create owes the start it answers (NET-079): only when
-/// every half it is about is true — the daemon is not running inside a
-/// microVM, the session is a host-address box, whose verdict is the one the
-/// host's cgroup tree decides, and the box declares egress at all. In the
-/// guest the start-up line and each launch's own record already say the
-/// interim's state, and a guest's causes name its image's builder rather
-/// than anything the person starting a session could run; an own-address
-/// box's verdict is decided on address leases, so there is no per-box state
-/// to advise about; and a box that declared nothing asked for no enforcement,
-/// so there is nothing to tell it the host cannot enforce — the host fact
-/// is still recorded on the reply, for `min session policy` to show. Over a
-/// declaring host-address box on a native host, the advisory is
-/// [`classifier::advisory_text`]'s — the same text the daemon's log line for
-/// an advisory-carrying create carries. Pure over its inputs, so the gate is
-/// pinned where it is written.
-fn create_classifier_advisory(
-    in_microvm: bool,
-    network: minimald_rpc::NetworkMode,
-    cause: Option<classifier::Cause>,
-    egress: Option<&boxes::EgressPolicy>,
-) -> Option<String> {
-    if in_microvm || network != minimald_rpc::NetworkMode::HostNet {
-        return None;
-    }
-    let egress = egress?;
-    cause.map(|cause| classifier::advisory_text(cause, egress))
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -2151,13 +2032,6 @@ async fn serve_get_session_runtime_facts(
                     error: "no session found".to_string(),
                 }),
                 Some(record) => {
-                    let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
-                        s.in_microvm().await,
-                        record.network,
-                        classifier::verdict_of(record.policy.egress.as_ref()),
-                        &crate::box_runtime::host_ip_enforcement_fact(),
-                        record.host_ip_enforcement,
-                    );
                     // The listen publishes the audit log refused (NET-046):
                     // a watcher-driven publish has no caller to answer, so
                     // the live actor's set is read here and `min session
@@ -2194,7 +2068,7 @@ async fn serve_get_session_runtime_facts(
                     let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
                     Ok(Errorable::Ok(minimald_rpc::BoxRuntimeFacts {
                         id: record.id,
-                        host_ip_enforcement,
+                        host_ip_enforcement: None,
                         unaudited_listen_ports,
                         audit_log,
                         shared_port_collisions,
