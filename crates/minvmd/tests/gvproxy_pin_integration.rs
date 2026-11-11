@@ -186,7 +186,7 @@ fn vm_harnesses_take_the_switch_from_the_common_helper() {
     assert!(
         checked
             .iter()
-            .any(|p| p.ends_with("egress_allowlist_integration.rs")),
+            .any(|p| p.ends_with("uplink_boot_integration.rs")),
         "the guard found no harnesses under {}: checked {checked:?}",
         dir.display()
     );
