@@ -11,6 +11,7 @@
 #define __always_inline inline __attribute__((always_inline))
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) typeof(val) *name
+#define barrier() __asm__ __volatile__("" : : : "memory")
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "the programs are written for little-endian targets"

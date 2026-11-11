@@ -5,7 +5,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use aya::{
     Ebpf, EbpfLoader,
     maps::{Map, MapData},
-    programs::{CgroupSkb, CgroupSock, CgroupSockAddr, ProgramError},
+    programs::{CgroupSkb, CgroupSock, CgroupSockAddr, ProgramError, SockOps},
 };
 
 use crate::{Error, Handles, sys};
@@ -23,6 +23,7 @@ pub const fn object_id() -> &'static str {
 enum Kind {
     Sock,
     SockAddr,
+    SockOps,
     Skb,
 }
 
@@ -35,7 +36,12 @@ struct Program {
 
 /// Every program of the object. One that is missing, fails the verifier or
 /// does not attach fails the whole engine.
-const PROGRAMS: [Program; 14] = [
+const PROGRAMS: [Program; 15] = [
+    Program {
+        name: "bp_sock_ops",
+        kind: Kind::SockOps,
+        attach_type: 3,
+    },
     Program {
         name: "bp_sock_create",
         kind: Kind::Sock,
@@ -109,7 +115,7 @@ const PROGRAMS: [Program; 14] = [
 ];
 
 /// The maps a daemon gets, in the order they are handed over.
-pub(crate) const MAPS: [&str; 10] = [
+pub(crate) const MAPS: [&str; 11] = [
     "box_cfg",
     "rules4",
     "rules6",
@@ -119,6 +125,7 @@ pub(crate) const MAPS: [&str; 10] = [
     "stats",
     "box_use",
     "flows",
+    "listens",
     "events",
 ];
 
@@ -137,6 +144,10 @@ pub struct MapSizes {
     pub flows: u32,
     /// Sockets of one box with a flow to one of its endpoints at a time.
     pub flows_per_box: u32,
+    /// Listening TCP sockets, over all boxes.
+    pub listens: u32,
+    /// Listening TCP sockets of one box that are recorded.
+    pub listens_per_box: u32,
     /// Bytes of the event ring buffer: a power of two, at least a page.
     pub event_bytes: u32,
 }
@@ -151,6 +162,8 @@ impl Default for MapSizes {
             endpoints: 4096,
             flows: 65536,
             flows_per_box: 1024,
+            listens: 16384,
+            listens_per_box: 256,
             event_bytes: 1 << 18,
         }
     }
@@ -189,6 +202,8 @@ impl Engine {
         let mut ebpf = EbpfLoader::new()
             .override_global("boxes_id", &boxes_id, true)
             .override_global("flows_per_box", &sizes.flows_per_box, true)
+            .override_global("listens_per_box", &sizes.listens_per_box, true)
+            .map_max_entries("listens", sizes.listens)
             .map_max_entries("box_cfg", sizes.boxes)
             .map_max_entries("box_use", sizes.boxes)
             .map_max_entries("stats", sizes.boxes)
@@ -212,6 +227,7 @@ impl Engine {
                 Kind::SockAddr => {
                     <&mut CgroupSockAddr>::try_from(prog).and_then(CgroupSockAddr::load)
                 }
+                Kind::SockOps => <&mut SockOps>::try_from(prog).and_then(SockOps::load),
                 Kind::Skb => <&mut CgroupSkb>::try_from(prog).and_then(CgroupSkb::load),
             }
             .map_err(program_error(p.name))?;
@@ -227,6 +243,7 @@ impl Engine {
         let fd = match p.kind {
             Kind::Sock => <&mut CgroupSock>::try_from(prog).and_then(|p| p.fd()),
             Kind::SockAddr => <&mut CgroupSockAddr>::try_from(prog).and_then(|p| p.fd()),
+            Kind::SockOps => <&mut SockOps>::try_from(prog).and_then(|p| p.fd()),
             Kind::Skb => <&mut CgroupSkb>::try_from(prog).and_then(|p| p.fd()),
         }
         .map_err(program_error(p.name))?;

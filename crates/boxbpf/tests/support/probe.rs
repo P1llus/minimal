@@ -457,7 +457,10 @@ fn hold_udp(to: SocketAddr, local_port: u16) {
 
 fn serve_tcp(at: SocketAddr) {
     let listener = TcpListener::bind(at).expect("bind");
-    say("ready");
+    say(&format!(
+        "ready port={}",
+        listener.local_addr().expect("address").port()
+    ));
     for mut stream in listener.incoming().flatten() {
         // The client may have given up already.
         let _sent = stream.write_all(b"hello\n");

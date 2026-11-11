@@ -357,8 +357,8 @@ mod guest {
 
         let mut refusals = 0;
         if let Some(source) = events.as_mut() {
-            while source.try_next().is_some() {
-                refusals += 1;
+            while let Some(event) = source.try_next() {
+                refusals += usize::from(matches!(event, netpol::event::Event::Net(_)));
             }
         }
         report.check(
@@ -366,6 +366,57 @@ mod guest {
             refusals > denied,
             &format!("{refusals} refusal events for {denied} refused flows and one socket"),
         );
+        // A box socket that listens is in the table until it is released,
+        // and a record says when to read the table.
+        let (Ok((port_read, port_write)), Ok((stop_read, stop_write))) =
+            (nix::unistd::pipe(), nix::unistd::pipe())
+        else {
+            return Ok(());
+        };
+        // SAFETY: one thread, and the child only uses sockets and the pipes.
+        let listener = unsafe { nix::unistd::fork() };
+        if let Ok(nix::unistd::ForkResult::Child) = listener {
+            drop((port_read, stop_write));
+            let joined = fs::write(format!("{CGROUP}/boxes/b/cgroup.procs"), "0");
+            let bound = joined.and_then(|()| TcpListener::bind("[::]:0"));
+            let said = bound
+                .as_ref()
+                .map_or(0, |l| l.local_addr().map_or(0, |a| a.port()));
+            let _sent = fs::File::from(port_write).write_all(said.to_string().as_bytes());
+            let mut wait = String::new();
+            let _closed = fs::File::from(stop_read).read_to_string(&mut wait);
+            std::process::exit(0);
+        }
+        drop((port_write, stop_read));
+        let mut said = String::new();
+        let _read = fs::File::from(port_read).read_to_string(&mut said);
+        let listen_port: u16 = said.parse().unwrap_or(0);
+        let listed = handles.listening(live.id(), netns)?;
+        let mut heard = false;
+        if let Some(source) = events.as_mut() {
+            while let Some(event) = source.try_next() {
+                if let netpol::event::Event::Listen(e) = event {
+                    heard |= e.box_id == live.id().0 && e.port == listen_port && e.open;
+                }
+            }
+        }
+        drop(stop_write);
+        if let Ok(nix::unistd::ForkResult::Parent { child }) = listener {
+            let _reaped = nix::sys::wait::waitpid(child, None);
+        }
+        let after = handles.listening(live.id(), netns)?;
+        report.check(
+            "listen",
+            listen_port != 0
+                && listed.len() == 1
+                && listed.iter().all(|l| l.port == listen_port)
+                && heard
+                && after.is_empty(),
+            &format!(
+                "port {listen_port}: in the table {listed:?}, record seen: {heard}, after release {after:?}"
+            ),
+        );
+
         let stats = handles.stats(live.id())?.unwrap_or_default();
         report.check(
             "stats",

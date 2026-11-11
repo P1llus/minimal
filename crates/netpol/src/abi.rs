@@ -42,6 +42,7 @@ pub const ACTION_ALLOW: u8 = 1;
 pub const ACTION_REDIRECT: u8 = 2;
 
 pub const EVENT_NET: u16 = 1;
+pub const EVENT_LISTEN: u16 = 2;
 
 /// A struct that is plain bytes: `repr(C)`, no padding, every bit pattern
 /// valid.
@@ -241,6 +242,28 @@ pub struct FlowVal {
     pub _pad: u32,
 }
 
+/// One listening TCP socket of a box.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ListenKey {
+    pub box_id: u64,
+    /// Cookie of the socket's network namespace.
+    pub netns: u64,
+    /// Socket cookie.
+    pub cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Listen {
+    /// The address the socket is bound to. All zero: any.
+    pub addr: [u8; 16],
+    pub port: u16,
+    /// 4 or 6, of the socket.
+    pub family: u8,
+    pub _pad: [u8; 5],
+}
+
 /// Starts every record of the event ring buffer. A reader skips a kind it
 /// does not know by `size`, and reads at most what it knows of a kind that
 /// has grown: fields are only appended.
@@ -279,6 +302,20 @@ pub struct EvNet {
     pub daddr: [u8; 16],
     pub _pad: u32,
     pub cookie: u64,
+}
+
+/// The listen record, [`EVENT_LISTEN`]: the listens map changed for the
+/// box.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct EvListen {
+    pub hdr: EvHdr,
+    pub netns: u64,
+    pub port: u16,
+    pub family: u8,
+    /// 1: a socket started to listen. 0: a listener is gone.
+    pub open: u8,
+    pub _pad: u32,
 }
 
 /// Which program reported an event.
@@ -473,7 +510,7 @@ fn line(out: &mut String, condition: &str) {
 }
 
 fn constants(out: &mut String) {
-    let pairs: [(&str, u64); 15] = [
+    let pairs: [(&str, u64); 16] = [
         ("BP_ABI_VERSION", u64::from(VERSION)),
         ("BP_ENDPOINTS_MAX", u64::from(ENDPOINTS_MAX)),
         ("BP_RULES_MAX", RULES_MAX as u64),
@@ -486,6 +523,7 @@ fn constants(out: &mut String) {
         ("BP_ALLOW", u64::from(ACTION_ALLOW)),
         ("BP_REDIRECT", u64::from(ACTION_REDIRECT)),
         ("BP_EV_NET", u64::from(EVENT_NET)),
+        ("BP_EV_LISTEN", u64::from(EVENT_LISTEN)),
         ("BP_P_TCP", u64::from(Protocols::TCP.bits())),
         ("BP_P_UDP", u64::from(Protocols::UDP.bits())),
         ("BP_P_ICMP", u64::from(Protocols::ICMP.bits())),
@@ -524,6 +562,9 @@ layouts! {
     }
     FlowKey = "bp_flow_key", 32 { netns, saddr, sport, proto, family }
     Usage = "bp_usage", 8 { flows, listens }
+    ListenKey = "bp_listen_key", 24 { box_id, netns, cookie }
+    Listen = "bp_listen", 24 { addr, port, family }
+    EvListen = "bp_ev_listen", 40 { hdr, netns, port, family, open }
     FlowVal = "bp_flow_val", 32 { box_id, orig_addr, orig_port, orig_family, endpoint }
     EvHdr = "bp_ev_hdr", 24 { kind, size, cpu, ts_ns, box_id }
     EvNet = "bp_ev_net", 88 {
@@ -836,7 +877,7 @@ mod tests {
         assert!(c.contains("BP_ABI_VERSION == 4"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
-        assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 16);
+        assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 19);
     }
 
     #[test]

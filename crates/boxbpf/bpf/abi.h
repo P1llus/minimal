@@ -195,6 +195,25 @@ struct bp_usage {
 };
 
 /*
+ * A TCP socket of a box that listens: one entry per socket, from listen()
+ * to the release of the socket. Userspace reads the map to know which ports
+ * of a box are open, in which of its network namespaces. A record of kind
+ * BP_EV_LISTEN says when to read.
+ */
+struct bp_listen_key {
+	__u64 box_id;
+	__u64 netns;  /* cookie of the socket's network namespace */
+	__u64 cookie; /* socket cookie */
+};
+
+struct bp_listen {
+	__u8  addr[16]; /* the address the socket is bound to; all zero: any */
+	__u16 port;
+	__u8  family;   /* 4 or 6, of the socket */
+	__u8  _pad[5];
+};
+
+/*
  * Every record of the event ring buffer starts with this. A reader skips a
  * kind it does not know by `size` and reads at most what it knows of a kind
  * that has grown: fields are only ever appended.
@@ -208,7 +227,8 @@ struct bp_ev_hdr {
 };
 
 /* Record kinds. */
-#define BP_EV_NET 1
+#define BP_EV_NET    1
+#define BP_EV_LISTEN 2
 
 /* bp_ev_net.hook */
 #define BP_H_SOCK_CREATE 1
@@ -251,6 +271,17 @@ struct bp_ev_net {
 	__u8  daddr[16];
 	__u32 _pad;
 	__u64 cookie;    /* socket cookie */
+};
+
+/* The listens map changed for this box. The map is the truth: a reader
+ * that misses a record finds the change when it next reads the map. */
+struct bp_ev_listen {
+	struct bp_ev_hdr hdr;
+	__u64 netns;
+	__u16 port;
+	__u8  family; /* 4 or 6 */
+	__u8  open;   /* 1: a socket started to listen. 0: a listener is gone. */
+	__u32 _pad;
 };
 
 #endif /* BOXBPF_ABI_H */

@@ -483,7 +483,8 @@ impl Engine {
         let mut unknown_box: u64 = 0;
         loop {
             let event = match reader.next().await {
-                Ok(event) => event,
+                Ok(netpol::event::Event::Net(event)) => event,
+                Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(%error, "reading the policy engine's events stopped");
                     return;

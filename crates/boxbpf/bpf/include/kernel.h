@@ -77,6 +77,49 @@ struct bpf_sock_addr {
 	__bpf_md_ptr(struct bpf_sock *, sk);
 };
 
+/* The fields up to `sk`. The programs read op, family, the local address
+ * and port, and sk. */
+struct bpf_sock_ops {
+	__u32 op;
+	__u32 args[4];
+	__u32 family;
+	__u32 remote_ip4;
+	__u32 local_ip4;    /* network order */
+	__u32 remote_ip6[4];
+	__u32 local_ip6[4]; /* network order */
+	__u32 remote_port;
+	__u32 local_port;   /* host order */
+	__u32 is_fullsock;
+	__u32 snd_cwnd;
+	__u32 srtt_us;
+	__u32 bpf_sock_ops_cb_flags;
+	__u32 state;
+	__u32 rtt_min;
+	__u32 snd_ssthresh;
+	__u32 rcv_nxt;
+	__u32 snd_nxt;
+	__u32 snd_una;
+	__u32 mss_cache;
+	__u32 ecn_flags;
+	__u32 rate_delivered;
+	__u32 rate_interval_us;
+	__u32 packets_out;
+	__u32 retrans_out;
+	__u32 total_retrans;
+	__u32 segs_in;
+	__u32 data_segs_in;
+	__u32 segs_out;
+	__u32 data_segs_out;
+	__u32 lost_out;
+	__u32 sacked_out;
+	__u32 sk_txhash;
+	__u64 bytes_received;
+	__u64 bytes_acked;
+	__bpf_md_ptr(struct bpf_sock *, sk);
+};
+
+#define BPF_SOCK_OPS_TCP_LISTEN_CB 11
+
 struct __sk_buff {
 	__u32 len;
 	__u32 pkt_type;

@@ -403,6 +403,16 @@ fn a_box_in_its_own_network_namespace() {
 
     // ---- ingress: new inbound flows only on published ports
     let _box_server = cg.hold_probe_in("own", box_ns, &["serve-tcp", "::", "18300"]);
+    // The listener is known by the namespace it is in.
+    let listeners = |netns| h.handles.listening(live.id(), netns).expect("listeners");
+    assert_eq!(
+        listeners(inside_ns),
+        [boxbpf::Listening {
+            address: ip("::"),
+            port: 18300
+        }]
+    );
+    assert!(listeners(here).is_empty());
     let inbound = |addr: &str| Cgroups::peer_probe(peer_ns, &["tcp", addr, "18300", "700"]);
     let published = PortOf {
         protocols: Protocols::TCP,

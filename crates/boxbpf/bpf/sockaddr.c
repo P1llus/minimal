@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
 /*
- * Syscall-time hooks: sock_create, connect, sendmsg, recvmsg, getpeername, bind.
+ * Syscall-time hooks: sock_create, connect, sendmsg, recvmsg, getpeername,
+ * bind, and the listen callback of sock_ops.
  *
  * They give the application an errno at once, and they are the only place a
  * destination can be rewritten. The packet hooks in skb.c stay authoritative.
@@ -357,21 +358,103 @@ int bp_sock_create(struct bpf_sock *sk)
 	return refuse(box);
 }
 
-/* The socket's entry in the flows map must not outlive it: the next socket
- * with the same local address and port may belong to anyone. */
+/*
+ * A box socket started to listen. The daemon publishes ports that boxes
+ * open, and this is how it learns of one without watching the box's
+ * processes. Only TCP has the callback.
+ *
+ * A box has room for listens_per_box entries. A listener over that is not
+ * recorded, and so not published.
+ */
+SEC("sockops")
+int bp_sock_ops(struct bpf_sock_ops *ctx)
+{
+	struct bp_listen_key lk = {};
+	struct bp_listen lv = {};
+	struct sk_owner *owner;
+	struct bp_usage *use;
+	struct sk_state *st;
+	struct bpf_sock *sk;
+
+	if (ctx->op != BPF_SOCK_OPS_TCP_LISTEN_CB)
+		return 1;
+	sk = ctx->sk;
+	if (!sk)
+		return 1;
+	owner = bpf_sk_storage_get(&sk_box, sk, 0, 0);
+	if (!owner || !owner->box)
+		return 1;
+	st = bpf_sk_storage_get(&sk_state, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!st)
+		return 1;
+	if (!(st->flags & ST_LISTEN)) {
+		use = bpf_map_lookup_elem(&box_use, &owner->box);
+		if (!use || use->listens >= listens_per_box)
+			return 1;
+		__sync_fetch_and_add(&use->listens, 1);
+		st->flags |= ST_LISTEN;
+	}
+
+	lk.box_id = owner->box;
+	lk.netns = owner->netns;
+	lk.cookie = bpf_get_socket_cookie(ctx);
+	lv.port = ctx->local_port;
+	if (ctx->family == AF_INET6) {
+		__u32 a[4];
+
+		/* The verifier takes these fields one at a time. The barriers
+		 * keep the compiler from reading two as one. */
+		a[0] = ctx->local_ip6[0];
+		barrier();
+		a[1] = ctx->local_ip6[1];
+		barrier();
+		a[2] = ctx->local_ip6[2];
+		barrier();
+		a[3] = ctx->local_ip6[3];
+		lv.family = 6;
+		__builtin_memcpy(lv.addr, a, 16);
+	} else {
+		__u32 a = ctx->local_ip4;
+
+		lv.family = 4;
+		__builtin_memcpy(lv.addr, &a, 4);
+	}
+	bpf_map_update_elem(&listens, &lk, &lv, BPF_ANY);
+	st->listen_port = lv.port;
+	st->listen_family = lv.family;
+	emit_listen(lk.box_id, lk.netns, lv.port, lv.family, 1);
+	return 1;
+}
+
+/* What a socket has in the flows and listens maps must not outlive it: the
+ * next socket with the same local address and port may belong to anyone. */
 SEC("cgroup/sock_release")
 int bp_sock_release(struct bpf_sock *sk)
 {
 	struct sk_state *st = bpf_sk_storage_get(&sk_state, sk, 0, 0);
+	struct sk_owner *owner;
 	struct bp_usage *use;
-	__u64 box;
 
-	if (!st || !(st->flags & ST_FLOW))
+	if (!st || !(st->flags & (ST_FLOW | ST_LISTEN)))
 		return 1;
-	bpf_map_delete_elem(&flows, &st->flow_key);
-	box = sock_box(sk);
-	use = bpf_map_lookup_elem(&box_use, &box);
-	if (use && use->flows)
+	if (st->flags & ST_FLOW)
+		bpf_map_delete_elem(&flows, &st->flow_key);
+	owner = bpf_sk_storage_get(&sk_box, sk, 0, 0);
+	if (!owner)
+		return 1;
+	use = bpf_map_lookup_elem(&box_use, &owner->box);
+	if (use && (st->flags & ST_FLOW) && use->flows)
 		__sync_fetch_and_add(&use->flows, -1);
+	if (st->flags & ST_LISTEN) {
+		struct bp_listen_key lk = {};
+
+		lk.box_id = owner->box;
+		lk.netns = owner->netns;
+		lk.cookie = bpf_get_socket_cookie(sk);
+		bpf_map_delete_elem(&listens, &lk);
+		if (use && use->listens)
+			__sync_fetch_and_add(&use->listens, -1);
+		emit_listen(lk.box_id, lk.netns, st->listen_port, st->listen_family, 0);
+	}
 	return 1;
 }

@@ -203,3 +203,118 @@ fn a_udp_socket_gets_the_answers_of_many_peers() {
     let stats = h.handles.stats(id).expect("stats").expect("counters");
     assert_eq!(stats.rx_drop, 0, "{stats:?}");
 }
+
+fn listening(h: &Harness, id: boxbpf::BoxId, netns: u64) -> Vec<(IpAddr, u16)> {
+    h.handles
+        .listening(id, netns)
+        .expect("read the listeners")
+        .into_iter()
+        .map(|l| (l.address, l.port))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_listening_socket_is_in_the_table_until_it_is_released() {
+    use netpol::event::{Event, ListenEvent};
+
+    let Some(mut h) =
+        Harness::start("cases::sockets::a_listening_socket_is_in_the_table_until_it_is_released")
+    else {
+        return;
+    };
+    let mut events = h.handles.take_events().expect("event source");
+    let here = boxbpf::current_netns_cookie().expect("namespace cookie");
+    let live = h.install("l", host_ip(), BoxPolicy::default());
+    let other = h.install("m", host_ip(), BoxPolicy::default());
+    let id = live.id();
+    assert!(listening(&h, id, here).is_empty());
+
+    let at4 = IpAddr::V4(h.v4(1, 1));
+    let any6: IpAddr = "::".parse().expect("address");
+    let (on4, port4) = h.listen_in("l", at4);
+    let (_on6, port6) = h.listen_in("l", any6);
+    let mut expected = vec![(at4, port4), (any6, port6)];
+    expected.sort_unstable();
+    assert_eq!(listening(&h, id, here), expected);
+    assert!(listening(&h, other.id(), here).is_empty(), "another box");
+    assert!(listening(&h, id, here + 1).is_empty(), "another namespace");
+    assert_eq!(h.handles.usage(id).expect("usage").listens, 2);
+
+    // The record that says "read the table now".
+    let heard = |events: &mut boxbpf::events::Source| -> Vec<ListenEvent> {
+        Harness::drain_all(events)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Listen(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    };
+    let opened = heard(&mut events);
+    assert_eq!(opened.len(), 2, "{opened:?}");
+    assert!(
+        opened.iter().any(|e| e.box_id == id.0
+            && e.netns == here
+            && e.port == port4
+            && e.family == netpol::Family::V4
+            && e.open),
+        "{opened:?}"
+    );
+
+    // A bound datagram socket and a TCP socket that only connects are no
+    // listeners, and neither is a listener outside every box.
+    let outside = std::net::TcpListener::bind((h.v4(1, 2), 0)).expect("listen");
+    let port = outside.local_addr().expect("address").port();
+    assert!(
+        h.probe(
+            "l",
+            &["tcp", &h.v4(1, 2).to_string(), &port.to_string(), "300"]
+        )
+        .starts_with("ok ")
+    );
+    assert!(
+        h.probe("l", &["bind", "udp", &at4.to_string(), "0"])
+            .starts_with("ok ")
+    );
+    assert_eq!(listening(&h, id, here), expected);
+
+    // The entry goes with the socket.
+    drop(on4);
+    crate::support::wait_for("the closed listener to leave the table", || {
+        listening(&h, id, here) == [(any6, port6)]
+    });
+    let closed = heard(&mut events);
+    assert!(
+        closed.iter().any(|e| e.port == port4 && !e.open),
+        "{closed:?}"
+    );
+    assert_eq!(h.handles.usage(id).expect("usage").listens, 1);
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_box_has_room_for_so_many_listeners() {
+    let Some(mut h) = Harness::start_sized(
+        "cases::sockets::a_box_has_room_for_so_many_listeners",
+        "listens_per_box",
+        2,
+    ) else {
+        return;
+    };
+    let here = boxbpf::current_netns_cookie().expect("namespace cookie");
+    let full = h.install("full", host_ip(), BoxPolicy::default());
+    let free = h.install("free", host_ip(), BoxPolicy::default());
+    let at = IpAddr::V4(h.v4(1, 1));
+    let held: Vec<_> = (0..3).map(|_| h.listen_in("full", at)).collect();
+    // The third listens, as far as the box can tell. It is not recorded.
+    assert_eq!(listening(&h, full.id(), here).len(), 2);
+    assert_eq!(h.handles.usage(full.id()).expect("usage").listens, 2);
+    let (_other, port) = h.listen_in("free", at);
+    assert_eq!(listening(&h, free.id(), here), [(at, port)]);
+    drop(held);
+    crate::support::wait_for("the listeners to leave the table", || {
+        listening(&h, full.id(), here).is_empty()
+    });
+    assert_eq!(h.handles.usage(full.id()).expect("usage").listens, 0);
+}

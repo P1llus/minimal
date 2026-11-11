@@ -193,6 +193,74 @@ impl Flows {
     }
 }
 
+/// A TCP socket of a box that listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Listening {
+    /// The address the socket is bound to. Unspecified: every address of
+    /// the family, and for an IPv6 socket usually IPv4 as well.
+    pub address: IpAddr,
+    pub port: u16,
+}
+
+/// The table of listening sockets alone, for a task that watches a box's
+/// ports and must not wait for the writers' lock.
+pub struct Listens {
+    map: HashMap<MapData, Raw<abi::ListenKey>, Raw<abi::Listen>>,
+    /// A second descriptor of the map, to make further handles from.
+    fd: OwnedFd,
+}
+
+impl Listens {
+    fn from_fd(fd: OwnedFd) -> Result<Self, Error> {
+        let kept = fd.try_clone().map_err(|source| Error::Sys {
+            what: "duplicate the listens map",
+            source,
+        })?;
+        let data = MapData::from_fd(fd).map_err(Error::map("listens"))?;
+        Ok(Self {
+            map: HashMap::try_from(Map::HashMap(data)).map_err(Error::map("listens"))?,
+            fd: kept,
+        })
+    }
+
+    /// Another handle on the same map.
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        let fd = self.fd.try_clone().map_err(|source| Error::Sys {
+            what: "duplicate the listens map",
+            source,
+        })?;
+        Self::from_fd(fd)
+    }
+
+    /// The TCP sockets of the box that listen now in the network namespace
+    /// `netns`, sorted. The programs add a socket when it starts to listen
+    /// and take it out when it is released. A [`netpol::event::ListenEvent`]
+    /// says when this changed. The table is what counts: read it after an
+    /// event, and now and then without one.
+    ///
+    /// This walks the table of all boxes.
+    pub fn listening(&self, id: BoxId, netns: u64) -> Result<Vec<Listening>, Error> {
+        let mut out = Vec::new();
+        for entry in self.map.iter() {
+            let (Raw(key), Raw(listen)) = match entry {
+                Ok(entry) => entry,
+                // An entry that went while we walked.
+                Err(MapError::KeyNotFound) => continue,
+                Err(error) => return Err(Error::map("listens")(error)),
+            };
+            if key.box_id == id.0 && key.netns == netns {
+                out.push(Listening {
+                    address: abi::addr_of(&listen.addr, listen.family),
+                    port: listen.port,
+                });
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+}
+
 pub struct Handles {
     box_cfg: HashMap<MapData, u64, Raw<abi::BoxCfg>>,
     rules4: lpm_trie::LpmTrie<MapData, [u8; 20], Raw<abi::Rules>>,
@@ -203,6 +271,7 @@ pub struct Handles {
     stats: PerCpuHashMap<MapData, u64, Raw<abi::Stats>>,
     box_use: HashMap<MapData, u64, Raw<abi::Usage>>,
     flows: Flows,
+    listens: Listens,
     events: Option<RingBuf<MapData>>,
     boxes: StdHashMap<u64, Held>,
     /// Entries of replaced or abandoned generations that a delete failed
@@ -255,6 +324,7 @@ impl Handles {
             box_use: HashMap::try_from(Map::HashMap(next("box_use")?))
                 .map_err(Error::map("box_use"))?,
             flows: Flows::from_fd(next_fd(count)?)?,
+            listens: Listens::from_fd(next_fd(count)?)?,
             events: Some(
                 RingBuf::try_from(Map::RingBuf(next("events")?)).map_err(Error::map("events"))?,
             ),
@@ -649,5 +719,15 @@ impl Handles {
     /// A handle on the flows map for an endpoint task.
     pub fn flows(&self) -> Result<Flows, Error> {
         self.flows.try_clone()
+    }
+
+    /// See [`Listens::listening`].
+    pub fn listening(&self, id: BoxId, netns: u64) -> Result<Vec<Listening>, Error> {
+        self.listens.listening(id, netns)
+    }
+
+    /// A handle on the table of listening sockets for a watcher task.
+    pub fn listens(&self) -> Result<Listens, Error> {
+        self.listens.try_clone()
     }
 }

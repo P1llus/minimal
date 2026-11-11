@@ -134,8 +134,8 @@ fn the_loader_serves_only_the_supervisor_of_a_delegated_boxes_cgroup() {
         && out.status.success()
     {
         let listing = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(listing.matches("bp_").count(), 14, "{listing}");
-        assert_eq!(listing.matches(" multi ").count(), 14, "{listing}");
+        assert_eq!(listing.matches("bp_").count(), 15, "{listing}");
+        assert_eq!(listing.matches(" multi ").count(), 15, "{listing}");
     }
 }
 
@@ -179,6 +179,9 @@ fn the_async_reader_yields_refusals() {
                 .await
                 .expect("an event within five seconds")
                 .expect("read an event");
+            let netpol::event::Event::Net(event) = event else {
+                panic!("not a network event: {event:?}");
+            };
             assert_eq!((event.box_id, event.hook), (bare.0, Hook::SockCreate));
             // Stamped with the boot-time clock, a moment ago.
             let age = boxbpf::boot_time_ns().saturating_sub(event.time_ns);
@@ -317,7 +320,7 @@ fn an_engine_nobody_confirms_is_taken_off_again() {
         let (conn, reply, maps) =
             probe::loader_message(&g.socket, &attach, Some(g.boxes.as_fd())).expect("exchange");
         assert!(reply.starts_with("ok abi="), "{reply}");
-        assert_eq!(maps.len(), 10);
+        assert_eq!(maps.len(), 11);
         if let Some(word) = answer {
             nix::sys::socket::send(
                 std::os::fd::AsRawFd::as_raw_fd(&conn),

@@ -365,6 +365,17 @@ impl Harness {
         Ipv4Addr::new(127, self.net.0, self.net.1, (group << 5) | (host & 31))
     }
 
+    /// Starts a TCP listener in a box and returns it with its port.
+    pub fn listen_in(&self, box_name: &str, at: IpAddr) -> (Held, u16) {
+        let held = self.hold_probe(box_name, &["serve-tcp", &at.to_string(), "0"]);
+        let port = held
+            .ready
+            .strip_prefix("port=")
+            .and_then(|p| p.parse().ok())
+            .expect("the listener's port");
+        (held, port)
+    }
+
     /// The /24 all of this test's IPv4 addresses are in.
     pub fn v4_net(&self) -> String {
         format!("127.{}.{}.0/24", self.net.0, self.net.1)
@@ -423,8 +434,8 @@ impl Harness {
         self.cgroups().hold_probe(box_name, args)
     }
 
-    /// The next events, waiting a little for stragglers.
-    pub fn drain(source: &mut boxbpf::events::Source) -> Vec<netpol::event::NetEvent> {
+    /// The next events of every kind, waiting a little for stragglers.
+    pub fn drain_all(source: &mut boxbpf::events::Source) -> Vec<netpol::event::Event> {
         let mut out = Vec::new();
         let end = Instant::now() + Duration::from_millis(200);
         while Instant::now() < end {
@@ -434,6 +445,17 @@ impl Harness {
             }
         }
         out
+    }
+
+    /// The next network events, waiting a little for stragglers.
+    pub fn drain(source: &mut boxbpf::events::Source) -> Vec<netpol::event::NetEvent> {
+        Self::drain_all(source)
+            .into_iter()
+            .filter_map(|event| match event {
+                netpol::event::Event::Net(e) => Some(e),
+                _ => None,
+            })
+            .collect()
     }
 }
 
