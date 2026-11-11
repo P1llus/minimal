@@ -90,6 +90,7 @@ pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
 mod forward_revoke;
+pub(crate) mod gvproxy_api;
 pub(crate) mod proxy_reclaim;
 mod shuttle;
 mod stale_gvproxy;

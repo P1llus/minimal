@@ -400,25 +400,6 @@ fn supervisor_registry(
         .persisting_to(registry_file)
 }
 
-/// The bound on one forwarder exchange the node mirror's binder makes with
-/// the switch: the connect, the request and the answer. A switch that
-/// stalls past it fails the bind, and the guest sends the notice again.
-const MIRROR_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The largest switch answer the node mirror's binder reads. gvproxy's
-/// forwarder answers are one status line and a short body.
-const MIRROR_SWITCH_MAX_ANSWER: usize = 16 * 1024;
-
-/// The body gvproxy's forwarder answers an expose with when it already
-/// holds a forward at the listener: the goal state holds.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-const SWITCH_ALREADY_BOUND: &str = "proxy already running";
-
-/// The body gvproxy's forwarder answers an unexpose with when it holds no
-/// forward at the listener: the goal state holds.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-const SWITCH_NOT_BOUND: &str = "proxy not found";
-
 /// The production binder of the node's mirrored binds (NET-138): it asks the
 /// host switch (gvproxy's forwarder, on the switch socket) to listen at the
 /// node's reserved-range address on the host and forward to the same port at
@@ -448,6 +429,7 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         port: u16,
     ) -> Result<(), crate::box_registry::MirrorBindError> {
         use crate::box_registry::MirrorBindError;
+        use crate::net::gvproxy_api::ExposeError;
         let ledger = self
             .table
             .mirror_ledger()
@@ -455,27 +437,21 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         let noted = ledger
             .note_bind(address, port, self.node)
             .map_err(|refused| MirrorBindError::Failed(refused.to_string()))?;
-        let body = format!(
-            r#"{{"local":"{address}:{port}","remote":"{}:{port}","protocol":"tcp"}}"#,
-            self.node
-        );
-        let result = match post_switch_forwarder(&self.switch_sock, "expose", &body) {
-            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
-            Ok((_, answer)) if answer.contains("address already in use") => {
-                Err(MirrorBindError::Occupied)
+        let api = crate::net::gvproxy_api::SwitchApi::new(self.switch_sock.clone());
+        let result = match api.expose(
+            std::net::SocketAddrV4::new(address, port),
+            std::net::SocketAddrV4::new(self.node, port),
+            minimald_rpc::IpProto::Tcp,
+        ) {
+            Ok(()) | Err(ExposeError::AlreadyBound) => Ok(()),
+            Err(ExposeError::AddressInUse) => Err(MirrorBindError::Occupied),
+            Err(error @ ExposeError::Refused { .. }) => {
+                Err(MirrorBindError::Failed(error.to_string()))
             }
-            Ok((status, answer)) => Err(MirrorBindError::Failed(format!(
-                "the switch answered the expose with HTTP {status}: {:?}",
-                answer.trim()
-            ))),
-            Err(error) => Err(MirrorBindError::Unanswered(format!(
-                "the expose went unanswered: {error}"
-            ))),
+            Err(error @ ExposeError::Unanswered(_)) => {
+                Err(MirrorBindError::Unanswered(error.to_string()))
+            }
         };
-        // A note this bind made goes when the switch bound nothing. An
-        // unanswered expose may have bound, so its note stays for the
-        // mirror's retry or undo.
         if noted
             && matches!(
                 result,
@@ -489,90 +465,26 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
 
     fn unbind(&self, address: std::net::Ipv4Addr, port: u16) -> crate::box_registry::MirrorUnbind {
         use crate::box_registry::MirrorUnbind;
-        let body = format!(r#"{{"local":"{address}:{port}","protocol":"tcp"}}"#);
-        match post_switch_forwarder(&self.switch_sock, "unexpose", &body) {
-            Ok((status, _)) if (200..300).contains(&status) => {}
-            Ok((500, answer)) if answer.trim() == SWITCH_NOT_BOUND => {}
-            Ok((status, answer)) => {
-                return MirrorUnbind::Refused(format!(
-                    "the switch answered the unexpose with HTTP {status}: {:?}",
-                    answer.trim()
-                ));
+        use crate::net::gvproxy_api::UnexposeError;
+        let api = crate::net::gvproxy_api::SwitchApi::new(self.switch_sock.clone());
+        match api.unexpose(
+            std::net::SocketAddrV4::new(address, port),
+            minimald_rpc::IpProto::Tcp,
+        ) {
+            Ok(_) => {}
+            Err(error @ UnexposeError::Refused { .. }) => {
+                return MirrorUnbind::Refused(error.to_string());
             }
-            Err(error) => {
-                return MirrorUnbind::Unanswered(format!("the unexpose went unanswered: {error}"));
+            Err(error @ UnexposeError::Unanswered(_)) => {
+                return MirrorUnbind::Unanswered(error.to_string());
             }
         }
-        // The listener is closed, so no new connection arrives after the
-        // ones taken here.
         let connections_reset = self.table.mirror_ledger().map_or(0, |ledger| {
             ledger.forget_bind(address, port, self.node);
             ledger.reset_port(self.node, port)
         });
         MirrorUnbind::Undone { connections_reset }
     }
-}
-
-/// One forwarder exchange with the switch at `switch_sock`: `verb` posted
-/// with the JSON `body`, answered by a status and a body, bounded by
-/// [`MIRROR_SWITCH_TIMEOUT`] per read and write. Blocking: the node mirror
-/// calls its binder from the report door's thread, outside every lock.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn post_switch_forwarder(
-    switch_sock: &std::path::Path,
-    verb: &str,
-    body: &str,
-) -> std::io::Result<(u16, String)> {
-    use std::io::{Read as _, Write as _};
-    let mut switch = std::os::unix::net::UnixStream::connect(switch_sock)?;
-    switch.set_read_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
-    switch.set_write_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
-    let request = format!(
-        "POST /services/forwarder/{verb} HTTP/1.1\r\nHost: localhost\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    switch.write_all(request.as_bytes())?;
-    let mut answer = Vec::with_capacity(256);
-    let mut chunk = [0u8; 1024];
-    loop {
-        if let Some(head_end) = answer
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|at| at + 4)
-        {
-            let head = String::from_utf8_lossy(answer.get(..head_end).unwrap_or_default());
-            let length = head.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.trim()
-                    .eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            });
-            if length.is_some_and(|length| answer.len() >= head_end + length) {
-                break;
-            }
-        }
-        if answer.len() >= MIRROR_SWITCH_MAX_ANSWER {
-            break;
-        }
-        let n = switch.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        answer.extend_from_slice(chunk.get(..n).unwrap_or_default());
-    }
-    let text = String::from_utf8_lossy(&answer);
-    let status = text
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| std::io::Error::other("the switch's answer had no status line"))?;
-    let body = text
-        .split_once("\r\n\r\n")
-        .map_or_else(String::new, |(_, body)| body.to_string());
-    Ok((status, body))
 }
 
 /// The name the node's mirror address is allocated under in the machine's
@@ -2953,17 +2865,15 @@ pub(crate) fn proxy_reclaim_publisher(
         let noted = ledger
             .note_forward(listener, preferred, node, substitute)
             .map_err(|refused| refused.to_string())?;
-        let body = format!(
-            r#"{{"local":"{listener}:{preferred}","remote":"{node}:{substitute}","protocol":"tcp"}}"#
-        );
-        let result = match post_switch_forwarder(&switch_sock, "expose", &body) {
-            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND && !noted => Ok(()),
-            Ok((status, answer)) => Err(format!(
-                "the switch answered the expose with HTTP {status}: {:?}",
-                answer.trim()
-            )),
-            Err(error) => Err(format!("the expose went unanswered: {error}")),
+        let api = crate::net::gvproxy_api::SwitchApi::new(switch_sock.clone());
+        let result = match api.expose(
+            std::net::SocketAddrV4::new(listener, preferred),
+            std::net::SocketAddrV4::new(node, substitute),
+            minimald_rpc::IpProto::Tcp,
+        ) {
+            Ok(()) => Ok(()),
+            Err(crate::net::gvproxy_api::ExposeError::AlreadyBound) if !noted => Ok(()),
+            Err(error) => Err(error.to_string()),
         };
         if noted && result.is_err() {
             ledger.forget_bind(listener, preferred, node);
