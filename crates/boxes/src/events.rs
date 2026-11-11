@@ -206,7 +206,13 @@ mod tests {
         let line = r#"{"box":"01a1cb31-b787-75f2-aa69-d77d6b0522f1","parent":null,"ts":7,"type":"syscall_refused","data":{"nr":41}}"#;
         let event: BoxEvent = serde_json_lenient::from_str(line).unwrap();
         assert_eq!(event.kind, BoxEventType::Unknown);
-        assert_eq!(event.data.get("nr").and_then(|v| v.as_u64()), Some(41));
+        assert_eq!(
+            event
+                .data
+                .get("nr")
+                .and_then(serde_json_lenient::Value::as_u64),
+            Some(41)
+        );
         let known = line.replace("syscall_refused", "net_refused");
         let event: BoxEvent = serde_json_lenient::from_str(&known).unwrap();
         assert_eq!(event.kind, BoxEventType::NetRefused);

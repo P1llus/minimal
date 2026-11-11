@@ -36,6 +36,10 @@ use super::{
 };
 use crate::events::{NetRefusal, Source};
 
+/// Names the resolvers boxes' queries are forwarded to, as a
+/// comma-separated list of `address:port`, in place of the node's own.
+pub const UPSTREAM_ENV: &str = "MINIMALD_UPSTREAM_DNS";
+
 const DNS_PORT: u16 = 53;
 /// The largest message taken from a box or from upstream.
 const MAX_MESSAGE: usize = 4096;
@@ -554,7 +558,7 @@ pub(crate) async fn serve_udp(
         };
         let query = buf.get(..n).unwrap_or_default().to_vec();
         let (resolver, of, socket) = (Arc::clone(&resolver), Arc::clone(&of), Arc::clone(&socket));
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             if let Some(reply) = resolver.answer(&of, &query, Transport::Udp).await {
                 let _sent = socket.send_to(&reply, peer).await;
             }
@@ -591,7 +595,7 @@ pub(crate) async fn serve_tcp(
             continue;
         };
         let (resolver, of) = (Arc::clone(&resolver), Arc::clone(&of));
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok(Ok(Some(query))) =
                 tokio::time::timeout(TCP_IDLE, read_framed(&mut stream)).await
             {
@@ -950,7 +954,7 @@ mod tests {
     async fn a_query_goes_to_the_first_server_that_answers() {
         let server = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let at = server.local_addr().expect("address");
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let mut buf = [0u8; 512];
             while let Ok((n, peer)) = server.recv_from(&mut buf).await {
                 let question = Message::from_vec(buf.get(..n).unwrap_or_default()).expect("decode");

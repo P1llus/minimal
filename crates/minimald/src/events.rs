@@ -372,7 +372,7 @@ pub(crate) async fn sink(
         if writes.is_empty() {
             continue;
         }
-        let written = tokio::task::spawn_blocking(move || {
+        let written = crate::traced::spawn_blocking(move || {
             for (of, kind, data) in writes {
                 of.log().append(kind, data);
             }

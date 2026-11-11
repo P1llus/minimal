@@ -929,16 +929,24 @@ impl BoxLauncher for SandboxLauncher {
         // this launch's verdict fact and never a concurrent launch's.
         // `PlannedLaunch` owns the release from here: an early `Err` return
         // or a cancelled launch gives the lease back.
-        let planned = sandbox::PlannedLaunch::begin(crate::net::provider::network_for(
+        let network = crate::net::provider::network_for(
             network_mode,
             &net_switch,
             &session_name,
             Some(policy),
             own_address.clone(),
             box_addresses,
-        ))
-        .await
-        .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
+        );
+        let network = match ctx
+            .box_cgroup()
+            .and_then(|cgroup| crate::net::engine::Engine::current().resolver_address(cgroup))
+        {
+            Some(resolver) => crate::net::provider::with_box_resolver(network, resolver),
+            None => network,
+        };
+        let planned = sandbox::PlannedLaunch::begin(network)
+            .await
+            .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
 
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set

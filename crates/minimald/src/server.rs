@@ -1730,6 +1730,17 @@ async fn start_policy_engine_tasks(state: &ServerStateHandle, in_microvm: bool) 
     } else {
         (Upstream::of_this_host(), std::net::Ipv4Addr::LOCALHOST)
     };
+    // A deployment that must not use the node's configured resolvers
+    // names its own.
+    let upstream = std::env::var(crate::net::resolver::UPSTREAM_ENV)
+        .ok()
+        .map_or(upstream, |list| {
+            Upstream::servers(
+                list.split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect(),
+            )
+        });
     let zone: Arc<dyn crate::net::answerer::Zone> = hostnames.clone();
     let resolver = Resolver::new(engine, Zone::new(zone, host), upstream);
     let router = Router::new(hostnames, proxied_request_verdict);

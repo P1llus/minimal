@@ -509,6 +509,44 @@ pub(crate) fn network_for(
     }
 }
 
+/// `network`, with the box's resolver file naming `resolver`: the address
+/// of the box's own resolver endpoint. The policy engine sends the box's
+/// DNS there whatever server it asks, so the file only has to name a server
+/// that can be redirected. A copy of the host's file may name one that
+/// cannot: an IPv6 link-local server with a scope.
+pub(crate) fn with_box_resolver(
+    network: Arc<dyn Network>,
+    resolver: std::net::Ipv4Addr,
+) -> Arc<dyn Network> {
+    Arc::new(BoxResolver {
+        inner: network,
+        resolver,
+    })
+}
+
+#[derive(Debug)]
+struct BoxResolver {
+    inner: Arc<dyn Network>,
+    resolver: std::net::Ipv4Addr,
+}
+
+impl Network for BoxResolver {
+    fn plan(&self) -> PlanFuture<'_> {
+        Box::pin(async move {
+            let plan = self.inner.plan().await?;
+            Ok(plan.with_resolver(Resolver::Nameservers(vec![self.resolver])))
+        })
+    }
+
+    fn attach(&self, spawned: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+        self.inner.attach(spawned)
+    }
+
+    fn abandon(&self) -> sandbox::AbandonFuture<'_> {
+        self.inner.abandon()
+    }
+}
+
 /// [`network_for`] for a task run (NET-138): an `OwnIp` task attaches at
 /// one of the task addresses the VM host registered with its session's box
 /// (`task_addresses`, off the session record) — each a host-side row
@@ -895,6 +933,22 @@ mod tests {
                 })
                 .allowing_self_allocation(),
         ))
+    }
+
+    #[tokio::test]
+    async fn a_box_with_a_resolver_endpoint_has_it_in_its_resolver_file() {
+        let switch = counting_switch();
+        let endpoint = crate::net::endpoints::V4;
+        let plan = with_box_resolver(
+            network_for(NetworkMode::HostNet, &switch, "s", None, None, None),
+            endpoint,
+        )
+        .plan()
+        .await
+        .unwrap();
+        assert_eq!(plan.resolver(), &Resolver::Nameservers(vec![endpoint]));
+        // Nothing else about the plan changes.
+        assert!(!plan.isolates_netns());
     }
 
     /// 017-005's precondition: the mode decides the provider, in one place,

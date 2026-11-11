@@ -879,6 +879,16 @@ impl Engine {
         }
     }
 
+    /// The address to write into the box's resolver file, when the box's
+    /// DNS goes to an endpoint of its own.
+    // Only the real launcher asks, which the unit tests replace.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn resolver_address(&self, cgroup: &BoxCgroup) -> Option<std::net::Ipv4Addr> {
+        self.by_cgroup(BoxId(cgroup.id()))
+            .filter(|of| of.wants.resolver)
+            .map(|_| endpoints::V4)
+    }
+
     pub(crate) fn installed(&self, session: SessionId) -> Option<Arc<Installed>> {
         let attached = self.attached_state()?;
         let id = *attached
