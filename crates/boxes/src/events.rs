@@ -37,6 +37,13 @@ pub enum BoxEventType {
     Resumed,
     /// A client detached from the box.
     Detached,
+    /// The box's network policy refused something: a connection, a
+    /// datagram, a bind, a name, or a proxied request.
+    NetRefused,
+    /// A type this build does not know, written by a newer one. Readers
+    /// pass it on and do not fail on it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl BoxEventType {
@@ -53,6 +60,8 @@ impl BoxEventType {
             Self::Renamed => "renamed",
             Self::Resumed => "resumed",
             Self::Detached => "detached",
+            Self::NetRefused => "net_refused",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -190,6 +199,18 @@ mod tests {
         assert_eq!(value["ts"], 1);
         assert_eq!(value["box"], event.box_id.to_string());
         assert!(value["data"].is_object());
+    }
+
+    #[test]
+    fn a_type_from_a_newer_build_reads_as_unknown_and_keeps_its_data() {
+        let line = r#"{"box":"01a1cb31-b787-75f2-aa69-d77d6b0522f1","parent":null,"ts":7,"type":"syscall_refused","data":{"nr":41}}"#;
+        let event: BoxEvent = serde_json_lenient::from_str(line).unwrap();
+        assert_eq!(event.kind, BoxEventType::Unknown);
+        assert_eq!(event.data.get("nr").and_then(|v| v.as_u64()), Some(41));
+        let known = line.replace("syscall_refused", "net_refused");
+        let event: BoxEvent = serde_json_lenient::from_str(&known).unwrap();
+        assert_eq!(event.kind, BoxEventType::NetRefused);
+        assert_eq!(event.kind.name(), "net_refused");
     }
 
     #[test]
