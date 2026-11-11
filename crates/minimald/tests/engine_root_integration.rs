@@ -513,11 +513,13 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     let rebind = daemon.connect("names", "rebind.test", port);
     assert_ne!(rebind.trim(), "ok", "{rebind}");
     assert!(daemon.connect("names", "127.0.0.2", port).contains(REFUSED));
-    // Listing the host's name does not open the host's loopback: the name
-    // has no address for a box, and nothing is admitted for it.
-    let host = daemon.exec("names", "getent hosts host.min.internal; echo rc=$?");
-    assert!(host.contains("rc=2"), "{host}");
+    // Listing the host's name does not open the host's loopback. The
+    // box's hosts file gives the name an address, the resolver gives it
+    // none, and no lookup admits anything for it.
+    daemon.exec("names", "getent hosts host.min.internal");
     assert!(daemon.connect("names", "127.0.0.1", port).contains(REFUSED));
+    let by_name = daemon.connect("names", "host.min.internal", port);
+    assert!(by_name.contains(REFUSED), "{by_name}");
 
     // Refusals are box events, each with its source.
     wait_for("the refusal events", Duration::from_secs(10), || {
