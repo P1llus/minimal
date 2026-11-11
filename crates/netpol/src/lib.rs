@@ -30,3 +30,4 @@ pub use model::{
     Action, Defaults, Direction, Endpoint, EndpointIndex, Family, ModelError, NamePattern, Origin,
     PortRange, Prefix, Protocol, Protocols, Rule, SetId, Target, Verdict,
 };
+pub use policy::{BoxAction, BoxPolicy, BoxRule};

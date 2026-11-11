@@ -14,6 +14,8 @@ pub mod channel_progress;
 pub mod connection;
 mod diag;
 pub mod env;
+#[cfg(target_os = "linux")]
+mod events;
 mod exec;
 #[cfg(target_os = "linux")]
 pub mod guest;
@@ -21,6 +23,8 @@ mod hooks;
 mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;
+#[cfg(target_os = "linux")]
+pub mod policy_loader;
 #[cfg(target_os = "linux")]
 pub mod reaper;
 pub mod rpc;

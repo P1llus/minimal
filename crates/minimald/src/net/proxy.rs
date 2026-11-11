@@ -778,6 +778,75 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
     }
 }
 
+/// The hostname proxy at the endpoints of boxes: each listener serves one
+/// box, and only connections the engine names as that box's.
+pub(crate) struct BoxEndpoints<T> {
+    router: Router<T>,
+    engine: &'static crate::net::engine::Engine,
+}
+
+impl<T> BoxEndpoints<T> {
+    pub(crate) const fn new(
+        router: Router<T>,
+        engine: &'static crate::net::engine::Engine,
+    ) -> Self {
+        Self { router, engine }
+    }
+}
+
+impl<T: HostRoute> crate::net::engine::BoxProxy for BoxEndpoints<T> {
+    fn serve(
+        &self,
+        listener: TcpListener,
+        of: Arc<crate::net::engine::Installed>,
+        peers: crate::net::engine::Peers,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let (router, engine) = (self.router.clone(), self.engine);
+        Box::pin(async move {
+            loop {
+                let (client, peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "dns-proxy",
+                            box_id = %of.session(),
+                            %error,
+                            "a box's proxy endpoint stopped"
+                        );
+                        return;
+                    }
+                };
+                // A peer the engine has no flow of this box for is a
+                // process outside the box. It gets nothing, not even a
+                // status: the connection closes.
+                let service = crate::net::endpoints::Service::HostnameProxy;
+                if peers
+                    .of_box(&of, service, peer, netpol::Protocol::Tcp)
+                    .is_none()
+                {
+                    continue;
+                }
+                let router = router.clone();
+                let asker = Asker::Box(BoxAsker {
+                    of: Arc::clone(&of),
+                    engine,
+                });
+                crate::traced::spawn(async move {
+                    if let Err(error) = handle_connection(client, Some(peer), asker, &router).await
+                    {
+                        tracing::debug!(
+                            component = "dns-proxy",
+                            %peer,
+                            %error,
+                            "proxy connection closed with error"
+                        );
+                    }
+                });
+            }
+        })
+    }
+}
+
 /// Whether the client opened a raw `CONNECT` tunnel or a plain forward request
 /// whose buffered head must be replayed to the upstream.
 #[derive(Debug, Clone, Copy)]
@@ -807,9 +876,37 @@ struct ParsedRequest<'a> {
 /// (NET-001) naming what is known about it, so the daemon log never swallows
 /// a refused request.
 async fn handle_connection_io<C, T>(
-    mut client: C,
+    client: C,
     peer: Option<SocketAddr>,
     local: Option<SocketAddr>,
+    router: &Router<T>,
+) -> io::Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    T: HostRoute,
+{
+    handle_connection(client, peer, Asker::Shared { local }, router).await
+}
+
+/// Who a connection's requests are judged as.
+enum Asker {
+    /// A connection to the node's shared listener: a host program, or a
+    /// box with its own address, told apart by the peer address.
+    Shared { local: Option<SocketAddr> },
+    /// A connection to a box's own endpoint, which the engine attributed
+    /// to that box. Its requests are judged by the box's compiled policy.
+    Box(BoxAsker),
+}
+
+struct BoxAsker {
+    of: Arc<crate::net::engine::Installed>,
+    engine: &'static crate::net::engine::Engine,
+}
+
+async fn handle_connection<C, T>(
+    mut client: C,
+    peer: Option<SocketAddr>,
+    asker: Asker,
     router: &Router<T>,
 ) -> io::Result<()>
 where
@@ -824,8 +921,10 @@ where
     // peer — a host-side client such as the developer's browser — is no
     // caller, and its egress is ungated here exactly as a direct connection
     // from it would be (NET-071).
-    let lookup = match peer {
-        Some(SocketAddr::V4(peer)) => router.caller_for(peer, local).await,
+    let lookup = match (&asker, peer) {
+        (Asker::Shared { local }, Some(SocketAddr::V4(peer))) => {
+            router.caller_for(peer, *local).await
+        }
         _ => CallerLookup::NoBox,
     };
 
@@ -927,6 +1026,38 @@ where
             return write_refusal_status(&mut client, "403 Forbidden", reason).await;
         }
     };
+
+    // A box at its own endpoint: its compiled policy judges the target as
+    // it would judge the box's own connection there. The name the request
+    // carries stands for a pin, so a peer the box lists by name is admitted.
+    if let Asker::Box(asker) = &asker {
+        let flow = netpol::Flow {
+            direction: netpol::Direction::Egress,
+            protocol: netpol::Protocol::Tcp,
+            remote: std::net::IpAddr::V4(route.address()),
+            port,
+            local: None,
+        };
+        let decision = asker.engine.evaluate(&asker.of, &flow, Some(host));
+        if decision.verdict == netpol::FlowVerdict::Deny {
+            let reason = "the caller's egress policy denies this target";
+            asker.engine.observe(
+                Arc::clone(&asker.of),
+                crate::events::NetRefusal {
+                    source: crate::events::Source::HostnameProxy,
+                    direction: flow.direction,
+                    protocol: Some(flow.protocol),
+                    remote: Some(flow.remote),
+                    port: Some(port),
+                    name: Some(host.to_owned()),
+                    reason: crate::events::snake(&decision.reason),
+                    rule: crate::events::RuleRef::of(&asker.of.compiled(), decision.rule),
+                    pid: None,
+                },
+            );
+            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
+        }
+    }
 
     // The shared verdict, before the proxy dials anything: a request the
     // switch's own gates would refuse is refused here, where the host, the

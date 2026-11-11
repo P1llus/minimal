@@ -426,7 +426,7 @@ pub(crate) fn encode_query(name: &str, rtype: RecordType) -> Vec<u8> {
 /// inert; all of them carry the shared decision's TTL ceiling
 /// ([`zone_answer::ANSWER_TTL_SECS`]) so no number the answerer emits exceeds
 /// NET-126's bound.
-fn zone_soa() -> Record {
+pub(crate) fn zone_soa() -> Record {
     let apex = Name::from_utf8(format!("{HOSTNAME_SUFFIX}.")).expect("the zone apex parses");
     let mname = Name::from_utf8(format!("ns.{HOSTNAME_SUFFIX}.")).expect("the SOA mname parses");
     let rname =

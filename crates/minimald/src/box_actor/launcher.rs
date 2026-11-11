@@ -108,7 +108,11 @@ impl BoxActor {
         self.publications = Default::default();
         // Asked before anything is made for the box, its cgroup included: a
         // policy this host cannot enforce is refused, never run unenforced.
-        if let Err(refusal) = crate::net::engine::engine().can_enforce(network_mode, &policy) {
+        if let Err(refusal) = crate::net::engine::Engine::current().can_enforce(
+            network_mode,
+            &record.policy,
+            self.deny_all_opt_out,
+        ) {
             tracing::info!(
                 box_id = %record.id,
                 network_mode = %network_mode.word(),
@@ -130,7 +134,7 @@ impl BoxActor {
             // before any of this runs) and its patches are materialized
             // into the home dir.
             LaunchPhase::Activating => match self.build_context(true).await {
-                Ok(ctx) => self.in_box_cgroup(ctx),
+                Ok(ctx) => self.in_box_cgroup(ctx).await,
                 Err(error) => Err(error),
             },
         }

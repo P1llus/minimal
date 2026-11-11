@@ -1696,8 +1696,8 @@ impl BoxActor {
                 format!("Its network settings are not valid: {error}."),
             )
         })?;
-        crate::net::engine::engine()
-            .can_enforce(started.network, &started.policy)
+        crate::net::engine::Engine::current()
+            .can_enforce(started.network, &started.policy, self.deny_all_opt_out)
             .map_err(|refusal| std::io::Error::new(std::io::ErrorKind::InvalidInput, refusal))?;
         Ok(Some(spec))
     }

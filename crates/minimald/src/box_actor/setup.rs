@@ -928,7 +928,7 @@ impl BoxActor {
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         Ok(crate::box_ops::BuildPlacement {
             box_name,
-            cgroup: self.ensure_cgroup()?,
+            cgroup: self.ensure_cgroup().await?,
             network: box_build_network(&record, &self.net_switch, self.deny_all_opt_out),
         })
     }
@@ -1120,15 +1120,19 @@ impl BoxActor {
         }
 
         let ctx = self.build_context(scaffold_if_missing).await?;
-        self.in_box_cgroup(ctx)
+        self.in_box_cgroup(ctx).await
     }
 
     /// `ctx`, with everything it starts placed in the box's cgroup: a task
     /// run, a check, a launch and the package builds of each are the box's.
     /// A daemon with no cgroup root leaves the context as it is.
-    pub(super) fn in_box_cgroup(&mut self, ctx: mctx::Context) -> Result<mctx::Context, String> {
+    pub(super) async fn in_box_cgroup(
+        &mut self,
+        ctx: mctx::Context,
+    ) -> Result<mctx::Context, String> {
         let cgroup = self
             .ensure_cgroup()
+            .await
             .map_err(|error| format!("the box's cgroup could not be made: {error}"))?;
         Ok(match cgroup {
             Some(cgroup) => ctx.with_box_cgroup(cgroup),

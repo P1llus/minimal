@@ -663,31 +663,68 @@ impl BoxActor {
         self.destroy_cgroup().await;
     }
 
-    /// The box's cgroup, made at first use. `None` on a daemon with no
-    /// cgroup root, where boxes run without one.
+    /// The box's cgroup, made at first use with the box's network policy
+    /// in place: nothing of the box starts in a cgroup the policy engine
+    /// has no entry for. `None` on a daemon with no cgroup root, where
+    /// boxes run without one.
     ///
     /// # Errors
     ///
     /// When the daemon has a cgroup root and the box's cgroup cannot be
-    /// made in it.
-    pub(super) fn ensure_cgroup(&mut self) -> std::io::Result<Option<sandbox::cgroup::BoxCgroup>> {
-        if self.cgroup.is_none()
-            && let Some(root) = crate::box_cgroups::root()
-        {
-            let cgroup = root.create_box(&self.record.id().to_string())?;
-            tracing::debug!(
-                box_id = %self.record.id(),
-                cgroup = %cgroup.path().display(),
-                cgroup_id = cgroup.id(),
-                "made the box's cgroup"
-            );
-            self.cgroup = Some(cgroup);
+    /// made in it, or the box's network policy cannot be enforced here.
+    pub(super) async fn ensure_cgroup(
+        &mut self,
+    ) -> std::io::Result<Option<sandbox::cgroup::BoxCgroup>> {
+        use crate::net::engine::{BoxFacts, Engine};
+
+        let Some(root) = crate::box_cgroups::root() else {
+            return Ok(None);
+        };
+        let record = self.record.record().await?;
+        let facts = BoxFacts {
+            session: record.id,
+            mode: record.network,
+            policy: record.policy.clone(),
+            deny_all_opt_out: self.deny_all_opt_out,
+        };
+        let engine = Engine::current();
+        let refused = |error: crate::net::engine::InstallError| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+        };
+        if let Some(cgroup) = &self.cgroup {
+            // A launch after the one that made the cgroup: the entry is
+            // there, and follows the record if that changed in between.
+            if let Some(installed) = engine.installed(record.id)
+                && !Engine::matches(&installed, &facts)
+            {
+                engine.reconfigure(&installed, &facts).map_err(refused)?;
+            }
+            return Ok(Some(cgroup.clone()));
         }
-        Ok(self.cgroup.clone())
+        let cgroup = root.create_box(&record.id.to_string())?;
+        let log = Arc::new(crate::events::DiskLog(self.record.object().await?));
+        if let Err(error) = engine.install(&cgroup, facts, log) {
+            // Nothing ran in it. Without an entry it must not stay around
+            // for a later launch to find.
+            if let Err(error) = cgroup.destroy(CGROUP_DESTROY_LIMIT).await {
+                tracing::warn!(box_id = %record.id, %error, "removing the box's unused cgroup");
+            }
+            return Err(refused(error));
+        }
+        tracing::debug!(
+            box_id = %record.id,
+            cgroup = %cgroup.path().display(),
+            cgroup_id = cgroup.id(),
+            "made the box's cgroup"
+        );
+        self.cgroup = Some(cgroup.clone());
+        Ok(Some(cgroup))
     }
 
     /// Ends the box's cgroup: kills what is left in it, waits for it to
-    /// empty, and removes it.
+    /// empty, removes it, and takes the box out of the policy engine. The
+    /// engine's entry goes also when processes outlived the kill, which
+    /// leaves them without network.
     async fn destroy_cgroup(&mut self) {
         let Some(cgroup) = self.cgroup.take() else {
             return;
@@ -699,6 +736,7 @@ impl BoxActor {
                 "the box's cgroup could not be removed; the next daemon start removes it"
             );
         }
+        crate::net::engine::Engine::current().uninstall(*self.record.id());
     }
 
     /// The processes a stop of this box signals: its cgroup's, or its

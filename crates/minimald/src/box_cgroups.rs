@@ -27,7 +27,7 @@ const SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// `located` is where the root is, and `exe` is this binary, which the
 /// spawner is. A daemon with no root runs its boxes without cgroups, and
 /// says so once here.
-pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf) {
+pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf, guest: bool) {
     use sandbox::cgroup::Located;
 
     let root = match located {
@@ -69,6 +69,14 @@ pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf) {
             None
         }
     };
+    // The policy engine for the boxes below the root, before any box can
+    // start: every box cgroup gets its entry at creation.
+    let node = if guest {
+        crate::net::spec::Node::guest(crate::net::DEFAULT_SUBNET)
+    } else {
+        crate::net::spec::Node::native()
+    };
+    crate::net::engine::Engine::boot(root.as_ref(), node);
     let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Detached, root.clone());
     set_root(root);
 

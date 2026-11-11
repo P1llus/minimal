@@ -1223,6 +1223,11 @@ impl Server {
         let zone_answerer_port = config.zone_answerer_port;
         let state = ServerStateHandle::new(config, log_release).await?;
 
+        // What answers at the endpoints of boxes, before any box starts:
+        // the resume below launches them.
+        #[cfg(target_os = "linux")]
+        start_policy_engine_tasks(&state, in_microvm).await;
+
         // Bring up the actor of every active session restored from the
         // store, so each one's box name routes from daemon start rather than
         // from the first RPC that names the session. Enqueued here, before
@@ -1700,6 +1705,41 @@ async fn reap_if_unfinalized(
 /// answerer over the machine-global channel, host the interim only while
 /// nothing serves, never both — described at its own site.
 #[cfg(target_os = "linux")]
+/// Gives the policy engine what serves a box's endpoints (the resolver
+/// and the hostname proxy) and starts its event and sweep tasks.
+#[cfg(target_os = "linux")]
+async fn start_policy_engine_tasks(state: &ServerStateHandle, in_microvm: bool) {
+    use crate::net::{
+        engine::{Engine, Serving},
+        proxy::{BoxEndpoints, Router},
+        resolver::{Resolver, Upstream, Zone},
+        switch::proxied_request_verdict,
+    };
+
+    let engine = Engine::current();
+    let hostnames = state.sessions_manager().await.hostnames();
+    // A guest's resolver is the virtual network's, at its gateway, and the
+    // host's name answers with the host alias there. On a native node the
+    // host is the node itself.
+    let subnet = crate::net::DEFAULT_SUBNET;
+    let (upstream, host) = if in_microvm {
+        (
+            Upstream::servers(vec![(subnet.dns_server(), 53).into()]),
+            subnet.host_alias(),
+        )
+    } else {
+        (Upstream::of_this_host(), std::net::Ipv4Addr::LOCALHOST)
+    };
+    let zone: Arc<dyn crate::net::answerer::Zone> = hostnames.clone();
+    let resolver = Resolver::new(engine, Zone::new(zone, host), upstream);
+    let router = Router::new(hostnames, proxied_request_verdict);
+    engine.start_tasks(Serving {
+        runtime: tokio::runtime::Handle::current(),
+        resolver: Arc::new(resolver),
+        hostname_proxy: Arc::new(BoxEndpoints::new(router, engine)),
+    });
+}
+
 async fn start_host_proxies(
     state: &ServerStateHandle,
     in_microvm: bool,
@@ -2124,6 +2164,15 @@ impl HostProxyStartup {
                 // busy compiles its own-address boxes at the port it
                 // actually landed on, not the configured one it moved off.
                 state.set_switch_hostname_proxy_port(bound_port).await;
+                // A box that dials the shared listener is sent to its own
+                // endpoint, which needs the port the listener ended up on.
+                let mut listeners = vec![(std::net::Ipv4Addr::LOCALHOST, bound_port).into()];
+                if state.in_microvm().await {
+                    // A guest's listener is on every address. Its boxes
+                    // know it by the node's address on the virtual network.
+                    listeners.push((crate::net::DEFAULT_SUBNET.daemon_ip(), bound_port).into());
+                }
+                crate::net::engine::Engine::current().set_node_hostname_proxy(listeners);
             }
         }
     }

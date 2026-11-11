@@ -43,7 +43,10 @@ pub(crate) mod provider;
 pub(crate) mod dns_gate;
 
 // Whether a box's network policy can be enforced on this host.
+pub(crate) mod endpoints;
 pub(crate) mod engine;
+pub(crate) mod resolver;
+pub(crate) mod spec;
 
 // WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
 // default build carries no WireGuard code (R4.7).
