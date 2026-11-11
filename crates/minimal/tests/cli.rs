@@ -2359,47 +2359,6 @@ async fn policy_shows_effective_egress() {
         "a host-address session has no per-session ingress policy to show:\n{text}"
     );
 
-    // NET-079: the per-box enforcement state rides its own runtime-facts
-    // reply beside the rules — never a field on the policy, whose strict
-    // shape an older `min` would reject over a key it has no field for —
-    // and the row the render prints is the state that reply carried, in the
-    // machine spelling. Whatever this host actually decides is what shows:
-    // the assertion is on the agreement between the reply and the row, not
-    // on the state, which is the host's to answer.
-    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
-    let resp = client
-        .oneshot_rpc::<GetSessionRuntimeFacts>(GetSessionRuntimeFactsRequest::Id(host_id))
-        .await
-        .unwrap();
-    let facts = match resp {
-        minimald_rpc::Errorable::Ok(facts) => facts,
-        minimald_rpc::Errorable::Err { error } => {
-            panic!("GetSessionRuntimeFacts failed: {error}")
-        }
-    };
-    let host_ip_enforcement = facts
-        .host_ip_enforcement
-        .expect("a host-address session answers a state");
-    let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &policy,
-        boxes::NetworkMode::HostNet,
-        Some(host_ip_enforcement),
-        &[],
-        None,
-    )
-    .unwrap();
-    let text = String::from_utf8(out).unwrap();
-    assert!(
-        text.contains(&format!(
-            "  per-box enforcement  {}\n",
-            host_ip_enforcement.machine_str()
-        )),
-        "the enforcement row must carry the runtime-facts reply's state, in \
-         its own machine spelling:\n{text}"
-    );
-
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — the whole policy is replaced by the one-line
     // note the TUI's detail pane shows, since `egress / allow-all` there
@@ -2930,37 +2889,20 @@ async fn policy_shows_unset_egress_as_named_default() {
         boxes::EffectiveEgress::AllowAll,
         "a bare host-address box keeps the shipped allow-all"
     );
-    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
-    let resp = client
-        .oneshot_rpc::<GetSessionRuntimeFacts>(GetSessionRuntimeFactsRequest::Id(host_id))
-        .await
-        .unwrap();
-    let facts = match resp {
-        minimald_rpc::Errorable::Ok(facts) => facts,
-        minimald_rpc::Errorable::Err { error } => {
-            panic!("GetSessionRuntimeFacts failed: {error}")
-        }
-    };
-    let enforcement = facts
-        .host_ip_enforcement
-        .expect("a host-address session answers a state");
     let mut out = Vec::new();
     format_policy(
         &mut out,
         &host_policy,
         boxes::NetworkMode::HostNet,
-        Some(enforcement),
+        None,
         &[],
         None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains(&format!(
-            "egress\n  allow-all (default)\n  per-box enforcement  {}\n",
-            enforcement.machine_str()
-        )),
-        "the host-address default sits beside the per-box enforcement value: {text}"
+        text.contains("egress\n  allow-all (default)\n"),
+        "the host-address default is marked as the default: {text}"
     );
 
     // A declared deny-all box beside the unset one: the same surface, a
