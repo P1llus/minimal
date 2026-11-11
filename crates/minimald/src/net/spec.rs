@@ -377,6 +377,46 @@ mod tests {
     }
 
     #[test]
+    fn a_listener_on_every_address_is_redirected_whatever_address_the_box_dials() {
+        let endpoint: std::net::SocketAddrV4 = "127.0.80.1:20481".parse().expect("address");
+        let services = Services {
+            hostname_proxy: Some(netpol::Endpoint {
+                v4: Some(endpoint),
+                v6: None,
+            }),
+            ..Services::default()
+        };
+        let verdict = |listener: &str, dialled: &str| {
+            let mut node = Node::guest(switch::DEFAULT_SUBNET);
+            node.hostname_proxy = vec![listener.parse().expect("address")];
+            let compiled = Spec {
+                deployment: deployment(&node, NetworkMode::HostNet, services, Vec::new()),
+                policy: netpol::BoxPolicy::default(),
+                options: OPTIONS,
+            }
+            .compile()
+            .expect("compile");
+            let flow = Flow {
+                direction: Direction::Egress,
+                protocol: Protocol::Tcp,
+                remote: dialled.parse().expect("address"),
+                port: 7654,
+                local: None,
+            };
+            compiled.evaluate(&flow, None).verdict
+        };
+        let redirected = FlowVerdict::Redirect(SocketAddr::V4(endpoint));
+        // The guest's listener accepts on every address, and a box can
+        // dial any of them: each one lands on the box's own endpoint.
+        for dialled in ["127.0.0.1", "127.0.0.2", "100.64.255.253"] {
+            assert_eq!(verdict("0.0.0.0:7654", dialled), redirected, "{dialled}");
+        }
+        // A listener on one address is redirected at that address only.
+        assert_eq!(verdict("127.0.0.1:7654", "127.0.0.1"), redirected);
+        assert_ne!(verdict("127.0.0.1:7654", "127.0.0.2"), redirected);
+    }
+
+    #[test]
     fn a_guest_box_is_kept_off_the_gateway_and_its_dns_redirected() {
         let guest = Node::guest(switch::DEFAULT_SUBNET);
         let resolver = netpol::Endpoint {

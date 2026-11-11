@@ -331,7 +331,32 @@ impl BindFailure {
 /// carried inside the failure's reason, and its kind beside it
 /// ([`BindFailure::kind`]).
 pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure> {
-    match TcpListener::bind(addr).await {
+    bind_listener_after(addr, |_| {}).await
+}
+
+/// [`bind_listener`], with a step between taking the address and
+/// accepting on it. `bound` gets the address the socket has. Nothing can
+/// connect before it returns, so whatever must hold for the first
+/// connection is put in place there.
+///
+/// # Errors
+///
+/// As [`bind_listener`].
+pub async fn bind_listener_after(
+    addr: SocketAddr,
+    bound: impl FnOnce(SocketAddr),
+) -> Result<TcpListener, BindFailure> {
+    let listen = || -> io::Result<TcpListener> {
+        let socket = match addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+        }?;
+        socket.set_reuseaddr(true)?;
+        socket.bind(addr)?;
+        bound(socket.local_addr()?);
+        socket.listen(1024)
+    };
+    match listen() {
         Ok(listener) => {
             tracing::info!(
                 component = "dns-proxy",
@@ -1718,6 +1743,26 @@ pub(crate) async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The step between bind and listen sees the address the socket has,
+    /// and nothing connects before it returns.
+    #[tokio::test]
+    async fn nothing_connects_to_a_listener_before_its_bound_step_returns() {
+        let mut seen = None;
+        let listener = bind_listener_after("127.0.0.1:0".parse().unwrap(), |addr| {
+            let refused = std::net::TcpStream::connect(addr).is_err();
+            seen = Some((addr, refused));
+        })
+        .await
+        .unwrap();
+        let (addr, refused) = seen.expect("the step ran");
+        assert_ne!(addr.port(), 0);
+        assert_eq!(listener.local_addr().unwrap(), addr);
+        assert!(refused, "a connection was taken before the step returned");
+        TcpStream::connect(addr)
+            .await
+            .expect("it accepts afterwards");
+    }
     use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddrV4;
     use std::sync::{Mutex, RwLock};

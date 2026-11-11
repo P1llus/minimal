@@ -485,6 +485,8 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
             "a.wild.test",
             "--allow-dns-hosts",
             "rebind.test",
+            "--allow-dns-hosts",
+            "host.min.internal",
         ],
     );
     let (public4, public6) = (PUBLIC4.to_string(), PUBLIC6.to_string());
@@ -511,6 +513,11 @@ fn a_box_s_policy_decides_what_it_reaches_for_both_families() {
     let rebind = daemon.connect("names", "rebind.test", port);
     assert_ne!(rebind.trim(), "ok", "{rebind}");
     assert!(daemon.connect("names", "127.0.0.2", port).contains(REFUSED));
+    // Listing the host's name does not open the host's loopback: the name
+    // has no address for a box, and nothing is admitted for it.
+    let host = daemon.exec("names", "getent hosts host.min.internal; echo rc=$?");
+    assert!(host.contains("rc=2"), "{host}");
+    assert!(daemon.connect("names", "127.0.0.1", port).contains(REFUSED));
 
     // Refusals are box events, each with its source.
     wait_for("the refusal events", Duration::from_secs(10), || {
@@ -693,13 +700,21 @@ fn a_loader_of_another_version_is_not_used() {
     let daemon = Daemon::start(dir.path(), &path, None);
     let log = daemon.log();
     assert!(log.contains("from another version"), "{log}");
-    let activation = daemon.activate(
-        "sub",
-        &["--network", "host_ip", "--allow-subnets", "127.0.0.1/32"],
-    );
-    let exec = daemon.connect("sub", "127.0.0.1", 9);
-    assert!(
-        format!("{activation}{exec}").contains("min finalize-install"),
-        "{activation}{exec}"
-    );
+    // A loader that answered may have attached its programs, which this
+    // daemon cannot write maps for. Below them no box has a network, so
+    // none starts: not a restricted one, and not one that allows
+    // everything.
+    for (name, flags) in [
+        (
+            "sub",
+            &["--network", "host_ip", "--allow-subnets", "127.0.0.1/32"][..],
+        ),
+        ("open", &["--network", "host_ip"][..]),
+    ] {
+        let activation = daemon.activate(name, flags);
+        let exec = daemon.connect(name, "127.0.0.1", 9);
+        let said = format!("{activation}{exec}");
+        assert_ne!(exec.trim(), "ok", "{said}");
+        assert!(said.contains("min finalize-install"), "{said}");
+    }
 }

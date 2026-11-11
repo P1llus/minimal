@@ -41,8 +41,10 @@ use crate::events::{NetRefusal, Source};
 pub const UPSTREAM_ENV: &str = "MINIMALD_UPSTREAM_DNS";
 
 const DNS_PORT: u16 = 53;
-/// The largest message taken from a box or from upstream.
-const MAX_MESSAGE: usize = 4096;
+/// The largest message taken over UDP, from a box or from upstream, and
+/// the payload size the resolver tells upstream it takes. TCP carries
+/// whatever its two-byte length can say.
+const MAX_DATAGRAM: usize = 4096;
 /// Addresses pinned from one answer.
 const MAX_PINS: usize = 32;
 /// How long one upstream server gets, and all of them together.
@@ -90,9 +92,12 @@ pub(crate) enum Decided {
         name: String,
         query: Box<Message>,
     },
-    /// A name for the node's resolver.
+    /// A name for the node's resolver, with the query to send there:
+    /// built from the one question the policy checked, and nothing else
+    /// of what the box sent.
     Forward {
         name: String,
+        query: Vec<u8>,
     },
 }
 
@@ -136,7 +141,9 @@ pub(crate) fn decide(query: &[u8], view: &View<'_>) -> Decided {
     if message.metadata.op_code != OpCode::Query {
         return reply(ResponseCode::NotImp);
     }
-    let Some(question) = message.queries.first() else {
+    // One question is what resolvers send and what the policy checks. A
+    // second one would go upstream unchecked.
+    let [question] = message.queries.as_slice() else {
         return reply(ResponseCode::FormErr);
     };
     let name = normalized(question.name());
@@ -164,7 +171,30 @@ pub(crate) fn decide(query: &[u8], view: &View<'_>) -> Decided {
     if matches!(qtype, RecordType::HTTPS | RecordType::SVCB) && !view.compiled.names.is_empty() {
         return reply(ResponseCode::NoError);
     }
-    Decided::Forward { name }
+    match upstream_query(&message, question) {
+        Some(query) => Decided::Forward { name, query },
+        None => Decided::Drop,
+    }
+}
+
+/// The query the node's resolver gets for a box's question: the box's id
+/// and recursion flag, the one question, and an EDNS record of the
+/// resolver's own when the box sent one. Of the box's EDNS record only the
+/// DNSSEC bit and a payload size within the resolver's own limit carry
+/// over, so no option and no second record of the box reaches upstream.
+fn upstream_query(message: &Message, question: &hickory_proto::op::Query) -> Option<Vec<u8>> {
+    let mut query = Message::query();
+    query.metadata.id = message.metadata.id;
+    query.metadata.recursion_desired = message.metadata.recursion_desired;
+    query.add_query(question.clone());
+    if let Some(theirs) = &message.edns {
+        let mut ours = hickory_proto::op::Edns::new();
+        let limit = u16::try_from(MAX_DATAGRAM).unwrap_or(u16::MAX);
+        ours.set_max_payload(theirs.max_payload().clamp(512, limit));
+        ours.set_dnssec_ok(theirs.flags().dnssec_ok);
+        query.set_edns(ours);
+    }
+    encoded(&query)
 }
 
 /// What the zone holds for a name.
@@ -174,6 +204,47 @@ pub(crate) enum ZoneAnswer {
     /// The name exists and has no address to tell.
     NoData,
     NoSuchName,
+}
+
+/// A zone answer after the pin check, for a name a rule of the box names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZoneAdmission {
+    /// What the box is told.
+    pub(crate) answer: ZoneAnswer,
+    /// The address to admit for the box.
+    pub(crate) pin: Option<(IpAddr, SetId)>,
+    /// The address the zone holds and the box is not told: one its policy
+    /// would have to allow by prefix before a name may open it.
+    pub(crate) refused: Option<IpAddr>,
+}
+
+/// Puts a zone answer through the check every pinned address passes. A
+/// listed name opens the address it resolves to on every port, so a zone
+/// name gets no more than an upstream name would: an internal address is
+/// pinned only when a prefix the box allows covers it.
+pub(crate) fn admit_zone(answer: ZoneAnswer, name: &str, view: &View<'_>) -> ZoneAdmission {
+    let told = ZoneAdmission {
+        answer,
+        pin: None,
+        refused: None,
+    };
+    let (ZoneAnswer::Address(address), Some(set)) = (answer, view.compiled.set_for_name(name))
+    else {
+        return told;
+    };
+    let address = IpAddr::V4(address);
+    if pins::may_pin(address, view.allowed, view.infrastructure) {
+        ZoneAdmission {
+            pin: Some((address, set)),
+            ..told
+        }
+    } else {
+        ZoneAdmission {
+            answer: ZoneAnswer::NoData,
+            pin: None,
+            refused: Some(address),
+        }
+    }
 }
 
 /// The reply for a zone name.
@@ -329,12 +400,14 @@ impl Upstream {
         let socket = UdpSocket::bind(bind).await?;
         socket.connect(server).await?;
         socket.send(query).await?;
-        let mut buf = vec![0u8; MAX_MESSAGE];
+        // One byte more than a datagram may have: a read that fills the
+        // buffer was cut short, and half an answer is no answer.
+        let mut buf = vec![0u8; MAX_DATAGRAM + 1];
         loop {
             let n = socket.recv(&mut buf).await?;
             // The reply to this query carries its id. Anything else on the
             // socket is not an answer.
-            if n >= 2 && buf.get(..2) == query.get(..2) {
+            if (2..=MAX_DATAGRAM).contains(&n) && buf.get(..2) == query.get(..2) {
                 buf.truncate(n);
                 return Ok(buf);
             }
@@ -381,18 +454,18 @@ impl Upstream {
 /// The box-name zone as the resolver reads it.
 pub(crate) struct Zone {
     names: Arc<dyn answerer::Zone>,
-    /// What `host.min.internal` answers with on this node.
-    host: Ipv4Addr,
 }
 
 impl Zone {
-    pub(crate) fn new(names: Arc<dyn answerer::Zone>, host: Ipv4Addr) -> Self {
-        Self { names, host }
+    pub(crate) fn new(names: Arc<dyn answerer::Zone>) -> Self {
+        Self { names }
     }
 
     fn lookup(&self, name: &str) -> ZoneAnswer {
+        // The host's name exists and has no address a box may be told:
+        // the host's loopback is not a box's to reach by a name.
         if name == zone_answer::HOST_ROW_NAME {
-            return ZoneAnswer::Address(self.host);
+            return ZoneAnswer::NoData;
         }
         match self.names.zone_entry(name, &[]) {
             ZoneEntry::Held {
@@ -471,18 +544,20 @@ impl Resolver {
                 Some(reply)
             }
             Decided::Zone { name, query } => {
-                let answer = self.zone.lookup(&name);
-                // The daemon's own answer needs no rebinding filter: a
-                // listed peer is admitted at the address the zone gives.
-                if let (ZoneAnswer::Address(address), Some(set)) =
-                    (answer, compiled.set_for_name(&name))
-                {
-                    self.pin(of, IpAddr::V4(address), set);
+                let admitted = admit_zone(self.zone.lookup(&name), &name, &view);
+                if let Some((address, set)) = admitted.pin {
+                    self.pin(of, address, set);
                 }
-                zone_reply(&query, answer)
+                if let Some(address) = admitted.refused {
+                    self.refused(of, &name, "rebinding", Some(address));
+                }
+                zone_reply(&query, admitted.answer)
             }
-            Decided::Forward { name } => {
-                let Some(reply) = self.upstream.ask(query, via).await else {
+            Decided::Forward {
+                name,
+                query: upstream,
+            } => {
+                let Some(reply) = self.upstream.ask(&upstream, via).await else {
                     let query = Message::from_vec(query).ok()?;
                     return encoded(&empty(&query, ResponseCode::ServFail));
                 };
@@ -510,11 +585,7 @@ async fn read_framed(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>>
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
-    let len = usize::from(u16::from_be_bytes(len));
-    if len > MAX_MESSAGE {
-        return Err(std::io::ErrorKind::InvalidData.into());
-    }
-    let mut message = vec![0u8; len];
+    let mut message = vec![0u8; usize::from(u16::from_be_bytes(len))];
     stream.read_exact(&mut message).await?;
     Ok(Some(message))
 }
@@ -538,7 +609,7 @@ pub(crate) async fn serve_udp(
 ) {
     let socket = Arc::new(socket);
     let in_flight = Arc::new(Semaphore::new(UDP_IN_FLIGHT));
-    let mut buf = vec![0u8; MAX_MESSAGE];
+    let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         let (n, peer) = match socket.recv_from(&mut buf).await {
             Ok(received) => received,
@@ -806,6 +877,122 @@ mod tests {
             decide(&query("notmin.internal", RecordType::A), &view(&open)),
             Decided::Forward { .. }
         ));
+    }
+
+    #[test]
+    fn a_query_with_more_than_one_question_is_refused_and_never_forwarded() {
+        let policy = by_name(&["example.com"]);
+        let mut two = Message::query();
+        two.metadata.id = 7;
+        two.add_query(Query::query(name("example.com"), RecordType::A));
+        two.add_query(Query::query(
+            name("secret-data.exfil.test"),
+            RecordType::TXT,
+        ));
+        match decide(&two.to_vec().expect("encode"), &view(&policy)) {
+            Decided::Reply(reply) => assert_eq!(rcode(&reply), ResponseCode::FormErr),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_upstream_query_carries_the_checked_question_and_nothing_else_of_the_box() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+
+        let policy = by_name(&["example.com"]);
+        let mut theirs = Message::query();
+        theirs.metadata.id = 0x4242;
+        theirs.metadata.recursion_desired = true;
+        theirs.add_query(Query::query(name("example.com"), RecordType::A));
+        // What a box could smuggle out beside the question: an extra
+        // record, and an EDNS option with bytes of its choosing.
+        theirs.add_additional(Record::from_rdata(
+            name("secret-data.exfil.test"),
+            1,
+            RData::A(A("192.0.2.1".parse().expect("v4"))),
+        ));
+        let mut edns = Edns::new();
+        edns.set_max_payload(65_000);
+        edns.set_dnssec_ok(true);
+        edns.options_mut().insert(EdnsOption::Unknown(
+            u16::from(EdnsCode::Padding),
+            b"secret-data".to_vec(),
+        ));
+        theirs.set_edns(edns);
+
+        let Decided::Forward { name: asked, query } =
+            decide(&theirs.to_vec().expect("encode"), &view(&policy))
+        else {
+            panic!("a listed name is forwarded");
+        };
+        assert_eq!(asked, "example.com");
+        assert!(
+            !query.windows(6).any(|w| w == b"secret"),
+            "bytes of the box beyond its question went upstream"
+        );
+        let ours = Message::from_vec(&query).expect("decode");
+        assert_eq!(ours.metadata.id, 0x4242);
+        assert!(ours.metadata.recursion_desired);
+        assert_eq!(ours.queries.len(), 1);
+        assert!(ours.answers.is_empty() && ours.additionals.is_empty());
+        let edns = ours.edns.expect("the resolver's own EDNS record");
+        assert!(edns.flags().dnssec_ok);
+        assert_eq!(usize::from(edns.max_payload()), MAX_DATAGRAM);
+        assert!(edns.options().as_ref().is_empty());
+
+        // A box that sent no EDNS record gets a query without one.
+        let Decided::Forward { query, .. } = decide(
+            &super::tests::query("example.com", RecordType::A),
+            &view(&policy),
+        ) else {
+            panic!("a listed name is forwarded");
+        };
+        assert!(Message::from_vec(&query).expect("decode").edns.is_none());
+    }
+
+    #[test]
+    fn a_zone_name_opens_no_more_than_an_upstream_name_would() {
+        let listed = by_name(&["peer.min.internal"]);
+        let set = listed.set_for_name("peer.min.internal").expect("set");
+        let loopback = ZoneAnswer::Address(Ipv4Addr::new(127, 0, 64, 9));
+        // An internal address is told and pinned only inside a prefix the
+        // box allows. Otherwise the box learns the name exists and gets no
+        // address, which is also what it is refused.
+        let closed = admit_zone(loopback, "peer.min.internal", &view(&listed));
+        assert_eq!(closed.answer, ZoneAnswer::NoData);
+        assert_eq!(closed.pin, None);
+        assert_eq!(closed.refused, Some("127.0.64.9".parse().expect("address")));
+
+        let allowed = ["127.0.64.0/24".parse().expect("prefix")];
+        let mut open = view(&listed);
+        open.allowed = &allowed;
+        let admitted = admit_zone(loopback, "peer.min.internal", &open);
+        assert_eq!(admitted.answer, loopback);
+        assert_eq!(
+            admitted.pin,
+            Some(("127.0.64.9".parse().expect("address"), set))
+        );
+        // A box that allows everything pins nothing and is told the answer.
+        let everything = compiled(BoxPolicy::default());
+        let told = admit_zone(loopback, "peer.min.internal", &view(&everything));
+        assert_eq!(
+            (told.answer, told.pin, told.refused),
+            (loopback, None, None)
+        );
+    }
+
+    #[test]
+    fn the_host_s_name_has_no_address_for_a_box() {
+        struct Empty;
+        impl answerer::Zone for Empty {
+            fn zone_entry(&self, _host: &str, _node: &[Ipv4Addr]) -> ZoneEntry {
+                ZoneEntry::Absent
+            }
+        }
+        let zone = Zone::new(Arc::new(Empty));
+        assert_eq!(zone.lookup("host.min.internal"), ZoneAnswer::NoData);
+        assert_eq!(zone.lookup("nobody.min.internal"), ZoneAnswer::NoSuchName);
     }
 
     #[test]
