@@ -349,6 +349,9 @@ fn rule_block(syscall: &'static str, rule: &Rule) -> Result<Vec<libc::sock_filte
     Ok(block)
 }
 
+/// The syscall number -1, which names no syscall.
+const NO_SYSCALL: u32 = u32::MAX;
+
 /// The section that judges every syscall of one ABI: a dispatch on the
 /// syscall number, then the rules of each syscall in table order.
 fn abi_section(profile: &Profile, abi: Abi) -> Result<Vec<libc::sock_filter>, CompileError> {
@@ -377,6 +380,10 @@ fn abi_section(profile: &Profile, abi: Abi) -> Result<Vec<libc::sock_filter>, Co
 
     let mut section = vec![load(OFFSET_NR)];
     if let (Abi::Native, Some(bit)) = (abi, arch::X32_BIT) {
+        // A tracer cancels a syscall by setting its number to -1, and the
+        // filter runs after the tracer. The kernel answers -1 with `ENOSYS`.
+        section.push(jump(libc::BPF_JEQ, NO_SYSCALL, 0, 1));
+        section.push(ret(Action::Allow));
         section.push(jump(libc::BPF_JGE, bit, 0, 1));
         section.push(ret(Action::KillProcess));
     }
@@ -602,7 +609,7 @@ mod tests {
     #[test]
     fn an_x32_call_is_killed() {
         let program = box_program();
-        for nr in [0x4000_0000u32, 0x4000_0000 | 41, u32::MAX] {
+        for nr in [0x4000_0000u32, 0x4000_0000 | 41, u32::MAX - 1] {
             assert_eq!(evaluate(program, call(arch::NATIVE, nr, 1, 0)), KILL);
         }
         // The compat ABI has no x32 numbers; a large number there is an
@@ -611,6 +618,16 @@ mod tests {
             evaluate(program, call(arch::COMPAT, 0x4000_0000, 1, 0)),
             ALLOW
         );
+    }
+
+    /// The number a tracer sets to cancel a syscall is allowed on both
+    /// ABIs, and is no x32 call.
+    #[test]
+    fn the_syscall_number_minus_one_is_allowed() {
+        let program = box_program();
+        for arch in [arch::NATIVE, arch::COMPAT] {
+            assert_eq!(evaluate(program, call(arch, u32::MAX, 1, 0)), ALLOW);
+        }
     }
 
     #[test]
@@ -852,6 +869,18 @@ mod tests {
             libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
             "wait status {status:#x}"
         );
+    }
+
+    /// A call of syscall -1 under the installed profile returns `ENOSYS`,
+    /// as it does for a tracer that cancelled a syscall.
+    #[test]
+    fn the_kernel_answers_syscall_minus_one_with_enosys() {
+        let report = under_the_box_profile(|| {
+            // SAFETY: -1 names no syscall, so the kernel runs nothing.
+            [outcome(unsafe { libc::syscall(-1) })]
+        })
+        .expect("the call returns under the profile");
+        assert_eq!(report, [libc::ENOSYS as u8]);
     }
 
     /// The 32-bit helper: each socket syscall through the i386 ABI, one
