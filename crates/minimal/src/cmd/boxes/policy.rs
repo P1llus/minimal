@@ -195,7 +195,7 @@ pub fn format_policy_on_host(
     network: boxes::NetworkMode,
     host_ip_enforcement: Option<boxes::HostIpEnforcement>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
-    fabric: Option<switch::SwitchSubnet>,
+    _fabric: Option<switch::SwitchSubnet>,
     native_host: bool,
 ) -> Result<(), anyhow::Error> {
     // BEP-085: the credentialed-upstream row reads the host kind too, since
@@ -753,7 +753,7 @@ pub fn write_policy_json_noting(
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
     host_kind: paths::HostKind,
-    fabric: Option<switch::SwitchSubnet>,
+    _fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     unaudited_listen_ports: &[u16],
