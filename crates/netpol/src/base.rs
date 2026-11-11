@@ -1,0 +1,615 @@
+//! The base policy: the rules a deployment and mode imply for every box,
+//! before the box declares anything.
+//!
+//! It is data in the same rule model as the box's own rules. Each entry is
+//! built by one small function below and carries an [`Origin`] that names it.
+
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::{
+    Action, Defaults, Direction, Endpoint, EndpointIndex, NamePattern, Origin, PortRange, Prefix,
+    Protocols, Rule, Target, Verdict,
+};
+
+/// Endpoint indexes the base policy uses.
+pub const RESOLVER: EndpointIndex = EndpointIndex(0);
+pub const CREDENTIAL_PROXY: EndpointIndex = EndpointIndex(1);
+pub const HOSTNAME_PROXY: EndpointIndex = EndpointIndex(2);
+
+/// The kernel a box runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    Native,
+    Guest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// A fresh network namespace with loopback only.
+    None,
+    /// The node's network namespace.
+    HostIp,
+    /// Its own namespace with an address on the virtual network.
+    OwnIp,
+}
+
+impl Mode {
+    /// True when the box's sockets live in a namespace of its own.
+    #[must_use]
+    pub const fn own_namespace(self) -> bool {
+        !matches!(self, Self::HostIp)
+    }
+}
+
+/// The addresses of the box itself. Empty for `host_ip` and `none`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxAddrs {
+    pub v4: Option<Ipv4Addr>,
+    pub v6: Option<Ipv6Addr>,
+}
+
+/// The virtual network a box, or the node of a `host_ip` box, sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualNetwork {
+    pub subnet: Prefix,
+    pub gateway: IpAddr,
+    /// The address that stands for the host's loopback, where there is one.
+    pub host_alias: Option<IpAddr>,
+}
+
+/// A port with the transport protocols it is open for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PortOf {
+    pub protocols: Protocols,
+    pub port: u16,
+}
+
+/// The per-box sockets of the daemon. `None` means the box does not get
+/// that service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Services {
+    /// All DNS of the box is redirected here.
+    pub resolver: Option<Endpoint>,
+    /// TCP 443 to steered names is redirected here.
+    pub credential_proxy: Option<Endpoint>,
+    /// Reached directly: the box is told its address.
+    pub hostname_proxy: Option<Endpoint>,
+}
+
+/// Where the daemon's endpoints for all boxes live, when boxes could reach
+/// each other's: a loopback prefix, or a port range on one address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointRange {
+    pub prefix: Prefix,
+    pub ports: PortRange,
+}
+
+/// What the base policy is built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployment {
+    pub node: NodeKind,
+    pub mode: Mode,
+    pub addrs: BoxAddrs,
+    pub network: Option<VirtualNetwork>,
+    /// Whether the transport under the box carries IPv6 at all.
+    pub transport_ipv6: bool,
+    /// Host ports the box may reach on the host alias.
+    pub host_exposures: Vec<PortOf>,
+    /// Ports of the box that accept inbound flows.
+    pub published: Vec<PortOf>,
+    pub services: Services,
+    pub endpoint_ranges: Vec<EndpointRange>,
+    /// Names whose TCP 443 goes through the credential proxy.
+    pub steered: Vec<NamePattern>,
+}
+
+impl Deployment {
+    /// A deployment with nothing but node and mode set.
+    #[must_use]
+    pub const fn new(node: NodeKind, mode: Mode) -> Self {
+        Self {
+            node,
+            mode,
+            addrs: BoxAddrs { v4: None, v6: None },
+            network: None,
+            transport_ipv6: false,
+            host_exposures: Vec::new(),
+            published: Vec::new(),
+            services: Services {
+                resolver: None,
+                credential_proxy: None,
+                hostname_proxy: None,
+            },
+            endpoint_ranges: Vec::new(),
+            steered: Vec::new(),
+        }
+    }
+}
+
+/// The rules and settings a deployment gives a box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BasePolicy {
+    /// Decided before anything the box declares.
+    pub before: Vec<Rule>,
+    /// Decided after the box's rules and before the default. A box rule or
+    /// a pinned name can admit what these refuse.
+    pub after: Vec<Rule>,
+    pub defaults: Defaults,
+    pub endpoints: Vec<(EndpointIndex, Endpoint)>,
+    /// Packets must leave from the box's own addresses.
+    pub source_check: bool,
+    pub addrs: BoxAddrs,
+}
+
+const LOOPBACK4: Prefix = prefix4(Ipv4Addr::new(127, 0, 0, 0), 8);
+const LOOPBACK6: Prefix = Prefix::host(IpAddr::V6(Ipv6Addr::LOCALHOST));
+const LINK_LOCAL6: Prefix = prefix6(0xfe80, 10);
+const MULTICAST_LINK6: Prefix = prefix6(0xff02, 16);
+
+/// Everything IPv6 that needs a route off the node: global unicast, unique
+/// local, link-local, multicast, and the NAT64 prefix.
+const ROUTED6: [Prefix; 5] = [
+    prefix6(0x2000, 3),
+    prefix6(0xfc00, 7),
+    LINK_LOCAL6,
+    prefix6(0xff00, 8),
+    Prefix::host(IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0))).truncated(96),
+];
+
+const fn prefix4(addr: Ipv4Addr, len: u8) -> Prefix {
+    Prefix::host(IpAddr::V4(addr)).truncated(len)
+}
+
+const fn prefix6(first: u16, len: u8) -> Prefix {
+    Prefix::host(IpAddr::V6(Ipv6Addr::new(first, 0, 0, 0, 0, 0, 0, 0))).truncated(len)
+}
+
+const ICMP6_ROUTER_SOLICIT: u16 = 133;
+const ICMP6_NEIGHBOUR_SOLICIT: u16 = 135;
+const ICMP6_NEIGHBOUR_ADVERT: u16 = 136;
+const ICMP6_MLD_QUERY: u16 = 130;
+const ICMP6_MLD_DONE: u16 = 132;
+const ICMP6_MLD2_REPORT: u16 = 143;
+
+fn range(lo: u16, hi: u16) -> PortRange {
+    PortRange::new(lo, hi).unwrap_or(PortRange::ALL)
+}
+
+fn egress(target: Target, action: Action, origin: Origin) -> Rule {
+    Rule::new(Direction::Egress, target, action, origin)
+}
+
+/// The box reaches its own endpoints, also when a later entry would refuse
+/// the address they sit on.
+fn own_endpoints(s: &Services, out: &mut Vec<Rule>) {
+    let entries = [
+        (s.resolver, Protocols::TCP_UDP),
+        (s.credential_proxy, Protocols::TCP),
+        (s.hostname_proxy, Protocols::TCP),
+    ];
+    for (endpoint, protocols) in entries {
+        let Some(e) = endpoint else { continue };
+        let socks = [
+            e.v4.map(|a| (IpAddr::V4(*a.ip()), a.port())),
+            e.v6.map(|a| (IpAddr::V6(*a.ip()), a.port())),
+        ];
+        for (addr, port) in socks.into_iter().flatten() {
+            out.push(
+                egress(
+                    Target::Net(Prefix::host(addr)),
+                    Action::Allow,
+                    Origin::OwnEndpoints,
+                )
+                .protocols(protocols)
+                .ports(PortRange::one(port)),
+            );
+        }
+    }
+}
+
+/// No box reaches the endpoints the daemon serves to other boxes.
+fn other_endpoints(ranges: &[EndpointRange], out: &mut Vec<Rule>) {
+    for r in ranges {
+        // A port range only means something for TCP and UDP.
+        let protocols = if r.ports == PortRange::ALL {
+            Protocols::ALL
+        } else {
+            Protocols::TCP_UDP
+        };
+        out.push(
+            egress(Target::Net(r.prefix), Action::Deny, Origin::OtherEndpoints)
+                .protocols(protocols)
+                .ports(r.ports),
+        );
+    }
+}
+
+/// All DNS goes to the resolver endpoint, whatever server the box asks.
+/// One rule per family the endpoint has: a redirect cannot change family.
+fn resolver(endpoint: Option<Endpoint>, out: &mut Vec<Rule>) {
+    let Some(e) = endpoint else { return };
+    let families = [
+        (e.v4.is_some(), Prefix::V4_ALL),
+        (e.v6.is_some(), Prefix::V6_ALL),
+    ];
+    for (_, all) in families.into_iter().filter(|(has, _)| *has) {
+        out.push(
+            egress(
+                Target::Net(all),
+                Action::Redirect(RESOLVER),
+                Origin::Resolver,
+            )
+            .protocols(Protocols::TCP_UDP)
+            .ports(PortRange::one(53)),
+        );
+    }
+}
+
+/// TCP 443 to a steered name goes through the credential proxy. UDP 443 is
+/// refused so that a client falls back from QUIC at once.
+fn steering(proxy: Option<Endpoint>, names: &[NamePattern], out: &mut Vec<Rule>) {
+    if proxy.is_none() {
+        return;
+    }
+    for name in names {
+        let target = Target::Names(name.clone());
+        out.push(
+            egress(
+                target.clone(),
+                Action::Redirect(CREDENTIAL_PROXY),
+                Origin::Steering,
+            )
+            .protocols(Protocols::TCP)
+            .ports(PortRange::one(443)),
+        );
+        out.push(
+            egress(target, Action::Deny, Origin::Steering)
+                .protocols(Protocols::UDP)
+                .ports(PortRange::one(443)),
+        );
+    }
+}
+
+/// A box with its own namespace may always talk to itself: its loopback
+/// and its own addresses, both ways.
+fn own_addresses(addrs: &BoxAddrs, out: &mut Vec<Rule>) {
+    let own = [addrs.v4.map(IpAddr::V4), addrs.v6.map(IpAddr::V6)]
+        .into_iter()
+        .flatten()
+        .map(Prefix::host);
+    for prefix in [LOOPBACK4, LOOPBACK6].into_iter().chain(own) {
+        for direction in [Direction::Egress, Direction::Ingress] {
+            out.push(Rule::new(
+                direction,
+                Target::Net(prefix),
+                Action::Allow,
+                Origin::OwnAddresses,
+            ));
+        }
+    }
+}
+
+/// The kernel sends neighbour discovery from sockets that belong to the
+/// box's cgroup when a box process created the namespace. Without these the
+/// box has no IPv6 neighbours and none can find it.
+fn neighbour_discovery(out: &mut Vec<Rule>) {
+    let icmp = |target: Prefix, types: PortRange| {
+        egress(
+            Target::Net(target),
+            Action::Allow,
+            Origin::NeighbourDiscovery,
+        )
+        .protocols(Protocols::ICMP)
+        .ports(types)
+    };
+    // Solicitations and advertisements also go to a neighbour's unicast
+    // address. Only the kernel can send these types: raw sockets are refused.
+    out.push(icmp(
+        Prefix::V6_ALL,
+        range(ICMP6_NEIGHBOUR_SOLICIT, ICMP6_NEIGHBOUR_ADVERT),
+    ));
+    out.push(icmp(MULTICAST_LINK6, PortRange::one(ICMP6_ROUTER_SOLICIT)));
+    out.push(icmp(
+        MULTICAST_LINK6,
+        range(ICMP6_MLD_QUERY, ICMP6_MLD_DONE),
+    ));
+    out.push(icmp(MULTICAST_LINK6, PortRange::one(ICMP6_MLD2_REPORT)));
+}
+
+/// Where the transport carries no IPv6, IPv6 off the node fails at once
+/// instead of timing out.
+fn no_ipv6_transport(out: &mut Vec<Rule>) {
+    for prefix in ROUTED6 {
+        out.push(egress(
+            Target::Net(prefix),
+            Action::Deny,
+            Origin::NoIpv6Transport,
+        ));
+    }
+}
+
+/// The host alias is open on the exposed ports only, and the gateway not at
+/// all. DNS to the gateway is redirected before this is reached.
+fn infrastructure(net: &VirtualNetwork, exposures: &[PortOf], out: &mut Vec<Rule>) {
+    if let Some(alias) = net.host_alias {
+        let alias = Target::Net(Prefix::host(alias));
+        for e in exposures {
+            out.push(
+                egress(alias.clone(), Action::Allow, Origin::HostExposure)
+                    .protocols(e.protocols)
+                    .ports(PortRange::one(e.port)),
+            );
+        }
+        out.push(egress(alias, Action::Deny, Origin::Infrastructure));
+    }
+    out.push(egress(
+        Target::Net(Prefix::host(net.gateway)),
+        Action::Deny,
+        Origin::Infrastructure,
+    ));
+}
+
+/// New inbound flows are admitted on published ports.
+fn published(ports: &[PortOf], out: &mut Vec<Rule>) {
+    for p in ports {
+        out.push(
+            Rule::new(
+                Direction::Ingress,
+                Target::Any,
+                Action::Allow,
+                Origin::Published,
+            )
+            .protocols(p.protocols)
+            .ports(PortRange::one(p.port)),
+        );
+    }
+}
+
+const fn defaults(mode: Mode) -> Defaults {
+    match mode {
+        Mode::HostIp => Defaults {
+            egress: Verdict::Allow,
+            ingress: Verdict::Allow,
+            bind: Verdict::Allow,
+        },
+        Mode::OwnIp | Mode::None => Defaults {
+            egress: Verdict::Deny,
+            ingress: Verdict::Deny,
+            bind: Verdict::Allow,
+        },
+    }
+}
+
+/// Builds the base policy of one box.
+#[must_use]
+pub fn base_policy(d: &Deployment) -> BasePolicy {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+
+    own_endpoints(&d.services, &mut before);
+    other_endpoints(&d.endpoint_ranges, &mut before);
+    resolver(d.services.resolver, &mut before);
+    steering(d.services.credential_proxy, &d.steered, &mut before);
+    if d.mode.own_namespace() {
+        own_addresses(&d.addrs, &mut before);
+    }
+    if d.mode == Mode::OwnIp && d.transport_ipv6 {
+        neighbour_discovery(&mut before);
+    }
+    if d.mode != Mode::None && !d.transport_ipv6 {
+        no_ipv6_transport(&mut before);
+    }
+    if let Some(net) = &d.network {
+        infrastructure(net, &d.host_exposures, &mut before);
+        // Other boxes. A rule of the box or a pinned peer name admits one.
+        after.push(egress(
+            Target::Net(net.subnet),
+            Action::Deny,
+            Origin::VirtualNetwork,
+        ));
+    }
+    published(&d.published, &mut before);
+
+    let endpoints = [
+        (RESOLVER, d.services.resolver),
+        (CREDENTIAL_PROXY, d.services.credential_proxy),
+        (HOSTNAME_PROXY, d.services.hostname_proxy),
+    ]
+    .into_iter()
+    .filter_map(|(index, endpoint)| endpoint.map(|e| (index, e)))
+    .collect();
+
+    BasePolicy {
+        before,
+        after,
+        defaults: defaults(d.mode),
+        endpoints,
+        source_check: d.mode == Mode::OwnIp,
+        addrs: d.addrs,
+    }
+}
+
+impl fmt::Display for BasePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "defaults: egress {}, ingress {}, bind {}",
+            self.defaults.egress, self.defaults.ingress, self.defaults.bind
+        )?;
+        if self.source_check {
+            writeln!(f, "source address must be the box's own")?;
+        }
+        for (EndpointIndex(i), e) in &self.endpoints {
+            write!(f, "endpoint {i}:")?;
+            if let Some(a) = e.v4 {
+                write!(f, " {a}")?;
+            }
+            if let Some(a) = e.v6 {
+                write!(f, " {a}")?;
+            }
+            writeln!(f)?;
+        }
+        for (title, rules) in [
+            ("before the box's rules", &self.before),
+            ("after the box's rules", &self.after),
+        ] {
+            if rules.is_empty() {
+                continue;
+            }
+            writeln!(f, "{title}:")?;
+            for rule in rules {
+                writeln!(f, "  {rule}  ({})", rule.origin)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{SocketAddrV4, SocketAddrV6};
+
+    use super::*;
+
+    fn own_ip() -> Deployment {
+        let mut d = Deployment::new(NodeKind::Guest, Mode::OwnIp);
+        d.addrs.v4 = Some(Ipv4Addr::new(192, 168, 127, 5));
+        d.network = Some(VirtualNetwork {
+            subnet: "192.168.127.0/24".parse().unwrap(),
+            gateway: "192.168.127.1".parse().unwrap(),
+            host_alias: Some("192.168.127.254".parse().unwrap()),
+        });
+        d.host_exposures = vec![PortOf {
+            protocols: Protocols::TCP,
+            port: 5432,
+        }];
+        d.published = vec![PortOf {
+            protocols: Protocols::TCP,
+            port: 8080,
+        }];
+        d.services.resolver = Some(Endpoint {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+            v6: None,
+        });
+        d
+    }
+
+    #[test]
+    fn host_ip_without_services_is_only_defaults_and_the_ipv6_limit() {
+        let mut d = Deployment::new(NodeKind::Native, Mode::HostIp);
+        d.transport_ipv6 = true;
+        let base = base_policy(&d);
+        assert!(base.before.is_empty() && base.after.is_empty());
+        assert_eq!(base.defaults.egress, Verdict::Allow);
+        assert!(!base.source_check);
+
+        d.transport_ipv6 = false;
+        let base = base_policy(&d);
+        assert_eq!(base.before.len(), ROUTED6.len());
+        assert!(
+            base.before
+                .iter()
+                .all(|r| r.origin == Origin::NoIpv6Transport && r.action == Action::Deny)
+        );
+    }
+
+    #[test]
+    fn own_ip_entries_are_in_protection_order() {
+        let base = base_policy(&own_ip());
+        let origins: Vec<Origin> = base.before.iter().map(|r| r.origin).collect();
+        let first = |o: Origin| origins.iter().position(|x| *x == o).unwrap();
+        assert!(first(Origin::OwnEndpoints) < first(Origin::Resolver));
+        assert!(first(Origin::Resolver) < first(Origin::Infrastructure));
+        assert!(first(Origin::HostExposure) < first(Origin::Infrastructure));
+        assert!(first(Origin::OwnAddresses) < first(Origin::NoIpv6Transport));
+        assert!(origins.contains(&Origin::Published));
+        assert_eq!(base.after.len(), 1);
+        assert_eq!(base.after.first().unwrap().origin, Origin::VirtualNetwork);
+        assert_eq!(base.defaults.egress, Verdict::Deny);
+        assert!(base.source_check);
+        // An endpoint without an IPv6 address gets no IPv6 redirect.
+        let redirects: Vec<&Rule> = base
+            .before
+            .iter()
+            .filter(|r| r.origin == Origin::Resolver)
+            .collect();
+        assert_eq!(redirects.len(), 1);
+        assert_eq!(
+            redirects.first().unwrap().target,
+            Target::Net(Prefix::V4_ALL)
+        );
+    }
+
+    #[test]
+    fn ipv6_transport_adds_neighbour_discovery_and_drops_the_ipv6_limit() {
+        let mut d = own_ip();
+        d.transport_ipv6 = true;
+        d.addrs.v6 = Some("fd00::5".parse().unwrap());
+        d.services.resolver = Some(Endpoint {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+            v6: Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0)),
+        });
+        let base = base_policy(&d);
+        assert!(
+            base.before
+                .iter()
+                .any(|r| r.origin == Origin::NeighbourDiscovery)
+        );
+        assert!(
+            base.before
+                .iter()
+                .all(|r| r.origin != Origin::NoIpv6Transport)
+        );
+        assert_eq!(
+            base.before
+                .iter()
+                .filter(|r| r.origin == Origin::Resolver)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn steering_needs_a_proxy_endpoint() {
+        let mut d = own_ip();
+        d.steered = vec!["api.example.com".parse().unwrap()];
+        assert!(
+            base_policy(&d)
+                .before
+                .iter()
+                .all(|r| r.origin != Origin::Steering)
+        );
+        d.services.credential_proxy = Some(Endpoint {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8443)),
+            v6: None,
+        });
+        let base = base_policy(&d);
+        let steer: Vec<&Rule> = base
+            .before
+            .iter()
+            .filter(|r| r.origin == Origin::Steering)
+            .collect();
+        assert_eq!(steer.len(), 2);
+        assert_eq!(
+            steer.first().unwrap().action,
+            Action::Redirect(CREDENTIAL_PROXY)
+        );
+        assert_eq!(steer.last().unwrap().action, Action::Deny);
+    }
+
+    #[test]
+    fn display_names_every_entry() {
+        let text = base_policy(&own_ip()).to_string();
+        assert!(text.contains("defaults: egress deny, ingress deny, bind allow"));
+        assert!(text.contains("(DNS to the box resolver)"));
+        assert!(text.contains("after the box's rules:"));
+        assert!(text.contains("192.168.127.0/24  (virtual network)"));
+    }
+}

@@ -1,0 +1,116 @@
+//! Listeners the test process runs itself, as the daemon would: plain
+//! targets for allowed flows, and the per-box service endpoints.
+
+use std::{
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
+    sync::mpsc::{Receiver, channel},
+    thread,
+    time::Duration,
+};
+
+use netpol::Protocol;
+
+/// A TCP listener on every address of the host that greets with `hello`.
+/// Returns its port.
+pub fn banner() -> u16 {
+    let listener = TcpListener::bind("[::]:0").expect("bind a banner listener");
+    let port = listener.local_addr().expect("local address").port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            // The client may have gone away.
+            let _sent = stream.write_all(b"hello\n");
+        }
+    });
+    port
+}
+
+/// A UDP socket at `at` that answers every datagram. Returns its port.
+pub fn udp_echo(at: IpAddr) -> u16 {
+    let sock = UdpSocket::bind(SocketAddr::new(at, 0)).expect("bind a UDP echo socket");
+    let port = sock.local_addr().expect("local address").port();
+    thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        while let Ok((_, peer)) = sock.recv_from(&mut buf) {
+            let _sent = sock.send_to(b"pong", peer);
+        }
+    });
+    port
+}
+
+fn dns_answer(query: &[u8], answer: Ipv4Addr) -> Vec<u8> {
+    let mut reply = query.to_vec();
+    if let Some(flags) = reply.get_mut(2..4) {
+        flags.copy_from_slice(&[0x81, 0x80]);
+    }
+    if let Some(count) = reply.get_mut(6..8) {
+        count.copy_from_slice(&[0, 1]);
+    }
+    reply.extend([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+    reply.extend(answer.octets());
+    reply
+}
+
+/// A resolver endpoint: answers every query over UDP and TCP at `at` with
+/// one A record and reports the peer of each query.
+pub fn dns_endpoint(at: SocketAddr, answer: Ipv4Addr) -> Receiver<(SocketAddr, Protocol)> {
+    let (tx, rx) = channel();
+    let udp = UdpSocket::bind(at).expect("bind a resolver endpoint (UDP)");
+    let tcp = TcpListener::bind(at).expect("bind a resolver endpoint (TCP)");
+    let udp_tx = tx.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, peer)) = udp.recv_from(&mut buf) {
+            let _sent = udp.send_to(&dns_answer(buf.get(..n).unwrap_or_default(), answer), peer);
+            let _told = udp_tx.send((peer, Protocol::Udp));
+        }
+    });
+    thread::spawn(move || {
+        for mut stream in tcp.incoming().flatten() {
+            let Ok(peer) = stream.peer_addr() else {
+                continue;
+            };
+            let _timeout = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut len = [0u8; 2];
+            if stream.read_exact(&mut len).is_err() {
+                // A plain connect with no query, as the isolation checks do.
+                continue;
+            }
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            if stream.read_exact(&mut query).is_err() {
+                continue;
+            }
+            let reply = dns_answer(&query, answer);
+            let _sent = stream
+                .write_all(&u16::try_from(reply.len()).expect("length").to_be_bytes())
+                .and_then(|()| stream.write_all(&reply));
+            let _told = tx.send((peer, Protocol::Tcp));
+        }
+    });
+    rx
+}
+
+/// A proxy endpoint: accepts at `at`, says `proxied`, reports each peer.
+pub fn proxy_endpoint(at: SocketAddr) -> Receiver<SocketAddr> {
+    let (tx, rx) = channel();
+    let listener = TcpListener::bind(at).expect("bind a proxy endpoint");
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let Ok(peer) = stream.peer_addr() else {
+                continue;
+            };
+            let _told = tx.send(peer);
+            let _sent = stream.write_all(b"proxied\n");
+        }
+    });
+    rx
+}
+
+/// A free port on an address, for an endpoint the test binds next.
+pub fn free_port(at: IpAddr) -> u16 {
+    TcpListener::bind(SocketAddr::new(at, 0))
+        .expect("bind")
+        .local_addr()
+        .expect("local address")
+        .port()
+}

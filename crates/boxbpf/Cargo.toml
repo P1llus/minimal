@@ -1,0 +1,28 @@
+[package]
+name = "boxbpf"
+description = "The box policy engine in the kernel: cgroup eBPF programs, their loader, typed map handles, the event reader and the loader protocol. Linux only; an empty library elsewhere."
+# aya needs 1.98, above the workspace floor.
+rust-version = "1.98"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+libc.workspace = true
+netpol.workspace = true
+nix = { workspace = true, features = ["uio"] }
+thiserror.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+netpol.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true, features = ["process", "uio"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
