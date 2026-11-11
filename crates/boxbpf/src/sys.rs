@@ -202,6 +202,20 @@ pub(crate) fn xattr(fd: BorrowedFd<'_>, name: &std::ffi::CStr) -> Option<Vec<u8>
     buf.get(..n).map(<[u8]>::to_vec)
 }
 
+pub(crate) fn set_xattr(fd: BorrowedFd<'_>, name: &std::ffi::CStr, value: &[u8]) -> io::Result<()> {
+    // SAFETY: name is a C string and value is readable for its length.
+    let ret = unsafe {
+        libc::fsetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    cvt(libc::c_long::from(ret)).map(drop)
+}
+
 /// The peer of a unix socket as a pidfd. Linux 6.5.
 pub(crate) fn peer_pidfd(sock: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     const SO_PEERPIDFD: libc::c_int = 77;

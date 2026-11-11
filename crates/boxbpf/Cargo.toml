@@ -15,12 +15,13 @@ libc.workspace = true
 netpol.workspace = true
 nix = { workspace = true, features = ["uio"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
+tokio.workspace = true
 
 [build-dependencies]
 netpol.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true, features = ["process", "uio"] }
 tempfile.workspace = true
 
 [lints]

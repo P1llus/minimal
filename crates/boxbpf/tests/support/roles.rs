@@ -5,6 +5,7 @@ use std::{
     io::Read,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -39,6 +40,17 @@ fn lo_addr(action: &str, addr: &str) {
     }
 }
 
+/// Removes a cgroup directory tree, deepest first. Whatever is still
+/// populated stays.
+fn remove_cgroups(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for child in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+            remove_cgroups(&child);
+        }
+    }
+    let _busy = std::fs::remove_dir(dir);
+}
+
 /// The loader as root: serves requests until stdin closes, which happens
 /// when the test that started it ends, however it ends.
 fn loader() {
@@ -53,6 +65,10 @@ fn loader() {
         lo_addr("add", addr);
     }
 
+    // Roots handed over to tests live below a base of this helper's own.
+    let handover = PathBuf::from(format!("boxbpf-test-{}", std::process::id()));
+    let handover_dir = Path::new("/sys/fs/cgroup").join(&handover);
+
     let cleanup_path = socket_path.clone();
     std::thread::spawn(move || {
         let mut sink = Vec::new();
@@ -62,6 +78,15 @@ fn loader() {
             lo_addr("del", addr);
         }
         let _removed = std::fs::remove_file(&cleanup_path);
+        // A handed-over root empties when the test process that was moved
+        // into it has exited, which is a moment after it closed our stdin.
+        for _ in 0..100 {
+            remove_cgroups(&handover_dir);
+            if !handover_dir.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         std::process::exit(0);
     });
 
@@ -81,11 +106,15 @@ fn loader() {
         .expect("open the socket to all users");
     socket::listen(&listener, Backlog::new(16).expect("backlog")).expect("listen");
 
+    let options = ServeOptions {
+        handover_base: Some(handover),
+        ..ServeOptions::default()
+    };
     loop {
         let conn = socket::accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC).expect("accept");
         // SAFETY: accept4 returned a new descriptor that nothing else owns.
         let conn = unsafe { OwnedFd::from_raw_fd(conn) };
-        match serve(conn.as_fd(), &ServeOptions::default()) {
+        match serve(conn.as_fd(), &options) {
             Ok(served) => eprintln!("loader helper: served {served:?}"),
             Err(e) => eprintln!("loader helper: {e}"),
         }

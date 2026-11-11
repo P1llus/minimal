@@ -371,6 +371,11 @@ impl Harness {
 }
 
 impl Cgroups {
+    /// The box cgroups below another root than the harness's own.
+    pub fn at(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     /// Creates a box cgroup and returns its id. No policy yet.
     pub fn new_box(&self, name: &str) -> BoxId {
         let dir = self.root.join("boxes").join(name);

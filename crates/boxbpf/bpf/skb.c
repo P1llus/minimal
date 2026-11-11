@@ -172,10 +172,15 @@ static __always_inline int addr_eq(const __u32 *a, const __u32 *b)
  * neighbour discovery sends from. */
 static __always_inline int src_ok(const struct bp_box_cfg *cfg, const struct pkt *p)
 {
+	__u32 own[4];
+
 	if (p->family == 4)
 		return p->saddr[0] == cfg->addr4 ||
 		       (p->saddr[0] & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
-	if (!__builtin_memcmp(p->saddr, cfg->addr6, 16))
+	/* Word compares: older clang turns a memcmp builtin into a call, which
+	 * BPF does not have. */
+	__builtin_memcpy(own, cfg->addr6, 16);
+	if (addr_eq(p->saddr, own))
 		return 1;
 	if ((p->saddr[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000))
 		return 1;

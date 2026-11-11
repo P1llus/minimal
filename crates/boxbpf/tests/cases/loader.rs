@@ -13,7 +13,7 @@ use nix::sys::socket::{
     self, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 
-use crate::support::{Harness, host_ip};
+use crate::support::{Cgroups, Harness, host_ip};
 
 fn open(path: &std::path::Path) -> OwnedFd {
     fs::File::open(path).expect("open a directory").into()
@@ -191,4 +191,74 @@ fn the_async_reader_yields_refusals() {
         }
         assert_eq!(reader.skipped(), 0);
     });
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader() {
+    let Some(h) = Harness::start(
+        "cases::loader::a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader",
+    ) else {
+        return;
+    };
+    let own_cgroup = || {
+        fs::read_to_string("/proc/self/cgroup")
+            .expect("own cgroup")
+            .trim()
+            .to_owned()
+    };
+    let before = own_cgroup();
+
+    // The loader creates the root, marks it delegated and moves us into
+    // its supervisor/. systemd is not involved.
+    let root = loader::request_root(&h.socket).expect("a root from the loader");
+    let root_path =
+        fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd())).expect("path of the root");
+    let rel = root_path
+        .strip_prefix("/sys/fs/cgroup")
+        .expect("below the cgroup mount");
+    assert_eq!(
+        own_cgroup(),
+        format!("0::/{}/supervisor", rel.display()),
+        "moved from {before}"
+    );
+    let meta = fs::metadata(&root_path).expect("stat the root");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::uid(&meta),
+        nix::unistd::getuid().as_raw()
+    );
+
+    // From here on it is the ordinary path: our boxes/, our request.
+    fs::create_dir(root_path.join("boxes")).expect("create boxes/ in the new root");
+    let boxes = open(&root_path.join("boxes"));
+    let mut handles = loader::request(&h.socket, boxes.as_fd()).expect("an engine in the new root");
+    let cg = Cgroups::at(root_path.clone());
+    let id = cg.new_box("b");
+    let socket_args = [
+        "sock",
+        &libc::AF_INET.to_string(),
+        &libc::SOCK_STREAM.to_string(),
+        "0",
+    ];
+    assert_eq!(cg.probe("b", &socket_args), "err 1", "no policy yet");
+    let spec = netpol::Spec {
+        deployment: host_ip(),
+        policy: BoxPolicy::default(),
+        options: netpol::compile::Options::default(),
+    };
+    let live = handles.install(id, spec).expect("install");
+    assert_eq!(cg.probe("b", &socket_args), "ok");
+    handles.uninstall(&live).expect("uninstall");
+
+    // A box process of that root is refused like any other.
+    let out = cg.probe(
+        "b",
+        &[
+            "loader-request",
+            &h.socket.to_string_lossy(),
+            &root_path.join("boxes").to_string_lossy(),
+        ],
+    );
+    assert!(out.starts_with("err ") && out.contains("not in"), "{out}");
+    fs::remove_dir(root_path.join("boxes").join("b")).expect("remove the box cgroup");
 }

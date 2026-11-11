@@ -9,10 +9,19 @@
 //! repeated request for the same cgroup finds the programs through the
 //! kernel and hands out the same maps.
 //!
+//! On a host without a systemd user manager nobody delegates a cgroup to the
+//! daemon. There the daemon first asks for a root: the loader creates a
+//! cgroup for it, marks it delegated, moves the daemon into its
+//! `supervisor/` and hands the directory over. The attach request that
+//! follows is checked exactly like any other.
+//!
 //! Wire format, one line of text per message:
 //! - request: `attach abi=<n>`, with one descriptor
 //! - reply: `ok abi=<n> cgroup=<id> reused=<0|1>`, with one descriptor per
-//!   map in a fixed order, or `err <reason>`
+//!   map in a fixed order
+//! - request: `root abi=<n>`
+//! - reply: `ok abi=<n> root=<path>`, with the descriptor of the new root
+//! - any refusal: `err <reason>`
 
 use std::{
     ffi::CStr,
@@ -26,34 +35,49 @@ use netpol::abi;
 use nix::{
     fcntl::{OFlag, openat},
     sys::{
-        socket::{self, AddressFamily, SockFlag, SockType, UnixAddr, sockopt::PeerCredentials},
+        socket::{
+            self, AddressFamily, SockFlag, SockType, UnixAddr,
+            sockopt::{PeerCredentials, ReceiveTimeout},
+        },
         stat::Mode,
+        time::TimeVal,
     },
 };
 
 use crate::{Engine, Error, Handles, MapSizes, engine, sys};
 
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+const REQUEST_TIMEOUT_SECS: i64 = 5;
+const REPLY_TIMEOUT_SECS: i64 = 30;
 /// systemd sets this on the cgroup of a unit it delegates. Only root can
 /// set a `trusted.` attribute, so the owner of the cgroup cannot forge it.
 const DELEGATE_XATTR: &CStr = c"trusted.delegate";
 
 /// What the loader does for a request it accepts.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ServeOptions {
     pub sizes: MapSizes,
+    /// Where to create cgroup roots for daemons that ask for one, as a
+    /// path below the cgroup mount. `None` refuses such requests: on a
+    /// systemd host the daemon gets its root from systemd.
+    pub handover_base: Option<PathBuf>,
 }
 
 /// A request the loader served.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Served {
-    pub uid: u32,
-    /// Cgroup id of the attach point.
-    pub cgroup: u64,
-    /// The cgroup path below the cgroup mount, as the loader sees it.
-    pub path: PathBuf,
-    /// True when the programs were already attached there.
-    pub reused: bool,
+pub enum Served {
+    /// An engine at the peer's `boxes/`.
+    Engine {
+        uid: u32,
+        /// Cgroup id of the attach point.
+        cgroup: u64,
+        /// The cgroup path below the cgroup mount, as the loader sees it.
+        path: PathBuf,
+        /// True when the programs were already attached there.
+        reused: bool,
+    },
+    /// A new cgroup root for the peer, which now runs in its `supervisor/`.
+    Root { uid: u32, path: PathBuf },
 }
 
 /// Why a request was turned down. The text goes to the peer and to the log.
@@ -196,29 +220,17 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-fn serve_inner(
-    conn: BorrowedFd<'_>,
-    options: &ServeOptions,
-) -> Result<(Served, Vec<OwnedFd>), Refusal> {
-    let (request, mut fds) =
-        sys::recv_with_fds(conn.as_raw_fd()).map_err(io_step("read the request"))?;
-    let request = String::from_utf8_lossy(&request);
-    if !request.starts_with("attach ") {
-        return policy("unknown request");
-    }
-    // A daemon built against other layouts would misread every map.
-    let theirs = field(&request, "abi").and_then(|v| v.parse::<u32>().ok());
-    if theirs != Some(abi::VERSION) {
-        return policy(format!(
-            "abi mismatch: loader={} daemon={}",
-            abi::VERSION,
-            theirs.map_or_else(|| "?".to_owned(), |v| v.to_string())
-        ));
-    }
-    let (Some(boxes), None) = (fds.pop(), fds.pop()) else {
-        return policy("the request must carry exactly one descriptor");
-    };
+/// The reply line and the descriptors that go with it.
+type Reply = (String, Vec<OwnedFd>);
 
+fn attach(
+    conn: BorrowedFd<'_>,
+    mut fds: Vec<OwnedFd>,
+    options: &ServeOptions,
+) -> Result<(Served, Reply), Refusal> {
+    let (Some(boxes), None) = (fds.pop(), fds.pop()) else {
+        return policy("an attach request must carry exactly one descriptor");
+    };
     let target = authorize(conn, boxes.as_fd())?;
     let cgroup = sys::cgroup_id(boxes.as_fd()).map_err(io_step("read the cgroup id"))?;
 
@@ -231,15 +243,135 @@ fn serve_inner(
             (engine.map_fds().map_err(engine_error)?, false)
         }
     };
+    let reply = format!(
+        "ok abi={} cgroup={cgroup} reused={}",
+        abi::VERSION,
+        u8::from(reused)
+    );
     Ok((
-        Served {
+        Served::Engine {
             uid: target.uid,
             cgroup,
             path: target.path,
             reused,
         },
-        maps,
+        (reply, maps),
     ))
+}
+
+/// Removes roots of earlier daemons that have ended. A cgroup that still
+/// has processes or children refuses the removal, which is the check.
+fn sweep_roots(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for root in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        if let Ok(boxes) = fs::read_dir(root.join("boxes")) {
+            for stale in boxes.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+                let _busy = fs::remove_dir(stale);
+            }
+        }
+        for dir in [root.join("boxes"), root.join("supervisor"), root] {
+            let _busy = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// What a delegation hands to the owner, per the kernel's cgroup rules: the
+/// directory and the files that move processes and enable controllers.
+fn delegate(dir: &Path, uid: u32, gid: u32) -> Result<(), Refusal> {
+    for file in [
+        "",
+        "cgroup.procs",
+        "cgroup.threads",
+        "cgroup.subtree_control",
+    ] {
+        std::os::unix::fs::chown(dir.join(file), Some(uid), Some(gid))
+            .map_err(io_step("chown the new root"))?;
+    }
+    Ok(())
+}
+
+fn hand_over_root(
+    conn: BorrowedFd<'_>,
+    options: &ServeOptions,
+) -> Result<(Served, Reply), Refusal> {
+    let Some(base) = &options.handover_base else {
+        return policy(
+            "this loader hands out no cgroup roots: start the daemon in a delegated systemd unit",
+        );
+    };
+    let cred = socket::getsockopt(&conn, PeerCredentials)
+        .map_err(nix_step("read the peer's credentials"))?;
+    let pidfd = sys::peer_pidfd(conn).map_err(io_step("get a pidfd of the peer"))?;
+
+    let base_dir = Path::new(CGROUP_MOUNT).join(base);
+    fs::create_dir_all(&base_dir).map_err(io_step("create the base cgroup"))?;
+    sweep_roots(&base_dir);
+    // Controllers reach the new root only if every level above passes them
+    // on. Where one cannot, the root simply has fewer: limits are optional.
+    for level in [Path::new(CGROUP_MOUNT), base_dir.as_path()] {
+        let _partial = fs::write(level.join("cgroup.subtree_control"), "+cpu +memory +pids");
+    }
+
+    let rel = base.join(format!("u{}-{}", cred.uid(), cred.pid()));
+    let root = Path::new(CGROUP_MOUNT).join(&rel);
+    let supervisor = root.join("supervisor");
+    fs::create_dir(&root).map_err(io_step("create the new root"))?;
+    fs::create_dir(&supervisor).map_err(io_step("create supervisor/"))?;
+    delegate(&root, cred.uid(), cred.gid())?;
+    delegate(&supervisor, cred.uid(), cred.gid())?;
+    let root_fd = sys::open_dir(&root).map_err(io_step("open the new root"))?;
+    // The mark `authorize` looks for. Only root can set it.
+    sys::set_xattr(root_fd.as_fd(), DELEGATE_XATTR, b"1")
+        .map_err(io_step("mark the new root delegated"))?;
+
+    // The daemon cannot move itself: that takes write access to a cgroup
+    // above both its old place and the new one.
+    fs::write(supervisor.join("cgroup.procs"), cred.pid().to_string())
+        .map_err(io_step("move the peer"))?;
+    // The pid could have been recycled between the peer's connect and the
+    // write. The pidfd still names the peer: if it is gone, so is our claim
+    // on whoever got moved.
+    if !sys::pidfd_alive(pidfd.as_fd()) {
+        return policy("the peer exited during the handover");
+    }
+    let reply = format!("ok abi={} root={}", abi::VERSION, root.display());
+    Ok((
+        Served::Root {
+            uid: cred.uid(),
+            path: rel,
+        },
+        (reply, vec![root_fd]),
+    ))
+}
+
+fn serve_inner(conn: BorrowedFd<'_>, options: &ServeOptions) -> Result<(Served, Reply), Refusal> {
+    // The loader serves one connection at a time. A peer that connects and
+    // then says nothing must not hold it up.
+    socket::setsockopt(
+        &conn,
+        ReceiveTimeout,
+        &TimeVal::new(REQUEST_TIMEOUT_SECS, 0),
+    )
+    .map_err(nix_step("set the request timeout"))?;
+    let (request, fds) =
+        sys::recv_with_fds(conn.as_raw_fd()).map_err(io_step("read the request"))?;
+    let request = String::from_utf8_lossy(&request);
+    // A daemon built against other layouts would misread every map.
+    let theirs = field(&request, "abi").and_then(|v| v.parse::<u32>().ok());
+    if theirs != Some(abi::VERSION) {
+        return policy(format!(
+            "abi mismatch: loader={} daemon={}",
+            abi::VERSION,
+            theirs.map_or_else(|| "?".to_owned(), |v| v.to_string())
+        ));
+    }
+    match request.split_whitespace().next() {
+        Some("attach") => attach(conn, fds, options),
+        Some("root") if fds.is_empty() => hand_over_root(conn, options),
+        _ => policy("unknown request"),
+    }
 }
 
 /// Serves one accepted connection of the loader socket. Needs root.
@@ -248,14 +380,8 @@ fn serve_inner(
 /// [`Error::Refused`] for the loader's log.
 pub fn serve(conn: BorrowedFd<'_>, options: &ServeOptions) -> Result<Served, Error> {
     match serve_inner(conn, options) {
-        Ok((served, maps)) => {
-            let reply = format!(
-                "ok abi={} cgroup={} reused={}",
-                abi::VERSION,
-                served.cgroup,
-                u8::from(served.reused)
-            );
-            let raw: Vec<_> = maps.iter().map(AsRawFd::as_raw_fd).collect();
+        Ok((served, (reply, fds))) => {
+            let raw: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
             sys::send_with_fds(conn.as_raw_fd(), reply.as_bytes(), &raw)
                 .map_err(Error::sys("send the reply"))?;
             Ok(served)
@@ -270,9 +396,12 @@ pub fn serve(conn: BorrowedFd<'_>, options: &ServeOptions) -> Result<Served, Err
     }
 }
 
-/// Asks the loader at `socket` for an engine at `boxes` and returns its
-/// handles. The caller must run in the `supervisor` cgroup next to `boxes`.
-pub fn request(socket: &Path, boxes: BorrowedFd<'_>) -> Result<Handles, Error> {
+/// One request and its reply, checked for refusal and ABI.
+fn exchange(
+    socket: &Path,
+    request: &str,
+    fds: &[std::os::fd::RawFd],
+) -> Result<(String, Vec<OwnedFd>), Error> {
     let addr = UnixAddr::new(socket).map_err(|e| Error::Sys {
         what: "name the loader socket",
         source: e.into(),
@@ -291,26 +420,30 @@ pub fn request(socket: &Path, boxes: BorrowedFd<'_>) -> Result<Handles, Error> {
         what: "connect to the policy loader",
         source: e.into(),
     })?;
-    sys::send_with_fds(
-        conn.as_raw_fd(),
-        format!("attach abi={}", abi::VERSION).as_bytes(),
-        &[boxes.as_raw_fd()],
-    )
-    .map_err(Error::sys("send the request to the policy loader"))?;
+    // Loading and verifying thirteen programs takes well under a second.
+    // A loader that stays silent this long is not going to answer.
+    socket::setsockopt(&conn, ReceiveTimeout, &TimeVal::new(REPLY_TIMEOUT_SECS, 0)).map_err(
+        |e| Error::Sys {
+            what: "set the reply timeout",
+            source: e.into(),
+        },
+    )?;
+    let line = format!("{request} abi={}", abi::VERSION);
+    sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), fds)
+        .map_err(Error::sys("send the request to the policy loader"))?;
     let (reply, fds) = sys::recv_with_fds(conn.as_raw_fd())
         .map_err(Error::sys("read the policy loader's reply"))?;
     let reply = String::from_utf8_lossy(&reply).into_owned();
 
     if let Some(reason) = reply.strip_prefix("err ") {
         // Name the fix when the two sides were built from different layouts.
-        if reason.starts_with("abi mismatch") {
-            let loader = field(reason, "loader").and_then(|v| v.parse().ok());
-            if let Some(loader) = loader {
-                return Err(Error::AbiMismatch {
-                    loader,
-                    daemon: abi::VERSION,
-                });
-            }
+        if reason.starts_with("abi mismatch")
+            && let Some(loader) = field(reason, "loader").and_then(|v| v.parse().ok())
+        {
+            return Err(Error::AbiMismatch {
+                loader,
+                daemon: abi::VERSION,
+            });
         }
         return Err(Error::Refused(reason.to_owned()));
     }
@@ -318,11 +451,32 @@ pub fn request(socket: &Path, boxes: BorrowedFd<'_>) -> Result<Handles, Error> {
         return Err(Error::Protocol(reply));
     }
     match field(&reply, "abi").and_then(|v| v.parse::<u32>().ok()) {
-        Some(v) if v == abi::VERSION => Handles::from_fds(fds),
+        Some(v) if v == abi::VERSION => Ok((reply, fds)),
         Some(loader) => Err(Error::AbiMismatch {
             loader,
             daemon: abi::VERSION,
         }),
         None => Err(Error::Protocol(reply)),
+    }
+}
+
+/// Asks the loader at `socket` for an engine at `boxes` and returns its
+/// handles. The caller must run in the `supervisor` cgroup next to `boxes`.
+pub fn request(socket: &Path, boxes: BorrowedFd<'_>) -> Result<Handles, Error> {
+    let (_, fds) = exchange(socket, "attach", &[boxes.as_raw_fd()])?;
+    Handles::from_fds(fds)
+}
+
+/// Asks the loader for a cgroup root, for a daemon that has none because
+/// the host has no systemd user manager. On return the calling process runs
+/// in `supervisor/` of the root whose directory is returned. The caller
+/// creates `boxes/` in it and calls [`request`].
+///
+/// Call this before starting any thread: the loader moves the process.
+pub fn request_root(socket: &Path) -> Result<OwnedFd, Error> {
+    let (reply, mut fds) = exchange(socket, "root", &[])?;
+    match (fds.pop(), fds.pop()) {
+        (Some(root), None) => Ok(root),
+        _ => Err(Error::Protocol(reply)),
     }
 }
