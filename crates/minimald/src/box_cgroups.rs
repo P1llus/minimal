@@ -69,9 +69,9 @@ pub fn boot(located: sandbox::cgroup::Located, exe: std::path::PathBuf) {
             None
         }
     };
+    let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Detached, root.clone());
     set_root(root);
 
-    let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Detached);
     if let Err(error) = spawner.start() {
         // Each launch tries again, and fails with the reason.
         tracing::error!(%error, "the daemon's spawner did not start; no box can run");

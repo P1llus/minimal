@@ -490,8 +490,11 @@ fn probe_rootfs(dir: &Path, probe: &Path) {
 /// the daemon's: the boxes of a proof are its jobs, and a process a proof
 /// starts in a running box is started by its enter shim.
 fn use_daemon_spawner() {
-    let spawner =
-        sandbox::Spawner::process(env!("CARGO_BIN_EXE_minimald"), sandbox::Terminal::Detached);
+    let spawner = sandbox::Spawner::process(
+        env!("CARGO_BIN_EXE_minimald"),
+        sandbox::Terminal::Detached,
+        None,
+    );
     // Proofs that share a process share the first one's spawner.
     let _installed = spawner.install();
 }

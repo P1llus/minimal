@@ -924,12 +924,12 @@ impl BoxActor {
 
     /// Where this box's package builds run: its cgroup, and its own network
     /// when it has one.
-    async fn build_placement(&self) -> Result<crate::box_ops::BuildPlacement, std::io::Error> {
+    async fn build_placement(&mut self) -> Result<crate::box_ops::BuildPlacement, std::io::Error> {
         let record = self.record.record().await?;
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         Ok(crate::box_ops::BuildPlacement {
             box_name,
-            cgroup: self.cgroup.clone(),
+            cgroup: self.ensure_cgroup()?,
             network: box_build_network(&record, &self.net_switch, self.deny_all_opt_out),
         })
     }
@@ -1121,12 +1121,18 @@ impl BoxActor {
         }
 
         let ctx = self.build_context(scaffold_if_missing).await?;
-        // Every context the box hands out runs the package builds it starts
-        // in the box's cgroup, so a task run, a check and a launch's builds
-        // are the box's. `build_context` gave the context the box's own
-        // network, where it has one.
-        Ok(match &self.cgroup {
-            Some(cgroup) => ctx.with_box_cgroup(cgroup.clone()),
+        self.in_box_cgroup(ctx)
+    }
+
+    /// `ctx`, with everything it starts placed in the box's cgroup: a task
+    /// run, a check, a launch and the package builds of each are the box's.
+    /// A daemon with no cgroup root leaves the context as it is.
+    pub(super) fn in_box_cgroup(&mut self, ctx: mctx::Context) -> Result<mctx::Context, String> {
+        let cgroup = self
+            .ensure_cgroup()
+            .map_err(|error| format!("the box's cgroup could not be made: {error}"))?;
+        Ok(match cgroup {
+            Some(cgroup) => ctx.with_box_cgroup(cgroup),
             None => ctx,
         })
     }
@@ -1240,10 +1246,10 @@ impl BoxActor {
             }?;
         }
         let ctx = mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
-        // NET-155: an own-address box has no classifier leaf. Every package
-        // build its context starts, the activation launch's among them,
-        // attaches to a network of the box's own, under the box's egress
-        // rules. A box with no network has none to give them.
+        // NET-155: every package build the context of an own-address box
+        // starts, the activation launch's among them, attaches to a network
+        // of the box's own, under the box's egress rules. A box with no
+        // network has none to give them.
         let record = self
             .record
             .record()

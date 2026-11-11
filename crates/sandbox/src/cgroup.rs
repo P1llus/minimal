@@ -213,7 +213,7 @@ pub fn delegated_scope_available() -> bool {
 }
 
 /// The daemon's cgroup root, with its `supervisor` and `boxes` children.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Root {
     dir: PathBuf,
     /// The root as `/proc/<pid>/cgroup` spells it, with no trailing slash:
@@ -667,6 +667,19 @@ impl BoxCgroup {
     /// When the cgroup still holds a process after `limit`, or cannot be
     /// removed. The cgroup then stays for the next daemon start to sweep.
     pub async fn destroy(&self, limit: Duration) -> io::Result<()> {
+        let cgroup = self.clone();
+        // The wait is a poll on `cgroup.events`, off the async threads.
+        tokio::task::spawn_blocking(move || cgroup.destroy_blocking(limit))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// [`Self::destroy`], for a caller on a thread of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::destroy`].
+    pub fn destroy_blocking(&self, limit: Duration) -> io::Result<()> {
         if self.0.destroyed.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -679,7 +692,7 @@ impl BoxCgroup {
             }
             Err(e) => return Err(named(e, "killing", &self.0.dir)),
         }
-        if !self.emptied(limit).await? {
+        if !emptied_blocking(&self.0.dir, limit)? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(

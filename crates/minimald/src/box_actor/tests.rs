@@ -14722,19 +14722,48 @@ fn box_package_build_under_box_egress_verdict_gives_no_network_box_none() {
     assert!(super::setup::box_build_network(&host, &switch, false).is_none());
 }
 
-/// Spawns a stand-in box: `/bin/sh` sets `trap`, then loops on `sleep`.
-/// It answers once the shell set the trap and started its first `sleep`, so
-/// a stop never reaches a shell that still has the default SIGTERM action.
-fn spawn_stand_in_box(trap: &str) -> std::process::Child {
+/// A cgroup for a stand-in box, in a cgroup root made for the test named
+/// `test`. `None` on a host that gives the test no delegated cgroup, and in
+/// the run that only starts the test again inside one.
+fn stand_in_cgroup(test: &str) -> Option<sandbox::cgroup::BoxCgroup> {
+    let root = sandbox::cgroup::testing::delegated_root(test)?;
+    Some(
+        root.create_box(&SessionId::mint().to_string())
+            .expect("a cgroup for the stand-in box"),
+    )
+}
+
+/// Spawns a stand-in box in `cgroup`: `/bin/sh` sets `trap`, then loops on
+/// `sleep`. It answers once the shell set the trap and started its first
+/// `sleep`, so a stop never reaches a shell that still has the default
+/// SIGTERM action.
+fn spawn_stand_in_box(cgroup: &sandbox::cgroup::BoxCgroup, trap: &str) -> std::process::Child {
     use std::io::BufRead;
-    let mut child = std::process::Command::new("/bin/sh")
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let procs = std::fs::OpenOptions::new()
+        .write(true)
+        .open(cgroup.path().join("cgroup.procs"))
+        .expect("the stand-in box's cgroup.procs");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
         .arg("-c")
         .arg(format!(
             "{trap}; sleep 0.05 & echo ready; wait; while :; do sleep 0.05; done"
         ))
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the stand-in box");
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: the step makes one `write` on a descriptor opened above.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1) == 1 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command.spawn().expect("spawn the stand-in box");
     let stdout = child.stdout.take().expect("the stand-in box's stdout");
     let mut line = String::new();
     std::io::BufReader::new(stdout)
@@ -14785,18 +14814,20 @@ fn stand_in_entrypoint(
 async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
     use boxes::core::record::{RecordState, StopEnding};
 
+    let Some(cgroup) = stand_in_cgroup(
+        "box_actor::tests::stop_sends_term_then_kill_and_records_exited_stopped_with_signal",
+    ) else {
+        return;
+    };
     // A box that ignores SIGTERM: the grace runs out and SIGKILL ends it.
-    let child = spawn_stand_in_box("trap '' TERM");
-    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let child = spawn_stand_in_box(&cgroup, "trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::Cgroup(cgroup.clone());
     let entrypoint = stand_in_entrypoint(child);
-    assert!(
-        !processes.pids().is_empty(),
-        "the stand-in box should be running"
-    );
+    assert!(processes.left() > 0, "the stand-in box should be running");
     let started = std::time::Instant::now();
     let outcome = super::stop_box_processes(
         SessionId::mint(),
-        Some(processes),
+        processes.clone(),
         entrypoint,
         false,
         Duration::from_millis(500),
@@ -14816,7 +14847,10 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
     );
     assert!(outcome.unfinished.is_none());
     assert!(
-        processes.pids().is_empty(),
+        cgroup
+            .emptied(Duration::from_secs(5))
+            .await
+            .expect("reading the stand-in box's cgroup"),
         "no process of the box outlives the stop"
     );
 
@@ -14875,14 +14909,17 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
 async fn stop_force_kills_at_once() {
     use boxes::core::record::StopEnding;
 
-    let child = spawn_stand_in_box("trap '' TERM");
-    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let Some(cgroup) = stand_in_cgroup("box_actor::tests::stop_force_kills_at_once") else {
+        return;
+    };
+    let child = spawn_stand_in_box(&cgroup, "trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::Cgroup(cgroup.clone());
     let entrypoint = stand_in_entrypoint(child);
 
     let started = std::time::Instant::now();
     let outcome = super::stop_box_processes(
         SessionId::mint(),
-        Some(processes),
+        processes.clone(),
         entrypoint,
         true,
         Duration::from_secs(60),
@@ -14902,7 +14939,10 @@ async fn stop_force_kills_at_once() {
         }
     );
     assert!(
-        processes.pids().is_empty(),
+        cgroup
+            .emptied(Duration::from_secs(5))
+            .await
+            .expect("reading the stand-in box's cgroup"),
         "no process of the box outlives the forced stop"
     );
 }
@@ -14914,8 +14954,13 @@ async fn stop_force_kills_at_once() {
 async fn stop_forced_during_a_graceful_stop_kills_at_once() {
     use boxes::core::record::StopEnding;
 
-    let child = spawn_stand_in_box("trap '' TERM");
-    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let Some(cgroup) =
+        stand_in_cgroup("box_actor::tests::stop_forced_during_a_graceful_stop_kills_at_once")
+    else {
+        return;
+    };
+    let child = spawn_stand_in_box(&cgroup, "trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::Cgroup(cgroup.clone());
     let entrypoint = stand_in_entrypoint(child);
     let forced = super::StopForce::default();
 
@@ -14928,7 +14973,7 @@ async fn stop_forced_during_a_graceful_stop_kills_at_once() {
     let started = std::time::Instant::now();
     let outcome = super::stop_box_processes(
         SessionId::mint(),
-        Some(processes),
+        processes.clone(),
         entrypoint,
         false,
         Duration::from_secs(60),
@@ -14952,7 +14997,10 @@ async fn stop_forced_during_a_graceful_stop_kills_at_once() {
         }
     );
     assert!(
-        processes.pids().is_empty(),
+        cgroup
+            .emptied(Duration::from_secs(5))
+            .await
+            .expect("reading the stand-in box's cgroup"),
         "no process of the box outlives the forced stop"
     );
 }
@@ -14964,13 +15012,18 @@ async fn stop_forced_during_a_graceful_stop_kills_at_once() {
 async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
     use boxes::core::record::{RecordState, StopEnding};
 
-    let child = spawn_stand_in_box("trap 'exit 125' TERM");
-    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let Some(cgroup) =
+        stand_in_cgroup("box_actor::tests::stop_records_an_entrypoint_exit_125_as_its_exit_code")
+    else {
+        return;
+    };
+    let child = spawn_stand_in_box(&cgroup, "trap 'exit 125' TERM");
+    let processes = crate::box_runtime::BoxProcesses::Cgroup(cgroup.clone());
     let entrypoint = stand_in_entrypoint(child);
 
     let outcome = super::stop_box_processes(
         SessionId::mint(),
-        Some(processes),
+        processes.clone(),
         entrypoint,
         false,
         Duration::from_secs(5),
@@ -15210,65 +15263,6 @@ async fn stop_with_a_failing_event_write_still_records_stopped() {
         .unwrap()
         .expect("a stopped box keeps its record");
     assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
-}
-
-/// BOX-013: a container supervisor that already exited and was reaped has
-/// no readable namespace. Its pid can belong to an unrelated process by
-/// then, so the stop finds no process of the box and signals nothing.
-#[test]
-fn of_container_on_a_reaped_supervisor_signals_nothing() {
-    let mut child = std::process::Command::new("/bin/true")
-        .spawn()
-        .expect("spawn the stand-in supervisor");
-    let pid = child.id();
-    child.wait().expect("reap the stand-in supervisor");
-
-    for root in [pid, u32::try_from(i32::MAX).unwrap()] {
-        let processes = crate::box_runtime::BoxProcesses::of_container(root);
-        assert!(
-            processes.pids().is_empty(),
-            "a supervisor with no readable namespace has no processes"
-        );
-        // Signal 0 checks delivery and sends nothing, so a reused pid is safe.
-        assert_eq!(processes.signal(0), 0, "no process is signalled");
-    }
-}
-
-/// BOX-013: a pid in the daemon's own namespace that is not the daemon's
-/// child is not a supervisor the daemon spawned. A reaped supervisor's pid
-/// can be reused by such a process, so the stop signals nothing.
-#[test]
-fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
-    use std::io::BufRead as _;
-
-    // The shell's background `sleep` is a grandchild: its parent is the shell.
-    let mut shell = std::process::Command::new("/bin/sh")
-        .args(["-c", "sleep 30 & echo $!; wait"])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the stand-in shell");
-    let mut line = String::new();
-    std::io::BufReader::new(shell.stdout.take().expect("piped stdout"))
-        .read_line(&mut line)
-        .expect("read the grandchild's pid");
-    let grandchild: u32 = line.trim().parse().expect("a pid");
-
-    let processes = crate::box_runtime::BoxProcesses::of_container(grandchild);
-    assert!(
-        processes.pids().is_empty(),
-        "a process the daemon did not spawn is not the box's supervisor"
-    );
-    assert_eq!(processes.signal(0), 0, "no process is signalled");
-
-    // The grandchild is still alive: the stop did not reach it.
-    // SAFETY: `kill` reads no memory of ours.
-    assert_eq!(
-        unsafe { libc::kill(i32::try_from(grandchild).unwrap(), 0) },
-        0
-    );
-    // SAFETY: as above. This ends the stand-in before the shell is reaped.
-    unsafe { libc::kill(i32::try_from(grandchild).unwrap(), libc::SIGKILL) };
-    shell.wait().expect("reap the stand-in shell");
 }
 
 /// A session spec as a create sends it (BOX-068), with `pty_enabled` as

@@ -172,7 +172,7 @@ fn main() -> Result<(), Error> {
         sandbox::spawner::run_internal_mode();
         if let Ok(exe) = std::env::current_exe() {
             // A build's program can be the terminal's foreground program.
-            let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Shared);
+            let spawner = sandbox::Spawner::process(exe, sandbox::Terminal::Shared, None);
             let _ = spawner.install();
         }
     }

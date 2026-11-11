@@ -58,6 +58,15 @@ impl ProcessBackend for MockBackend {
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
+
+    fn signal_entrypoint(&self, signal: i32) {
+        // The entrypoint leads a process group of its own, which stands in
+        // for the PID namespace a real entrypoint is the init of: what the
+        // entrypoint started is reached with it.
+        // SAFETY: `kill` of the group of the child this backend holds
+        // unreaped.
+        unsafe { libc::kill(-(self.child.id() as libc::pid_t), signal) };
+    }
 }
 
 /// A launched session process backed by a plain host [`std::process::Child`].
@@ -214,6 +223,8 @@ impl BoxLauncher for MockLauncher {
             (master, tty_path, None)
         };
 
+        // See `MockBackend::signal_entrypoint`.
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let process = command.spawn()?;
         // The child holds its own ends now. The daemon's copies close here,
         // so the child's exit closes its pipes.

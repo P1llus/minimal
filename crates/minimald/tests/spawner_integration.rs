@@ -48,7 +48,11 @@ impl Fixture {
             None
         };
         // After the root is open, so the spawner starts in `supervisor`.
-        let spawner = Spawner::process(env!("CARGO_BIN_EXE_minimald"), Terminal::Detached);
+        let spawner = Spawner::process(
+            env!("CARGO_BIN_EXE_minimald"),
+            Terminal::Detached,
+            root.clone(),
+        );
         spawner.start().expect("starting the spawner process");
         spawner
             .clone()
@@ -88,6 +92,20 @@ impl Fixture {
         extra: &[(&str, &Path)],
         args: &[&str],
     ) -> TestBox {
+        self.launch_weighted(name, cgroup, plan, extra, args, None)
+            .await
+    }
+
+    /// [`Self::launch`], with a CPU weight for the box's sandbox.
+    async fn launch_weighted(
+        &self,
+        name: &str,
+        cgroup: Option<&BoxCgroup>,
+        plan: Option<NetPlan>,
+        extra: &[(&str, &Path)],
+        args: &[&str],
+        cpu_weight: Option<u64>,
+    ) -> TestBox {
         let source = self.dir.path().join(format!("{name}-rootfs"));
         let bin = source.join("usr/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -97,10 +115,13 @@ impl Fixture {
         for (program, file) in extra {
             std::fs::copy(file, bin.join(program)).unwrap();
         }
-        let config = Config::new(name)
+        let mut config = Config::new(name)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false)
             .with_box_cgroup(cgroup.cloned());
+        if let Some(weight) = cpu_weight {
+            config = config.with_cpu_weight(weight);
+        }
         let mut sandbox = config
             .build(self.dir.path().join(name), ())
             .await
@@ -277,6 +298,10 @@ async fn everything_of_a_box_starts_in_its_cgroup() {
     assert_eq!(cgroup_of(supervisor), in_box);
     assert_eq!(cgroup_of(program), in_box);
 
+    // A stop leaves the supervisor out of what it signals, and nothing else.
+    assert!(fixture.spawner.supervises(supervisor));
+    assert!(!fixture.spawner.supervises(program));
+
     // What `ps` shows: one spawner, and a supervisor per box.
     let spawner = parent_of(supervisor);
     assert_eq!(comm(spawner), "minimal-spawner");
@@ -381,6 +406,54 @@ async fn everything_of_a_box_starts_in_its_cgroup() {
         .destroy(DESTROY_LIMIT)
         .await
         .expect("the sibling's cgroup goes");
+}
+
+/// A daemon with a cgroup root runs no container in its own cgroup: a
+/// container that belongs to no box gets a cgroup of its own, with the CPU
+/// weight its sandbox asked for, and the cgroup goes when the container
+/// ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_of_no_box_gets_a_cgroup_of_its_own() {
+    let Some(fixture) = Fixture::new("a_container_of_no_box_gets_a_cgroup_of_its_own", true) else {
+        return;
+    };
+    let root = fixture.root();
+    let build = fixture
+        .launch_weighted(
+            "unboxed",
+            None,
+            None,
+            &[],
+            &["HOLD:/run/release"],
+            Some(300),
+        )
+        .await;
+    let supervisor = build.child.id();
+    let program = eventually("the container has its program", || init_of(supervisor).ok());
+    let own = root.dir().join("boxes/build-0");
+    let in_own = format!("0::{}/boxes/build-0", root.name());
+    assert_eq!(cgroup_of(supervisor), in_own);
+    assert_eq!(cgroup_of(program), in_own);
+    if root.controllers().cpu {
+        assert_eq!(
+            std::fs::read_to_string(own.join("cpu.weight"))
+                .unwrap()
+                .trim(),
+            "300"
+        );
+    }
+    assert_eq!(
+        procs_in(&root.dir().join("supervisor")).len(),
+        2,
+        "the daemon's cgroup holds the daemon and the spawner only"
+    );
+
+    build.release("release");
+    assert!(build.child.exited().await.success());
+    assert_eq!(build.report.finish()["self_cgroup"], "0::/");
+    eventually("the container's cgroup is removed", || {
+        (!own.exists()).then_some(())
+    });
 }
 
 /// A program that enters a box is in every namespace of the box's program,

@@ -658,6 +658,56 @@ impl BoxActor {
                 Self::kill_and_stop_loop(&host, &mut task, for_shutdown).await;
             }
         }
+        // Nothing of the box is meant to run now, so its cgroup goes, and
+        // anything still in it goes with it. The next start makes a new one.
+        self.destroy_cgroup().await;
+    }
+
+    /// The box's cgroup, made at first use. `None` on a daemon with no
+    /// cgroup root, where boxes run without one.
+    ///
+    /// # Errors
+    ///
+    /// When the daemon has a cgroup root and the box's cgroup cannot be
+    /// made in it.
+    pub(super) fn ensure_cgroup(&mut self) -> std::io::Result<Option<sandbox::cgroup::BoxCgroup>> {
+        if self.cgroup.is_none()
+            && let Some(root) = crate::box_cgroups::root()
+        {
+            let cgroup = root.create_box(&self.record.id().to_string())?;
+            tracing::debug!(
+                box_id = %self.record.id(),
+                cgroup = %cgroup.path().display(),
+                cgroup_id = cgroup.id(),
+                "made the box's cgroup"
+            );
+            self.cgroup = Some(cgroup);
+        }
+        Ok(self.cgroup.clone())
+    }
+
+    /// Ends the box's cgroup: kills what is left in it, waits for it to
+    /// empty, and removes it.
+    async fn destroy_cgroup(&mut self) {
+        let Some(cgroup) = self.cgroup.take() else {
+            return;
+        };
+        if let Err(error) = cgroup.destroy(CGROUP_DESTROY_LIMIT).await {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                %error,
+                "the box's cgroup could not be removed; the next daemon start removes it"
+            );
+        }
+    }
+
+    /// The processes a stop of this box signals: its cgroup's, or its
+    /// entrypoint when it has no cgroup.
+    fn processes(&self, host: &box_runtime::HostHandle) -> box_runtime::BoxProcesses {
+        match &self.cgroup {
+            Some(cgroup) => box_runtime::BoxProcesses::Cgroup(cgroup.clone()),
+            None => box_runtime::BoxProcesses::Entrypoint(host.clone()),
+        }
     }
 
     /// Launches a host for this session.
@@ -1635,6 +1685,10 @@ fn timeout_grace(box_id: &boxes::SessionId) -> std::time::Duration {
     STOP_GRACE
 }
 
+/// How long the processes of a stopped box get to leave its cgroup after
+/// the kill, before the cgroup is left for the next daemon start.
+const CGROUP_DESTROY_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What a stop's signals did to the box (BOX-013).
 #[derive(Debug)]
 pub(crate) struct StopOutcome {
@@ -1657,9 +1711,7 @@ pub(crate) struct StopOutcome {
 /// its start or in its grace period, ends the grace and sends SIGKILL at
 /// once: a forced stop sent meanwhile sets it. The ending stores the signal
 /// that the entrypoint ended after, unless the entrypoint exited with a
-/// status of its own. `processes` is `None` when the host did not name its
-/// container: the stop then signals nothing itself, and the caller's host
-/// kill ends the box.
+/// status of its own.
 ///
 /// In a real box the entrypoint is the init of the box's PID namespace. The
 /// kernel delivers SIGTERM from the daemon's namespace to that init only
@@ -1669,7 +1721,7 @@ pub(crate) struct StopOutcome {
 /// that order: SIGTERM, the grace period, then SIGKILL to what still runs.
 pub(crate) async fn stop_box_processes(
     box_id: boxes::SessionId,
-    processes: Option<box_runtime::BoxProcesses>,
+    processes: box_runtime::BoxProcesses,
     mut entrypoint: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     force: bool,
     grace: std::time::Duration,
@@ -1677,8 +1729,8 @@ pub(crate) async fn stop_box_processes(
 ) -> StopOutcome {
     use boxes::core::record::StopEnding;
 
-    let signal = |signal: i32| -> usize {
-        let reached = processes.map_or(0, |p| p.signal(signal));
+    let signal = async |signal: i32| -> usize {
+        let reached = processes.signal(signal).await;
         tracing::info!(
             box_id = %box_id,
             signal = stop_signal_name(signal),
@@ -1688,7 +1740,7 @@ pub(crate) async fn stop_box_processes(
         );
         reached
     };
-    let left = || processes.map_or(0, |p| p.pids().len());
+    let left = || processes.left();
 
     // `Some(None)`: the entrypoint ended before the stop sent a signal.
     // `Some(Some(s))`: it ended after the signal `s`.
@@ -1696,10 +1748,10 @@ pub(crate) async fn stop_box_processes(
     let mut sent = Vec::new();
     let forced_now = || forced.load(std::sync::atomic::Ordering::SeqCst);
     if force || forced_now() {
-        signal(libc::SIGKILL);
+        signal(libc::SIGKILL).await;
         sent.push(libc::SIGKILL);
     } else {
-        signal(libc::SIGTERM);
+        signal(libc::SIGTERM).await;
         sent.push(libc::SIGTERM);
         let deadline = tokio::time::Instant::now() + grace;
         loop {
@@ -1733,7 +1785,7 @@ pub(crate) async fn stop_box_processes(
             if ended_after.is_none() && entrypoint.is_finished() {
                 ended_after = Some(Some(libc::SIGTERM));
             }
-            signal(libc::SIGKILL);
+            signal(libc::SIGKILL).await;
             sent.push(libc::SIGKILL);
         }
     }
@@ -1870,18 +1922,9 @@ impl BoxActor {
             // unrecorded ending, its processes run now. This stop signals
             // them, and the record keeps how they ended.
             (_, Some((host, task))) => {
-                let container_pid = probe_host(host.get_attrs())
-                    .await
-                    .and_then(|attrs| attrs.container_pid);
-                if container_pid.is_none() {
-                    tracing::warn!(
-                        box_id = %box_id,
-                        "stop: the host did not name its container; the host kill ends the box"
-                    );
-                }
                 let outcome = stop_box_processes(
                     box_id,
-                    container_pid.map(box_runtime::BoxProcesses::of_container),
+                    self.processes(&host),
                     task,
                     force,
                     grace,
@@ -2001,18 +2044,9 @@ impl BoxActor {
         self.publish_host();
         let sent = match launched {
             Some((host, task)) => {
-                let container_pid = probe_host(host.get_attrs())
-                    .await
-                    .and_then(|attrs| attrs.container_pid);
-                if container_pid.is_none() {
-                    tracing::warn!(
-                        box_id = %box_id,
-                        "timeout: the host did not name its container; the host kill ends the box"
-                    );
-                }
                 let outcome = stop_box_processes(
                     box_id,
-                    container_pid.map(box_runtime::BoxProcesses::of_container),
+                    self.processes(&host),
                     task,
                     false,
                     timeout_grace(&box_id),

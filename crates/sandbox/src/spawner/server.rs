@@ -30,8 +30,6 @@ struct Job {
     process: Process,
     /// A container's first process, pinned the first time something needs it.
     init: Option<(u32, OwnedFd)>,
-    /// Whether the peer still holds the job's handle.
-    observed: bool,
 }
 
 impl Job {
@@ -164,11 +162,8 @@ impl Server {
                 Err(error) => ExitStatus::failure(format!("waiting for the enter shim: {error}")),
             },
         };
-        let observed = job.observed;
         self.jobs.remove(&id);
-        if observed {
-            self.send(&Event::Exited { id, status }, &[]);
-        }
+        self.send(&Event::Exited { id, status }, &[]);
     }
 
     fn handle(&mut self, request: Request, fds: Vec<OwnedFd>) {
@@ -190,7 +185,6 @@ impl Server {
                             Job {
                                 process: Process::Container(Box::new(container)),
                                 init: None,
-                                observed: true,
                             },
                         );
                     }
@@ -215,7 +209,6 @@ impl Server {
                         Job {
                             process: Process::Shim(shim),
                             init: None,
-                            observed: true,
                         },
                     );
                 }
@@ -261,8 +254,7 @@ impl Server {
                 }
             }
             Request::Forget { id } => {
-                if let Some(job) = self.jobs.get_mut(&id) {
-                    job.observed = false;
+                if let Some(job) = self.jobs.get(&id) {
                     core::signal(job.pidfd(), libc::SIGKILL);
                 }
             }

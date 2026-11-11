@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::cgroup::BoxCgroup;
+use crate::cgroup::{BoxCgroup, CpuWeight, LimitError, Root};
 use client::Connection;
 pub(crate) use wire::{ContainerSpec, Mount, Session, Tap};
 
@@ -97,12 +97,6 @@ pub enum Stdio {
 }
 
 impl Stdio {
-    /// [`Stdio::Inherit`].
-    #[must_use]
-    pub fn inherit() -> Self {
-        Self::Inherit
-    }
-
     /// [`Stdio::MakePipe`].
     #[must_use]
     pub fn piped() -> Self {
@@ -200,6 +194,8 @@ enum Backend {
 struct Inner {
     backend: Backend,
     connection: Mutex<Option<Arc<Connection>>>,
+    /// Where a container with no box cgroup gets a cgroup of its own.
+    root: Option<Root>,
 }
 
 /// A handle on a spawner. Clones share the one spawner.
@@ -226,7 +222,12 @@ impl Spawner {
     /// request, or by [`Spawner::start`], in the cgroup the caller is in
     /// then. It is started again on the next request if it has died, and
     /// everything it had started has died with it.
-    pub fn process(exe: impl Into<PathBuf>, terminal: Terminal) -> Self {
+    ///
+    /// `root` is the caller's cgroup root, if it has one. A container that
+    /// is started with no box cgroup then gets a cgroup of its own below
+    /// the root's `boxes`, removed when the container ends, so no container
+    /// shares the cgroup the caller and the spawner are in.
+    pub fn process(exe: impl Into<PathBuf>, terminal: Terminal, root: Option<Root>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 backend: Backend::Process {
@@ -234,6 +235,7 @@ impl Spawner {
                     terminal,
                 },
                 connection: Mutex::new(None),
+                root,
             }),
         }
     }
@@ -256,6 +258,7 @@ impl Spawner {
             inner: Arc::new(Inner {
                 backend: Backend::Thread,
                 connection: Mutex::new(None),
+                root: None,
             }),
         }
     }
@@ -273,8 +276,9 @@ impl Spawner {
     /// The spawner of this process: the installed one, or one that works in
     /// process when none was installed.
     ///
-    /// Read where a container's command is built ([`crate::Sandbox::command`])
-    /// and where a build asks for a socket of a box with no held network.
+    /// Read where a container's command is built ([`crate::Sandbox::command`]),
+    /// where a build asks for a socket of a box with no held network, and
+    /// where a stop asks which processes of a box are supervisors.
     /// Everything else takes its spawner from the job it works on.
     #[must_use]
     pub fn current() -> Self {
@@ -328,6 +332,49 @@ impl Spawner {
         if let Some(connection) = self.inner.connection.lock().expect("spawner lock").as_ref() {
             connection.hang_up();
         }
+    }
+
+    /// Whether `pid` is the supervisor of a container this spawner runs. A
+    /// stop that signals the processes of a box leaves the supervisor out:
+    /// it ends when the box's program does, and the program is killed
+    /// outright when its supervisor dies first.
+    #[must_use]
+    pub fn supervises(&self, pid: u32) -> bool {
+        self.inner
+            .connection
+            .lock()
+            .expect("spawner lock")
+            .as_ref()
+            .is_some_and(|connection| connection.supervises(pid))
+    }
+
+    /// A cgroup for one container that has no box cgroup, below `root`.
+    fn own_cgroup(root: &Root, cpu_weight: Option<u64>) -> io::Result<BoxCgroup> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "build-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let cgroup = root.create_box(&name).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("creating the cgroup `{name}` for a container: {error}"),
+            )
+        })?;
+        if let Some(weight) = cpu_weight {
+            match cgroup.set_cpu_weight(CpuWeight::clamped(weight)) {
+                Ok(()) => {}
+                // A weight is a share of what is there to share. Without
+                // the controller the container runs unweighted.
+                Err(LimitError::ControllerNotDelegated(_) | LimitError::NoCgroup) => {
+                    tracing::debug!(cgroup = %name, weight, "no cpu controller for a CPU weight");
+                }
+                Err(LimitError::Io(error)) => {
+                    tracing::warn!(cgroup = %name, weight, %error, "setting a CPU weight");
+                }
+            }
+        }
+        Ok(cgroup)
     }
 
     /// A command that runs `program` in a new container.
@@ -388,7 +435,11 @@ pub(crate) struct Launch {
     pub(crate) gate: Option<PathBuf>,
     pub(crate) session: Session,
     pub(crate) lo_up: bool,
+    /// The cgroup of the box the container belongs to.
     pub(crate) cgroup: Option<BoxCgroup>,
+    /// The CPU weight of a container that gets a cgroup of its own. A
+    /// container in a box's cgroup shares the box's CPU time unweighted.
+    pub(crate) cpu_weight: Option<u64>,
 }
 
 enum Target {
@@ -425,12 +476,6 @@ impl std::fmt::Debug for Command {
 }
 
 impl Command {
-    /// Adds an argument.
-    pub fn arg(&mut self, arg: impl AsRef<str>) -> &mut Self {
-        self.args.push(arg.as_ref().to_string());
-        self
-    }
-
     /// Adds arguments.
     pub fn args<I, S>(&mut self, args: I) -> &mut Self
     where
@@ -486,12 +531,6 @@ impl Command {
         self
     }
 
-    /// The program.
-    #[must_use]
-    pub fn get_program(&self) -> &str {
-        &self.program
-    }
-
     /// Runs the program to its end with its output captured.
     ///
     /// # Errors
@@ -542,11 +581,23 @@ impl Command {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
 
-        let (connection, cgroup) = match &self.target {
-            Target::Container { spawner, launch } => (spawner.connection()?, launch.cgroup.clone()),
-            Target::Running(entrance) => {
-                (Arc::clone(&entrance.connection), entrance.cgroup.clone())
+        let (connection, cgroup, own_cgroup) = match &self.target {
+            Target::Container { spawner, launch } => {
+                let connection = spawner.connection()?;
+                match (&launch.cgroup, &spawner.inner.root) {
+                    (Some(cgroup), _) => (connection, Some(cgroup.clone()), None),
+                    (None, Some(root)) => {
+                        let own = Spawner::own_cgroup(root, launch.cpu_weight)?;
+                        (connection, Some(own.clone()), Some(own))
+                    }
+                    (None, None) => (connection, None, None),
+                }
             }
+            Target::Running(entrance) => (
+                Arc::clone(&entrance.connection),
+                entrance.cgroup.clone(),
+                None,
+            ),
         };
         let mut fds = vec![stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
         fds.extend(cgroup.as_ref().map(BoxCgroup::dir_fd));
@@ -570,6 +621,8 @@ impl Command {
                         cgroup: has_cgroup,
                     },
                     &fds,
+                    true,
+                    own_cgroup,
                 )?
             }
             Target::Running(entrance) => {
@@ -588,6 +641,8 @@ impl Command {
                         cgroup: has_cgroup,
                     },
                     &fds,
+                    false,
+                    None,
                 )?
             }
         };
@@ -686,13 +741,6 @@ impl Child {
         self.outcome.ended().await
     }
 
-    /// The same as [`Self::exited`], for a holder that cannot keep a borrow
-    /// of the child across an await.
-    #[must_use]
-    pub fn exit(&self) -> Exit {
-        Exit(Arc::clone(&self.outcome))
-    }
-
     /// Kills the job.
     pub fn kill(&self) {
         self.signal(libc::SIGKILL, SignalTarget::Job);
@@ -722,29 +770,6 @@ impl Drop for Child {
         if self.outcome.get().is_none() {
             self.connection.forget(self.job);
         }
-    }
-}
-
-/// A job's end, to wait for apart from its [`Child`].
-#[derive(Clone)]
-pub struct Exit(Arc<client::Outcome>);
-
-impl Exit {
-    /// Resolves once the job has ended.
-    pub async fn exited(&self) -> ExitStatus {
-        self.0.ended().await
-    }
-
-    /// How the job ended, if it has.
-    #[must_use]
-    pub fn try_wait(&self) -> Option<ExitStatus> {
-        self.0.get()
-    }
-
-    /// Blocks until the job has ended.
-    #[must_use]
-    pub fn wait(&self) -> ExitStatus {
-        self.0.wait()
     }
 }
 
@@ -800,10 +825,5 @@ impl Entrance {
             datagram,
             self.cgroup.as_ref().map(BoxCgroup::dir_fd),
         )
-    }
-
-    /// Sends `signal` to the container's first process.
-    pub fn signal_program(&self, signal: i32) {
-        self.connection.signal(self.job, signal, true);
     }
 }

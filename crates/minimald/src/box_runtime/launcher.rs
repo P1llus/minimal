@@ -926,18 +926,6 @@ impl BoxLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Asked before anything is reserved or started for the box: a policy
-        // this host cannot enforce is refused, never run unenforced.
-        if let Err(refusal) = crate::net::engine::engine().can_enforce(network_mode, &policy) {
-            tracing::info!(
-                session = %session_name,
-                network_mode = %network_mode.word(),
-                %refusal,
-                "refused a box whose network policy this host cannot enforce"
-            );
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, refusal));
-        }
-
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
         // says what it is. The decision this launch itself read above goes in
@@ -1145,19 +1133,6 @@ impl BoxLauncher for SandboxLauncher {
             } else {
                 None
             };
-            // NET-070: a host-address box's program waits at a gate of its
-            // own until the launch records the box's PID namespace, so no
-            // connection it opens reaches the hostname proxy unattributed.
-            // A hook launch needs none: its gate holds the program until the
-            // first attach, after the launch returns.
-            let namespace_gate = if matches!(network_mode, NetworkMode::HostNet) && !for_hooks {
-                Some(
-                    env.hold_start(&mut container)
-                        .map_err(|e| io::Error::other(format!("start gate: {e}")))?,
-                )
-            } else {
-                None
-            };
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
@@ -1281,36 +1256,18 @@ impl BoxLauncher for SandboxLauncher {
                 tty_path,
                 late_notice_fd,
                 start_gate,
-                namespace_gate,
                 pipes,
             ))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd, start_gate, namespace_gate, pipes) =
-            match build_and_spawn {
-                Ok(parts) => parts,
-                Err(e) => return Err(e),
-            };
+        let (env, master, process, tty_path, late_notice_fd, start_gate, pipes) = build_and_spawn?;
 
         // From here the process exists, so every way out of this function
         // has to account for it — including the one no `return` covers, a
         // cancelled future. `SpawnedProcessGuard` owns it until the
         // handoff at the bottom; an `Err` return or a drop reaps it.
         let mut process = SpawnedProcessGuard::new(process);
-
-        // NET-070: the hostname proxy names a host-address box's connection by
-        // its PID namespace when no holder runs in a classifier leaf.
-        // A box with no namespace of its own looks like a process outside
-        // every box to the proxy, which a routing surface must never allow,
-        // so the launch fails closed: the `Err` drops `process` first, which
-        // reaps the box before its program leaves the gate.
-        if matches!(network_mode, NetworkMode::HostNet) {
-            require_host_address_box_namespace(session_id, process.get_mut().id())?;
-        }
-        if let Some(gate) = namespace_gate {
-            gate.release();
-        }
 
         // Step 3 (post-spawn): hand the process to the provider, which wires its
         // namespace onto the switch; a tap the sandbox layer built travels here

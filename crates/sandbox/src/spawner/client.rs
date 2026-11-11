@@ -13,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use super::ExitStatus;
 use super::wire::{self, Event, Request};
+use crate::cgroup::BoxCgroup;
 
 /// How a job ended, for every holder of its handle.
 #[derive(Default)]
@@ -70,12 +71,52 @@ enum Answer {
     Failed(String),
 }
 
+/// A job that has not been seen to end.
+struct Job {
+    outcome: Arc<Outcome>,
+    /// Whether the job is a container, whose process is its supervisor.
+    container: bool,
+    /// The pid of the job's process, once it has started.
+    pid: Option<u32>,
+    /// The cgroup made for this one container, which goes when it does.
+    own_cgroup: Option<BoxCgroup>,
+}
+
+impl Job {
+    /// The job is over.
+    fn end(self, status: ExitStatus) {
+        self.outcome.end(status);
+        if let Some(cgroup) = self.own_cgroup {
+            remove_own_cgroup(cgroup);
+        }
+    }
+}
+
+/// How long the processes of an ended container get to leave its cgroup.
+const OWN_CGROUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Removes the cgroup of a container that has ended, on a thread of its
+/// own: the last processes of the container may still be on their way out,
+/// and the events thread does not wait for them.
+fn remove_own_cgroup(cgroup: BoxCgroup) {
+    let removal = std::thread::Builder::new()
+        .name("spawner-cgroup".into())
+        .spawn(move || {
+            if let Err(error) = cgroup.destroy_blocking(OWN_CGROUP_LIMIT) {
+                tracing::warn!(%error, "removing the cgroup of an ended container");
+            }
+        });
+    if let Err(error) = removal {
+        tracing::warn!(%error, "no thread to remove the cgroup of an ended container");
+    }
+}
+
 #[derive(Default)]
 struct Table {
     /// Set once the spawner is gone.
     closed: bool,
     answers: HashMap<u64, mpsc::SyncSender<Answer>>,
-    jobs: HashMap<u64, Arc<Outcome>>,
+    jobs: HashMap<u64, Job>,
 }
 
 #[derive(Default)]
@@ -91,6 +132,9 @@ impl Shared {
         let (id, answer) = match event {
             Event::Started { id, pid, tap } => {
                 let tap = if tap { fds.next() } else { None };
+                if let Some(job) = table.jobs.get_mut(&id) {
+                    job.pid = Some(pid);
+                }
                 (id, Answer::Started { pid, tap })
             }
             Event::Socket { id } => match fds.next() {
@@ -99,8 +143,8 @@ impl Shared {
             },
             Event::Failed { id, error } => (id, Answer::Failed(error)),
             Event::Exited { id, status } => {
-                if let Some(outcome) = table.jobs.remove(&id) {
-                    outcome.end(status);
+                if let Some(job) = table.jobs.remove(&id) {
+                    job.end(status);
                 }
                 return;
             }
@@ -115,8 +159,8 @@ impl Shared {
         let mut table = self.table.lock().expect("spawner table lock");
         table.closed = true;
         table.answers.clear();
-        for (_, outcome) in table.jobs.drain() {
-            outcome.end(ExitStatus::failure(GONE));
+        for (_, job) in table.jobs.drain() {
+            job.end(ExitStatus::failure(GONE));
         }
     }
 }
@@ -183,54 +227,82 @@ impl Connection {
         &self,
         make: impl FnOnce(u64) -> Request,
         fds: &[BorrowedFd<'_>],
-        job: bool,
-    ) -> io::Result<(u64, Answer, Option<Arc<Outcome>>)> {
+        job: Option<Job>,
+    ) -> io::Result<(u64, Answer)> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = mpsc::sync_channel(1);
-        let outcome = job.then(Arc::<Outcome>::default);
         {
             let mut table = self.shared.table.lock().expect("spawner table lock");
             if table.closed {
+                drop(table);
+                if let Some(job) = job {
+                    job.end(ExitStatus::failure(GONE));
+                }
                 return Err(gone());
             }
             table.answers.insert(id, answer);
-            if let Some(outcome) = &outcome {
-                table.jobs.insert(id, Arc::clone(outcome));
+            if let Some(job) = job {
+                table.jobs.insert(id, job);
             }
         }
-        let forget = || {
+        // A job that never started is over.
+        let never_started = || {
             let mut table = self.shared.table.lock().expect("spawner table lock");
             table.answers.remove(&id);
-            table.jobs.remove(&id);
+            let job = table.jobs.remove(&id);
+            drop(table);
+            if let Some(job) = job {
+                job.end(ExitStatus::failure("the job did not start"));
+            }
         };
         if let Err(error) = self.send(&make(id), fds) {
-            forget();
+            never_started();
             return Err(error);
         }
         // The events thread drops the sender when the spawner goes.
         let answer = answered.recv().map_err(|_| gone())?;
         if matches!(answer, Answer::Failed(_)) {
-            forget();
+            never_started();
         }
-        Ok((id, answer, outcome))
+        Ok((id, answer))
     }
 
-    /// Starts a job: `make` builds a `Run` or an `Enter` request.
+    /// Starts a job: `make` builds a `Run` or an `Enter` request. A
+    /// container is a `Run`, and `own_cgroup` is the cgroup made for it
+    /// alone, which is removed when it ends.
     pub(crate) fn start(
         &self,
         make: impl FnOnce(u64) -> Request,
         fds: &[BorrowedFd<'_>],
+        container: bool,
+        own_cgroup: Option<BoxCgroup>,
     ) -> io::Result<Started> {
-        match self.ask(make, fds, true)? {
-            (id, Answer::Started { pid, tap }, Some(outcome)) => Ok(Started {
+        let outcome = Arc::<Outcome>::default();
+        let job = Job {
+            outcome: Arc::clone(&outcome),
+            container,
+            pid: None,
+            own_cgroup,
+        };
+        match self.ask(make, fds, Some(job))? {
+            (id, Answer::Started { pid, tap }) => Ok(Started {
                 id,
                 pid,
                 tap,
                 outcome,
             }),
-            (_, Answer::Failed(error), _) => Err(io::Error::other(error)),
-            _ => Err(io::Error::other("the spawner answered out of turn")),
+            (_, Answer::Failed(error)) => Err(io::Error::other(error)),
+            (_, Answer::Socket(_)) => Err(io::Error::other("the spawner answered out of turn")),
         }
+    }
+
+    /// Whether `pid` is the supervisor of a container this spawner runs.
+    pub(crate) fn supervises(&self, pid: u32) -> bool {
+        let table = self.shared.table.lock().expect("spawner table lock");
+        table
+            .jobs
+            .values()
+            .any(|job| job.container && job.pid == Some(pid))
     }
 
     /// Has the spawner create a socket in `cgroup`, and in the network
@@ -249,10 +321,12 @@ impl Connection {
             datagram,
             cgroup: cgroup.is_some(),
         };
-        match self.ask(make, cgroup.as_slice(), false)? {
-            (_, Answer::Socket(socket), _) => Ok(socket),
-            (_, Answer::Failed(error), _) => Err(io::Error::other(error)),
-            _ => Err(io::Error::other("the spawner answered out of turn")),
+        match self.ask(make, cgroup.as_slice(), None)? {
+            (_, Answer::Socket(socket)) => Ok(socket),
+            (_, Answer::Failed(error)) => Err(io::Error::other(error)),
+            (_, Answer::Started { .. }) => {
+                Err(io::Error::other("the spawner answered out of turn"))
+            }
         }
     }
 
@@ -270,12 +344,6 @@ impl Connection {
 
     /// Gives up a job's handle, which kills the job.
     pub(crate) fn forget(&self, id: u64) {
-        self.shared
-            .table
-            .lock()
-            .expect("spawner table lock")
-            .jobs
-            .remove(&id);
         let _ = self.send(&Request::Forget { id }, &[]);
     }
 }

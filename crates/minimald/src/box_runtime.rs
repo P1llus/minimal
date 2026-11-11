@@ -40,17 +40,16 @@ pub use pty::*;
 
 mod backend;
 mod binding;
-mod enforcement;
 mod handle;
 mod hooks;
 mod launcher;
 #[cfg(test)]
 mod mock;
 mod pipes;
+mod processes;
 
 pub(crate) use backend::*;
 pub(crate) use binding::*;
-pub(crate) use enforcement::*;
 pub use handle::*;
 use hooks::*;
 pub(crate) use launcher::*;
@@ -58,6 +57,7 @@ pub(crate) use launcher::*;
 pub(crate) use mock::*;
 pub(crate) use pipes::EntrypointIoTake;
 use pipes::{HostPipes, PIPE_EXIT_POLL, PipeStream, read_ready};
+pub(crate) use processes::*;
 
 /// What a host loop returns when it ends: the portable exit code, and the
 /// reaped [`ExitReason`] when the backend accounted for the end.
@@ -1295,6 +1295,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
                 match msg {
+                    Message::SignalEntrypoint(signal) => {
+                        self.process.signal_entrypoint(signal);
+                    }
                     Message::Kill(for_shutdown) => {
                         // The other way a session ends: someone asked it to.
                         // Without this line a destroy, a daemon shutdown and a

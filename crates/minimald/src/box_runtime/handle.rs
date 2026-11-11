@@ -6,6 +6,9 @@ use super::*;
 /// Actor messages to a [`Host`].
 pub(super) enum Message {
     Kill(bool),
+    /// Send this signal to the entrypoint, for the stop of a box that has
+    /// no cgroup to signal.
+    SignalEntrypoint(i32),
     /// Rename the session: update the host's display name and republish the
     /// new `MINIMAL_SESSION_NAME` through the per-attach environment channel,
     /// so the already-running shell picks it up at its next prompt.
@@ -311,6 +314,19 @@ impl HostHandle {
             // that will never observe it.
             Err(_e) => Err(()),
         }
+    }
+
+    /// Sends `signal` to the box's entrypoint. `Err(())` when the host's loop
+    /// is gone or wedged, and the signal did not land.
+    #[allow(clippy::result_unit_err)]
+    pub(crate) async fn signal_entrypoint(&self, signal: i32) -> Result<(), ()> {
+        self.sender
+            .send_timeout(
+                Message::SignalEntrypoint(signal),
+                crate::box_actor::HOST_PROBE_TIMEOUT,
+            )
+            .await
+            .map_err(|_| ())
     }
 
     /// Renames the session: the host updates its display name and republishes

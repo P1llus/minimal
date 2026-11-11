@@ -112,8 +112,7 @@ pub(crate) enum Request {
     },
     /// Signals the job's own process, or a container's first process.
     Signal { id: u64, signal: i32, to_init: bool },
-    /// The requester dropped the job's handle. The job is killed, and
-    /// nothing more is said about it.
+    /// The requester dropped the job's handle. The job is killed.
     Forget { id: u64 },
 }
 

@@ -253,10 +253,6 @@ pub struct EnvArgs {
     /// [`SetupForPackages`]: graph::SetupForPackages
     include_package_attr_wiring: bool,
 
-    /// The box's cgroup, which every process of the box runs in. `None`
-    /// where the daemon has no cgroup root.
-    box_cgroup: Option<BoxCgroup>,
-
     /// The proxy's root certificate, PEM-encoded, that [`Env::build`] adds
     /// to the box's own trust store (BEP-011). `None` for a box that gets
     /// no root: its trust store is the packages' own.
@@ -288,7 +284,6 @@ impl EnvArgs {
             session,
             session_id: None,
             include_package_attr_wiring: true,
-            box_cgroup: None,
             root_certificate: None,
         }
     }
@@ -371,14 +366,6 @@ impl EnvArgs {
     #[must_use]
     pub fn with_network(mut self, plan: sandbox::NetPlan) -> Self {
         self.network = plan;
-        self
-    }
-
-    /// Runs the environment's box, and every build it starts, in `cgroup`.
-    /// The cgroup must already exist.
-    #[must_use]
-    pub fn with_box_cgroup(mut self, cgroup: BoxCgroup) -> Self {
-        self.box_cgroup = Some(cgroup);
         self
     }
 
@@ -480,11 +467,10 @@ impl Env {
     /// helper), assembles the rootfs, and spawns the command
     /// channel actor.
     pub async fn build(mut ctx: Context, mut graph: Graph, args: EnvArgs) -> std::io::Result<Self> {
-        // Every package build this env starts runs in the box's cgroup: the
-        // missing packages below and the in-box installs later.
-        if let Some(cgroup) = args.box_cgroup.clone() {
-            ctx = ctx.with_box_cgroup(cgroup);
-        }
+        // The box's cgroup comes with the context: the box's actor put it
+        // there, so the package builds below, the box's own sandbox and the
+        // in-box installs later all run in it.
+        let box_cgroup = ctx.box_cgroup().cloned();
         // Resolve the requested package names to top-levels, then ensure the
         // helper's dependencies (`bash`, `socat`) are present.
         graph.top_levels = args
@@ -622,12 +608,10 @@ impl Env {
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
         // The box's id, for the fetch records its installs produce.
-        let box_id = args
-            .box_cgroup
+        let box_id = box_cgroup
             .as_ref()
             .map_or_else(|| args.name.clone(), |cgroup| cgroup.name().to_owned());
-        let box_cgroup = args.box_cgroup.clone();
-        let config = config.with_box_cgroup(args.box_cgroup);
+        let config = config.with_box_cgroup(box_cgroup.clone());
 
         // Wire up the channel actor and build the sandbox around the bridge.
         let (tx, rx) = mpsc::channel(8);

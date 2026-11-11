@@ -60,6 +60,9 @@ pub(crate) trait BoxProcess: Send + 'static {
     fn wait(&mut self) -> io::Result<i32>;
     /// Sends a kill signal to the process.
     fn kill(&mut self) -> io::Result<()>;
+    /// Sends `signal` to the box's entrypoint, the program the box was
+    /// started for.
+    fn signal_entrypoint(&self, signal: i32);
     /// `hakoniwa`'s account of how the process ended, available once
     /// [`Self::try_wait`] has returned `Some` or [`Self::wait`] has returned.
     ///
@@ -93,6 +96,8 @@ pub(crate) trait ProcessBackend: Send + 'static {
     fn wait(&mut self) -> io::Result<ExitReport>;
     /// See [`BoxProcess::kill`].
     fn kill(&mut self) -> io::Result<()>;
+    /// See [`BoxProcess::signal_entrypoint`].
+    fn signal_entrypoint(&self, signal: i32);
     /// Logs the backend's account of an observed exit. Called exactly once per
     /// session by [`HostProcess::record_exit`]; the default is silent, so a
     /// backend with nothing to say (the mock) need not implement it.
@@ -155,6 +160,10 @@ impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
         self.backend.kill()
     }
 
+    fn signal_entrypoint(&self, signal: i32) {
+        self.backend.signal_entrypoint(signal);
+    }
+
     fn exit_reason(&self) -> Option<ExitReason> {
         self.exit.clone()
     }
@@ -204,6 +213,10 @@ impl ProcessBackend for SandboxBackend {
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill();
         Ok(())
+    }
+
+    fn signal_entrypoint(&self, signal: i32) {
+        self.child.signal(signal, sandbox::SignalTarget::Program);
     }
 
     /// Logs on every exit, not just the non-zero ones, exactly once per session

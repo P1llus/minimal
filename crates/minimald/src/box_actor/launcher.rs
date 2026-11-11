@@ -51,6 +51,15 @@ pub(super) fn with_userns_hint(
     }
 }
 
+/// What a box that shares the host's address is refused with on a daemon
+/// that has no cgroup root.
+#[cfg(not(test))]
+const NO_CGROUP_FOR_HOST_ADDRESS_BOX: &str = "the box did not start: Minimal has no cgroup to \
+     run it in, so it cannot tell the box's connections from the host's. A box that shares the \
+     host's address (`host_ip`) needs the daemon to run in a delegated cgroup: a systemd unit or \
+     scope with `Delegate=yes`. A box with its own address (`own_ip`) or with no network runs \
+     without one.";
+
 impl BoxActor {
     /// Builds the session launcher used to mint a session host: the real
     /// sandboxed shell in production.
@@ -97,19 +106,50 @@ impl BoxActor {
         // Built here, per launch, so a respawn starts from an empty set and
         // nothing a dead spawn published can answer for its successor.
         self.publications = Default::default();
+        // Asked before anything is made for the box, its cgroup included: a
+        // policy this host cannot enforce is refused, never run unenforced.
+        if let Err(refusal) = crate::net::engine::engine().can_enforce(network_mode, &policy) {
+            tracing::info!(
+                box_id = %record.id,
+                network_mode = %network_mode.word(),
+                %refusal,
+                "refused a box whose network policy this host cannot enforce"
+            );
+            return Err(AttachError::SpawnFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                refusal,
+            )));
+        }
+        let ctx = match phase {
+            LaunchPhase::Attached => self.context(true).await,
+            // The activation launch runs inside `finalize`, before the
+            // record is promoted, so the status gate in `context` would
+            // reject it — see [`LaunchPhase::Activating`]. Everything
+            // that gate protects has already been established by the
+            // time finalize gets here: the session is composed (checked
+            // before any of this runs) and its patches are materialized
+            // into the home dir.
+            LaunchPhase::Activating => match self.build_context(true).await {
+                Ok(ctx) => self.in_box_cgroup(ctx),
+                Err(error) => Err(error),
+            },
+        }
+        .map_err(AttachError::ContextCreationFailed)?;
+        // The hostname proxy names the box behind a connection by the cgroup
+        // of the process that opened it. A box that shares the host's
+        // address has nothing else to be told from the host by.
+        if matches!(network_mode, boxes::NetworkMode::HostNet) && ctx.box_cgroup().is_none() {
+            tracing::warn!(
+                box_id = %record.id,
+                "refused a host-address box: this daemon has no cgroup to run it in"
+            );
+            return Err(AttachError::SpawnFailed(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                NO_CGROUP_FOR_HOST_ADDRESS_BOX,
+            )));
+        }
         Ok(box_runtime::SandboxLauncher {
-            ctx: match phase {
-                LaunchPhase::Attached => self.context(true).await,
-                // The activation launch runs inside `finalize`, before the
-                // record is promoted, so the status gate in `context` would
-                // reject it — see [`LaunchPhase::Activating`]. Everything
-                // that gate protects has already been established by the
-                // time finalize gets here: the session is composed (checked
-                // before any of this runs) and its patches are materialized
-                // into the home dir.
-                LaunchPhase::Activating => self.build_context(true).await,
-            }
-            .map_err(AttachError::ContextCreationFailed)?,
+            ctx,
             attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),

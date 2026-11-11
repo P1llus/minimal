@@ -989,6 +989,7 @@ impl<C: Channel> Sandbox<C> {
                 // hakoniwa brings `lo` up only where it builds a tap.
                 lo_up: isolate && plan.tap().is_none(),
                 cgroup: self.config.box_cgroup.clone(),
+                cpu_weight: self.config.cpu_weight,
             },
         })
     }
