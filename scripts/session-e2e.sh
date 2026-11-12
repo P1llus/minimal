@@ -23928,6 +23928,10 @@ while True:
   kill "$TWO_VM_HOLD_PID" 2>/dev/null || true
   wait "$TWO_VM_HOLD_PID" 2>/dev/null || true
   TWO_VM_HOLD_PID=""
+  # A later case seeds under the same two variables, so the seeds go here.
+  rm -rf "$TWO_VM_SEED_A_DIR" "$TWO_VM_SEED_B_DIR"
+  TWO_VM_SEED_A_DIR=""
+  TWO_VM_SEED_B_DIR=""
 
   echo "two named VMs on one machine OK (own state each, booted at once on their own proxy ports, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other, a held drawn port redrawn, a held pinned port starting the VM with its proxy down)"
   echo "::endgroup::"
