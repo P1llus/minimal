@@ -814,7 +814,6 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
-        host_ip_enforcement: None,
         shared_port_collisions: Vec::new(),
         attrs: None,
     }
@@ -6886,14 +6885,10 @@ fn ls_cell_at(text: &str, row_key: &str, column: &str, next: &str) -> String {
     row[start..end].trim().to_string()
 }
 
-/// A listing of one box per entry in `boxes`: its name, its network facts
-/// and its per-box enforcement.
+/// A listing of one box per entry in `boxes`: its name and its network
+/// facts.
 fn listing_of(
-    boxes: &[(
-        &str,
-        Option<minimald_rpc::BoxNetworkFacts>,
-        Option<boxes::HostIpEnforcement>,
-    )],
+    boxes: &[(&str, Option<minimald_rpc::BoxNetworkFacts>)],
 ) -> minimald_rpc::ListSessionsResponse {
     let id = |n: usize| {
         boxes::SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap()
@@ -6903,15 +6898,13 @@ fn listing_of(
         sessions: boxes
             .iter()
             .enumerate()
-            .map(|(n, (name, _, enforcement))| {
-                let mut entry = twin_entry(
+            .map(|(n, (name, _))| {
+                twin_entry(
                     &id(n + 1).to_string(),
                     Some(name),
                     Some("/work/proj"),
                     boxes::BoxState::Active,
-                );
-                entry.host_ip_enforcement = *enforcement;
-                entry
+                )
             })
             .collect(),
         daemon_version: None,
@@ -6922,7 +6915,7 @@ fn listing_of(
         box_networks: boxes
             .iter()
             .enumerate()
-            .filter_map(|(n, (_, facts, _))| facts.clone().map(|facts| (id(n + 1), facts)))
+            .filter_map(|(n, (_, facts))| facts.clone().map(|facts| (id(n + 1), facts)))
             .collect(),
     }
 }
@@ -6942,11 +6935,7 @@ fn ls_shows_box_loopback_address_names_row_follows_any_fallback_box() {
     };
     let own = std::net::Ipv4Addr::new(127, 0, 64, 2);
     let localhost = std::net::Ipv4Addr::LOCALHOST;
-    let row = |boxes: &[(
-        &str,
-        Option<minimald_rpc::BoxNetworkFacts>,
-        Option<boxes::HostIpEnforcement>,
-    )]| {
+    let row = |boxes: &[(&str, Option<minimald_rpc::BoxNetworkFacts>)]| {
         let mut resp = listing_of(boxes);
         resp.hostname_proxy_port = Some(7654);
         resp.answerer_bound = true;
@@ -6974,24 +6963,21 @@ fn ls_shows_box_loopback_address_names_row_follows_any_fallback_box() {
     let resolves = "<box>.min.internal resolves on this machine; open it through the HTTP \
                     proxy at 127.0.0.1:7654";
     assert_eq!(
-        row(&[
-            ("own", at(own, false), None),
-            ("fallback", at(localhost, true), None)
-        ]),
+        row(&[("own", at(own, false)), ("fallback", at(localhost, true))]),
         format!("BOX NAMES:       {resolves}"),
         "a mixed listing reads the fallback form"
     );
     assert_eq!(
-        row(&[("host", at(localhost, false), None)]),
+        row(&[("host", at(localhost, false))]),
         format!("BOX NAMES:       {opens}"),
         "a host-address box at 127.0.0.1 is not at the fallback"
     );
     assert_eq!(
-        row(&[("own", at(own, false), None)]),
+        row(&[("own", at(own, false))]),
         format!("BOX NAMES:       {opens}")
     );
     assert_eq!(
-        row(&[("unreported", None, None)]),
+        row(&[("unreported", None)]),
         format!("BOX NAMES:       {resolves}"),
         "a listing that proves no box off the fallback reads the fallback form"
     );
@@ -7016,9 +7002,9 @@ fn ls_shows_box_loopback_address() {
         })
     };
     let resp = listing_of(&[
-        ("own", at(std::net::Ipv4Addr::new(127, 0, 64, 2)), None),
-        ("fallback", at(std::net::Ipv4Addr::LOCALHOST), None),
-        ("unreported", None, None),
+        ("own", at(std::net::Ipv4Addr::new(127, 0, 64, 2))),
+        ("fallback", at(std::net::Ipv4Addr::LOCALHOST)),
+        ("unreported", None),
     ]);
     let render = |json: bool, listings: &[cmd::VmListing]| {
         let mut out = Vec::new();
@@ -7072,7 +7058,7 @@ fn ls_shows_box_loopback_address() {
         },
         cmd::VmListing {
             vm: "alpha".to_string(),
-            resp: listing_of(&[("other", at(std::net::Ipv4Addr::new(127, 0, 64, 9)), None)]),
+            resp: listing_of(&[("other", at(std::net::Ipv4Addr::new(127, 0, 64, 9)))]),
             control_sock: None,
             running: true,
         },
@@ -7091,12 +7077,10 @@ fn ls_shows_box_loopback_address() {
 
 /// T110: the EGRESS cell `min ls` prints for a box is the posture `min
 /// session policy` prints for the same box, in the same words: the named
-/// verdict, `declared rules` for a section listed as rows, and the per-box
-/// enforcement note for a host-address box this host cannot decide per
-/// box.
+/// verdict, and `declared rules` for a section listed as rows.
 #[test]
 fn ls_egress_matches_session_policy() {
-    use boxes::{EffectiveEgress, EgressPolicy, HostIpEnforcement, NetworkMode};
+    use boxes::{EffectiveEgress, EgressPolicy, NetworkMode};
     let rules = EgressPolicy {
         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
         allow_dns_hosts: Some(Vec::new()),
@@ -7107,35 +7091,31 @@ fn ls_egress_matches_session_policy() {
             "own-default",
             EffectiveEgress::DenyAll,
             NetworkMode::OwnIp,
-            None,
             "deny-all (default)",
         ),
         (
             "host-default",
             EffectiveEgress::AllowAll,
             NetworkMode::HostNet,
-            Some(HostIpEnforcement::PerBox),
             "allow-all (default)",
         ),
         (
-            "host-unenforced",
+            "host-deny-all",
             EffectiveEgress::Declared(EgressPolicy::deny_all()),
             NetworkMode::HostNet,
-            Some(HostIpEnforcement::None),
-            "deny-all; per-box enforcement none",
+            "deny-all",
         ),
         (
             "own-rules",
             EffectiveEgress::Declared(rules),
             NetworkMode::OwnIp,
-            None,
             "declared rules",
         ),
     ];
     let resp = listing_of(
         &cases
             .iter()
-            .map(|(name, egress, network, enforcement, _)| {
+            .map(|(name, egress, network, _)| {
                 (
                     *name,
                     Some(minimald_rpc::BoxNetworkFacts {
@@ -7143,7 +7123,6 @@ fn ls_egress_matches_session_policy() {
                         egress_posture: Some(minimald_rpc::EgressPosture::of(egress, *network)),
                         at_fallback: None,
                     }),
-                    *enforcement,
                 )
             })
             .collect::<Vec<_>>(),
@@ -7162,7 +7141,7 @@ fn ls_egress_matches_session_policy() {
     .expect("rendering the listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
 
-    for (name, egress, network, enforcement, words) in cases {
+    for (name, egress, network, words) in cases {
         let cell = ls_cell_at(&table, name, "EGRESS", "TITLE");
         assert_eq!(cell, words, "{name}:\n{table}");
         let mut policy = Vec::new();
@@ -7173,16 +7152,11 @@ fn ls_egress_matches_session_policy() {
                 ..Default::default()
             },
             network,
-            enforcement,
             &[],
-            None,
         )
         .expect("rendering the policy");
         let policy = String::from_utf8(policy).expect("the policy is UTF-8");
-        let (posture, note) = match cell.split_once("; ") {
-            Some((posture, note)) => (posture, Some(note)),
-            None => (cell.as_str(), None),
-        };
+        let posture = cell.as_str();
         if posture == "declared rules" {
             assert!(
                 policy.contains("egress\n  subnets  "),
@@ -7194,21 +7168,7 @@ fn ls_egress_matches_session_policy() {
                 "{name}: the policy view names the same posture:\n{policy}"
             );
         }
-        match note {
-            Some(note) => assert_eq!(note, "per-box enforcement none"),
-            None => assert!(
-                !policy.contains("per-box enforcement  none"),
-                "{name}: only an unenforced box carries the note:\n{policy}"
-            ),
-        }
-        if note.is_some() {
-            assert!(
-                policy.contains("  per-box enforcement  none\n"),
-                "{name}: the policy view states the same enforcement:\n{policy}"
-            );
-        }
     }
-    assert!(!table.contains("per_box"), "got:\n{table}");
 }
 
 /// A stopped VM `vm` under `state`: its state dir with the persisted box
@@ -7724,7 +7684,7 @@ fn attach_error_printed_after_terminal_restore() {
 /// `hostname_proxy_ports`. One served port prints the row it always did.
 #[tokio::test]
 async fn ls_reports_every_proxy_port() {
-    let mut resp = listing_of(&[("web", None, None)]);
+    let mut resp = listing_of(&[("web", None)]);
     resp.hostname_proxy_port = Some(65264);
     let render = |json: bool, ports: &[u16]| {
         let mut out = Vec::new();
@@ -9023,7 +8983,7 @@ fn unknown_box_address_exit4_names_address() {
 fn ls_native_routing_cause_on_proxy_row() {
     let reason = "the daemon could not bind 127.0.0.1:7654: Address in use (os error 98). \
                   Remedy: free the listen address";
-    let mut resp = listing_of(&[("web", None, None)]);
+    let mut resp = listing_of(&[("web", None)]);
     resp.hostname_routing_unavailable = Some(reason.to_string());
     resp.answerer_bound = true;
     let render = |resp: &minimald_rpc::ListSessionsResponse,
@@ -12160,7 +12120,6 @@ fn hold_record(
         exit_code: None,
         signal: None,
         hooks_enabled: true,
-        host_ip_enforcement: None,
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
@@ -12207,7 +12166,7 @@ fn none_box_hold_is_released_by_destroy_and_moved_by_rename() {
 /// row names the cause.
 #[test]
 fn ls_warning_clears_on_recovery_with_no_guest_port() {
-    let mut resp = listing_of(&[("web", None, None)]);
+    let mut resp = listing_of(&[("web", None)]);
     resp.hostname_proxy_port = None;
     resp.answerer_bound = true;
     let held = minimald_rpc::AnswererStatusReply {

@@ -1732,7 +1732,6 @@ mod tests {
             hooks_enabled: true,
             box_addresses: None,
             task_addresses: Vec::new(),
-            host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),

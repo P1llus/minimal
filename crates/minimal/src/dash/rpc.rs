@@ -825,15 +825,10 @@ pub struct Activated {
 }
 
 /// Whether the deny-all egress default binds an own-address box with no
-/// egress section that `created` answered the create of (NET-074): the
-/// build's phase has it in force, and the daemon, the side that knows,
-/// did not report its opt-out (NET-077) — the check `min session
-/// activate` makes before its note.
+/// egress section that `created` answered the create of: the daemon, the
+/// side that knows, did not report its opt-out.
 fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool {
-    match boxes::EGRESS_DEFAULT_PHASE {
-        boxes::EgressDefaultPhase::Announced => false,
-        boxes::EgressDefaultPhase::InForce => created.deny_all_opt_out != Some(true),
-    }
+    created.deny_all_opt_out != Some(true)
 }
 
 /// Resolves the upload root of `dir` and whether it is a VCS root, on a
@@ -1266,7 +1261,6 @@ mod tests {
             hooks_enabled: true,
             box_addresses,
             task_addresses: Vec::new(),
-            host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
@@ -1330,7 +1324,6 @@ mod tests {
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(handed),
-            host_ip_enforcement: None,
             box_id: Some(SessionId::from_bytes([9; 16])),
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),

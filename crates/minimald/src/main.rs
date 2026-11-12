@@ -266,13 +266,10 @@ pub struct ListenArgs {
     gvproxy_bin: Option<std::path::PathBuf>,
 
     /// Keep the earlier allow-all egress default for a box that declares no
-    /// `egress` section (NET-077). With the deny-all default in force (see
-    /// [`boxes::EGRESS_DEFAULT_PHASE`]), an own-address box created with
-    /// no egress declaration reaches nothing outside itself (NET-074) and
-    /// shows `deny-all (default)` in `min session policy` (NET-075). Opt out
-    /// to keep the prior default — a deployment that cannot carry the change
-    /// yet — and retire the flag once yours declares its boxes' egress. A
-    /// box that declares its own egress section is unaffected either way.
+    /// `egress` section. Without this flag an own-address box created with
+    /// no egress declaration reaches nothing outside itself and shows
+    /// `deny-all (default)` in `min session policy`. A box that declares
+    /// its own egress section is unaffected either way.
     /// `MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment opts out too,
     /// and survives the restarts `min` makes without the flag.
     #[arg(long, default_value_t = false)]
@@ -651,10 +648,8 @@ async fn async_main() -> Result<(), MainError> {
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
                 // The microVM's pid-1 has no flags to read, but the host
-                // hands it the operator's opt-out on the boot line (NET-077):
-                // the guest runs the egress default its host was started with
-                // — the rollout phase [`boxes::EGRESS_DEFAULT_PHASE`]
-                // carries — unless the operator opted out.
+                // hands it the operator's opt-out on the boot line: the
+                // guest runs the egress default its host was started with.
                 egress_deny_all_opt_out: guest::handed_egress_deny_all_opt_out(),
             }),
             global_args: GlobalArgs {

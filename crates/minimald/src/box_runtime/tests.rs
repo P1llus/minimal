@@ -4426,7 +4426,6 @@ fn stored_record(parent: boxes::SessionId) -> boxes::Record {
         hooks_enabled: true,
         task_addresses: Vec::new(),
         box_addresses: None,
-        host_ip_enforcement: None,
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),

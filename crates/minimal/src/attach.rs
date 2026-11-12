@@ -762,7 +762,6 @@ mod tests {
             project_path: Some(HostAbsPath::try_new(path).unwrap()),
             status,
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }
@@ -777,7 +776,6 @@ mod tests {
             project_path: None,
             status,
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }

@@ -216,7 +216,6 @@ mod tests {
             project_path: None,
             status: Default::default(),
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }

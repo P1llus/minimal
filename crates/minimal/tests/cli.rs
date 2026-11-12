@@ -235,7 +235,6 @@ fn ls_shows_shared_resource_pool() {
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
             status: boxes::BoxState::Active,
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }],
@@ -276,7 +275,6 @@ fn ls_table_exposes_project_path_and_status() {
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
             status: boxes::BoxState::Active,
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }],
@@ -306,260 +304,6 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("/work/proj"),
         "row should show project path: {text}"
     );
-}
-
-/// The cell under `column` in the row that contains `row_key`, read by
-/// the header's positions: `column` up to `next`, the column after it. A
-/// cell can hold spaces, so the row is not split on whitespace.
-fn ls_cell(text: &str, row_key: &str, column: &str, next: &str) -> String {
-    let header = text
-        .lines()
-        .find(|l| l.contains("SESSION ID"))
-        .unwrap_or_else(|| panic!("a header in:\n{text}"));
-    let start = header.find(column).expect("the column in the header");
-    let end = header.find(next).expect("the next column in the header");
-    let row = text
-        .lines()
-        .find(|l| l.contains(row_key) && !l.contains("SESSION ID"))
-        .unwrap_or_else(|| panic!("a row for {row_key} in:\n{text}"));
-    row[start..end].trim().to_string()
-}
-
-/// NET-079's proof names the listing, in `min session policy`'s words
-/// (T110): a host-address box that runs unenforced shows its posture with
-/// `; per-box enforcement none` in the human `min ls`, one decided per box
-/// shows its posture alone, and a box the daemon reports no posture for
-/// shows `-`.
-#[test]
-fn ls_table_shows_host_address_enforcement() {
-    let id = |n: u64| SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap();
-    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
-        id: id(n),
-        name: Some(name.to_string()),
-        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: boxes::BoxState::Active,
-        git: None,
-        host_ip_enforcement: enforcement,
-        shared_port_collisions: Vec::new(),
-        attrs: None,
-    };
-    let posture = |posture| minimald_rpc::BoxNetworkFacts {
-        loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
-        egress_posture: Some(posture),
-        at_fallback: Some(true),
-    };
-    let resp = ListSessionsResponse {
-        box_networks: [
-            (id(1), posture(minimald_rpc::EgressPosture::DenyAll)),
-            (id(2), posture(minimald_rpc::EgressPosture::AllowAllDefault)),
-        ]
-        .into_iter()
-        .collect(),
-        daemon_version: None,
-        hostname_routing_unavailable: None,
-        hostname_proxy_port: None,
-        zone_answerer_port: None,
-        answerer_bound: false,
-        resource_pool: None,
-        sessions: vec![
-            entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
-            entry("unenforced", 2, Some(minimald_rpc::HostIpEnforcement::None)),
-            entry("own-address", 3, None),
-        ],
-    };
-    let mut out = Vec::new();
-
-    format_ls(
-        &mut out,
-        &LsArgs {
-            raw: false,
-            json: false,
-        },
-        &resp,
-        None,
-        None,
-    )
-    .unwrap();
-
-    let text = String::from_utf8(out).unwrap();
-    let egress = |name: &str| ls_cell(&text, name, "EGRESS", "TITLE");
-    assert_eq!(egress("decided"), "deny-all", "got:\n{text}");
-    assert_eq!(
-        egress("unenforced"),
-        "allow-all (default); per-box enforcement none",
-        "got:\n{text}"
-    );
-    assert_eq!(egress("own-address"), "-", "got:\n{text}");
-    assert!(!text.contains("per_box"), "got:\n{text}");
-}
-
-/// NET-129's listing half: a box that yields a declared port at a shared
-/// address gets one `warning:` line per port naming the box (by id when it
-/// has no name), the port and the holder; a box that yields nothing gets
-/// none. `--json` carries the rows under the entry's `shared_port_collisions`
-/// key, present only on the entry that yields.
-#[test]
-fn ls_reports_yielded_shared_address_ports() {
-    let entry = |name: Option<&str>, n: u64, collisions| minimald_rpc::ListSessionsEntry {
-        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
-        name: name.map(str::to_string),
-        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: boxes::BoxState::Active,
-        git: None,
-        host_ip_enforcement: None,
-        shared_port_collisions: collisions,
-        attrs: None,
-    };
-    let held = |port| minimald_rpc::SharedPortCollision {
-        port,
-        held_by: "first.min.internal".to_string(),
-    };
-    let resp = ListSessionsResponse {
-        box_networks: Default::default(),
-        daemon_version: None,
-        hostname_routing_unavailable: None,
-        hostname_proxy_port: None,
-        zone_answerer_port: None,
-        answerer_bound: false,
-        resource_pool: None,
-        sessions: vec![
-            entry(Some("first"), 1, Vec::new()),
-            entry(Some("second"), 2, vec![held(8080), held(9090)]),
-            entry(None, 3, vec![held(8080)]),
-        ],
-    };
-    let listings = vec![VmListing {
-        vm: "default".to_string(),
-        resp: resp.clone(),
-        control_sock: None,
-        running: true,
-    }];
-
-    assert_eq!(
-        shared_port_collision_lines(&listings),
-        vec![
-            "warning: second: port 8080 is held by first.min.internal; not forwarded",
-            "warning: second: port 9090 is held by first.min.internal; not forwarded",
-            "warning: 00000000-0000-0000-0000-000000000003: port 8080 is held by \
-             first.min.internal; not forwarded",
-        ]
-    );
-
-    let mut out = Vec::new();
-    format_ls(
-        &mut out,
-        &LsArgs {
-            raw: false,
-            json: true,
-        },
-        &resp,
-        None,
-        None,
-    )
-    .unwrap();
-    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
-    let sessions = document["sessions"].as_array().unwrap();
-    assert!(
-        sessions[0].get("shared_port_collisions").is_none(),
-        "a box that yields nothing carries no key: {document}"
-    );
-    assert_eq!(
-        sessions[1]["shared_port_collisions"],
-        serde_json_lenient::json!([
-            {"port": 8080, "held_by": "first.min.internal"},
-            {"port": 9090, "held_by": "first.min.internal"},
-        ]),
-        "the yielding box lists each port and its holder: {document}"
-    );
-}
-
-/// The multi-VM table carries the same EGRESS cell, after the VM column
-/// each row leads with.
-#[test]
-fn ls_across_vms_table_shows_host_address_enforcement() {
-    let id = |n: u64| SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap();
-    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
-        id: id(n),
-        name: Some(name.to_string()),
-        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: boxes::BoxState::Active,
-        git: None,
-        host_ip_enforcement: enforcement,
-        shared_port_collisions: Vec::new(),
-        attrs: None,
-    };
-    let posture = |n: u64, posture| {
-        (
-            id(n),
-            minimald_rpc::BoxNetworkFacts {
-                loopback_address: None,
-                egress_posture: Some(posture),
-                at_fallback: None,
-            },
-        )
-    };
-    let listing = |vm: &str, sessions, box_networks| VmListing {
-        vm: vm.to_string(),
-        resp: ListSessionsResponse {
-            box_networks,
-            daemon_version: None,
-            hostname_routing_unavailable: None,
-            hostname_proxy_port: None,
-            zone_answerer_port: None,
-            answerer_bound: false,
-            resource_pool: None,
-            sessions,
-        },
-        control_sock: None,
-        running: true,
-    };
-    let listings = vec![
-        listing(
-            "default",
-            vec![
-                entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
-                entry("own-address", 3, None),
-            ],
-            [posture(1, minimald_rpc::EgressPosture::AllowAllDefault)]
-                .into_iter()
-                .collect(),
-        ),
-        listing(
-            "alpha",
-            vec![entry(
-                "unenforced",
-                2,
-                Some(minimald_rpc::HostIpEnforcement::None),
-            )],
-            [posture(2, minimald_rpc::EgressPosture::DeclaredRules)]
-                .into_iter()
-                .collect(),
-        ),
-    ];
-    let mut out = Vec::new();
-
-    format_ls_across_vms(
-        &mut out,
-        &LsArgs {
-            raw: false,
-            json: false,
-        },
-        &listings,
-        &[None, None],
-        &[None, None],
-    )
-    .unwrap();
-
-    let text = String::from_utf8(out).unwrap();
-    let egress = |name: &str| ls_cell(&text, name, "EGRESS", "TITLE");
-    assert_eq!(egress("decided"), "allow-all (default)", "got:\n{text}");
-    assert_eq!(
-        egress("unenforced"),
-        "declared rules; per-box enforcement none",
-        "got:\n{text}"
-    );
-    assert_eq!(egress("own-address"), "-", "got:\n{text}");
-    assert_eq!(ls_cell(&text, "decided", "ADDRESS", "STATUS"), "-");
 }
 
 #[tokio::test]
@@ -1213,15 +957,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
         };
 
         let mut out = Vec::new();
-        format_policy(
-            &mut out,
-            &policy,
-            boxes::NetworkMode::OwnIp,
-            None,
-            &[],
-            None,
-        )
-        .unwrap();
+        format_policy(&mut out, &policy, boxes::NetworkMode::OwnIp, &[]).unwrap();
         let text = String::from_utf8(out).unwrap();
         let row = if declared {
             format!("  dynamic ingress  {mode}\n")
@@ -1245,7 +981,6 @@ async fn policy_shows_resolved_dynamic_ingress() {
             &mut out,
             &policy,
             boxes::NetworkMode::OwnIp,
-            None,
             Ok(vec![]),
             &[],
         )
@@ -2045,15 +1780,7 @@ async fn policy_json_carries_schema_and_pending() {
     ];
 
     let mut out = Vec::new();
-    write_policy_json(
-        &mut out,
-        &policy,
-        boxes::NetworkMode::OwnIp,
-        None,
-        Ok(live),
-        &[],
-    )
-    .unwrap();
+    write_policy_json(&mut out, &policy, boxes::NetworkMode::OwnIp, Ok(live), &[]).unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
     assert_eq!(
         document["schema"], "min/v1/session-policy",
@@ -2112,7 +1839,6 @@ async fn policy_json_carries_schema_and_pending() {
         &mut out,
         &policy,
         boxes::NetworkMode::OwnIp,
-        None,
         Ok(vec![pre_field]),
         &[],
     )
@@ -2152,7 +1878,6 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         &mut out,
         &policy,
         boxes::NetworkMode::OwnIp,
-        None,
         Ok(Vec::new()),
         &[],
     )
@@ -2171,7 +1896,6 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         &mut out,
         &policy,
         boxes::NetworkMode::OwnIp,
-        None,
         Err(
             "could not read the ports this box published while running: no session found"
                 .to_string(),
@@ -2192,7 +1916,6 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         &mut out,
         &policy,
         boxes::NetworkMode::NoNet,
-        None,
         Ok(Vec::new()),
         &[],
     )
@@ -2290,15 +2013,7 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &policy,
-        boxes::NetworkMode::OwnIp,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &policy, boxes::NetworkMode::OwnIp, &[]).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -2340,15 +2055,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &policy,
-        boxes::NetworkMode::HostNet,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &policy, boxes::NetworkMode::HostNet, &[]).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -2381,15 +2088,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &policy,
-        boxes::NetworkMode::NoNet,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &policy, boxes::NetworkMode::NoNet, &[]).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "This box has no network (--network none)\n",
@@ -2430,48 +2129,16 @@ async fn policy_shows_deny_all_default() {
             panic!("GetEffectiveSessionPolicy failed: {error}")
         }
     };
-    // Over the wire, the daemon answers the resolution the phase this build
-    // ships leaves in force — announced, so a bare box still allows all
-    // (NET-076), and the command's data path carries that answer.
-    assert_eq!(
-        policy.egress,
-        boxes::effective_egress(
-            None,
-            boxes::NetworkMode::OwnIp,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        ),
-        "the daemon must answer the shipped phase's resolution for a bare box"
-    );
-
-    // The default's own posture, with the phase passed explicitly: once in
-    // force, a bare own-address box resolves to deny-all, and the command's
-    // renderer prints it as that — and nothing else.
-    let in_force = boxes::EffectiveBoxPolicy {
-        egress: boxes::effective_egress(
-            None,
-            boxes::NetworkMode::OwnIp,
-            boxes::EgressDefaultPhase::InForce,
-            false,
-        ),
-        ingress: None,
-        credentialed_upstream: None,
-    };
+    // Over the wire, a bare own-address box answers deny-all, and the
+    // command's renderer prints it as that and nothing else.
+    let in_force = policy;
     assert_eq!(
         in_force.egress,
         boxes::EffectiveEgress::DenyAll,
-        "the in-force default for a bare own-address box is deny-all"
+        "the default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &in_force,
-        boxes::NetworkMode::OwnIp,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &in_force, boxes::NetworkMode::OwnIp, &[]).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny-all (default)\n"),
@@ -2522,15 +2189,7 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, boxes::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &policy,
-        boxes::NetworkMode::HostNet,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &policy, boxes::NetworkMode::HostNet, &[]).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow-all (default)\n"),
@@ -2795,24 +2454,11 @@ async fn policy_shows_unset_egress_as_named_default() {
     };
     assert_eq!(
         own_policy.egress,
-        boxes::effective_egress(
-            None,
-            boxes::NetworkMode::OwnIp,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false
-        ),
-        "a box with no section resolves to the shipped phase's default"
+        boxes::effective_egress(None, boxes::NetworkMode::OwnIp, false),
+        "a box with no section resolves to its mode's default"
     );
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &own_policy,
-        boxes::NetworkMode::OwnIp,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &own_policy, boxes::NetworkMode::OwnIp, &[]).unwrap();
     let own_text = String::from_utf8(out).unwrap();
     let name = match own_policy.egress {
         boxes::EffectiveEgress::DenyAll => "  deny-all (default)\n",
@@ -2841,7 +2487,6 @@ async fn policy_shows_unset_egress_as_named_default() {
         &mut out,
         &own_policy,
         boxes::NetworkMode::OwnIp,
-        None,
         Ok(Vec::new()),
         &[],
     )
@@ -2890,15 +2535,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         "a bare host-address box keeps the shipped allow-all"
     );
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &host_policy,
-        boxes::NetworkMode::HostNet,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &host_policy, boxes::NetworkMode::HostNet, &[]).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow-all (default)\n"),
@@ -2933,15 +2570,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         "a declared deny-all box's effective egress is its declaration"
     );
     let mut out = Vec::new();
-    format_policy(
-        &mut out,
-        &declared_policy,
-        boxes::NetworkMode::OwnIp,
-        None,
-        &[],
-        None,
-    )
-    .unwrap();
+    format_policy(&mut out, &declared_policy, boxes::NetworkMode::OwnIp, &[]).unwrap();
     let declared_text = String::from_utf8(out).unwrap();
     assert!(
         declared_text.contains("egress\n  deny-all\n"),
@@ -2961,7 +2590,6 @@ async fn policy_shows_unset_egress_as_named_default() {
         &mut out,
         &declared_policy,
         boxes::NetworkMode::OwnIp,
-        None,
         Ok(Vec::new()),
         &[],
     )
@@ -3014,11 +2642,6 @@ async fn policy_shows_unset_egress_as_named_default() {
 async fn deny_all_in_force_note_printed() {
     const NOTE: &str = "This box can reach no external address: a --network own_ip box with no \
                         egress rules gets the deny-all default";
-    assert_eq!(
-        boxes::EGRESS_DEFAULT_PHASE,
-        boxes::EgressDefaultPhase::InForce,
-        "this build ships the deny-all default in force"
-    );
     let (_daemon, args) = setup().await;
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -3114,12 +2737,6 @@ async fn deny_all_in_force_note_printed() {
     assert!(
         !opted_out_stderr.contains(NOTE),
         "an opted-out daemon's bare box keeps allow-all and is not noted:\n{opted_out_stderr}"
-    );
-
-    // The announced phase prints nothing: its announcement is retired.
-    assert!(
-        deny_all_default_notice(boxes::EgressDefaultPhase::Announced).is_none(),
-        "the retired announcement must not print"
     );
 }
 

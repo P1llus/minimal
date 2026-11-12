@@ -123,20 +123,12 @@ pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
 /// Egress policy for a session: the `egress` section as declared, before
 /// [`effective_egress`] resolves it.
 ///
-/// `None` on a destination list (`allow_subnets`, `allow_dns_hosts`) grants
-/// nothing once the spec is expanded: under the in-force deny-all default
-/// (NET-074) [`effective_egress`] resolves it to present and empty on every
-/// declared section, whatever the box's network mode, and only the daemon's
-/// opt-out (NET-077) keeps the earlier allow-all reading of it. Allow-all is
-/// therefore written out, as `0.0.0.0/0` and `::/0` in `allow_subnets`; no
-/// absent list stands in for it. `::/0` is the forward-compatible spelling:
-/// v1 compiles IPv4 rules only and drops IPv6 as a family (NET-082), so it
-/// grants nothing today. `allow_protocols` filters the reach the two
-/// destination lists grant rather than granting any, so `None` there
-/// narrows nothing: every protocol passes. `deny_subnets: None` denies
-/// nothing. A `deny_subnets` entry is subtractive: it carves a range out of
-/// what the `allow_*` fields admit, so a rule set is effective only where it
-/// is not also denied.
+/// A section that has a destination list (`allow_subnets`,
+/// `allow_dns_hosts`), even an empty one, refuses what it does not list, and
+/// the list it leaves out grants nothing. A section with neither list, only
+/// `deny_subnets` or `allow_protocols`, allows the rest. `allow_protocols`
+/// filters the reach and grants none, so `None` there lets every protocol
+/// pass. A `deny_subnets` entry carves a range out of what is allowed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct EgressPolicy {
     /// Allowed destination CIDR prefixes. `None` grants no destination once
@@ -213,15 +205,9 @@ impl EgressPolicy {
     /// `allow_subnets` and `allow_dns_hosts`, present and empty. Those two
     /// are the grants; `allow_protocols` only filters what they grant, so
     /// it is not read — a section that grants no destination reaches
-    /// nothing whatever protocols it lists, which is the shape
-    /// [`effective_egress`] resolves a declaration with no destination
-    /// list (protocols only, denies only) to under the in-force default
-    /// without the opt-out, whatever the box's network mode. `deny_subnets`
-    /// is not read
-    /// either — it subtracts from what the `allow_*` fields admit, and
-    /// there is nothing there to subtract from. The one predicate the
-    /// in-VM classifier, the host-side registry and `min session policy`
-    /// share, so the box each treats as deny-all is one shape.
+    /// nothing whatever protocols it lists. `deny_subnets` is not read
+    /// either: it subtracts from what the `allow_*` fields admit, and
+    /// there is nothing there to subtract from.
     #[must_use]
     pub fn admits_nothing(&self) -> bool {
         self.allow_subnets.as_ref().is_some_and(Vec::is_empty)
@@ -392,49 +378,6 @@ impl BoxPolicy {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The deny-all egress default's rollout (NET-074..NET-077).
-//
-// An absent `egress` section used to mean allow-all on every dimension
-// (03-spec R2.1). The deny-all default replaces that for an own-address box:
-// in force, it reaches nothing outside itself, and an opt-out keeps the
-// earlier allow-all. The release before it only announced the change.
-// ---------------------------------------------------------------------------
-
-/// Which release the deny-all egress default is in (NET-074..NET-077): a
-/// build-time fact, not configuration, because it is decided by which build
-/// is running. Every path that needs it — the session gate, the session-start
-/// log line, `min session policy`, the activate note — reads
-/// [`EGRESS_DEFAULT_PHASE`] rather than a flag nobody could set differently
-/// within one build.
-///
-/// Deliberately not `#[non_exhaustive]`: a future phase (a default retired
-/// after its soak, say) must break the exhaustive matches over this enum,
-/// forcing each one to say what the new phase means for it, rather than
-/// falling into a wildcard arm that silently keeps the old answer.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum EgressDefaultPhase {
-    /// The coming default is announced at activate (NET-076); an absent
-    /// `egress` section still allows all. The release before the default
-    /// bound; kept so the cutover's arms stay named and tested, and no
-    /// build ships it now.
-    Announced,
-    /// The default binds: an own-address box created with no `egress`
-    /// section reaches nothing outside itself (NET-074) and shows
-    /// `deny all` in `min session policy` (NET-075), the opt-out excepted
-    /// (NET-077).
-    InForce,
-}
-
-/// The phase this build ships: the deny-all default is in force (NET-074),
-/// so an own-address box with no `egress` section reaches nothing outside
-/// itself unless its daemon opted out (NET-077), and the announcement
-/// (NET-076) is retired. This constant is the whole cutover — every reader
-/// of it (the session gate, the session-start line, `min session policy`,
-/// the activate note) follows — and minvmd's own phase must match it (a
-/// build-time assertion there refuses a split).
-pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce;
-
 /// The egress a box's traffic is actually held to: its declared section when
 /// it has one, otherwise the default [`effective_egress`] resolves for an
 /// absent one. This is what `min session policy` shows;
@@ -444,20 +387,16 @@ pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectiveEgress {
-    /// An absent `egress` section under the in-force default (NET-074):
-    /// nothing outside the box is reachable, the resolver Minimal owns for
-    /// it excepted (NET-079).
+    /// No `egress` section on a box with its own address: nothing outside
+    /// the box is reachable.
     DenyAll,
-    /// The earlier default (03-spec R2.1): every dimension allows all. What
-    /// an absent section keeps behind the daemon's opt-out (NET-077), on any
-    /// box without an address of its own, and under the announced phase.
+    /// No `egress` section on a box that shares its host's address, or
+    /// behind the daemon's opt-out: everything is reachable.
     #[default]
     AllowAll,
-    /// The box declared its own egress section, carried as declared except
-    /// that under the in-force default (NET-074, without the opt-out) a
-    /// destination list the section leaves absent is resolved to present
-    /// and empty, on a box of any network mode: an absent list in the
-    /// expanded spec grants nothing.
+    /// The box declared its own egress section. Where the section refuses
+    /// what it does not list, a destination list it leaves out is resolved
+    /// to present and empty.
     Declared(EgressPolicy),
 }
 
@@ -500,8 +439,8 @@ impl EffectiveEgress {
 // ingress rides `GetLiveIngress`) rather than a new field here.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveBoxPolicy {
-    /// The effective egress: the declaration, or the default the rollout
-    /// phase and the daemon's opt-out leave in force.
+    /// The effective egress: the declaration, or the default of the box's
+    /// mode and the daemon's opt-out.
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
@@ -511,48 +450,37 @@ pub struct EffectiveBoxPolicy {
     pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
-/// Resolves the effective egress of a box (NET-074/NET-077). An absent
-/// `egress` section is the default's to decide: deny-all once
-/// [`EgressDefaultPhase::InForce`], on an own-address box
-/// ([`NetworkMode::OwnIp`]) whose daemon has not opted out; the shipped
-/// allow-all of 03-spec R2.1 in every other case: before the default is in
-/// force, behind the opt-out, or for a box that shares its host's namespace
-/// (or has no network at all) and so owns no address of its own to deny
-/// from. A declared section is the box's own — a box that says what it
-/// wants gets what it said — and the in-force default decides the
-/// destination lists it leaves absent, on a box of any network mode: once
-/// in force and not opted out, an absent `allow_subnets` or
-/// `allow_dns_hosts` is resolved to present and empty, so it grants nothing
-/// in its dimension (an absent list in the expanded spec grants nothing; the
-/// arch's default-deny rule is not mode-qualified, and a host that decides
-/// per box reads the resolved shape, NET-079); before the default is in
-/// force, or behind the opt-out, the absent list keeps the earlier allow-all
-/// reading. Only the absent-*section* default is own-address scoped.
-/// `allow_protocols` is left as declared in every arm: it filters the reach
-/// the destination lists grant and grants none itself, so `allow_subnets =
-/// ["0.0.0.0/0"]` alone is the written-out IPv4 allow-all.
+/// Resolves the egress a box is held to, as the engine reads the same
+/// declaration ([`egress::box_policy`]).
 ///
-/// `opt_out` is the daemon's deny-all opt-out flag (NET-077); the caller
-/// threads it in from the daemon's configuration, because it is the daemon —
-/// not the client asking about a session — that knows whether it set the
-/// flag.
+/// With no `egress` section the box's mode decides: a box with its own
+/// address reaches nothing unless its daemon opted out, and a box that
+/// shares its host's address reaches everything. A section that has an
+/// allow list refuses what it does not list, so the allow list it leaves
+/// out is resolved to present and empty. A section with only deny entries
+/// or protocols allows the rest, and is carried as declared.
+///
+/// `opt_out` is the daemon's deny-all opt-out. The daemon passes it, because
+/// only the daemon knows whether it is set.
 #[must_use]
 pub fn effective_egress(
     declared: Option<&EgressPolicy>,
     network: NetworkMode,
-    phase: EgressDefaultPhase,
     opt_out: bool,
 ) -> EffectiveEgress {
-    let in_force = phase == EgressDefaultPhase::InForce && !opt_out;
+    // A box with no network has no egress to resolve.
+    let denies_the_rest =
+        network != NetworkMode::NoNet && egress::denies_by_default(declared, network, opt_out);
     match declared {
-        Some(section) if in_force => {
+        Some(section) => {
             let mut section = section.clone();
-            section.allow_subnets.get_or_insert_with(Vec::new);
-            section.allow_dns_hosts.get_or_insert_with(Vec::new);
+            if denies_the_rest {
+                section.allow_subnets.get_or_insert_with(Vec::new);
+                section.allow_dns_hosts.get_or_insert_with(Vec::new);
+            }
             EffectiveEgress::Declared(section)
         }
-        Some(section) => EffectiveEgress::Declared(section.clone()),
-        None if in_force && network == NetworkMode::OwnIp => EffectiveEgress::DenyAll,
+        None if denies_the_rest => EffectiveEgress::DenyAll,
         None => EffectiveEgress::AllowAll,
     }
 }
@@ -1190,47 +1118,6 @@ pub struct BoxAddresses {
     pub loopback_address: Ipv4Addr,
 }
 
-/// The per-box egress enforcement state a host-address session's verdict runs
-/// under (NET-079): `per_box` when the session's own launch placed its box in
-/// a classifier leaf of the host's cgroup tree — the state a host that can
-/// decide per box gives the host-address boxes it launches — and `none` when
-/// the launch did not, because the host cannot decide per box at all, or
-/// because the box got no leaf to be decided on, and the box runs with the
-/// host's address and no verdict of its own.
-///
-/// Defined here — beside the [`Record`] field that carries a box's own launch
-/// outcome — rather than in the RPC crate that first spelled it, because the
-/// record is a session-plane type that crate already depends on; the RPC
-/// crate re-exports it under the path its clients spell, so no wire form
-/// changes.
-///
-/// The default is `none` — a daemon that has not read its host, or one whose
-/// host cannot decide, both spell the state the boxes on it run in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostIpEnforcement {
-    /// The box's launch placed it in a classifier leaf: its egress verdict is
-    /// decided on that leaf of its own.
-    PerBox,
-    /// The box runs with the host's address and no verdict of its own.
-    #[default]
-    None,
-}
-
-impl HostIpEnforcement {
-    /// The machine spelling the stringly surfaces carry — the create
-    /// response, the session runtime-facts reply, the daemon's log lines —
-    /// so a script that greps one surface for the state finds the same word
-    /// on every other.
-    #[must_use]
-    pub fn machine_str(self) -> &'static str {
-        match self {
-            Self::PerBox => "per_box",
-            Self::None => "none",
-        }
-    }
-}
-
 /// One grant's sealed value, delivered into the box (BEP-007): the box's
 /// environment holds `sealed` in the variable `variable`. The value is
 /// sealed to this host's Box Egress Proxy key, so it is not a credential
@@ -1367,37 +1254,13 @@ pub struct Record {
     )]
     pub box_id: Option<BoxId>,
 
-    /// The per-box egress enforcement this session's own launch placed its
-    /// host-address box under (NET-079): `per_box` when the launch placed the
-    /// box in a classifier leaf of the host's cgroup tree, `none` when it did
-    /// not — the box's own record of its launch, kept on the session record
-    /// rather than in `attrs` so no client can assert it, and daemon-owned
-    /// from its first write: the create strips the key for every mode and
-    /// only a launch ever sets this field.
-    ///
-    /// The reading surfaces show this record, not the host's current state:
-    /// a box launched unenforced stays `none` for its life even after a later
-    /// launch decides per box, because the outcome is a fact about the launch
-    /// that produced it and never about the host as it stands now. Only the
-    /// display halves lower it — a host whose table has since stopped
-    /// deciding reads as `none` for every box on it — never raise it.
-    ///
-    /// `None` for a session that is not host-address (its verdict is decided
-    /// on address leases, never on the host's cgroup tree) and for a
-    /// host-address box that has not launched yet, whose reads fall back to
-    /// the host's state. Defaults to `None` for records that predate the
-    /// field: pre-existing sessions had no launch to record, and their reads
-    /// answer over the host's state exactly as they did before it existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_ip_enforcement: Option<HostIpEnforcement>,
-
     /// Whether a launch has bound this box's host-side row (NET-138): set,
     /// and persisted, by the first host launch of a box that carries
     /// [`Self::box_addresses`]. The row lives exactly as long as that
     /// launch's switch attachment and is never registered again, so once
     /// this is set, any host other than that first launch's is rowless —
-    /// including every host after a daemon restart. Daemon-owned, like
-    /// [`Self::host_ip_enforcement`]. Defaults to `false` for records that
+    /// including every host after a daemon restart. Only the daemon writes
+    /// it. Defaults to `false` for records that
     /// predate the field and for a registered box that has not launched yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_row_bound: bool,
@@ -1407,8 +1270,8 @@ pub struct Record {
     /// box's first publish after a daemon restart: several boxes can
     /// publish one port at a shared address, one of them holds it, and the
     /// box that was serving it before the restart takes it again whichever
-    /// box the restart publishes first. Daemon-owned, like
-    /// [`Self::host_ip_enforcement`]. Empty for a box that has not launched,
+    /// box the restart publishes first. Only the daemon writes it. Empty for
+    /// a box that has not launched,
     /// one that held no port at its last launch, and a record that predates
     /// the field.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -2160,7 +2023,6 @@ mod tests {
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
-            host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
@@ -2333,85 +2195,86 @@ mod tests {
         }
     }
 
-    /// NET-074/NET-075/NET-076/NET-077: what an absent `egress` section
-    /// resolves to, by rollout phase, opt-out, and network mode — and that
-    /// the deny-all arm is not a label but the section whose compiled rules
-    /// admit nothing.
+    /// The egress `min session policy` shows is the one the engine holds
+    /// the box to: the default of the mode with no section, deny-the-rest
+    /// for a section with an allow list, allow-the-rest for one that only
+    /// denies or names protocols.
     #[test]
-    fn effective_egress_by_phase_and_opt_out() {
-        let declared = EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
-            ..EgressPolicy::default()
-        };
-
-        // A declared section is carried verbatim before the default is in
-        // force and behind the opt-out; in force, on a box of any mode, the
-        // default also decides the destination list the section left absent
-        // (`allow_dns_hosts` here), resolving it to present and empty, which
-        // `absent_destination_lists_grant_nothing_once_merged` proves in
-        // full.
-        for phase in [EgressDefaultPhase::Announced, EgressDefaultPhase::InForce] {
-            for opt_out in [false, true] {
-                for network in [NetworkMode::OwnIp, NetworkMode::HostNet, NetworkMode::NoNet] {
-                    let in_force = phase == EgressDefaultPhase::InForce && !opt_out;
-                    let expected = if in_force {
-                        EgressPolicy {
-                            allow_dns_hosts: Some(Vec::new()),
-                            ..declared.clone()
-                        }
-                    } else {
-                        declared.clone()
-                    };
-                    assert_eq!(
-                        effective_egress(Some(&declared), network, phase, opt_out),
-                        EffectiveEgress::Declared(expected),
-                        "a declared egress section under phase {phase:?}, \
-                         opt_out {opt_out}, mode {network:?}",
-                    );
-                }
-            }
-        }
-
-        // The one case the default rewrites: an own-address box with no
-        // `egress` section, once the default is in force, unless the daemon
-        // opted out (NET-077) — and still allow-all while the default is
-        // only announced (NET-076's other half).
+    fn effective_egress_reads_a_declaration_as_the_engine_does() {
+        use NetworkMode::{HostNet, NoNet, OwnIp};
+        // No section: the mode's default, and the opt-out for a box with
+        // its own address.
         assert_eq!(
-            effective_egress(None, NetworkMode::OwnIp, EgressDefaultPhase::InForce, false),
-            EffectiveEgress::DenyAll,
-            "in force without the opt-out, an own-address box with no egress \
-             section denies all (NET-074)",
+            effective_egress(None, OwnIp, false),
+            EffectiveEgress::DenyAll
         );
         assert_eq!(
-            effective_egress(None, NetworkMode::OwnIp, EgressDefaultPhase::InForce, true),
-            EffectiveEgress::AllowAll,
-            "the opt-out keeps the shipped allow-all default (NET-077)",
+            effective_egress(None, OwnIp, true),
+            EffectiveEgress::AllowAll
         );
-        assert_eq!(
-            effective_egress(
-                None,
-                NetworkMode::OwnIp,
-                EgressDefaultPhase::Announced,
-                false
-            ),
-            EffectiveEgress::AllowAll,
-            "while the default is only announced, an absent section still \
-             allows all (NET-076)",
-        );
-
-        // The default scopes to own-address boxes: a box that shares its
-        // host's namespace owns no address of its own to deny from, and a
-        // none box has no network to deny on.
-        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+        for opt_out in [false, true] {
             assert_eq!(
-                effective_egress(None, network, EgressDefaultPhase::InForce, false),
-                EffectiveEgress::AllowAll,
-                "an absent section on a {network:?} box keeps the shipped default",
+                effective_egress(None, HostNet, opt_out),
+                EffectiveEgress::AllowAll
+            );
+            assert_eq!(
+                effective_egress(None, NoNet, opt_out),
+                EffectiveEgress::AllowAll
             );
         }
 
-        // The deny-all arm is the section with an empty list on each allow
-        // dimension and nothing denied.
+        // An allow list refuses the rest in every mode, opted out or not:
+        // the list the section leaves out is empty.
+        let subnets = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            ..EgressPolicy::default()
+        };
+        for network in [OwnIp, HostNet] {
+            for opt_out in [false, true] {
+                assert_eq!(
+                    effective_egress(Some(&subnets), network, opt_out),
+                    EffectiveEgress::Declared(EgressPolicy {
+                        allow_dns_hosts: Some(Vec::new()),
+                        ..subnets.clone()
+                    }),
+                    "{network:?}, opt_out {opt_out}"
+                );
+            }
+        }
+
+        // Only deny entries, or only protocols: the rest is allowed, in
+        // every mode, and the section reads as declared.
+        let denies = EgressPolicy {
+            deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+            ..EgressPolicy::default()
+        };
+        let protocols = EgressPolicy {
+            allow_protocols: Some(vec![IpProto::Tcp]),
+            ..EgressPolicy::default()
+        };
+        for section in [&denies, &protocols] {
+            for network in [OwnIp, HostNet] {
+                let resolved = effective_egress(Some(section), network, false);
+                assert_eq!(resolved, EffectiveEgress::Declared(section.clone()));
+                assert_eq!(resolved.summary_label(), None, "{network:?}");
+            }
+        }
+
+        // A section that declares nothing leaves the default to the mode.
+        let empty = EgressPolicy::default();
+        assert_eq!(
+            effective_egress(Some(&empty), OwnIp, false),
+            EffectiveEgress::Declared(EgressPolicy {
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(Vec::new()),
+                ..empty.clone()
+            })
+        );
+        assert_eq!(
+            effective_egress(Some(&empty), HostNet, false),
+            EffectiveEgress::Declared(empty.clone())
+        );
+
         assert!(EgressPolicy::deny_all().admits_nothing());
     }
 
@@ -2464,26 +2327,6 @@ mod tests {
                 ..EgressPolicy::default()
             }
             .admits_nothing()
-        );
-        let protocols_only = EgressPolicy {
-            allow_protocols: Some(vec![IpProto::Tcp]),
-            ..EgressPolicy::default()
-        };
-        let EffectiveEgress::Declared(resolved) = effective_egress(
-            Some(&protocols_only),
-            NetworkMode::OwnIp,
-            EgressDefaultPhase::InForce,
-            false,
-        ) else {
-            panic!("a declared section stays declared");
-        };
-        assert!(
-            resolved.admits_nothing(),
-            "a protocols-only declaration grants no destination once resolved",
-        );
-        assert_eq!(
-            EffectiveEgress::Declared(resolved).summary_label(),
-            Some("deny-all")
         );
         // `deny_subnets` is not read: the deny-all shape stays deny-all
         // with a subtraction set.

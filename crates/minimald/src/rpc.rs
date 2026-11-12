@@ -193,7 +193,6 @@ async fn serve_list_sessions(
                         status: i.status,
                         git: None,
                         // No box runs under per-box host enforcement in this version.
-                        host_ip_enforcement: None,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -278,12 +277,7 @@ fn box_network_facts(
     };
     let at_fallback = box_at_fallback(host_address, loopback_address);
     let egress_posture = record.map(|record| {
-        let effective = effective_policy_reply(
-            &record.policy,
-            record.network,
-            boxes::EGRESS_DEFAULT_PHASE,
-            opt_out,
-        );
+        let effective = effective_policy_reply(&record.policy, record.network, opt_out);
         minimald_rpc::EgressPosture::of(&effective.egress, record.network)
     });
     minimald_rpc::BoxNetworkFacts {
@@ -497,7 +491,6 @@ async fn serve_create_session(
                     return Ok(Errorable::Err { error });
                 }
             }
-            req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
             // The session remembers its creator, so an attach from another
             // connection cannot run the Draft shortcut while this one is
@@ -557,8 +550,6 @@ async fn serve_create_session(
                         answerer_bound: zone_answerer_port.is_some(),
                         // No advisory and no per-box host enforcement in
                         // this version; the fields stay on the wire.
-                        classifier_advisory: None,
-                        host_ip_enforcement: None,
                     })
                 }
                 // BOX-163: a running box holds the name. The reply names the
@@ -598,16 +589,6 @@ async fn serve_create_session(
         })
         .await
 }
-
-/// The record-attr key a create strips unconditionally (NET-079): the key
-/// the state was once recorded under, so the one a client might assert to
-/// hand the reads a state of its own choosing. The per-box enforcement is a
-/// daemon-owned launch record — written only by the box's own launch, on
-/// the record's `host_ip_enforcement` field, never an attr — and displayed
-/// as that record lowered by the host's current fact, so the key is
-/// removed whatever the session's network mode, and whatever value it
-/// carries.
-const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
 /// The refusal a host's user-namespace restriction yields (NET-143): the
 /// wire crate's lead — what the client recognises the refusal by — around
@@ -1822,22 +1803,15 @@ async fn serve_get_session_policy(
 /// box can reach goes in this strict reply, so an older `min` fails visibly
 /// instead of under-reporting the box's reach — the lane is such a field,
 /// and `min session policy` reads no other reply that carries it.
-/// Descriptive state — NET-079's enforcement state among it — never rides
-/// here: it answers beside this reply, over `GetSessionRuntimeFacts`, so an
-/// older client keeps reading the rules.
-///
-/// `phase` is the rollout phase to resolve under — the handler serves
-/// [`boxes::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
-/// tests name [`boxes::EgressDefaultPhase::InForce`] so the deny-all
-/// posture they prove does not hang on that constant.
+/// Later facts about a box answer beside this reply, over
+/// `GetSessionRuntimeFacts`, so an older client keeps reading the rules.
 pub(crate) fn effective_policy_reply(
     policy: &boxes::BoxPolicy,
     network: boxes::NetworkMode,
-    phase: boxes::EgressDefaultPhase,
     opt_out: bool,
 ) -> minimald_rpc::EffectiveBoxPolicy {
     minimald_rpc::EffectiveBoxPolicy {
-        egress: boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
+        egress: boxes::effective_egress(policy.egress.as_ref(), network, opt_out),
         ingress: policy.ingress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
     }
@@ -1845,19 +1819,11 @@ pub(crate) fn effective_policy_reply(
 
 /// `GetEffectiveSessionPolicy`: the same record
 /// [`serve_get_session_policy`] serves, with the egress half resolved to what
-/// the engine enforces — the answer `min session policy` renders (NET-075).
+/// the engine holds the box to, which is what `min session policy` renders.
 ///
-/// Resolved here rather than in the client because the inputs are this
-/// daemon's own facts: the rollout phase its build ships
-/// ([`boxes::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
-/// own-address box with no `egress` section answers `deny_all` with the
-/// default in force (NET-074) and `allow_all` behind the opt-out; a declared
-/// section answers as it is enforced — the lists it declared
-/// verbatim, and under the in-force default, on a box of any network mode,
-/// a destination list it left absent present and empty, the wire meaning
-/// being "what this box is held to", never "what it wrote"; the strict
-/// declaration the record holds is never rewritten to say any of this, and
-/// `GetSessionPolicy` is the reply that echoes it.
+/// Resolved here because the daemon's opt-out is this daemon's own fact. The
+/// declaration on the record is never rewritten, and `GetSessionPolicy` is
+/// the reply that echoes it.
 async fn serve_get_effective_session_policy(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1878,21 +1844,11 @@ async fn serve_get_effective_session_policy(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(record) => {
-                    // NET-079's enforcement state no longer rides this
-                    // reply: the policy struct is `deny_unknown_fields`, so
-                    // an older `min` would reject the whole reply over the
-                    // key it has no field for. It answers over
-                    // `GetSessionRuntimeFacts` (see
-                    // [`serve_get_session_runtime_facts`]), beside the
-                    // rules rather than inside them.
-                    Ok(Errorable::Ok(effective_policy_reply(
-                        &record.policy,
-                        record.network,
-                        boxes::EGRESS_DEFAULT_PHASE,
-                        opt_out,
-                    )))
-                }
+                Some(record) => Ok(Errorable::Ok(effective_policy_reply(
+                    &record.policy,
+                    record.network,
+                    opt_out,
+                ))),
             }
         })
         .await
@@ -1953,20 +1909,12 @@ async fn serve_get_live_ingress(
         .await
 }
 
-/// `GetSessionRuntimeFacts`: NET-079's per-box enforcement state for one
-/// session — the box's own launch record, lowered by the daemon's one
-/// classifier fact over the record's own declaration and network mode — the
-/// same read the listing answers over, so `min session policy` and a listing
-/// cannot disagree, and never re-probed here. The record is the box's own
-/// launch outcome, so a box launched unenforced says `none` for its life
-/// beside the rules it runs under, never the host's later state.
+/// `GetSessionRuntimeFacts`: what `min session policy` prints beside a
+/// session's rules.
 ///
-/// Served over this reply rather than a field on the effective policy
-/// because the policy struct is `deny_unknown_fields`: an older `min` has no
-/// field for the key and would refuse the whole reply, rules included. A
-/// client that cannot ask for the facts — an older `min`, against this
-/// daemon, or a newer one against an older daemon — simply gets no row,
-/// which is the same silence the field's own absence reads as.
+/// Served over this reply rather than fields on the effective policy
+/// because the policy struct is `deny_unknown_fields`: an older `min` would
+/// refuse the whole reply, rules included, over a key it has no field for.
 async fn serve_get_session_runtime_facts(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -2024,7 +1972,6 @@ async fn serve_get_session_runtime_facts(
                     let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
                     Ok(Errorable::Ok(minimald_rpc::BoxRuntimeFacts {
                         id: record.id,
-                        host_ip_enforcement: None,
                         unaudited_listen_ports,
                         audit_log,
                         shared_port_collisions,

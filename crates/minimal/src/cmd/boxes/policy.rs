@@ -3,76 +3,16 @@
 use super::*;
 
 /// The one-line note `min session activate` prints for an own-address box
-/// that declares no egress while the deny-all default is in force
-/// (NET-074): the default the box now has, and the flags that declare its
-/// reach. `None` under [`boxes::EgressDefaultPhase::Announced`]: the
-/// announcement that phase printed (NET-076) is retired with it, and an
-/// absent section still allows all there, so there is nothing to note.
+/// that declares no egress: the default the box has, and the flags that
+/// declare its reach.
 ///
-/// The opt-out half of the scope is the caller's to check: the daemon, not
-/// the client, knows whether it set its opt-out (NET-077), so
-/// [`activate_box`] reads it off the create reply and stays silent for
-/// a box the default does not bind.
-pub fn deny_all_default_notice(phase: boxes::EgressDefaultPhase) -> Option<&'static str> {
-    match phase {
-        boxes::EgressDefaultPhase::Announced => None,
-        boxes::EgressDefaultPhase::InForce => Some(
-            "This box can reach no external address: a --network own_ip box with no egress \
-             rules gets the deny-all default. To allow outbound traffic, activate a new \
-             session with --allow-subnets or --allow-dns-hosts, for example \
-             --allow-dns-hosts github.com.",
-        ),
-    }
-}
-
-/// The classifier advisory a create reply carries (NET-079), as the line
-/// the activation prints: this host's cause in words for why it cannot
-/// decide a host-address box's egress verdict per box, the state that
-/// leaves the box in, and — when the missing privileged step is the cause —
-/// the exact command that installs it. The daemon spelled it, because the
-/// daemon is the side that read the host; the start prints it verbatim, so
-/// the terminal, the daemon's own log line for the same create, and the
-/// start all say the same thing. A reply that carries no advisory — from a
-/// host that decides per box, or from a daemon that predates the field —
-/// writes nothing: no line to print then, the way the other create-reply
-/// facts read.
-///
-/// A writer over the reply rather than a string out of it, so the render
-/// the start drives and the render a test drives are the same code — the
-/// test pins the bytes the terminal gets, not an accessor's echo of the
-/// field it read. The advisory is never a prompt: it names what a person
-/// may run, and running it — and any privilege prompt it carries — is the
-/// person's act, never the session start's, so the activation prints it
-/// and goes on without waiting for an answer.
-pub fn write_classifier_advisory(
-    out: &mut impl std::io::Write,
-    created: &minimald_rpc::CreateSessionResponse,
-) -> std::io::Result<()> {
-    if let Some(advisory) = created.classifier_advisory.as_deref() {
-        writeln!(out, "{advisory}")?;
-    }
-    Ok(())
-}
-
-/// [`write_classifier_advisory`] as the start drives it: the render over
-/// the person's own stderr, best-effort. The advisory qualifies a session
-/// the daemon has already created — it never gates one — so a note that
-/// cannot print must not fail the activation that carried it: a stderr
-/// closed by the person running the start, or a reader gone before the
-/// note landed (the broken pipe `min version | head -1` taught this CLI
-/// to expect), is the person's pipe to manage, and the write's error is
-/// logged and left, never propagated — the activation goes on to the
-/// session's work the way it already does for a reply that carries no
-/// advisory at all. Logged at `debug`, because a person whose stderr
-/// cannot take the note cannot read a louder line about it either.
-pub fn print_classifier_advisory(
-    out: &mut impl std::io::Write,
-    created: &minimald_rpc::CreateSessionResponse,
-) {
-    if let Err(error) = write_classifier_advisory(out, created) {
-        tracing::debug!(%error, "the classifier advisory did not print");
-    }
-}
+/// The caller checks the daemon's opt-out first. The daemon knows whether
+/// it is set, so [`activate_box`] reads it off the create reply and stays
+/// silent for a box the default does not bind.
+pub const DENY_ALL_DEFAULT_NOTICE: &str = "This box can reach no external address: a --network \
+     own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, \
+     activate a new session with --allow-subnets or --allow-dns-hosts, for example \
+     --allow-dns-hosts github.com.";
 
 /// The words `min session policy` and `min ls` both print for a box's
 /// egress posture (T110), so the two surfaces cannot drift. A default is
@@ -90,113 +30,35 @@ pub fn egress_posture_words(posture: minimald_rpc::EgressPosture) -> &'static st
     }
 }
 
-/// The EGRESS cell `min ls` prints for a box (T110): the posture in
-/// [`egress_posture_words`]' words, with `; per-box enforcement none`
-/// appended for a host-address box this host cannot decide per box, the
-/// fact `min session policy` prints as its `per-box enforcement` row. A
-/// posture the daemon did not report prints `-`.
+/// The EGRESS cell `min ls` prints for a box: the posture in
+/// [`egress_posture_words`]' words. A posture the daemon did not report
+/// prints `-`.
 #[must_use]
-pub fn egress_posture_cell(
-    posture: Option<minimald_rpc::EgressPosture>,
-    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
-) -> String {
-    let Some(posture) = posture else {
-        return "-".to_string();
-    };
-    let words = egress_posture_words(posture);
-    match host_ip_enforcement {
-        Some(boxes::HostIpEnforcement::None) => format!("{words}; per-box enforcement none"),
-        _ => words.to_string(),
-    }
+pub fn egress_posture_cell(posture: Option<minimald_rpc::EgressPosture>) -> String {
+    posture.map_or_else(
+        || "-".to_string(),
+        |posture| egress_posture_words(posture).to_string(),
+    )
 }
 
-/// Render a session's effective policy as its rules: the egress the gate
-/// enforces (NET-074/NET-075) — a declared section's dimensions each
-/// resolved to its list or its default (`allow-all`; `deny subnets` reads
-/// `(none)` when nothing is denied), the declared deny-all section by name
-/// (`deny-all` — every list empty would otherwise read as blankness, which
-/// is nothing, never a verdict), or, for a box that declared no egress
-/// at all, the default its daemon resolved to (`deny-all` once the deny-all
-/// default is in force; `allow-all` behind the opt-out or before it),
-/// marked as a default and not as a declaration on the row itself —
-/// `deny-all (default)`, `allow-all (default)` — so a box the rollout
-/// silenced and a box that declared the same verdict never read the same;
-/// the declared deny-all row carries no mark, because the box chose it.
-/// Both spell with the requirement's own hyphenated tokens. The egress
-/// rows carry NET-079's per-box enforcement when the daemon
-/// reported one: a host-address box's verdict is decided on the host's
-/// cgroup tree, so the egress block that says what the box may reach also
-/// says whether this host can decide that per box — `none` beside a
-/// declaration that then describes the box's posture, not its fact: the
-/// state the box actually runs in. An own-address box, a none box, and a
-/// reply that carries no state say nothing there — the row a render prints
-/// from silence would be the decided-looking one a daemon that predates
-/// the fact never sent — the
-/// node-plane baseline set the helper enumerates beside it (NET-130: the
-/// categories the in-VM daemon's own registry and cache fetches are to
-/// reach, one row a category's subnets, headed by the posture the
-/// host-side gate decides those fetches under — announced, the shipped
-/// posture, the run path's allow-all interim node row still decides them
-/// and the set binds nothing yet; in force, the set decides them whatever
-/// the box's own declaration resolves to, so it is what a deny-all box
-/// reads beside), and the ingress mappings spelled out.
-/// `network` is the session's network mode. `host_ip_enforcement` is the
-/// per-box egress state the daemon's runtime-facts reply carried (NET-079):
-/// the box's own launch record lowered by the host's current fact, spelled
-/// in the machine's own words (`per_box`/`none`, the same spellings the
-/// record, the listing, and the daemon's log line carry), never an invented
-/// prose of its own. `None` — a session that is not host-address, or a
-/// daemon that predates the reply — prints no row at all. `fabric` is the
-/// switch plan the
-/// session's own-address surface leaves its frames on — the plan the
-/// host-side helper builds this enumeration from, named where the CLI knows
-/// it: the microVM backend's run path builds its registry and this set from
-/// the default plan, so the command passes that. A backend with no helper
-/// beside its switch — the native daemon's own per-daemon switch, whose
-/// plan the reply does not carry and which has no host-side gate the set
-/// would describe — passes `None`, and the block is omitted there rather
-/// than printed from a plan the session does not attach to. The modes
-/// without a surface to describe are held to the TUI's detail pane: a none
-/// box has no network at all, so it prints the pane's one-line note in
-/// place of both blocks (`allow-all` egress would claim a reach a box with
-/// no network does not have), and a host-address session shares its host's
-/// namespace, so it has no per-session ingress policy — the block is
-/// omitted entirely, and with it the baseline set, which is a
-/// switch-fabric surface and has nothing to describe there either.
-/// Shared by `min session policy`'s printer and the integration
-/// tests that pin the rendering (NET-061, NET-075).
+/// Renders a session's effective policy as its rules.
+///
+/// The egress block prints a declared section's dimensions, each as its
+/// list or its default (`allow-all`, and `(none)` for `deny subnets` when
+/// nothing is denied). A section that admits nothing prints `deny-all`. A
+/// box that declared no egress prints the default its daemon resolved,
+/// marked as one: `deny-all (default)` or `allow-all (default)`. The
+/// ingress block prints the mappings and the dynamic stance.
+///
+/// A box with no network prints one line in place of both blocks. A box
+/// that shares its host's address has no ingress policy, so its ingress
+/// block is left out. Shared by `min session policy` and the tests that
+/// pin the rendering.
 pub fn format_policy(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
-    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
-    fabric: Option<switch::SwitchSubnet>,
-) -> Result<(), anyhow::Error> {
-    format_policy_on_host(
-        out,
-        effective,
-        network,
-        host_ip_enforcement,
-        shared_port_collisions,
-        fabric,
-        false,
-    )
-}
-
-/// [`format_policy`], told whether the box runs on a native host.
-/// `native_host` is the caller's fact about the daemon it talks to (the
-/// host kind), never derived from `fabric`: `fabric` names a switch plan
-/// and says nothing about the host. On a native host a host-address box
-/// prints a row that says the host exposures do not apply to it (NET-160).
-pub fn format_policy_on_host(
-    out: &mut impl std::io::Write,
-    effective: &boxes::EffectiveBoxPolicy,
-    network: boxes::NetworkMode,
-    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
-    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
-    _fabric: Option<switch::SwitchSubnet>,
-    native_host: bool,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — nothing the blocks print would describe anything
@@ -238,34 +100,6 @@ pub fn format_policy_on_host(
             )?,
         }
         write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
-    }
-    // NET-079's per-box enforcement, as the egress block's closing row: a
-    // host-address box's verdict is decided on the host's cgroup tree, so
-    // this is the row that says whether the rules above are decided per box
-    // at all — and a `deny-all` printed beside an enforcement of `none` is
-    // the honest rendering, the posture the box declared beside the state it
-    // actually runs in, rather than a verdict that looks decided and is not.
-    // The value is the runtime-facts reply's, in the machine spelling: the
-    // row a person reads here names the same fact the record's
-    // `host_ip_enforcement` field and the daemon's log line carry, so the
-    // three surfaces agree by construction. Printed only when the daemon
-    // reported a state — `None`, for a session that is not host-address, or
-    // from a daemon too old to answer the facts reply, prints nothing
-    // rather than a row silence never carried.
-    if let Some(enforcement) = host_ip_enforcement {
-        writeln!(out, "  per-box enforcement  {}", enforcement.machine_str())?;
-    }
-    // NET-160: a host-address box on a native host runs in the host's own
-    // network namespace, so no gate applies the host exposures table to it
-    // (design §7.1 Lanes, NET-079). The row says so in place of a list of
-    // exposures. `native_host` is the caller's host kind. On a VM-backed
-    // host the box sits behind the host-side gate, and the row is not
-    // printed.
-    if network == boxes::NetworkMode::HostNet && native_host {
-        writeln!(
-            out,
-            "  host exposures  not applied: this box shares the host's network"
-        )?;
     }
     // Ingress is an own-address surface: the switch's static forwarder is the
     // only per-session ingress minimald applies, and a host-address box
@@ -662,19 +496,10 @@ pub fn write_policy_json(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
-    fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
 ) -> Result<(), anyhow::Error> {
-    write_policy_json_noting(
-        out,
-        effective,
-        network,
-        fabric,
-        live,
-        shared_port_collisions,
-        &[],
-    )
+    write_policy_json_noting(out, effective, network, live, shared_port_collisions, &[])
 }
 
 /// [`write_policy_json`], with the permitted listening ports the daemon left
@@ -686,7 +511,6 @@ pub fn write_policy_json_noting(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
-    _fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     unaudited_listen_ports: &[u16],
@@ -959,18 +783,11 @@ pub(crate) async fn box_policy_as_json(
             Ok(inputs) => inputs,
             Err(failure) => return Err(failure.machine_failure().into()),
         };
-    // The fabric the baseline set builds from — keyed the same way the text
-    // rendering keys it (see the comment in [`cmd_session_policy`]): the
-    // backend this command actually talks to, with no fabric named for the
-    // native daemon's per-daemon switch.
-    let host_kind = daemon_host_kind(global);
-    let fabric = (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
     write_policy_json_noting(
         &mut out,
         &policy,
         record.network,
-        fabric,
         live,
         &shared_port_collisions,
         &unaudited_listen_ports,
@@ -1025,7 +842,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  dynamic ingress  allow"),
@@ -1053,7 +870,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :80"),
@@ -1077,7 +894,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
         assert!(rendered.contains("  allow-all\n"), "{rendered}");
@@ -1095,10 +912,7 @@ mod tests {
     /// row carries none and the default's carries it — asserted here as
     /// the difference between the two renders, in the text and in the JSON
     /// document, whose `source` field carries the same distinction for a
-    /// machine. On a host-address box the row sits beside the per-box
-    /// enforcement value (T73): declared deny-all beside `per_box` is the
-    /// enforced posture, and beside `none` the box's posture beside the
-    /// state it runs in.
+    /// machine.
     #[test]
     fn policy_shows_declared_deny_all() {
         let declared = EffectiveBoxPolicy {
@@ -1109,7 +923,7 @@ mod tests {
 
         // Own-address: the name, and no dimension rows — never blankness.
         let mut out = Vec::new();
-        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &declared, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny-all\n"),
@@ -1138,7 +952,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, &[]).unwrap();
         let default_rendered = String::from_utf8(out).unwrap();
         assert!(
             default_rendered.contains("egress\n  deny-all (default)\n"),
@@ -1160,15 +974,7 @@ mod tests {
         // the box declared nothing to carry.
         let egress_of = |policy: &EffectiveBoxPolicy| {
             let mut out = Vec::new();
-            write_policy_json(
-                &mut out,
-                policy,
-                NetworkMode::OwnIp,
-                None,
-                Ok(Vec::new()),
-                &[],
-            )
-            .unwrap();
+            write_policy_json(&mut out, policy, NetworkMode::OwnIp, Ok(Vec::new()), &[]).unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()["egress"]
                 .clone()
         };
@@ -1206,23 +1012,6 @@ mod tests {
              the document"
         );
 
-        // Host-address: the same name beside the per-box enforcement value.
-        let mut out = Vec::new();
-        format_policy(
-            &mut out,
-            &declared,
-            NetworkMode::HostNet,
-            Some(boxes::HostIpEnforcement::PerBox),
-            &[],
-            None,
-        )
-        .unwrap();
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(
-            rendered.contains("egress\n  deny-all\n  per-box enforcement  per_box\n"),
-            "the deny-all row sits beside the per-box enforcement value: {rendered}"
-        );
-
         // A section that allows something is not deny-all and keeps its
         // rows: one allowed subnet makes the verdict "10.0.0.0/8 and
         // nothing else", not deny-all, so it must not collapse to the name.
@@ -1237,7 +1026,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  subnets  10.0.0.0/8"),
@@ -1276,7 +1065,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &names_only, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &names_only, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  subnets  (none)\n")
@@ -1300,7 +1089,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny-all (default)\n"),
@@ -1319,133 +1108,11 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  allow-all (default)\n"),
             "an opted-out bare box must show allow-all: {rendered}"
-        );
-    }
-
-    /// NET-079's per-box enforcement row in the policy render: printed as
-    /// the egress block's closing row when the daemon reported a state over
-    /// the runtime-facts reply, in the machine spelling the record and the
-    /// daemon's log line carry — and printed from silence never, because a
-    /// row made of nothing would be the decided-looking one a daemon that
-    /// predates the reply never sent. The requirement's own case is the
-    /// first: a deny-all declaration beside an enforcement of `none` is the
-    /// state the box actually runs in, not a verdict that looks decided and
-    /// is not.
-    #[test]
-    fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
-        let unenforced = EffectiveBoxPolicy {
-            egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
-            ingress: None,
-            credentialed_upstream: None,
-        };
-        let mut out = Vec::new();
-        format_policy(
-            &mut out,
-            &unenforced,
-            NetworkMode::HostNet,
-            Some(boxes::HostIpEnforcement::None),
-            &[],
-            None,
-        )
-        .unwrap();
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(
-            rendered.contains("egress\n  deny-all\n  per-box enforcement  none\n"),
-            "a deny-all declaration beside an enforcement of none is the \
-             state the box runs in, got: {rendered}"
-        );
-
-        // The decided host's own spelling rides the same row.
-        let enforced = EffectiveBoxPolicy {
-            egress: EffectiveEgress::AllowAll,
-            ingress: None,
-            credentialed_upstream: None,
-        };
-        let mut out = Vec::new();
-        format_policy(
-            &mut out,
-            &enforced,
-            NetworkMode::HostNet,
-            Some(boxes::HostIpEnforcement::PerBox),
-            &[],
-            None,
-        )
-        .unwrap();
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(
-            rendered.contains("  per-box enforcement  per_box\n"),
-            "a host that decides per box says so in the machine spelling, \
-             got: {rendered}"
-        );
-
-        // No state reported, no row — the same silence an own-address box
-        // reads (its own render never carries the state at all), and the one
-        // a daemon too old to answer the facts reply leaves the caller with.
-        let silent = EffectiveBoxPolicy {
-            egress: EffectiveEgress::DenyAll,
-            ingress: None,
-            credentialed_upstream: None,
-        };
-        let mut out = Vec::new();
-        format_policy(&mut out, &silent, NetworkMode::HostNet, None, &[], None).unwrap();
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(
-            !rendered.contains("per-box enforcement"),
-            "no state reported means no row, got: {rendered}"
-        );
-    }
-
-    /// NET-160: a host-address box on a native host shares the host's
-    /// network namespace, so the host exposures table is not applied to
-    /// it, and the view says so. A host that is not native, with or
-    /// without a fabric named, and an own-address box print no such row.
-    #[test]
-    fn native_host_ip_network_view_says_host_exposures_do_not_apply() {
-        const ROW: &str = "  host exposures  not applied: this box shares the host's network\n";
-        let policy = EffectiveBoxPolicy {
-            egress: EffectiveEgress::AllowAll,
-            ingress: None,
-            credentialed_upstream: None,
-        };
-        let render = |network, fabric, native_host| {
-            let mut out = Vec::new();
-            format_policy_on_host(&mut out, &policy, network, None, &[], fabric, native_host)
-                .unwrap();
-            String::from_utf8(out).unwrap()
-        };
-
-        let native = render(NetworkMode::HostNet, None, true);
-        assert!(
-            native.contains(ROW),
-            "a native host-address box must say exposures do not apply, got: {native}"
-        );
-
-        let vm = render(
-            NetworkMode::HostNet,
-            Some(switch::SwitchSubnet::default()),
-            false,
-        );
-        assert!(
-            !vm.contains("host exposures"),
-            "a VM-backed host-address box prints no such row, got: {vm}"
-        );
-
-        // No fabric named does not make the host native.
-        let unnamed = render(NetworkMode::HostNet, None, false);
-        assert!(
-            !unnamed.contains("host exposures"),
-            "a box not on a native host prints no such row, got: {unnamed}"
-        );
-
-        let own = render(NetworkMode::OwnIp, None, true);
-        assert!(
-            !own.contains("host exposures"),
-            "an own-address box prints no such row, got: {own}"
         );
     }
 
@@ -1466,7 +1133,7 @@ mod tests {
         };
         let json_of = |policy: &EffectiveBoxPolicy, network| {
             let mut out = Vec::new();
-            write_policy_json(&mut out, policy, network, None, Ok(Vec::new()), &[]).unwrap();
+            write_policy_json(&mut out, policy, network, Ok(Vec::new()), &[]).unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
         };
         for network in [NetworkMode::OwnIp, NetworkMode::HostNet, NetworkMode::NoNet] {
@@ -1480,196 +1147,10 @@ mod tests {
             assert!(json.get("credentialed_upstream").is_none(), "{json}");
 
             let mut out = Vec::new();
-            format_policy(&mut out, &declared, network, None, &[], None).unwrap();
+            format_policy(&mut out, &declared, network, &[]).unwrap();
             let rendered = String::from_utf8(out).unwrap();
             assert!(!rendered.contains("credentialed"), "{rendered}");
         }
-    }
-
-    /// The create reply the activation reads, with only the fields this
-    /// test's lines depend on set: an id and a version to satisfy the skew
-    /// gate, the classifier advisory, and the enforcement the same create
-    /// recorded.
-    fn create_reply(
-        advisory: Option<&str>,
-        host_ip_enforcement: Option<&str>,
-    ) -> minimald_rpc::CreateSessionResponse {
-        minimald_rpc::CreateSessionResponse {
-            id: boxes::SessionId::nil(),
-            daemon_version: Some("0.7.0".to_string()),
-            hostname_routing_unavailable: None,
-            hostname_proxy_port: None,
-            zone_answerer_port: None,
-            answerer_bound: false,
-            interim_loopback: false,
-            deny_all_opt_out: None,
-            classifier_advisory: advisory.map(str::to_string),
-            host_ip_enforcement: host_ip_enforcement.map(str::to_string),
-        }
-    }
-
-    /// NET-079: the advisory a create reply carries is the line the
-    /// activation prints, verbatim — with the exact command that installs
-    /// the classifier's privileged step when the step is the cause, spelled
-    /// by the daemon so the command the terminal shows is the one that ends
-    /// it — and it is never a prompt: no question in the line, nothing for
-    /// the start to wait on. A cause no command ends still names the cause
-    /// and never an install. A host that decides per box, or a daemon that
-    /// predates the field, prints nothing at all.
-    ///
-    /// The render itself is driven here, with a buffer, the way
-    /// [`format_policy`]'s tests drive that render — the same writer the
-    /// start drives, so what this pins is the bytes the terminal gets, not
-    /// an accessor's echo of the field it read: the advisory the daemon
-    /// spelled, the newline that ends it, the command as the last line
-    /// with nothing after it.
-    #[test]
-    fn activate_prints_classifier_advisory() {
-        // The reply a step-missing host sends: the daemon's own spelling,
-        // with the command on the last line so the thing a person copies
-        // is the command, verbatim.
-        let step_missing = create_reply(
-            Some(
-                "note: you asked this box for no network access, but this machine \
-                 can't enforce it yet, so the box can still reach the network.\n  \
-                 Enforce it: min finalize-install   (or start the box with --network \
-                 own_ip, which enforces it now)",
-            ),
-            Some("none"),
-        );
-        let mut out = Vec::new();
-        write_classifier_advisory(&mut out, &step_missing).unwrap();
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(
-            rendered.starts_with(
-                "note: you asked this box for no network access, but this machine \
-                 can't enforce it yet, so the box can still reach the network.\n"
-            ),
-            "the start prints the daemon's spelling verbatim, so the log, the \
-             reply, and the terminal cannot disagree, got: {rendered}"
-        );
-        assert!(
-            rendered.ends_with(
-                "  Enforce it: min finalize-install   (or start the box with --network \
-                 own_ip, which enforces it now)\n"
-            ),
-            "the missing privileged step is the cause, so the render carries \
-             the remedy that installs it, on the last line with nothing after \
-             it: {rendered}"
-        );
-        assert!(
-            !rendered.contains('?'),
-            "the advisory names what a person may run; it never asks: {rendered}"
-        );
-
-        // A host that cannot confine: the cause is still named, and no
-        // install can end it, so the line hands out the own-address start
-        // alone and says why.
-        let cannot_confine = create_reply(
-            Some(
-                "note: you asked this box for no network access, but this machine \
-                 can't enforce it yet, so the box can still reach the network.\n  \
-                 Enforce it: start the box with --network own_ip, which enforces it \
-                 now   (min finalize-install can't fix this: no cgroup2 mount with \
-                 nsdelegate covers the classifier tree, so a box could migrate out \
-                 of its leaf)",
-            ),
-            Some("none"),
-        );
-        let mut out = Vec::new();
-        write_classifier_advisory(&mut out, &cannot_confine).unwrap();
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(
-            rendered.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
-            "the advisory must name this cause in words too: {rendered}"
-        );
-        assert!(
-            rendered.ends_with("out of its leaf)\n"),
-            "the render ends where the daemon's text ends, with the newline \
-             that closes the last line: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Enforce it: min finalize-install"),
-            "no install ends this cause, so the advisory must not hand it out: {rendered}"
-        );
-        assert!(
-            !rendered.contains('?'),
-            "the advisory names what a person may run; it never asks: {rendered}"
-        );
-
-        // A host that decides per box, or a daemon that predates the field:
-        // nothing to print, the way the other create-reply facts read — the
-        // render writes not one byte.
-        let decided = create_reply(None, Some("per_box"));
-        let mut out = Vec::new();
-        write_classifier_advisory(&mut out, &decided).unwrap();
-        assert!(
-            out.is_empty(),
-            "a decided host's create carries no advisory, so its start prints \
-             none, got: {:?}",
-            String::from_utf8_lossy(&out)
-        );
-        let pre_field = create_reply(None, None);
-        let mut out = Vec::new();
-        write_classifier_advisory(&mut out, &pre_field).unwrap();
-        assert!(
-            out.is_empty(),
-            "a daemon that predates the field carries no advisory, so its \
-             start prints none, got: {:?}",
-            String::from_utf8_lossy(&out)
-        );
-    }
-
-    /// A writer whose reader has gone away, as a piped stderr whose tool
-    /// exited — or a closed one (`2>&-`) — leaves the start's stderr: the
-    /// broken pipe `min version | head -1` taught this CLI to expect.
-    struct ClosedPipe;
-
-    impl std::io::Write for ClosedPipe {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// NET-079: the advisory's print is best-effort, never load-bearing.
-    /// The note qualifies a session the daemon has already created — it
-    /// never gates one — so a start whose stderr cannot take it goes on
-    /// to the session's work instead of failing over a line it could not
-    /// say. The `?` this replaced made the note's own write failure the
-    /// activation's error, after the create it follows had already made
-    /// the session.
-    #[test]
-    fn classifier_advisory_print_is_best_effort() {
-        let step_missing = create_reply(
-            Some(
-                "note: you asked this box for no network access, but this machine \
-                 can't enforce it yet, so the box can still reach the network.\n  \
-                 Enforce it: min finalize-install   (or start the box with --network \
-                 own_ip, which enforces it now)",
-            ),
-            Some("none"),
-        );
-
-        // A writer that takes the note gets the render's own bytes — the
-        // delegation is the whole print, so the start's line is the one the
-        // tests above pinned.
-        let mut printed = Vec::new();
-        print_classifier_advisory(&mut printed, &step_missing);
-        let mut rendered = Vec::new();
-        write_classifier_advisory(&mut rendered, &step_missing).unwrap();
-        assert_eq!(
-            printed, rendered,
-            "the print must carry exactly the bytes the render writes"
-        );
-
-        // A writer whose reader is gone is logged and left: the print
-        // returns — no panic, no error for the start to fail on — the same
-        // way a reply that carries no advisory prints nothing and goes on.
-        print_classifier_advisory(&mut ClosedPipe, &step_missing);
     }
 
     /// NET-044: the ports a box published at runtime are listed beside the
@@ -1698,7 +1179,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, &[]).unwrap();
         write_live_ingress(&mut out, &live).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let (declared, live_rows) = rendered
@@ -1789,7 +1270,6 @@ mod tests {
                 &mut out,
                 &policy,
                 NetworkMode::OwnIp,
-                None,
                 Ok(Vec::new()),
                 &[],
                 ports,
@@ -1840,15 +1320,7 @@ mod tests {
         }];
 
         let mut out = Vec::new();
-        format_policy(
-            &mut out,
-            &policy,
-            NetworkMode::OwnIp,
-            None,
-            &collisions,
-            None,
-        )
-        .unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, &collisions).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :8080 (held by first.min.internal)\n"),
@@ -1867,7 +1339,6 @@ mod tests {
             &mut out,
             &policy,
             NetworkMode::OwnIp,
-            None,
             Ok(Vec::new()),
             &collisions,
         )
@@ -1880,15 +1351,7 @@ mod tests {
             "the document names the yielded port and its holder: {document}"
         );
         let mut out = Vec::new();
-        write_policy_json(
-            &mut out,
-            &policy,
-            NetworkMode::OwnIp,
-            None,
-            Ok(Vec::new()),
-            &[],
-        )
-        .unwrap();
+        write_policy_json(&mut out, &policy, NetworkMode::OwnIp, Ok(Vec::new()), &[]).unwrap();
         let document = String::from_utf8(out).unwrap();
         assert!(
             !document.contains("shared_port_collisions"),
@@ -1897,7 +1360,7 @@ mod tests {
 
         // No collisions, no marks: the same declaration renders as before.
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, &[]).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :8080\n"),

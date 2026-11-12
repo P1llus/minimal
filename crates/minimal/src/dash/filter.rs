@@ -39,7 +39,6 @@ mod tests {
             project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
             status: boxes::BoxState::Active,
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }

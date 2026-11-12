@@ -150,7 +150,6 @@ fn build_record(
         // Daemon-owned from its first line: a create holds no launch's
         // outcome to record, and the key a client might assert in `attrs`
         // is stripped above, so only a launch ever writes this field.
-        host_ip_enforcement: None,
         // The id the host's row of the box holds, beside its addresses.
         box_id: config.box_id,
         // Daemon-owned as well: only a launch binds the box's host-side row.

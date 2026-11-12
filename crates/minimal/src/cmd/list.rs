@@ -342,7 +342,6 @@ fn stopped_vm_listing(vm: &client::VmSocket) -> Option<VmListing> {
             status: boxes::BoxState::Stopped,
             git: None,
             attrs: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
         })
         .collect();
@@ -1420,10 +1419,7 @@ fn session_cells(
         .and_then(|facts| facts.loopback_address)
         .map_or_else(|| "-".to_string(), |address| address.to_string());
     let status = status_label(entry.status).to_string();
-    let egress = egress_posture_cell(
-        facts.and_then(|facts| facts.egress_posture),
-        entry.host_ip_enforcement,
-    );
+    let egress = egress_posture_cell(facts.and_then(|facts| facts.egress_posture));
     let project_path = entry
         .project_path
         .as_ref()

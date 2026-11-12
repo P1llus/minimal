@@ -970,24 +970,9 @@ async fn one_server_serves_multiple_back_to_back_clients() {
     }
 }
 
-/// NET-079's per-box enforcement is a daemon-owned launch record, never
-/// a client attr, displayed as the record lowered by the current fact.
-/// A box no launch has recorded yet shows the daemon's one classifier
-/// fact: a listing shows the same state the create response said for a
-/// host-address box (this test's default create is one, never
-/// launched), and the fact a test that set its own wrote. The guard is taken
-/// before the server is built and held across the awaited creates on
-/// purpose: the fact is process-global, so under libtest — where the
-/// tests of one binary share a process — a listing driven by another
-/// test would answer over a fact that test set.
-#[expect(
-    clippy::await_holding_lock,
-    reason = "the fact is process-global, so the guard must span the awaited \
-              reads it is held for"
-)]
+/// A created session is read back by its id and shows in the listing.
 #[tokio::test]
 async fn create_session_shows_in_get_and_list() {
-    let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     let server = TestServer::new().await;
     let mut client = server.connect().await;
 
@@ -1010,20 +995,6 @@ async fn create_session_shows_in_get_and_list() {
         get_session.record.as_ref().unwrap().project_path,
         HostAbsPath::try_new("/uwu").unwrap()
     );
-    assert!(
-        !get_session
-            .record
-            .as_ref()
-            .unwrap()
-            .attrs
-            .contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-        "the per-box enforcement is a daemon-owned launch record, never \
-         an attr: the record's own field carries it, written only by a \
-         launch, and displayed as that record lowered by the host's \
-         current fact, got: {:?}",
-        get_session.record.as_ref().unwrap().attrs
-    );
-
     let list_sessions = client.call::<ListSessions>(&()).await;
     assert!(list_sessions.resource_pool.is_some());
     assert_eq!(
@@ -1037,7 +1008,6 @@ async fn create_session_shows_in_get_and_list() {
             status: boxes::BoxState::Pending,
             // /uwu is not a git repository, so the probe yields nothing.
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }]
@@ -1638,11 +1608,8 @@ async fn own_ip_session(client: &mut TestClient, name: &str, policy: BoxPolicy) 
     own_ip_create_reply(client, name, policy).await.id
 }
 
-/// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
-/// SSH wire, what the engine enforces. The wire half asserts the reply the
-/// shipped phase resolves — in force, so `deny_all` — and the in-force
-/// posture is also proven by passing the phase explicitly to the same
-/// resolver the handler serves. In force, an own-address box with no
+/// `GetEffectiveSessionPolicy` answers, over the real SSH wire, what the
+/// engine enforces. An own-address box with no
 /// `egress` section answers `deny_all` — reported as the posture, not as
 /// a materialized section — and that reply survives the wire codec it
 /// travels as, while the strict `GetSessionPolicy` reply still carries
@@ -1678,24 +1645,6 @@ async fn effective_policy_response_round_trips() {
     };
     let laned_id = own_ip_session(&mut client, "laned-egress", laned_policy.clone()).await;
 
-    // The default's own case, with the phase passed explicitly
-    // (NET-074): an own-address box that declared nothing is deny-all
-    // once the default is in force.
-    assert_eq!(
-        super::effective_policy_reply(
-            &BoxPolicy::default(),
-            NetworkMode::OwnIp,
-            boxes::EgressDefaultPhase::InForce,
-            false,
-        ),
-        EffectiveBoxPolicy {
-            egress: EffectiveEgress::DenyAll,
-            ingress: None,
-            credentialed_upstream: None,
-        },
-        "an own-address box with no egress section must answer deny-all in force",
-    );
-
     // The response carries that posture across the wire codec it
     // travels as — the strict shape untouched beside it: the effective
     // reply spells the default, `deny_all`, and decodes back to the
@@ -1722,23 +1671,11 @@ async fn effective_policy_response_round_trips() {
         minimald_rpc::Errorable::Ok(deny_all),
     );
 
-    // Over the real wire, the reply follows the phase this build ships:
-    // whatever [`boxes::EGRESS_DEFAULT_PHASE`] resolves for a bare
-    // own-address box is what the daemon answers.
+    // Over the wire, a bare box with its own address answers deny-all.
     let bare = client
         .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
         .await
         .unwrap();
-    assert_eq!(
-        bare,
-        super::effective_policy_reply(
-            &BoxPolicy::default(),
-            NetworkMode::OwnIp,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        ),
-        "the wire must answer the shipped phase's resolution for a bare box",
-    );
     assert_eq!(
         bare.egress,
         EffectiveEgress::DenyAll,
@@ -1811,12 +1748,10 @@ async fn effective_policy_response_round_trips() {
     );
 }
 
-/// NET-077: a daemon started with the deny-all opt-out keeps the earlier
-/// allow-all default — an own-address box with no `egress` section
-/// answers `allow_all` where the same box on an opted-in daemon answers
-/// `deny_all` with the default in force — and
-/// its gate resolves no section, so nothing is enforced. A box that
-/// declared its own egress keeps it either way.
+/// A daemon started with the deny-all opt-out keeps the earlier allow-all
+/// default: an own-address box with no `egress` section answers
+/// `allow_all` where the same box on another daemon answers `deny_all`. A
+/// box that declared its own egress is read the same way on both.
 #[tokio::test]
 async fn deny_all_opt_out_keeps_prior_default() {
     let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
@@ -1848,28 +1783,31 @@ async fn deny_all_opt_out_keeps_prior_default() {
         "behind the opt-out, an absent egress section keeps the earlier allow-all",
     );
 
-    // The report and the gate agree, even in force: the same resolution
-    // the launcher applies materializes no section to enforce. The phase
-    // is passed explicitly so the opt-out stays proven against the
-    // posture it exists to defer whatever the shipped constant says.
+    // The builds of the box read the same resolution.
     assert_eq!(
         crate::box_actor::effective_egress_section(
             &boxes::BoxPolicy::default(),
             NetworkMode::OwnIp,
-            boxes::EgressDefaultPhase::InForce,
             true,
         ),
         None,
-        "behind the opt-out, the gate compiles no egress section at all",
+        "behind the opt-out, a bare box has no egress section",
     );
 
-    // The opt-out never rewrites a declaration: what the box said is
-    // what it gets, whichever daemon it runs on.
+    // The opt-out is for a box that declares nothing. A box that lists
+    // what it allows reaches only that on any daemon, so the list it left
+    // out reads as empty.
     let declared = client
         .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
         .await
         .unwrap();
-    assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+    assert_eq!(
+        declared.egress,
+        EffectiveEgress::Declared(boxes::EgressPolicy {
+            allow_dns_hosts: Some(Vec::new()),
+            ..egress
+        })
+    );
 }
 
 /// NET-076/NET-077: the create reply carries the daemon's opt-out —

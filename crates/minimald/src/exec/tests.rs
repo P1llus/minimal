@@ -261,7 +261,6 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         hooks_enabled: true,
         // No launch ever minted these records, so none has recorded its
         // outcome on one.
-        host_ip_enforcement: None,
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
@@ -328,22 +327,10 @@ async fn a_task_takes_the_network_of_its_session() {
             .with_transport(crate::net::SwitchTransport::VmHost),
     ));
 
-    let host = super::task_network(
-        &record_with(boxes::NetworkMode::HostNet),
-        &switch,
-        boxes::EGRESS_DEFAULT_PHASE,
-        false,
-        None,
-    );
+    let host = super::task_network(&record_with(boxes::NetworkMode::HostNet), &switch, None);
     assert!(!host.plan().await.unwrap().isolates_netns());
 
-    let no_net = super::task_network(
-        &record_with(boxes::NetworkMode::NoNet),
-        &switch,
-        boxes::EGRESS_DEFAULT_PHASE,
-        false,
-        None,
-    );
+    let no_net = super::task_network(&record_with(boxes::NetworkMode::NoNet), &switch, None);
     let plan = no_net.plan().await.unwrap();
     assert!(plan.isolates_netns() && !plan.wired());
 
@@ -353,41 +340,24 @@ async fn a_task_takes_the_network_of_its_session() {
     // A VM host's switch draws nothing (NET-138): the task attaches at a
     // task address its box's registration filed.
     record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
-    let own_ip = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
+    let own_ip = super::task_network(&record, &switch, None);
     let plan = own_ip.plan().await.unwrap();
     assert!(
         plan.isolates_netns(),
         "an own-IP task gets its own namespace"
     );
     assert!(matches!(plan.resolver(), sandbox::Resolver::Nameservers(_)));
-    // Its own identity on the switch, and the session's *effective*
-    // egress (NET-074), resolved under the phase this build ships, but
-    // none of its ingress, because the session's PTask is attached at the
-    // same time. The task carries a policy only where that egress has
-    // rules, so the answer follows the shipped phase rather than a literal
-    // a cutover would invalidate.
-    let gated = crate::box_actor::effective_egress_section(
-        &record.policy,
-        record.network,
-        boxes::EGRESS_DEFAULT_PHASE,
-        false,
-    )
-    .is_some();
+    // Its own identity on the switch, and none of the session's ingress,
+    // because the session's PTask is attached at the same time.
     let described = format!("{own_ip:?}");
     assert!(
-        described.contains("\"web-task\"") && described.contains(&format!("has_policy: {gated}")),
+        described.contains("\"web-task\"") && described.contains("has_policy: false"),
         "got {described}"
     );
     own_ip.abandon().await;
 
     // No name: the session id, rather than an empty hostname.
-    let unnamed = super::task_network(
-        &record_with(boxes::NetworkMode::OwnIp),
-        &switch,
-        boxes::EGRESS_DEFAULT_PHASE,
-        false,
-        None,
-    );
+    let unnamed = super::task_network(&record_with(boxes::NetworkMode::OwnIp), &switch, None);
     assert!(format!("{unnamed:?}").contains(&boxes::SessionId::nil().to_string()));
 }
 
@@ -415,9 +385,9 @@ async fn in_box_run_task_draws_a_task_slot() {
         std::net::Ipv4Addr::new(100, 64, 128, 2),
         std::net::Ipv4Addr::new(100, 64, 128, 3),
     ];
-    let first = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
+    let first = super::task_network(&record, &switch, None);
     first.plan().await.expect("a free task address");
-    let second = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
+    let second = super::task_network(&record, &switch, None);
     second.plan().await.expect("a second free task address");
     let held: Vec<_> = switch
         .lock()
@@ -431,7 +401,7 @@ async fn in_box_run_task_draws_a_task_slot() {
         "each run holds one task address"
     );
 
-    let third = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
+    let third = super::task_network(&record, &switch, None);
     let err = third.plan().await.expect_err("every task address is held");
     assert!(
         err.to_string()
@@ -453,7 +423,7 @@ async fn in_box_run_task_draws_a_task_slot() {
 async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
     let switch = vm_host_switch();
     let record = record_with(boxes::NetworkMode::OwnIp);
-    let task = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false, None);
+    let task = super::task_network(&record, &switch, None);
     let err = task.plan().await.expect_err("nothing is drawn");
     assert!(
         err.to_string()
@@ -461,133 +431,6 @@ async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
         "{err}"
     );
     assert!(switch.lock().await.leases().is_empty());
-}
-
-/// NET-074/NET-076/NET-077 for the task path: a task runs under the same
-/// egress default its session does, and nothing else changes with it. The
-/// task carries a policy only where the effective egress has rules. Under
-/// InForce, the shipped phase, a bare own-address task with no opt-out
-/// carries the deny-all section. The retired announced arm, pinned here by
-/// name, attaches the same task with no policy.
-///
-/// The phase decides only the *default* for a box that declared nothing.
-/// A box that declared an `egress` section is enforced on its session's
-/// own PTask in every phase, so a task in such a session carries that
-/// declaration under either phase.
-///
-/// The phase is passed by name, not read from the shipped constant, so
-/// both arms stay proven whichever one ships. `own_ip_default_deny_all`
-/// proves what the deny-all section itself enforces.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_task_gate_follows_the_egress_default() {
-    use std::sync::Arc;
-
-    let switch = Arc::new(tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-            .with_transport(crate::net::SwitchTransport::VmHost),
-    ));
-    // A bare own-address box: no egress declaration, so its egress is
-    // whatever the default resolves for an absent one.
-    let record = record_with(boxes::NetworkMode::OwnIp);
-
-    // Announced, no opt-out: an absent section still allows all, so the
-    // task carries no policy.
-    assert_eq!(
-        crate::box_actor::effective_egress_section(
-            &record.policy,
-            record.network,
-            boxes::EgressDefaultPhase::Announced,
-            false,
-        ),
-        None,
-        "an announced default resolves an absent section to allow-all"
-    );
-    let announced = super::task_network(
-        &record,
-        &switch,
-        boxes::EgressDefaultPhase::Announced,
-        false,
-        None,
-    );
-    assert!(
-        format!("{announced:?}").contains("has_policy: false"),
-        "an announced default gates nothing: {announced:?}"
-    );
-
-    // In force, no opt-out: the same absent section is the deny-all one,
-    // and the task carries it.
-    assert_eq!(
-        crate::box_actor::effective_egress_section(
-            &record.policy,
-            record.network,
-            boxes::EgressDefaultPhase::InForce,
-            false,
-        ),
-        Some(boxes::EgressPolicy::deny_all()),
-        "the in-force default resolves an absent section to deny-all"
-    );
-    let in_force = super::task_network(
-        &record,
-        &switch,
-        boxes::EgressDefaultPhase::InForce,
-        false,
-        None,
-    );
-    assert!(
-        format!("{in_force:?}").contains("has_policy: true"),
-        "the in-force default gates a bare box's task: {in_force:?}"
-    );
-
-    // A box that *declared* an egress section is the other case where
-    // the task carries a policy, and the announcement does not defer
-    // it: the declaration is enforced on the session's own PTask in every
-    // phase, so a task in that session resolves the same section its
-    // session did — the declaration, not the deny-all section and
-    // not nothing — under either phase. In force, the default also
-    // decides the destination list the declaration left absent
-    // (`allow_dns_hosts`): present and empty, granting nothing
-    // (NET-074); announced, the section is carried as declared.
-    let section = boxes::EgressPolicy {
-        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-        ..boxes::EgressPolicy::default()
-    };
-    let mut declared_record = record_with(boxes::NetworkMode::OwnIp);
-    declared_record.policy.egress = Some(section.clone());
-    for (phase, expected) in [
-        (boxes::EgressDefaultPhase::Announced, section.clone()),
-        (
-            boxes::EgressDefaultPhase::InForce,
-            boxes::EgressPolicy {
-                allow_dns_hosts: Some(Vec::new()),
-                ..section.clone()
-            },
-        ),
-    ] {
-        assert_eq!(
-            crate::box_actor::effective_egress_section(
-                &declared_record.policy,
-                declared_record.network,
-                phase,
-                false,
-            ),
-            Some(expected),
-            "a declared egress section reaches the task's gate as the \
-             default resolves it while the default is {phase:?}",
-        );
-    }
-    let declared = super::task_network(
-        &declared_record,
-        &switch,
-        boxes::EGRESS_DEFAULT_PHASE,
-        false,
-        None,
-    );
-    assert!(
-        format!("{declared:?}").contains("has_policy: true"),
-        "a declared egress section gates the task under the shipped \
-         phase too: {declared:?}"
-    );
 }
 
 /// 017-005. An own-IP task whose attach is refused stops with the

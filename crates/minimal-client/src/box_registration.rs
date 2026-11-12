@@ -917,7 +917,6 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
             box_id: None,
-            host_ip_enforcement: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             ends_with_run: false,

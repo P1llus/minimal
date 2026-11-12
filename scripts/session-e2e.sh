@@ -24340,11 +24340,10 @@ for row in lines:
   echo "check: ADDRESS for $lt_b is $lt_addr_b, the address its expose reply named"
 
   # ---- `min session policy`, no --vm: the same address and egress ---------
-  # The EGRESS cell is the policy's posture in the policy's words, and a
-  # `; per-box enforcement <x>` suffix is the policy's own row of that name.
+  # The EGRESS cell is the policy's posture in the policy's words.
   lt_egress_matches_policy() {
-    local box="$1" cell="$2" policy="$3" words enforcement
-    words="${cell%%;*}"
+    local box="$1" cell="$2" policy="$3" words
+    words="$cell"
     if [ "$cell" = "-" ]; then
       echo "::error::min ls shows no EGRESS posture for $box"
       lt_fail
@@ -24372,10 +24371,6 @@ for row in lines:
         lt_fail
       fi
       echo "check: EGRESS for $box is '$words', the posture min session policy prints"
-    fi
-    if [[ "$cell" == *"; per-box enforcement "* ]]; then
-      enforcement="${cell##*; per-box enforcement }"
-      lt_want_line "policy for $box names per-box enforcement $enforcement" "per-box enforcement  $enforcement" "$policy"
     fi
   }
   lt_run policy-a mnl session policy "$lt_a"

@@ -319,11 +319,9 @@ impl OwnAddressReporter {
 ///
 /// `policy` is the launch's whole session policy. The own-IP attach builds
 /// the box's ingress gate from it, and `None` attaches without one. The
-/// session launcher passes the box's *effective* policy (NET-074), and a
-/// task launch passes its session's effective egress alone when the rollout
-/// leaves one in force, `None` when the daemon opted out (or under the
-/// announced phase), because a task carries none of its session's ingress,
-/// the session's own PTask being attached at the same time.
+/// session launcher passes the box's policy. A task launch passes `None`,
+/// because a task carries none of its session's ingress, the session's own
+/// PTask being attached at the same time.
 /// `own_address` carries the registry handle an own-address launch reports its
 /// lease through once the box attaches (NET-001); a task launch passes `None`
 /// for that too. `box_addresses` carries the switch and loopback addresses

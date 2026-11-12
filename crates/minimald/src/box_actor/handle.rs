@@ -503,26 +503,6 @@ impl BoxHandle {
         })
     }
 
-    /// Whether this daemon opted out of the deny-all egress default
-    /// (NET-077), for the task path's effective-egress resolution. A dead
-    /// actor maps to `NotConnected`.
-    pub(crate) async fn deny_all_opt_out(&self) -> Result<bool, std::io::Error> {
-        let (send, recv) = oneshot::channel();
-        // Ignore send errors - the recv will also fail.
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "the actor may already be gone; the recv below reports that"
-        )]
-        let _ = self.0.send(BoxMessage::GetDenyAllOptOut(send)).await;
-        #[expect(
-            clippy::map_err_ignore,
-            reason = "a closed oneshot carries no cause beyond the actor being gone"
-        )]
-        recv.await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
-        })
-    }
-
     /// Configure the session's loadout from the client's wire contribution:
     /// `Ok(None)` means the composition finalized and the session is now
     /// `Active`; `Ok(Some(response))` means the client must gate the returned

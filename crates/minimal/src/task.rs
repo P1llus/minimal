@@ -338,9 +338,8 @@ impl std::fmt::Display for RunFlagMisplaced {
 impl std::error::Error for RunFlagMisplaced {}
 
 /// Writes what a run prints once its box exists, as `min session activate`
-/// prints it: the classifier advisory the create reply carries (NET-079),
-/// the deny-all default note for an `own_ip` box with no egress rules on a
-/// daemon that has not opted out (NET-074, NET-077), and the masked form
+/// prints it: the deny-all default note for an `own_ip` box with no egress
+/// rules on a daemon that has not opted out, and the masked form
 /// of each subnet flag that carries host bits. `mode_layer` is the table
 /// that set an `own_ip` mode, when the file set it.
 pub(crate) fn write_run_notices(
@@ -350,11 +349,9 @@ pub(crate) fn write_run_notices(
     egress: &crate::EgressArgs,
     mode_layer: Option<&str>,
 ) -> std::io::Result<()> {
-    crate::write_classifier_advisory(out, created)?;
     if request.config.network == boxes::NetworkMode::OwnIp
         && request.config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
-        && crate::deny_all_default_notice(boxes::EGRESS_DEFAULT_PHASE).is_some()
     {
         let (why, file_remedy) = match mode_layer {
             Some(layer) => (
@@ -3577,12 +3574,7 @@ mod tests {
         assert_eq!(net.mode, boxes::NetworkMode::OwnIp);
         assert_eq!(net.policy.egress, None);
         assert_eq!(
-            boxes::effective_egress(
-                net.policy.egress.as_ref(),
-                net.mode,
-                boxes::EGRESS_DEFAULT_PHASE,
-                false,
-            ),
+            boxes::effective_egress(net.policy.egress.as_ref(), net.mode, false),
             boxes::EffectiveEgress::DenyAll
         );
 
@@ -3602,9 +3594,9 @@ mod tests {
         );
     }
 
-    /// A create reply carrying `advisory`, on a daemon that has opted out
-    /// of the deny-all default when `opt_out` is set.
-    fn create_reply(advisory: Option<&str>, opt_out: bool) -> minimald_rpc::CreateSessionResponse {
+    /// A create reply of a daemon that has opted out of the deny-all default
+    /// when `opt_out` is set.
+    fn create_reply(opt_out: bool) -> minimald_rpc::CreateSessionResponse {
         minimald_rpc::CreateSessionResponse {
             id: boxes::SessionId::nil(),
             daemon_version: Some("0.7.0".to_string()),
@@ -3614,8 +3606,6 @@ mod tests {
             answerer_bound: false,
             interim_loopback: false,
             deny_all_opt_out: Some(opt_out),
-            classifier_advisory: advisory.map(str::to_string),
-            host_ip_enforcement: None,
         }
     }
 
@@ -3639,34 +3629,16 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
-    /// NET-079, NET-074: once its box exists, a run prints what an
-    /// activation prints: the classifier advisory the create reply
-    /// carries, the deny-all default note for an `own_ip` box with no
-    /// egress on a daemon that has not opted out, and the masked form of a
-    /// subnet flag with host bits.
+    /// Once its box exists, a run prints what an activation prints: the
+    /// deny-all default note for an `own_ip` box with no egress on a daemon
+    /// that has not opted out, and the masked form of a subnet flag with
+    /// host bits.
     #[test]
-    fn run_prints_the_advisory_and_notices_an_activation_prints() {
-        let advisory = "note: you asked this box for no network access, but this machine \
-                        can't enforce it yet, so the box can still reach the network.";
-        let flags = crate::EgressArgs {
-            deny_all_egress: true,
-            ..crate::EgressArgs::default()
-        };
-        assert_eq!(
-            run_notices(
-                boxes::NetworkMode::HostNet,
-                Some(boxes::EgressPolicy::deny_all()),
-                &create_reply(Some(advisory), false),
-                &flags,
-                None,
-            ),
-            format!("{advisory}\n"),
-        );
-
+    fn run_prints_the_notices_an_activation_prints() {
         let note = run_notices(
             boxes::NetworkMode::OwnIp,
             None,
-            &create_reply(None, false),
+            &create_reply(false),
             &crate::EgressArgs::default(),
             None,
         );
@@ -3680,7 +3652,7 @@ mod tests {
             run_notices(
                 boxes::NetworkMode::OwnIp,
                 None,
-                &create_reply(None, false),
+                &create_reply(false),
                 &crate::EgressArgs::default(),
                 Some("[tasks.build]"),
             ),
@@ -3696,7 +3668,7 @@ mod tests {
             run_notices(
                 boxes::NetworkMode::OwnIp,
                 None,
-                &create_reply(None, true),
+                &create_reply(true),
                 &crate::EgressArgs::default(),
                 None,
             ),
@@ -3711,7 +3683,7 @@ mod tests {
             run_notices(
                 boxes::NetworkMode::OwnIp,
                 crate::flag_egress(&subnets).unwrap(),
-                &create_reply(None, false),
+                &create_reply(false),
                 &subnets,
                 None,
             ),

@@ -152,32 +152,21 @@ pub(crate) fn engine_box(
 /// own name and carries none of the session's ingress — forwards a task
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
-/// reported for it. `phase` is the rollout phase to resolve the egress under
-/// — both callers pass [`boxes::EGRESS_DEFAULT_PHASE`], the phase this
-/// build ships, while the tests pass the phase by name so each arm's posture
-/// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
-/// read through the session handle so a task resolves its egress exactly as
-/// the launcher did.
+/// reported for it. The engine holds the task to its box's policy through
+/// `engine_box`.
 pub(crate) fn task_network(
     record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    phase: boxes::EgressDefaultPhase,
-    deny_all_opt_out: bool,
     engine_box: Option<crate::net::gvproxy_network::EngineBox>,
 ) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    let egress = crate::box_actor::effective_egress_section(
-        &record.policy,
-        record.network,
-        phase,
-        deny_all_opt_out,
-    );
     crate::net::provider::task_network_for(
         record.network,
         switch,
         &format!("{session}-task"),
-        egress.map(|section| boxes::BoxPolicy::new(Some(section), None)),
+        // A task declares no ingress, so its namespace has no ports to open.
+        None,
         // Never the record's handed box addresses (T66): the task's sandbox
         // is not the box the registration named, and the session's box
         // holds that address.
@@ -445,13 +434,7 @@ pub(super) async fn task_producer(
         })?;
         let switch = session.net_switch().await?;
         ensure_task_rows_stand(&record, &switch).await?;
-        let network = task_network(
-            &record,
-            &switch,
-            boxes::EGRESS_DEFAULT_PHASE,
-            session.deny_all_opt_out().await?,
-            engine_box(record.id),
-        );
+        let network = task_network(&record, &switch, engine_box(record.id));
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that

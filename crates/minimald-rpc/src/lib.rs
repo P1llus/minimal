@@ -195,20 +195,6 @@ pub struct RunningSessionAttrs {
     pub visual_bell: Option<Bell>,
 }
 
-/// The per-box egress enforcement state a host-address session's verdict
-/// runs under (NET-079), spelled `per_box` when the session's own launch
-/// placed its box in a classifier leaf of the host's cgroup tree and `none`
-/// when it did not and the box runs with the host's address and no verdict
-/// of its own.
-///
-/// The type is defined in the `boxes` crate — beside the
-/// [`Record`](boxes::Record) field that carries a box's own launch
-/// outcome, a session-plane type this crate already depends on — and
-/// re-exported here so the paths this crate's clients spell stay what they
-/// were: the listing's [`ListSessionsEntry::host_ip_enforcement`] answers in
-/// it, and the stringly surfaces carry its machine spelling.
-pub use boxes::HostIpEnforcement;
-
 /// An entry in the ListSessions response.
 ///
 /// `project_path` and `status` mirror the fields of the same name on the
@@ -240,24 +226,6 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
-    /// The per-box egress enforcement the session's box actually runs under
-    /// (NET-079): [`HostIpEnforcement::PerBox`] when the box's own launch
-    /// placed it in a classifier leaf of the host's tree,
-    /// [`HostIpEnforcement::None`] when it did not and the box runs with the
-    /// host's address and no verdict of its own. The box's own launch record,
-    /// lowered to `none` by the daemon's one classifier fact when the host
-    /// can no longer decide per box and never raised above it — so a box
-    /// launched unenforced stays `none` for its life, whatever a later launch
-    /// of another box decided — and the fact alone only while the session's
-    /// box has not launched yet, the same state the create response answers
-    /// over. `None` for a session that is not host-address (its verdict is
-    /// decided on address leases, never on the host's cgroup tree), for a
-    /// host-address box the classifier refused, whose launch said the
-    /// refusal, and when the record could not be read back — defaulted so an
-    /// entry from an older daemon still decodes, with the same silence the
-    /// other surfaces read as "not a host-address session".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_ip_enforcement: Option<HostIpEnforcement>,
     /// The declared ingress ports this box yields because another box at the
     /// same shared loopback address holds them (NET-129, first-come), one
     /// entry per port naming the holding box: the same registry read
@@ -591,14 +559,7 @@ pub struct BoxConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ends_with_run: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
-    /// session's record. The daemon writes none of its own: NET-079's
-    /// per-box enforcement is a daemon-owned launch record, carried on the
-    /// session record's own `host_ip_enforcement` field — written only by
-    /// the box's launch, never by a create — and displayed as that record
-    /// lowered by the host's current fact, so it is never a client attr.
-    /// A client supplying the daemon's own `host_ip_enforcement` key has it
-    /// stripped unconditionally, whatever the session's network mode — the
-    /// state is the host's verdict, never a caller's assertion.
+    /// session's record. The daemon writes none of its own.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
     /// The sealed value of each of the box's GitHub grants (BEP-007), as
@@ -2262,20 +2223,11 @@ pub struct CreateSessionResponse {
     /// old.
     #[serde(default)]
     pub interim_loopback: bool,
-    /// Whether the serving daemon opted out of the deny-all egress default
-    /// (NET-077). The rollout's one fact the client cannot know from its
-    /// own build: the phase is a build-time constant both sides share
-    /// ([`boxes::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
-    /// daemon alone. Carried here — on the reply the activation path
-    /// already holds — so `min session activate` can keep its in-force note
-    /// (NET-074) off a deployment that opted out: its bare boxes keep
-    /// allow-all, and a note saying deny-all would be false there. (The
-    /// field first carried the announcement, NET-076, now retired; it stays
-    /// for client and daemon skew.)
-    ///
-    /// `None` from a daemon that predates the field — and a daemon that
-    /// predates it cannot have the opt-out flag either, so a client reading
-    /// `None` reads it as not opted out.
+    /// Whether the serving daemon opted out of the deny-all egress default,
+    /// which only the daemon knows. `min session activate` reads it to keep
+    /// its note about that default off a deployment whose boxes keep
+    /// allow-all. `None` from a daemon that predates the field, which has
+    /// no opt-out either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
     /// Whether this daemon's box-zone answerer is bound in its own namespace
@@ -2285,55 +2237,6 @@ pub struct CreateSessionResponse {
     /// is where the user is about to rely on the names the surface answers.
     #[serde(default)]
     pub answerer_bound: bool,
-    /// The classifier advisory this host's verdict owes the session start
-    /// (NET-079): `Some` only when both halves it is about are true — the
-    /// daemon is not running inside a microVM, whose causes name its
-    /// image's builder rather than anything the person starting a session
-    /// could run, and the session is a host-address box, whose verdict is
-    /// the one the host's cgroup tree decides — and that host cannot
-    /// decide it per box, naming the cause in
-    /// words, the state that leaves the box in — unenforced, except that
-    /// a deny-all declaration is refused at placement while the probe
-    /// that would decide it cannot be read — and the exact command that
-    /// installs the
-    /// classifier's privileged step only when that step is the cause that
-    /// is missing, because a host that cannot confine a box is not
-    /// cleared by installing anything. Spelled by the daemon, which is
-    /// the one that read the host; printed by the client verbatim, and
-    /// never a prompt — running the command (and any privilege prompt it
-    /// carries) is the person's act, never the session start's: the start
-    /// still hands the box the host's address and runs it unenforced, and
-    /// only a deny-all declaration is refused later, at placement, while
-    /// the probe that would decide it cannot be read.
-    ///
-    /// `None` from a host that decides per box: silence is that host's
-    /// state, and a client reading `None` prints exactly what it printed
-    /// before this field. `None` from a daemon that predates it reads the
-    /// same way — nothing said, so nothing to print.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub classifier_advisory: Option<String>,
-    /// The per-box egress enforcement this host's verdict gives a
-    /// host-address session (NET-079): `per_box` when this host can decide
-    /// a box's verdict on a classifier leaf of its own, `none` when it
-    /// cannot and the box runs with the host's address and no verdict of
-    /// its own. Spelled in the machine spelling the daemon's log line and
-    /// the other replies use, so a script reads the state as data and not
-    /// by parsing the prose around it. `None` for a session that is not
-    /// host-address: an own-address or none box's verdict is decided on
-    /// address leases, never on the host's cgroup tree.
-    ///
-    /// The same derivation the listing and the policy read answer through,
-    /// with the same refusal gate: the session this create is minting has
-    /// no launch record yet, so the daemon's one classifier fact is the
-    /// best either half of it knows, and the box the gate refuses — a
-    /// deny-all host-address box the host cannot enforce, the one its own
-    /// launch would refuse — carries no enforcement value anywhere.
-    /// Never recorded at create: only a launch writes the box's own
-    /// outcome. `None` from a daemon that
-    /// predates the field is that daemon's silence, never a decided
-    /// `per_box`: a client that reads nothing here claims nothing from it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_ip_enforcement: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -3306,9 +3209,8 @@ impl OneshotSshRpc for GetSessionPolicy {
 /// strict declaration a client reads back stays exactly what the box was
 /// launched with: the deny-all default (NET-074) reaches the client as
 /// `deny_all` in this response without rewriting the record. The daemon
-/// answers it, not the client, because the inputs are the daemon's own
-/// facts — the rollout phase its build ships and its opt-out flag
-/// (NET-077) — which no client can know.
+/// answers it, not the client, because the daemon's opt-out flag is its
+/// own fact, which no client can know.
 pub struct GetEffectiveSessionPolicy;
 
 /// Request for the [`GetEffectiveSessionPolicy`] RPC: the same lookup as
@@ -3404,19 +3306,12 @@ impl OneshotSshRpc for GetLiveIngress {
 }
 
 /// An RPC to read the runtime facts about a session a policy render wants
-/// beside its rules (NET-079): the per-box egress enforcement the session's
-/// box actually runs under — the same state [`ListSessionsEntry::host_ip_enforcement`]
-/// and the create response answer over, served the same way.
+/// beside its rules.
 ///
-/// A separate reply rather than a field on [`EffectiveBoxPolicy`] because
-/// that policy struct is `deny_unknown_fields`: a strict struct an older `min`
-/// has no field for rejects a new key rather than ignoring it, so a fact that
-/// did not exist when that client was built must ride its own reply, the same
-/// shape live ingress takes ([`GetLiveIngress`]) — an older client that cannot
-/// ask for it never sees it, and a newer one degrades to silence rather than
-/// failing to read the rules at all. The facts are the daemon's to answer,
-/// because the enforcement is decided on the host's cgroup tree and recorded
-/// by the daemon at the box's own launch: no client can read either.
+/// A separate reply rather than fields on [`EffectiveBoxPolicy`] because
+/// that policy struct is `deny_unknown_fields`: an older `min` rejects a key
+/// it has no field for, so a fact that did not exist when that client was
+/// built comes in its own reply, as live ingress does ([`GetLiveIngress`]).
 pub struct GetSessionRuntimeFacts;
 
 /// Request for the [`GetSessionRuntimeFacts`] RPC: the same lookup as
@@ -3443,16 +3338,6 @@ pub struct BoxRuntimeFacts {
     /// The session these facts are about: the record the daemon read them
     /// from. Required, so the daemon's error reply never decodes as facts.
     pub id: SessionId,
-    /// The per-box egress enforcement the session's box actually runs under
-    /// (NET-079): the box's own launch record —
-    /// [`Record::host_ip_enforcement`](boxes::Record) — lowered to `none`
-    /// when the host can no longer decide per box and never raised above it,
-    /// and the host's own state only while the session's box has not
-    /// launched. `None` for a session that is not host-address, for a
-    /// host-address box the classifier refused, and when the record could not
-    /// be read back — the same states
-    /// [`ListSessionsEntry::host_ip_enforcement`] names.
-    pub host_ip_enforcement: Option<HostIpEnforcement>,
     /// The permitted listening ports the box's listen watcher left
     /// unpublished because their allow's audit record could not be written
     /// (NET-046 fails closed), in port order. A watcher-driven publish has

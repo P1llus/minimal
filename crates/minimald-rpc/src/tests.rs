@@ -796,8 +796,6 @@ fn create_session_response_round_trips() {
         // And the classifier state (NET-079): the advisory a start
         // prints and the enforcement a host-address box runs under
         // must not be able to silently drop off either.
-        classifier_advisory: None,
-        host_ip_enforcement: None,
     };
     let json = serde_json_lenient::to_string(&resp).expect("serializes");
     assert!(
@@ -823,8 +821,6 @@ fn create_session_response_carries_the_deny_all_opt_out() {
         zone_answerer_port: None,
         interim_loopback: false,
         answerer_bound: false,
-        classifier_advisory: None,
-        host_ip_enforcement: None,
     };
     let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
     assert!(
@@ -845,128 +841,10 @@ fn create_session_response_carries_the_deny_all_opt_out() {
     assert_eq!(round_trip(&opted_in), opted_in);
 }
 
-/// The classifier state a host that cannot decide per box puts on its
-/// create replies (NET-079), pinned on the wire: the unenforced state
-/// as `host_ip_enforcement: none` in the machine spelling — `per_box` on
-/// a host that decides, so the two hosts stay distinguishable to
-/// whatever reads the field — the cause in words inside the advisory,
-/// and the install command only for the cause it clears. A daemon
-/// that predates both fields decodes with neither: silence, never a
-/// decided `per_box`.
-#[test]
-fn create_response_carries_the_classifier_state() {
-    // The host whose step is missing: the advisory names the cause in
-    // words, names the state it leaves the box in, and carries the
-    // exact command that installs the privileged step.
-    let step_missing = CreateSessionResponse {
-        id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
-        daemon_version: Some("0.6.0".into()),
-        hostname_routing_unavailable: None,
-        hostname_proxy_port: None,
-        zone_answerer_port: None,
-        interim_loopback: false,
-        deny_all_opt_out: None,
-        answerer_bound: false,
-        classifier_advisory: Some(
-            "note: this host cannot decide a host-address box's egress \
-             verdict per box: the classifier's privileged step is not \
-             installed on this host. While it cannot, its host-address \
-             boxes run unenforced — whatever the boxes' declarations \
-             say. Install the classifier's privileged step with:\n  \
-             min finalize-install"
-                .to_string(),
-        ),
-        host_ip_enforcement: Some("none".into()),
-    };
-    let json = serde_json_lenient::to_string(&step_missing).expect("serializes");
-    assert!(
-        json.contains(r#""host_ip_enforcement":"none""#),
-        "the unenforced state must ride the wire in the machine spelling, got: {json}",
-    );
-    assert!(
-        json.contains("the classifier's privileged step is not installed"),
-        "the advisory names its cause in words, got: {json}",
-    );
-    assert!(
-        json.contains("min finalize-install"),
-        "the step's cause names the exact command that installs it, got: {json}",
-    );
-    assert_eq!(round_trip(&step_missing), step_missing);
-
-    // The host that cannot confine a box: the same state, named without
-    // a command — installing the step over such a tree would leave the
-    // cause standing, so the advisory must not name one.
-    let cannot_confine = CreateSessionResponse {
-        classifier_advisory: Some(
-            "note: this host cannot decide a host-address box's egress \
-             verdict per box: no cgroup2 mount with nsdelegate covers \
-             the classifier tree, so a box could migrate out of its \
-             leaf. While it cannot, its host-address boxes run \
-             unenforced — whatever the boxes' declarations say."
-                .to_string(),
-        ),
-        host_ip_enforcement: Some("none".into()),
-        ..step_missing
-    };
-    let json = serde_json_lenient::to_string(&cannot_confine).expect("serializes");
-    assert!(
-        !json.contains("min finalize-install"),
-        "a cause no command clears names no command, got: {json}",
-    );
-    assert_eq!(round_trip(&cannot_confine), cannot_confine);
-
-    // The decided host: nothing to say, so nothing on the wire — a
-    // client of either build reads the reply it always read.
-    let decided = CreateSessionResponse {
-        classifier_advisory: None,
-        host_ip_enforcement: Some("per_box".into()),
-        ..cannot_confine
-    };
-    let json = serde_json_lenient::to_string(&decided).expect("serializes");
-    assert!(
-        json.contains(r#""host_ip_enforcement":"per_box""#),
-        "a host that decides per box says so in the machine spelling, got: {json}",
-    );
-    assert!(
-        !json.contains("classifier_advisory"),
-        "a decided host carries no advisory, got: {json}",
-    );
-    assert_eq!(round_trip(&decided), decided);
-
-    // A daemon that predates both fields: the reply it always sent
-    // decodes with neither, and absence must not read as a decided
-    // `per_box` — an older daemon's silence is not evidence of
-    // anything, and a client that reads nothing claims nothing.
-    let pre_field: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
-        r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
-    )
-    .expect("a pre-field CreateSession reply must still decode");
-    match pre_field {
-        Errorable::Ok(c) => {
-            assert!(c.classifier_advisory.is_none());
-            assert_eq!(c.host_ip_enforcement, None);
-        }
-        Errorable::Err { error } => panic!("expected Ok, got {error}"),
-    }
-}
-
-/// NET-079's enforcement state never rides the strict policy reply: an
-/// older `min` built against the two-field [`EffectiveBoxPolicy`] —
-/// `deny_unknown_fields`, the strictness that keeps an all-optional
-/// struct from swallowing the daemon's `{"error":...}` replies under
-/// the untagged [`Errorable`] — rejects a key it has no field for, so a
-/// policy reply that grew the state would make every old client fail
-/// `min session policy` outright. Pinned here as the contract that keeps
-/// that from regressing: the state answers over
-/// [`GetSessionRuntimeFacts`] — a reply an old client simply never asks
-/// for, and this build's own answer to it stays anchored the same way
-/// the policy's `egress` is. NET-134's lane is the one deliberate
-/// exception, and this test pins both of its halves: a lane-less reply
-/// serializes without the lane's key and so still decodes in the old
-/// client's strict shape, while a laned reply — a fact `min session
-/// policy` reads from no other reply — is refused by that client, the
-/// visible error the lane's issue took over a lane the report is
-/// silent about.
+/// An older `min` reads the policy reply as a strict two-field struct, so
+/// a reply for a box without a credentialed upstream must carry no key it
+/// has no field for. Later facts answer over [`GetSessionRuntimeFacts`],
+/// which such a client never asks for.
 #[test]
 fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
     // The reply this build serves for a lane-less box: no enforcement
@@ -978,10 +856,6 @@ fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
         credentialed_upstream: None,
     });
     let json = serde_json_lenient::to_string(&reply).expect("the policy reply serializes");
-    assert!(
-        !json.contains("host_ip_enforcement"),
-        "the strict policy reply must carry no enforcement key, got: {json}",
-    );
     assert!(
         !json.contains("credentialed_upstream"),
         "a lane-less reply must carry no lane key, so the old shape still \
@@ -1011,14 +885,6 @@ fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
     );
     assert!(
         serde_json_lenient::from_str::<Errorable<OldClientPolicy>>(
-            r#"{"egress":"deny_all","ingress":null,"host_ip_enforcement":"none"}"#
-        )
-        .is_err(),
-        "the old client refuses a policy reply that grew the key — the \
-         reason the state answers over its own runtime-facts reply",
-    );
-    assert!(
-        serde_json_lenient::from_str::<Errorable<OldClientPolicy>>(
             r#"{"egress":"deny_all","ingress":null,"credentialed_upstream":{}}"#
         )
         .is_err(),
@@ -1036,7 +902,6 @@ fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
     // runtime facts grow and an older client keeps the ones it knows.
     let facts = BoxRuntimeFacts {
         id: SessionId::nil(),
-        host_ip_enforcement: Some(HostIpEnforcement::None),
         unaudited_listen_ports: Vec::new(),
         audit_log: None,
         shared_port_collisions: Vec::new(),
@@ -1064,7 +929,7 @@ fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
         }
     }
     match serde_json_lenient::from_str::<Errorable<BoxRuntimeFacts>>(
-        r#"{"id":"00000000-0000-0000-0000-000000000000","host_ip_enforcement":"per_box","a_later_fact":true}"#,
+        r#"{"id":"00000000-0000-0000-0000-000000000000","a_later_fact":true}"#,
     )
     .expect("a facts reply with a key this client does not know still decodes")
     {
@@ -1072,7 +937,6 @@ fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
             decoded,
             BoxRuntimeFacts {
                 id: SessionId::nil(),
-                host_ip_enforcement: Some(HostIpEnforcement::PerBox),
                 unaudited_listen_ports: Vec::new(),
                 audit_log: None,
                 shared_port_collisions: Vec::new(),
@@ -1450,7 +1314,6 @@ fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
         status: boxes::BoxState::Active,
         git: None,
         attrs: None,
-        host_ip_enforcement: None,
         shared_port_collisions: collisions,
     };
     let response = |sessions| ListSessionsResponse {
@@ -1888,11 +1751,7 @@ fn every_reply_id_round_trips_byte_for_byte() {
         |r| r.id,
         expected,
     );
-    round_trip::<BoxRuntimeFacts>(
-        &format!(r#"{{"id":"{HYPHENATED}","host_ip_enforcement":null}}"#),
-        |r| r.id,
-        expected,
-    );
+    round_trip::<BoxRuntimeFacts>(&format!(r#"{{"id":"{HYPHENATED}"}}"#), |r| r.id, expected);
 
     // The VM host's box control replies: the id as 32 hex digits.
     round_trip::<RegisteredBox>(

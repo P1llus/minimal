@@ -3934,33 +3934,17 @@ pub(crate) async fn activate_box(
                 );
             }
 
-            // NET-079: the host's verdict on whether it can decide a host-address
-            // box's egress per box, spelled by the daemon — the side that read the
-            // host — and printed verbatim, so the terminal, the daemon's log line
-            // for this same create, and the start all say the same thing. The
-            // advisory names the cause, the state it leaves the box in, and, when
-            // the missing privileged step is the cause, the exact command that
-            // installs it; it is never a prompt, and never load-bearing for the
-            // start either (see [`print_classifier_advisory`]). Printed after the
-            // session exists and before the work on it, like the notice below it,
-            // so a host that cannot decide per box is named at the start that
-            // runs there and not only in a log the person was not reading.
-            print_classifier_advisory(&mut std::io::stderr(), &created);
-
-            // The in-force note (NET-074): one line naming the default an
-            // own-address session that declared no egress now has, and how to
-            // declare reach. Scoped to the box the default binds — an own-address
-            // session with no egress section — on a daemon that has not opted out
-            // (NET-077): the opt-out is the daemon's own fact, so it is read off the
-            // create reply above, and an opted-out daemon's box keeps allow-all and
-            // needs no note. Printed after the session exists and before the work
-            // on it, so it is not lost above a failed activate's output.
+            // One line naming the default an own-address session that declared
+            // no egress has, and how to declare reach. The opt-out is the
+            // daemon's own fact, read off the create reply: an opted-out
+            // daemon's box keeps allow-all and needs no note. Printed after the
+            // session exists and before the work on it, so it is not lost above
+            // a failed activate's output.
             if request.config.network == minimald_rpc::NetworkMode::OwnIp
                 && request.config.policy.egress.is_none()
                 && created.deny_all_opt_out != Some(true)
-                && let Some(note) = deny_all_default_notice(boxes::EGRESS_DEFAULT_PHASE)
             {
-                eprintln!("{note}");
+                eprintln!("{DENY_ALL_DEFAULT_NOTICE}");
             }
 
             // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),

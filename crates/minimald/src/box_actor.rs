@@ -453,10 +453,6 @@ enum BoxMessage {
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
     GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
-    /// Whether this daemon opted out of the deny-all egress default
-    /// (NET-077), read by the task path so a task resolves its session's
-    /// effective egress (NET-074) the same way the launcher does.
-    GetDenyAllOptOut(oneshot::Sender<bool>),
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `BoxActor::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -1008,12 +1004,10 @@ impl BoxActor {
                 session = %record.id,
                 session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 network = %record.network.word(),
-                egress_default_phase = ?boxes::EGRESS_DEFAULT_PHASE,
                 deny_all_opt_out = conf.deny_all_opt_out,
                 effective_egress = ?boxes::effective_egress(
                     record.policy.egress.as_ref(),
                     record.network,
-                    boxes::EGRESS_DEFAULT_PHASE,
                     conf.deny_all_opt_out,
                 ),
                 dynamic_ingress = %record
@@ -2761,13 +2755,6 @@ impl BoxActor {
             }
             BoxMessage::GetNetSwitch(r) => {
                 let _ = r.send(Arc::clone(&self.net_switch));
-            }
-            BoxMessage::GetDenyAllOptOut(r) => {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the asker may already be gone; there is nothing to answer then"
-                )]
-                let _ = r.send(self.deny_all_opt_out);
             }
             #[cfg(test)]
             BoxMessage::PeekComposition(r) => {

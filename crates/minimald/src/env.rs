@@ -2238,14 +2238,8 @@ impl BoxChannel {
             // would hold it across the second await in a spawned future.
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
-            let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
-            let network = crate::exec::task_network(
-                &record,
-                &switch,
-                boxes::EGRESS_DEFAULT_PHASE,
-                opt_out,
-                crate::exec::engine_box(record.id),
-            );
+            let network =
+                crate::exec::task_network(&record, &switch, crate::exec::engine_box(record.id));
             let mut env = ctx
                 .make_env_with_network(
                     task_name,

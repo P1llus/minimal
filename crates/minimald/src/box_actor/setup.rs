@@ -19,27 +19,16 @@ fn warn_port_refusal(
     );
 }
 
-/// The egress *section* a session runs under: the materialized
-/// form of [`boxes::effective_egress`]'s answer — `None` for the
-/// allow-all default, the deny-all section for an absent declaration under the
-/// in-force default (NET-074), and a declaration with the destination lists
-/// it left absent resolved as that function documents. `phase` is the
-/// rollout phase to resolve under — the launcher and the task path pass
-/// [`boxes::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
-/// tests name [`boxes::EgressDefaultPhase::InForce`] so the posture they
-/// prove does not hang on that constant. `opt_out` is the daemon's deny-all
-/// opt-out (NET-077), threaded from the server config.
-///
-/// Shared by the session launcher and the task path
-/// ([`crate::exec::task_network`]), so a task runs under the same egress
-/// its session does.
+/// The egress section a box is held to, as [`boxes::effective_egress`]
+/// resolves it: `None` for the allow-all default, the deny-all section for
+/// a box with its own address and no declaration, and a declaration as the
+/// engine reads it. `opt_out` is the daemon's deny-all opt-out.
 pub(crate) fn effective_egress_section(
     policy: &boxes::BoxPolicy,
     network: boxes::NetworkMode,
-    phase: boxes::EgressDefaultPhase,
     opt_out: bool,
 ) -> Option<boxes::EgressPolicy> {
-    match boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
+    match boxes::effective_egress(policy.egress.as_ref(), network, opt_out) {
         boxes::EffectiveEgress::DenyAll => Some(boxes::EgressPolicy::deny_all()),
         boxes::EffectiveEgress::AllowAll => None,
         boxes::EffectiveEgress::Declared(section) => Some(section),
@@ -76,12 +65,7 @@ pub(crate) fn own_address_build_network(
     if record.network != boxes::NetworkMode::OwnIp {
         return None;
     }
-    let egress = effective_egress_section(
-        &record.policy,
-        record.network,
-        boxes::EGRESS_DEFAULT_PHASE,
-        deny_all_opt_out,
-    );
+    let egress = effective_egress_section(&record.policy, record.network, deny_all_opt_out);
     let denies_all = egress
         .as_ref()
         .is_some_and(boxes::EgressPolicy::admits_nothing);
@@ -94,8 +78,6 @@ pub(crate) fn own_address_build_network(
                 inner: crate::exec::task_network(
                     &record,
                     &switch,
-                    boxes::EGRESS_DEFAULT_PHASE,
-                    deny_all_opt_out,
                     crate::exec::engine_box(record.id),
                 ),
                 record: record.clone(),
@@ -140,32 +122,6 @@ impl sandbox::Network for OwnAddressBuildNetwork {
 
     fn abandon(&self) -> sandbox::AbandonFuture<'_> {
         self.inner.abandon()
-    }
-}
-
-/// The policy a session runs under: its declared ingress, and its
-/// egress resolved to the section [`effective_egress_section`] names — the
-/// deny-all section for an own-address box with no `egress` section once the
-/// default is in force (NET-074), the allow-all default for everything an
-/// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
-/// with the destination lists it left absent resolved. `phase` resolves
-/// under, exactly as [`effective_egress_section`] documents. The
-/// declaration on the record is left untouched: the strict `BoxPolicy`
-/// a client reads back stays exactly what the box was launched with.
-pub(crate) fn effective_session_policy(
-    policy: &boxes::BoxPolicy,
-    network: boxes::NetworkMode,
-    phase: boxes::EgressDefaultPhase,
-    opt_out: bool,
-) -> boxes::BoxPolicy {
-    boxes::BoxPolicy {
-        egress: effective_egress_section(policy, network, phase, opt_out),
-        ingress: policy.ingress.clone(),
-        // The credentialed-upstream declaration (NET-134) resolves nothing —
-        // the lane it opens is decided host-side, by the row the client's
-        // registration fills — so it is carried verbatim, like the ingress:
-        // the effective policy keeps the lane the box declared beside it.
-        credentialed_upstream: policy.credentialed_upstream.clone(),
     }
 }
 

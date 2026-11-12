@@ -26,7 +26,6 @@ impl BoxMessage {
             Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::GetRecord { .. } => "GetRecord",
             Self::GetNetSwitch { .. } => "GetNetSwitch",
-            Self::GetDenyAllOptOut(_) => "GetDenyAllOptOut",
             Self::GetComposition { .. } => "GetComposition",
             Self::GetPatchesUploadLock { .. } => "GetPatchesUploadLock",
             Self::GetHookScriptsUploadLock { .. } => "GetHookScriptsUploadLock",

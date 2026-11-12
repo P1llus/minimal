@@ -71,17 +71,9 @@ impl BoxActor {
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
-        // The box runs under its *effective* egress — an absent
-        // section on an own-address box is the deny-all section once the
-        // default is in force, this daemon's opt-out excepted (NET-077) —
-        // while the record keeps the declaration untouched for the strict
-        // `GetSessionPolicy` reply.
-        let policy = effective_session_policy(
-            &record.policy,
-            record.network,
-            boxes::EGRESS_DEFAULT_PHASE,
-            self.deny_all_opt_out,
-        );
+        // The attach reads the ingress half. The engine reads the egress
+        // half from the record itself.
+        let policy = record.policy.clone();
         // One publication set for the spawn this launch is about to run:
         // the runtime expose path reads it in this actor, and the listen
         // plan the launcher gathers shares it with the watcher the host it

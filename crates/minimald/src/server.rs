@@ -262,17 +262,12 @@ pub struct Config {
     #[serde(default)]
     pub daemon_identity_dir: Option<DaemonAbsPath>,
 
-    /// The daemon's opt-out of the deny-all egress default (NET-077). With
-    /// the default in force (see [`boxes::EGRESS_DEFAULT_PHASE`]), an
+    /// The daemon's opt-out of the deny-all egress default. Without it an
     /// own-address box created with no `egress` section reaches nothing
-    /// outside itself (NET-074) and shows `deny-all (default)` in
-    /// `min session policy` (NET-075). A deployment that cannot carry that
-    /// yet opts out, and its boxes keep the earlier allow-all default of
-    /// 03-spec R2.1. Set by `minimald run --egress-deny-all-opt-out`. A box
-    /// that declares its own egress section keeps its declared lists either
-    /// way; the opt-out also keeps the earlier allow-all reading of a
-    /// destination list the section left absent, which in force resolves to
-    /// present and empty (`boxes::effective_egress`).
+    /// outside itself and shows `deny-all (default)` in `min session
+    /// policy`. With it such a box keeps allow-all. Set by `minimald run
+    /// --egress-deny-all-opt-out`. A box that declares its own egress
+    /// section is unaffected (`boxes::effective_egress`).
     #[serde(default)]
     pub deny_all_opt_out: bool,
     /// How the create gate learns the host's verdict on the unprivileged
@@ -2403,8 +2398,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         zone_answerer_port: None,
         switch_subnet_octet: None,
         daemon_identity_dir: None,
-        // The default every unit-test daemon runs: the rollout phase this
-        // build ships, not opted out.
+        // The default every unit-test daemon runs: not opted out.
         deny_all_opt_out: false,
         // A unit-test daemon never starts a sandbox, and the host it runs on
         // may itself be restricted: the gate stays off unless a test fixes it.

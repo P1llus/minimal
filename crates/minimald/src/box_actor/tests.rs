@@ -3530,60 +3530,24 @@ async fn box_has_no_idle_stop() {
     }
 }
 
-/// NET-074: an own-address box created with no `egress` section reaches
-/// nothing outside itself, and this build ships the deny-all default in
-/// force (asserted first, so the constant cannot slip back unnoticed). The
-/// phase is also passed explicitly to the resolver, so the in-force posture
-/// is proven by name, and the launcher's policy under it is the
-/// deny-all section, which denies every destination it does not list and
-/// lists none. The
-/// session-start line names the phase, the opt-out, and the posture this
-/// build actually leaves in force, so a diagnostics bundle's log tail can
-/// say why the box reaches what it does.
+/// A box with its own address that declares no egress reaches nothing: the
+/// engine reads an absent section as deny for it. The session-start line
+/// names the opt-out and the egress the box is left with, so the log tail
+/// of a diagnostics bundle says why the box reaches what it does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_ip_default_deny_all() {
     use minimald_rpc::{CreateSession, CreateSessionRequest};
 
+    let own_ip = boxes::NetworkMode::OwnIp;
+    let policy = boxes::egress::box_policy(None, own_ip, false).expect("no section is a policy");
     assert_eq!(
-        boxes::EGRESS_DEFAULT_PHASE,
-        boxes::EgressDefaultPhase::InForce,
-        "this build ships the deny-all default in force (NET-074)",
-    );
-
-    // The launcher's resolution for an own-address box that declared
-    // nothing, once the default is in force: the deny-all section, egress
-    // only touched, ingress kept.
-    let declared = boxes::BoxPolicy::default();
-    let effective = super::effective_session_policy(
-        &declared,
-        boxes::NetworkMode::OwnIp,
-        boxes::EgressDefaultPhase::InForce,
-        false,
-    );
-    assert_eq!(
-        effective.egress,
-        Some(boxes::EgressPolicy::deny_all()),
-        "the gate's egress for an absent section is the deny-all section",
-    );
-    assert_eq!(effective.ingress, None);
-
-    // What that section is to the engine: a policy that denies what it
-    // does not list, and lists nothing.
-    let policy =
-        boxes::egress::box_policy(effective.egress.as_ref(), boxes::NetworkMode::OwnIp, false)
-            .expect("the deny-all section is a policy");
-    assert_eq!(
-        policy.egress_default(netpol::Verdict::Allow),
+        policy.egress_default(netpol::base::defaults(own_ip.into()).egress),
         netpol::Verdict::Deny
     );
     assert!(policy.allow.is_empty() && policy.names.is_empty());
 
-    // The same posture, observed where a diagnostics bundle reads it: the
-    // one line every session start logs, naming all three facts as this
-    // build ships them — the rollout phase it is in, the opt-out the daemon
-    // was started with, and the egress they leave this bare box with. The
-    // values follow the shipped constant, so a phase flip keeps this
-    // assertion honest about whatever the flip leaves in force.
+    // The same posture, where a diagnostics bundle reads it: the one line
+    // every session start logs.
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -3602,16 +3566,10 @@ async fn own_ip_default_deny_all() {
         .find(|line| line.contains("session starts") && line.contains("own-ip-bare"))
         .unwrap_or_else(|| panic!("the session start must be logged, got: {logged}"));
     for fact in [
-        format!("egress_default_phase={:?}", boxes::EGRESS_DEFAULT_PHASE),
         "deny_all_opt_out=false".to_string(),
         format!(
             "effective_egress={:?}",
-            boxes::effective_egress(
-                None,
-                boxes::NetworkMode::OwnIp,
-                boxes::EGRESS_DEFAULT_PHASE,
-                false
-            )
+            boxes::effective_egress(None, boxes::NetworkMode::OwnIp, false)
         ),
     ] {
         assert!(
@@ -11038,7 +10996,6 @@ async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_pl
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let id = create_configured_session(&mut client, "check-plain", "/uwu").await;
-    assert_eq!(read_record(&server, id).await.host_ip_enforcement, None);
 
     box_handle(&server, id)
         .await
@@ -11063,7 +11020,6 @@ fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -
         exit_code: None,
         signal: None,
         hooks_enabled: true,
-        host_ip_enforcement: None,
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
@@ -11194,8 +11150,7 @@ fn box_package_build_under_box_egress_verdict_gives_no_network_box_none() {
     let network = super::setup::box_build_network(&own, &switch, false).unwrap();
     assert!(!network.is_none());
 
-    let mut host = build_record(boxes::NetworkMode::HostNet, None);
-    host.host_ip_enforcement = Some(boxes::HostIpEnforcement::None);
+    let host = build_record(boxes::NetworkMode::HostNet, None);
     assert!(super::setup::box_build_network(&host, &switch, false).is_none());
 }
 

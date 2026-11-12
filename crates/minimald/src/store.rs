@@ -507,7 +507,6 @@ mod tests {
             signal: None,
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
-            host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),

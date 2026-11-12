@@ -1516,16 +1516,15 @@ impl ActivateArgs {
 pub struct EgressArgs {
     /// Allow outbound traffic to this destination subnet, in CIDR form,
     /// e.g. `10.0.0.0/8`. Repeatable. Adds to the `allow_subnets` that
-    /// minimal.toml declares for the box. Once any egress flag is given, an
-    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
-    /// allows nothing, unless the host opts out: `--allow-dns-hosts
-    /// github.com` alone reaches no address directly, and `--allow-subnets
-    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
-    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
-    /// enforces these rules: a `host_ip` box is refused at creation or, on
-    /// a host that cannot filter it, runs with the rules unenforced.
-    /// `--network none` rejects every egress flag. `min session policy`
-    /// shows the rules a box ended up with.
+    /// minimal.toml declares for the box. Once `--allow-subnets` or
+    /// `--allow-dns-hosts` is given, the box reaches only what the two
+    /// lists name: `--allow-dns-hosts github.com` alone reaches no address
+    /// directly, and `--allow-subnets 0.0.0.0/0` writes allow-all out. The
+    /// egress flags are accepted with `--network own_ip` and `--network
+    /// host_ip`, and both enforce them. A box whose rules this host cannot
+    /// enforce is refused at creation. `--network none` rejects every
+    /// egress flag. `min session policy` shows the rules a box ended up
+    /// with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
@@ -1553,8 +1552,7 @@ pub struct EgressArgs {
     /// stay, and `--deny-subnets` and `--allow-protocols` still apply.
     /// Unless the
     /// host opts out, a `--network own_ip` box with no egress rules already
-    /// reaches no external address. With `--network host_ip` it is enforced
-    /// only on a host that can filter each box.
+    /// reaches no external address.
     #[arg(
         long = "deny-all-egress",
         conflicts_with_all = ["allow_subnets", "allow_dns_hosts"]

@@ -949,7 +949,6 @@ mod tests {
             project_path: Some(paths::HostAbsPath::try_new("/src/x").unwrap()),
             status: boxes::BoxState::Active,
             git: None,
-            host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
             attrs: None,
         }
@@ -1065,7 +1064,6 @@ mod tests {
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
-            host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),

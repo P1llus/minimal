@@ -24,7 +24,6 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
         status: boxes::BoxState::Active,
         git: None,
-        host_ip_enforcement: None,
         shared_port_collisions: Vec::new(),
         attrs: None,
     }
@@ -87,7 +86,6 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         hooks_enabled: true,
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
-        host_ip_enforcement: None,
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),

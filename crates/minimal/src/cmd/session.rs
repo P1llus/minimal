@@ -366,8 +366,8 @@ pub async fn cmd_session_policy(
     // id prefix reaches the same session they do.
     let box_id = record.id.to_string();
 
-    // The daemon resolves the effective egress (NET-074/NET-077), because
-    // the rollout phase and its opt-out are the daemon's own facts; built
+    // The daemon resolves the effective egress, because its opt-out is the
+    // daemon's own fact; built
     // here rather than through a `SessionLookup` conversion so the request
     // types stay the rpc crate's, where the wire contract lives.
     use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
@@ -381,15 +381,9 @@ pub async fn cmd_session_policy(
         .await
         .context("GetEffectiveSessionPolicy RPC failed")?;
 
-    // NET-079's per-box enforcement answers beside the rules, over its own
-    // runtime-facts reply — never as a field on the policy, because the
-    // policy struct is `deny_unknown_fields`: an older `min` would reject the
-    // whole rules reply over a key it has no field for, so the fact rides a
-    // separate reply the way live ingress does. A client that cannot get it
-    // — an older daemon, a session mid-teardown — renders the rules with no
-    // enforcement row, silently: the row is an optional fact beside the
-    // declaration, and the same silence is what a session that is not
-    // host-address already prints.
+    // What the daemon reports beside the rules. A client that cannot get
+    // it, from an older daemon or a session mid-teardown, renders the rules
+    // without it.
     let facts_lookup = match SessionLookup::parse(&box_id) {
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
@@ -401,7 +395,6 @@ pub async fn cmd_session_policy(
         Ok(minimald_rpc::Errorable::Ok(facts)) => Some(facts),
         Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
     };
-    let host_ip_enforcement = facts.as_ref().and_then(|facts| facts.host_ip_enforcement);
     let shared_port_collisions = facts
         .as_ref()
         .map(|facts| facts.shared_port_collisions.clone())
@@ -415,35 +408,8 @@ pub async fn cmd_session_policy(
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
-            // The fabric the display builds the baseline set from: the
-            // microVM backend's run path builds its registry and the
-            // helper's enumeration from the default plan, so that is the
-            // plan the display can name for it. Keyed on the backend this
-            // command actually talks to — `client_host_kind`, the same
-            // key `resolve_socket_path` turns on — not on `use_minvmd()`,
-            // which is true only under an explicit `--provider
-            // local-minvmd`: on macOS that kind is `Minvmd` without the
-            // flag, minvmd being the only backend there. The native
-            // daemon's own per-daemon switch is a plan the reply does not
-            // carry — and it has no host-side gate the set would describe —
-            // so that arm passes `None` and the block is left out rather
-            // than printed from a plan the session does not attach to.
-            let host_kind = daemon_host_kind(global);
-            let fabric =
-                (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
-            // NET-160: the host exposures row turns on the host kind itself,
-            // not on `fabric`.
-            let native_host = host_kind == paths::HostKind::Minimald;
             let mut out = std::io::stdout();
-            format_policy_on_host(
-                &mut out,
-                &policy,
-                record.network,
-                host_ip_enforcement,
-                &shared_port_collisions,
-                fabric,
-                native_host,
-            )?;
+            format_policy(&mut out, &policy, record.network, &shared_port_collisions)?;
             write_live_ingress(&mut out, &live)?;
             if let Some(facts) = &facts {
                 write_unaudited_listen_ports(

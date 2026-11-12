@@ -88,6 +88,21 @@ pub fn box_policy(
     })
 }
 
+/// Whether the engine refuses what the box's egress section does not
+/// list. A section the engine cannot read is one no box runs with, and
+/// reads as refusing.
+#[must_use]
+pub fn denies_by_default(
+    egress: Option<&EgressPolicy>,
+    mode: NetworkMode,
+    deny_all_opt_out: bool,
+) -> bool {
+    let of_mode = netpol::base::defaults(mode.into()).egress;
+    box_policy(egress, mode, deny_all_opt_out)
+        .map_or(Verdict::Deny, |policy| policy.egress_default(of_mode))
+        == Verdict::Deny
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
