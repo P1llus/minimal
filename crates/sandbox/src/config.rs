@@ -241,6 +241,8 @@ pub struct Config {
     /// there. `None` runs the sandbox in the cgroup of the process that
     /// starts it. Set where the config is made and nowhere else, so no
     /// sandbox is configured without its cgroup being named.
+    // Only a Linux build starts containers and reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) box_cgroup: Option<crate::cgroup::BoxCgroup>,
 }
 
