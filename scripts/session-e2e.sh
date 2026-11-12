@@ -15159,26 +15159,22 @@ proof_bep_audit_http_and_messages_closed() {
   fi
 }
 
-# Whether the exec error in $2 is the daemon's own refusal to start a box
-# with a credentialed upstream. It starts none while it cannot deliver the
-# box's flows to the proxy, and says which setting it cannot apply. Records
-# case $1 as a KNOWN GAP then.
-credentialed_box_gap() {
-  # shellcheck disable=SC2016 # the backticks are the daemon's text
-  grep -qF -- 'sets `secrets`, which this version of Minimal cannot apply' "$2" 2>/dev/null || return 1
-  known_gap "$1" "the daemon starts no box with a credentialed upstream: its network policy sets \`secrets\`, which this version of Minimal cannot apply"
+# Whether this lane runs a box with a credentialed upstream: the credential
+# proxy is on the host of a VM, so only a node in a VM has a way to one, and
+# a native node creates no such box. Records case $1 as NOT RUN otherwise.
+bep_vm_gate() {
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$1" "no VM with a network on this target: a box with a credentialed upstream runs in a VM only, where the credential proxy is on the VM's host"
+    return 1
+  fi
 }
 
 # Proxy-variable proof: a box whose [session.network.bep] steering is
-# proxy_env starts with its own address and a credentialed upstream, and its
-# environment carries the proxy variables. The two cases start the box the
-# same way. An own_ip box needs the VM's network, so a target without gvproxy
-# records the case as NOT RUN. The box declares no grant, so the case needs no
-# sign-in and no running proxy: it reads the variables, never a connection
-# through them.
-# $1: the case name. Leaves the box's `env` output in $WORK/$1.env. Returns
-# 1 after recording the case as a KNOWN GAP when the daemon starts no box
-# with a credentialed upstream.
+# proxy_env starts with a credentialed upstream, and its environment carries
+# the proxy variables. The two cases start the box the same way. The box
+# declares no grant, so the case needs no sign-in and no running proxy: it
+# reads the variables, never a connection through them.
+# $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
 bep_proxy_env_box_env() {
   local pe_case="$1" pe_sid pe_out
   PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlpenv.XXXXXX)"
@@ -15202,7 +15198,6 @@ bep_proxy_env_box_env() {
     >"$WORK/$pe_case.env" 2>"$WORK/$pe_case.exec.err"; then
     mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
     rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
-    credentialed_box_gap "$pe_case" "$WORK/$pe_case.exec.err" && return 1
     echo "::error::'min session exec' in the proxy_env box failed"
     cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
     fail
@@ -15219,22 +15214,17 @@ bep_env_value() {
 
 proof_bep_proxy_env_and_no_proxy_are_set() {
   echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY"
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: an own_ip box needs the VM's network, and this target has none"
-    echo "::endgroup::"
-    return 0
-  fi
+  bep_vm_gate bep_proxy_env_and_no_proxy_are_set || { echo "::endgroup::"; return 0; }
   local pe_env pe_https pe_http pe_no
-  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set || { echo "::endgroup::"; return 0; }
+  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set
   pe_env="$WORK/bep_proxy_env_and_no_proxy_are_set.env"
   pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
   pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
   pe_no="$(bep_env_value "$pe_env" NO_PROXY)"
-  # launch_proxy_env (crates/minimald/src/box_runtime.rs) builds the value
-  # from the subnet's reserved proxy address, broadcast - 3, and
-  # boxes::core::bep::PROXY_LISTENER_PORT.
-  if ! [[ "$pe_https" =~ ^http://100\.64\.[0-9]+\.[0-9]+:8118$ ]]; then
-    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the subnet's proxy address at port 8118"
+  # The box's own credential proxy endpoint: a port of the daemon's on the
+  # address every box reaches its endpoints at.
+  if ! [[ "$pe_https" =~ ^http://127\.0\.80\.1:[0-9]+$ ]]; then
+    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the box's own endpoint on 127.0.80.1"
     fail
   fi
   if [ "$pe_http" != "$pe_https" ]; then
@@ -15252,13 +15242,9 @@ proof_bep_proxy_env_and_no_proxy_are_set() {
 
 proof_bep_proxy_env_sets_node_use_env_proxy() {
   echo "::group::proxy_env box: NODE_USE_ENV_PROXY"
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: an own_ip box needs the VM's network, and this target has none"
-    echo "::endgroup::"
-    return 0
-  fi
+  bep_vm_gate bep_proxy_env_sets_node_use_env_proxy || { echo "::endgroup::"; return 0; }
   local pe_env pe_node
-  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy || { echo "::endgroup::"; return 0; }
+  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy
   pe_env="$WORK/bep_proxy_env_sets_node_use_env_proxy.env"
   pe_node="$(bep_env_value "$pe_env" NODE_USE_ENV_PROXY)"
   if [ "$pe_node" != "1" ]; then
@@ -15267,6 +15253,103 @@ proof_bep_proxy_env_sets_node_use_env_proxy() {
   fi
   rm -f "$pe_env"
   echo "proxy_env box: NODE_USE_ENV_PROXY=1"
+  echo "::endgroup::"
+}
+
+# The path from a box to the credential proxy, end to end: a box dials the
+# proxy its environment names, which is its own endpoint on the node. The
+# node carries the connection through the VM host's stream door to the
+# proxy, under the box's id. The proxy here is the VM host daemon's
+# stand-in (MINVMD_BEP_STUB), which answers a connection with one line
+# naming the box id and the entry it was delivered with. So the case needs
+# no sign-in and no `bep`, and runs on every VM lane. The box declares no
+# grant: with one, `min` needs the real proxy before it creates the box.
+# Once for a box with its own address and once for one that shares the
+# node's.
+proof_bep_proxy_env_box_reaches_the_proxy() {
+  echo "::group::proxy_env box: a connection through HTTPS_PROXY arrives at the proxy under the box's id"
+  local xp_case=bep_proxy_env_box_reaches_the_proxy xp_mode xp_out xp_sid xp_said xp_want
+  bep_vm_gate "$xp_case" || { echo "::endgroup::"; return 0; }
+  # The running daemon pair has the proxy or nothing at the proxy's socket.
+  # A new pair starts the stand-in there.
+  export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlxp.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$PROXY_ENV_SEED_DIR/minimal.toml"
+  mkdir "$PROXY_ENV_SEED_DIR/.git"
+  xp_fail() {
+    [ -n "${xp_sid:-}" ] && mnl session destroy --force "$xp_sid" >/dev/null 2>&1
+    rm -rf "${PROXY_ENV_SEED_DIR:?}"; PROXY_ENV_SEED_DIR=""
+    fail
+  }
+  for xp_mode in own_ip host_ip; do
+    xp_sid=""
+    xp_out="$(cd "$PROXY_ENV_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "e2e-proxy-path-${xp_mode%_ip}" --network "$xp_mode" --credentialed-upstream \
+      </dev/null 2>"$WORK/$xp_case.err")" || {
+      echo "::error::'min session activate --network $xp_mode --credentialed-upstream' of the proxy_env box failed"
+      echo "--- stdout ---"; printf '%s\n' "$xp_out"
+      echo "--- stderr ---"; cat "$WORK/$xp_case.err" 2>/dev/null || true
+      xp_fail
+    }
+    xp_sid="$(printf '%s\n' "$xp_out" | tail -n1 | tr -d '\r')"
+    # shellcheck disable=SC2016 # the box's shell expands these
+    xp_said="$(mnl session exec "$xp_sid" bash -c \
+      'p="${HTTPS_PROXY#http://}"; exec 3<>"/dev/tcp/${p%:*}/${p##*:}" || exit 1
+       printf "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n" >&3
+       IFS= read -r -t 20 line <&3; printf "%s\n" "$line"' </dev/null 2>"$WORK/$xp_case.exec.err" | tr -d '\r')" || true
+    xp_want="box_id=$xp_sid entry=dialled"
+    if [ "$xp_said" != "$xp_want" ]; then
+      echo "::error::the $xp_mode box's connection through HTTPS_PROXY was answered '${xp_said:-<nothing>}', not the stand-in's '$xp_want'"
+      cat "$WORK/$xp_case.exec.err" 2>/dev/null || true
+      xp_fail
+    fi
+    echo "$xp_mode box $xp_sid: the proxy's stand-in answered '$xp_said'"
+    mnl session destroy --force "$xp_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "${PROXY_ENV_SEED_DIR:?}"; PROXY_ENV_SEED_DIR=""
+  rm -f "${WORK:?}/${xp_case:?}".*
+  echo "::endgroup::"
+}
+
+# A native node has no way to a credential proxy, so it creates no box that
+# declares a credentialed upstream, and says why.
+proof_bep_native_node_creates_no_credentialed_box() {
+  echo "::group::native node: a box with a credentialed upstream is refused when it is created"
+  local nn_case=bep_native_node_creates_no_credentialed_box nn_out nn_dir nn_want
+  nn_want="this node has no credential proxy"
+  if [ -n "$E2E_VM" ]; then
+    not_run "$nn_case" "this target's node is in a VM, which has a credential proxy on its host"
+    echo "::endgroup::"
+    return 0
+  fi
+  nn_dir="$(hook_mktemp /tmp/mnlnn.XXXXXX)"
+  hook_seed_preamble > "$nn_dir/minimal.toml"
+  mkdir "$nn_dir/.git"
+  if nn_out="$(cd "$nn_dir" && mnl session activate . --no-prompt --name e2e-native-credentialed \
+    --credentialed-upstream </dev/null 2>&1)"; then
+    echo "::error::a native node created a box with a credentialed upstream"
+    printf '%s\n' "$nn_out"
+    mnl session destroy --force e2e-native-credentialed >/dev/null 2>&1 || true
+    rm -rf "${nn_dir:?}"
+    fail
+  fi
+  rm -rf "${nn_dir:?}"
+  if [[ "$nn_out" != *"$nn_want"* ]]; then
+    echo "::error::the refusal does not say that $nn_want"
+    printf '%s\n' "$nn_out"
+    fail
+  fi
+  if mnl ls 2>/dev/null | grep -q 'e2e-native-credentialed'; then
+    echo "::error::the refused box is listed"
+    fail
+  fi
+  echo "refused, and not listed: $(printf '%s\n' "$nn_out" | grep -F "$nn_want" | head -n1)"
   echo "::endgroup::"
 }
 
@@ -25313,6 +25396,8 @@ case "${1:-}" in
     proof_bep_signing_rotation_keeps_running_box_working
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
+    proof_bep_proxy_env_box_reaches_the_proxy
+    proof_bep_native_node_creates_no_credentialed_box
     proof_bep_root_ca_present_in_box_trust_store
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
@@ -25371,6 +25456,8 @@ case "${1:-}" in
     | bep_signing_rotation_keeps_running_box_working \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
+    | bep_proxy_env_box_reaches_the_proxy \
+    | bep_native_node_creates_no_credentialed_box \
     | bep_root_ca_present_in_box_trust_store \
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
     | bep_trust_env_points_at_bundle_and_root \
@@ -25432,6 +25519,7 @@ case "${1:-}" in
     echo "         bep_first_slice_end_to_end bep_store_reference_end_to_end"
     echo "         bep_signing_rotation_keeps_running_box_working"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
+    echo "         bep_proxy_env_box_reaches_the_proxy bep_native_node_creates_no_credentialed_box"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
