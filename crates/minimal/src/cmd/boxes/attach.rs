@@ -1613,7 +1613,7 @@ mod tests {
             .expect("the control server binds its socket");
             let switch = host_dir.join("switch.sock");
             accept_every_forward(&switch);
-            let guest = minvmd::control::spawn_guest_reports_door(
+            let guest = minvmd::control::spawn_guest_door(
                 &control,
                 registry.clone(),
                 answerer,

@@ -2692,7 +2692,7 @@ fn guest_door_env(
     proxy_publish: &crate::control::ProxyPublishStatus,
     publisher: Option<crate::net::publish::Publisher>,
 ) -> std::io::Result<(&'static str, std::path::PathBuf)> {
-    let door = crate::control::spawn_guest_door(
+    let door = crate::control::spawn_guest_door_with(
         control_sock_path,
         boxes.clone(),
         answerer.clone(),

@@ -344,9 +344,9 @@ pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
 /// `boxes` on a dedicated thread, whose handle the caller holds for as
 /// long as the daemon lives.
 ///
-/// The in-VM daemon's report channel ([`GUEST_CONTROL_SOCK_FILE`]) is not
+/// The guest door ([`GUEST_CONTROL_SOCK_FILE`]) is not
 /// bound here: the supervisor binds it as the vsock bridge's other half
-/// ([`spawn_guest_reports_door`]), so the door exists exactly when a
+/// ([`spawn_guest_door`]), so the door exists exactly when a
 /// running VM is handed it at
 /// [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`] (7352). A guest verb that
 /// reaches the host's socket does not parse there.
@@ -401,7 +401,7 @@ pub fn spawn(
 /// peer.
 ///
 /// The bind happens on the calling thread, so a failure is a startup error.
-pub fn spawn_guest_reports_door(
+pub fn spawn_guest_door(
     control_sock_path: &Path,
     boxes: BoxRegistry,
     answerer: AnswererStatus,
@@ -413,7 +413,7 @@ pub fn spawn_guest_reports_door(
         boxes.clone(),
         None,
     );
-    spawn_guest_door(
+    spawn_guest_door_with(
         control_sock_path,
         boxes,
         answerer,
@@ -422,10 +422,10 @@ pub fn spawn_guest_reports_door(
     )
 }
 
-/// [`spawn_guest_reports_door`] with the publisher the door's publish verbs
+/// [`spawn_guest_door`] with the publisher the door's publish verbs
 /// act through. Without one, a publish is refused: the VM has no virtual
 /// network to forward into.
-pub(crate) fn spawn_guest_door(
+pub(crate) fn spawn_guest_door_with(
     control_sock_path: &Path,
     boxes: BoxRegistry,
     answerer: AnswererStatus,
@@ -3392,7 +3392,7 @@ mod tests {
             Some(audit_log_path(sock_path)),
         );
         std::mem::forget(fake);
-        spawn_guest_door(
+        spawn_guest_door_with(
             sock_path,
             boxes.clone(),
             answerer.clone(),
@@ -6423,7 +6423,7 @@ mod tests {
         assert_eq!(read_mirror_collisions(&sock_path).await, Some(Vec::new()));
 
         // The guest door does not answer the verb.
-        let guest = spawn_guest_reports_door(
+        let guest = spawn_guest_door(
             &sock_path,
             boxes.clone(),
             answerer,
@@ -6614,8 +6614,9 @@ mod tests {
                 boxes.clone(),
                 Some(audit_log_path(&host)),
             );
-            let guest = spawn_guest_door(&host, boxes, answerer, proxy_publish, Some(publisher))
-                .expect("the guest door binds");
+            let guest =
+                spawn_guest_door_with(&host, boxes, answerer, proxy_publish, Some(publisher))
+                    .expect("the guest door binds");
             Self {
                 _dir: dir,
                 host,
