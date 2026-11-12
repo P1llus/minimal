@@ -204,10 +204,7 @@ pub struct Config {
     /// to the installed location (`switch::installed_gvproxy_bin`) when unset.
     #[serde(default)]
     pub gvproxy_bin: Option<PathBuf>,
-    /// Whether this `minimald` runs inside a `minvmd` libkrun VM (DM1/3/4). When
-    /// `true`, `OwnIp` PTasks attach to the **host** gvproxy (owned by `minvmd`)
-    /// over a vsock shuttle instead of spawning gvproxy in-guest.
-    /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
+    /// Whether this `minimald` runs inside a `minvmd` libkrun VM (DM1/3/4).
     #[serde(default)]
     pub in_microvm: bool,
     /// Whether the guest boot path actually mounted the writable data volume
@@ -430,17 +427,11 @@ pub struct ServerState {
 
     /// Why the host-side egress proxy is not reachable, if it is not. Set by
     /// [`start_host_proxies`] and read by the `ListSessions` RPC.
-    ///
-    /// Both failure paths land here, because they produce the same symptom
-    /// from different places: on DM2 the bind itself fails, and on DM1 the
-    /// bind succeeds inside the guest but publishing it on the host loopback
-    /// does not. A fix that surfaced only the first would stay silent on
-    /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
 
     /// The port the hostname proxy is actually listening on, once its
-    /// startup retry has bound (and, in a microVM, published) it: the
-    /// configured port when the deployment pinned one, the documented
+    /// startup retry has bound it: the configured port when the deployment
+    /// pinned one, the documented
     /// default when nobody did and it was free, else the OS-selected free
     /// port the fallback asked for (NET-024/NET-025). `None` until then —
     /// which is also what a client talking to a pre-discovery daemon sees —
@@ -448,7 +439,7 @@ pub struct ServerState {
     hostname_proxy_port: Option<u16>,
 
     /// The port the box-zone answerer is actually listening on (UDP), once
-    /// its startup has bound (and, in a microVM, published) it. Carries the
+    /// its startup has bound it. Carries the
     /// same configured/default/selected story [`Self::hostname_proxy_port`]
     /// does; reported beside it so the host-resolver recipe can name the
     /// port to point at.
@@ -475,8 +466,7 @@ impl ServerState {
         // file. The shared `Arc` is the single source of truth, injected into
         // every per-launch `SandboxLauncher` through the sessions manager.
         // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
-        // (owned by `minvmd`) over a vsock shuttle. DM2 (native Linux): spawn +
-        // own gvproxy locally.
+        // (owned by `minvmd`). DM2 (native Linux): spawn + own gvproxy locally.
         let transport = if config.in_microvm {
             crate::net::SwitchTransport::HostShuttle {
                 cid: crate::net::VSOCK_HOST_CID,
@@ -525,10 +515,8 @@ impl ServerState {
                 switch_subnet,
             )
             .with_transport(transport)
-            // This switch belongs to *this* daemon instance: its `OwnIp`
-            // DNS registrations carry the instance id as their host label,
-            // so a second daemon on the same host registers its own names
-            // instead of overwriting the first's records (NET-027).
+            // The hostname registry mints names under the host label the
+            // switch carries, so two daemons on one host need distinct ones.
             .with_host_id(daemon_id.clone()),
         ));
         // One line at daemon start naming the switch subnet this instance's
@@ -644,19 +632,16 @@ async fn reserved_range(in_microvm: bool) -> crate::net::dns::RangeVerdict {
 /// answerer's lease record (NET-010), never keyed on the daemon's octet.
 ///
 /// A daemon in a microVM (DM1/3/4) does **not** own its switch: it attaches
-/// its boxes' taps to the host gvproxy `minvmd` owns, whose config the
+/// its boxes to the host gvproxy `minvmd` owns, whose config the
 /// guest can neither read nor change — `minvmd` renders it with
 /// [`crate::net::DEFAULT_SUBNET`], the default /16. Every address the
 /// guest derives from its switch must be one that gvproxy actually answers
 /// at: an `OwnIp` box's lease *and* its gateway and DNS server (the
-/// switch's `network + 1`, where gvproxy answers DNS), the resolver a
-/// host-address box gets, and the legacy host literal
-/// [`crate::net::switch`](crate::net::switch)'s relay watches
-/// (the subnet's `broadcast - 1` — the /16's `100.64.255.254` is the
-/// literal NET-004 names). A derived /24 here would point every box at
+/// switch's `network + 1`, where gvproxy answers DNS), and the resolver a
+/// host-address box gets. A derived /24 here would point every box at
 /// `100.64.<octet>.1` — an address no gvproxy answers — and the boxes in
-/// the VM lose all egress, DNS first: the guest root tap
-/// ([`crate::guest::bring_up_root_egress`]) is configured from the same
+/// the VM lose all egress, DNS first: the guest bridge
+/// ([`crate::guest_net::wire_at_boot`]) is configured from the same
 /// /16, so a microVM daemon carries that /16 whatever octet it was given —
 /// the guest cannot move a switch it does not own onto another.
 fn switch_subnet_for(in_microvm: bool, octet: u8) -> crate::net::SwitchSubnet {
@@ -834,7 +819,7 @@ impl ServerStateHandle {
     }
 
     /// Clears the hostname-routing unavailability note: the proxy's startup
-    /// retry bound and published it, so `ListSessions` stops reporting the
+    /// retry bound it, so `ListSessions` stops reporting the
     /// reason and `min ls` stops printing the warning — without a daemon
     /// restart (NET-022).
     pub(crate) async fn clear_proxy_unavailable(&self) {
@@ -842,7 +827,7 @@ impl ServerStateHandle {
     }
 
     /// Records the port the hostname proxy actually listens on, once its
-    /// startup has bound (and, in a microVM, published) it.
+    /// startup has bound it.
     pub(crate) async fn set_hostname_proxy_port(&self, port: u16) {
         self.0.lock().await.hostname_proxy_port = Some(port);
     }
@@ -856,7 +841,7 @@ impl ServerStateHandle {
     }
 
     /// Records the port the box-zone answerer actually listens on (UDP),
-    /// once its startup has bound (and, in a microVM, published) it.
+    /// once its startup has bound it.
     pub(crate) async fn set_zone_answerer_port(&self, port: u16) {
         // No host exposure reaches the answerer.
         #[cfg(target_os = "linux")]
@@ -1190,8 +1175,7 @@ impl Server {
 
         // Start minimald's host-side egress proxy (B5, on its configured,
         // default, or OS-selected port) and the box-zone answerer beside it
-        // for the server's lifetime, and in a microVM (DM1) publish them on
-        // the macOS host loopback. minimald is Linux-only, and the PTask
+        // for the server's lifetime. minimald is Linux-only, and the PTask
         // hostname registry they route against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
@@ -1615,31 +1599,6 @@ async fn reap_if_unfinalized(
     }
 }
 
-/// Binds and serves minimald's host-side listeners — the egress proxy, and
-/// beside it the box-zone answerer — for the daemon's lifetime and, in a
-/// microVM (DM1), publishes them on the macOS host loopback.
-///
-/// The proxies route by `Host:` header through the sessions manager's shared
-/// PTask hostname registry; the answerer serves the same registry as DNS,
-/// answering `*.min.internal` for the host OS (NET-009). In a microVM they
-/// bind the daemon's switch IP
-/// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
-/// gvproxy forward can reach them; on native Linux (DM2) they bind host
-/// loopback directly.
-///
-/// Each startup — the bind, and in a microVM the host-loopback publish —
-/// runs on a detached task that retries with backoff until it succeeds
-/// ([`drive_proxy_until_serving`], NET-021) and then clears the unavailable
-/// note `min ls` warns from (NET-022). Nothing here is awaited: a listener
-/// whose port some other process holds must not hold the SSH accept loop
-/// hostage — the daemon starts serving regardless, reports the reason on its
-/// state, and the listener comes up on its own once the address frees.
-///
-/// The answerer's native startup is not a bind at all but the acquisition
-/// ([`crate::net::answerer::acquire`], NET-122): the same detached rule, a
-/// different decision — publish this daemon's rows into the manager-held
-/// answerer over the machine-global channel, host the interim only while
-/// nothing serves, never both — described at its own site.
 #[cfg(target_os = "linux")]
 /// Gives the policy engine what serves a box's endpoints (the resolver
 /// and the hostname proxy) and starts its event and sweep tasks.
@@ -1695,6 +1654,26 @@ async fn start_policy_engine_tasks(state: &ServerStateHandle, in_microvm: bool) 
     });
 }
 
+/// Binds and serves minimald's host-side listeners — the egress proxy, and
+/// beside it the box-zone answerer — for the daemon's lifetime.
+///
+/// The proxies route by `Host:` header through the sessions manager's shared
+/// PTask hostname registry; the answerer serves the same registry as DNS,
+/// answering `*.min.internal` for the host OS (NET-009).
+///
+/// Each startup runs on a detached task that retries with backoff until it
+/// succeeds ([`drive_proxy_until_serving`], NET-021) and then clears the
+/// unavailable note `min ls` warns from (NET-022). Nothing here is awaited: a
+/// listener
+/// whose port some other process holds must not hold the SSH accept loop
+/// hostage — the daemon starts serving regardless, reports the reason on its
+/// state, and the listener comes up on its own once the address frees.
+///
+/// The answerer's native startup is not a bind at all but the acquisition
+/// ([`crate::net::answerer::acquire`], NET-122): the same detached rule, a
+/// different decision — publish this daemon's rows into the manager-held
+/// answerer over the machine-global channel, host the interim only while
+/// nothing serves, never both — described at its own site.
 async fn start_host_proxies(
     state: &ServerStateHandle,
     in_microvm: bool,
@@ -1704,8 +1683,8 @@ async fn start_host_proxies(
     use std::net::{IpAddr, Ipv4Addr};
 
     // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
-    // eth0 has finished coming up, then publish the port on the host loopback via
-    // the gvproxy forwarder. DM2: bind host loopback directly, no host-expose.
+    // eth0 has finished coming up. The VM host forwards to it. DM2: bind host
+    // loopback directly.
     let bind_base: IpAddr = if in_microvm {
         Ipv4Addr::UNSPECIFIED.into()
     } else {
@@ -1717,10 +1696,7 @@ async fn start_host_proxies(
     // only when that is busy asks the OS for a free one, so a second daemon
     // on the same host takes its own port instead of silently losing routing
     // (NET-025). The driver records the port it ended up on where the RPCs a
-    // client discovers it from can read it. In a VM, the *publication* of
-    // that port on the host loopback follows the same default-first rule and
-    // walks to a host port of its own when the host already holds the
-    // default — the bind itself never moves for a publish (NET-059).
+    // client discovers it from can read it.
     crate::traced::spawn(drive_proxy_until_serving(
         state.clone(),
         HostProxyStartup::Egress {
@@ -1737,8 +1713,7 @@ async fn start_host_proxies(
     // host only: the loopback answerer the host's resolver is routed to for
     // `*.min.internal` (design §7.1, NET-009).
     //
-    // A daemon inside a microVM starts no answerer and publishes none
-    // through the forwarder: on a VM-backed host the zone is the VM host
+    // A daemon inside a microVM starts no answerer: on a VM-backed host the zone is the VM host
     // daemon's to answer — `minvmd`'s host answerer serves it on the host
     // loopback from the host-authored table (NET-138), the same semantics
     // over the same shared decision — and an in-guest answerer behind the
@@ -1783,7 +1758,7 @@ async fn start_host_proxies(
 /// Starts the host-address listen watcher of a daemon inside a microVM for
 /// the daemon's life (NET-138): a host-address box shares the node's
 /// namespace, so the VM host daemon opens its listeners on the host only
-/// from the listen notices this watcher sends over the report door. It
+/// from the listen notices this watcher sends over the guest door. It
 /// stops when the daemon shuts down.
 #[cfg(target_os = "linux")]
 async fn start_host_address_listen_watcher(state: &ServerStateHandle) {
@@ -1806,8 +1781,8 @@ async fn start_host_address_listen_watcher(state: &ServerStateHandle) {
     ));
 }
 
-/// The retry schedule a host-side proxy's startup uses while its bind (or, in
-/// a microVM, its host-loopback publish) keeps failing: each retry waits twice
+/// The retry schedule a host-side proxy's startup uses while its bind
+/// keeps failing: each retry waits twice
 /// as long as the one before, from `initial` up to `max`. Tests pass a
 /// compressed schedule so a retry loop's worth of failures costs milliseconds
 /// instead of seconds.
@@ -1860,9 +1835,8 @@ pub enum PortSource {
     Configured,
     /// No port was configured and the documented default one was free.
     Default,
-    /// The OS chose: no port was configured and the default was busy, a
-    /// publish was refused and the port was re-picked, or the bind asked
-    /// for port `0` outright.
+    /// The OS chose: no port was configured and the default was busy, or
+    /// the bind asked for port `0` outright.
     Selected,
 }
 
@@ -1979,10 +1953,7 @@ impl HostProxyStartup {
 
     /// Spawns the serve loop for a bound listener. Runs for the daemon's
     /// lifetime: the startup retry never rebinds a bound-and-served
-    /// listener — a host publish the host refuses moves the *publication*
-    /// to a host port of its own (see
-    /// [`ProxyPort::reselects_when_publish_refused`]) while the listener
-    /// keeps the port it bound.
+    /// listener.
     async fn spawn_serve(
         &self,
         state: &ServerStateHandle,
@@ -2008,22 +1979,17 @@ impl HostProxyStartup {
         }
     }
 
-    /// Clears the failure note: bound and published, the proxy is serving.
+    /// Clears the failure note: the proxy is bound and serving.
     async fn clear_unavailable(&self, state: &ServerStateHandle) {
         match self {
             Self::Egress { .. } => state.clear_proxy_unavailable().await,
         }
     }
 
-    /// Reports the bound-and-published proxy on the state: the port a
-    /// client can reach — `reported_port` — is what the discovery fields of
-    /// the `ListSessions` and `CreateSession` replies carry, so a client can
-    /// find — and point `HTTP(S)_PROXY` at — this daemon's port (NET-026).
-    /// That is the port the listener bound (`bound_port`) everywhere except
-    /// a VM whose publication had to take a host port of its own (NET-059):
-    /// there the published port is the one a host client can dial, and the
-    /// boxes inside the VM keep reaching the bound one on the loopback they
-    /// share with the daemon. The one info line beside it is the
+    /// Reports the bound proxy on the state. The discovery fields of the
+    /// `ListSessions` and `CreateSession` replies carry `bound_port`, so a
+    /// client can find this daemon's port and point `HTTP(S)_PROXY` at it.
+    /// The one info line beside it is the
     /// diagnostics-bundle answer to "which port is this daemon on, and who
     /// chose it": the bundle tails the daemon log, and two daemons on one
     /// host (NET-027) is exactly when the question gets asked.
@@ -2056,8 +2022,6 @@ impl HostProxyStartup {
 ///
 /// Detached for the daemon's lifetime by `start_host_proxies`; also spawned
 /// directly by tests, which hold the address and watch the retry recover.
-/// The test path never publishes on a host loopback — the host gvproxy a
-/// publish needs is a harness this helper's callers don't have.
 #[cfg(any(test, feature = "test-support"))]
 #[cfg(target_os = "linux")]
 pub async fn retry_hostname_proxy_until_serving(
@@ -2081,9 +2045,6 @@ pub async fn retry_hostname_proxy_until_serving(
 /// (port `0` asks the OS for a free one) against the native scope and
 /// records the port it landed on, so a test's RPC replies carry the answerer's
 /// port beside the proxy's (`min ls` prints both).
-///
-/// The test path never publishes on a host loopback, for the same reason the
-/// proxy helper's does not.
 #[cfg(any(test, feature = "test-support"))]
 #[cfg(target_os = "linux")]
 pub async fn retry_zone_answerer_until_serving(
@@ -2109,38 +2070,18 @@ pub async fn retry_zone_answerer_until_serving(
 
 /// Drives one host-side proxy to serving, retrying with backoff (NET-021).
 ///
-/// Two gates stand between daemon start and a serving proxy, in order: the
-/// listener must bind, and — in a microVM (DM1), where the listener binds
-/// inside the guest — the port must then be published on the host loopback via
-/// the gvproxy forwarder. Each failed attempt logs one warning carrying the
+/// Each failed attempt logs one warning carrying the
 /// failure's reason and remedy and the next retry delay, and records it on the
 /// state note the `ListSessions` RPC serves, so `min ls` and
-/// `min session activate` print it (NET-020). Once both gates pass the note is
+/// `min session activate` print it (NET-020). Once the listener binds the note is
 /// cleared and — when any attempt failed — one info line marks the recovery
 /// (NET-022): the warning disappears from `min ls` without a daemon restart.
 /// The port the listener ended up on — and who chose it, per the
 /// [`ProxyPort`] policy — is recorded on the state for the RPC replies'
 /// discovery field, and named in one startup info line (NET-025, NET-026).
 ///
-/// The serve loop starts as soon as the listener binds and stays up while the
-/// publish retries; the bind gate never runs again once it has passed, so a
-/// bound-and-served listener is never dropped and rebound — the one
-/// exception [`ProxyPort::reselects_when_publish_refused`] names moved the
-/// *bind*, and the walk that replaces it moves only the *publication*: a
-/// host port the host refuses is left for the next proposal, one rung
-/// further up, while the listener keeps the documented port this VM's own
-/// boxes share its loopback on (NET-059).
-///
-/// The one publish failure that is *terminal* rather than retried: inside a
-/// microVM, a host port the host already holds on the port the boot line
-/// handed this daemon (a handed port has no rung of its own) is reported
-/// to the VM host daemon over the boot-marker channel
-/// ([`report_proxy_port_held`]) and the drive ends there — the VM host owns
-/// the reservation, so it owns the retry, a redraw onto a fresh port, and
-/// its fail-the-start decision needs the report, not silence backed by a
-/// backoff the host never learns from (T93). Every other publish failure —
-/// a transient one, a walk that exhausted its rungs — keeps the existing
-/// backoff (NET-021).
+/// The serve loop starts as soon as the listener binds, and a
+/// bound-and-served listener is never dropped and rebound.
 #[cfg(target_os = "linux")]
 pub(crate) async fn drive_proxy_until_serving(
     state: ServerStateHandle,
@@ -2150,7 +2091,7 @@ pub(crate) async fn drive_proxy_until_serving(
     let component = proxy.component();
     let bind_base = proxy.bind_base();
     // Which port to ask for, and what a busy one does. The address the loop
-    // binds can move under the two fallbacks below; the base never does.
+    // binds can move under the fallback below; the base never does.
     let choice = proxy.port_choice();
     let mut addr = SocketAddr::new(bind_base, choice.first_port());
     // The port the proxy ends up on is read off the bound listener: a
@@ -2173,9 +2114,6 @@ pub(crate) async fn drive_proxy_until_serving(
                 match listener.local_addr() {
                     Ok(local) => {
                         bound_port = local.port();
-                        // The publication proposes the port the listener
-                        // actually landed on, so a relocated bind (a busy
-                        // default, NET-025) publishes what it bound.
                         // The serve task runs for the daemon's lifetime;
                         // its handle is dropped on purpose — nothing ever
                         // aborts it, because nothing ever rebinds.
@@ -2256,14 +2194,11 @@ pub(crate) async fn drive_proxy_until_serving(
         );
     }
     proxy.clear_unavailable(&state).await;
-    // The port the RPC discovery field carries is the port a client can
-    // reach: the bound one, or — on a VM whose publication had to take a
-    // host port of its own — the published one.
     proxy.record_serving(&state, bound_port, source).await;
 }
 
-/// Drives the box-zone answerer to serving, the same two gates, the same
-/// backoff, the same [`ProxyPort`] policy and the same publication walk the
+/// Drives the box-zone answerer to serving, with the same
+/// backoff and the same [`ProxyPort`] policy the
 /// routing proxies take ([`drive_proxy_until_serving`], NET-021). Retained
 /// for the test helpers that hold an address and watch the retry recover
 /// ([`retry_zone_answerer_until_serving`], and the tests that drive it
@@ -2274,10 +2209,7 @@ pub(crate) async fn drive_proxy_until_serving(
 /// this drive.
 ///
 /// Binds at
-/// `bind_base` on `port`, and — in a microVM (DM1), where the socket binds
-/// inside the guest — publishes the port on the host loopback through the
-/// gvproxy forwarder's **UDP** path, the transport the host resolver's
-/// datagrams travel on. Once both gates pass,
+/// `bind_base` on `port`. Once the socket is bound,
 /// [`crate::net::answerer::serve`] runs for the daemon's lifetime, and the
 /// port it ended up on — and who chose it — is recorded on the state for the
 /// RPC replies to carry beside the proxy's.
@@ -2294,17 +2226,11 @@ pub(crate) async fn drive_proxy_until_serving(
 /// (the proxies carry that), and its failures are the host's resolver config
 /// to read in the log.
 ///
-/// The serve loop starts as soon as the socket binds and stays up while the
-/// publish retries; the bind gate never runs again once it has passed, so a
-/// bound-and-served answerer is never dropped and rebound. The publish walk
-/// only ever covers boots with no handed port — a native run with the port
-/// unconfigured, or one that landed on `0` — where a host port the host
-/// refuses is left for the next proposal, one rung further up
-/// ([`next_host_publish_port`]), while the socket keeps the port it bound:
-/// the same "publication walks, bind stays" rule the proxies follow. A
+/// The serve loop starts as soon as the socket binds, and a
+/// bound-and-served answerer is never dropped and rebound. A
 /// VM-hosted daemon never reaches this drive at all
-/// ([`start_host_proxies`] returns before it), so the walk's in-VM leg has
-/// no caller: the zone on a VM-backed host is the VM host daemon's host
+/// ([`start_host_proxies`] returns before it):
+/// the zone on a VM-backed host is the VM host daemon's host
 /// answerer's to serve (NET-138), never a guest's.
 #[cfg(target_os = "linux")]
 #[cfg(any(test, feature = "test-support"))]
@@ -2329,15 +2255,12 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
             Ok(socket) => match socket.local_addr() {
                 Ok(local) => {
                     // Serving from the moment the socket is bound, like
-                    // the proxies: the publish can still retry behind it.
+                    // the proxies.
                     // The serve loop takes a clone; the registry inside is
                     // the daemon's one either way. The bound port — the
                     // only place a selected one lives — is what the
-                    // publish below and the state's discovery field need.
+                    // state's discovery field needs.
                     bound_port = local.port();
-                    // The publication proposes the port the socket
-                    // actually landed on, so a relocated bind (a busy
-                    // default, NET-025) publishes what it bound.
                     let bound_addr = SocketAddr::new(bind_base, bound_port);
                     tracing::info!(
                         component = COMPONENT,
@@ -2349,8 +2272,7 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
                     let serve_answerer = answerer.clone();
                     // The serve task runs for the daemon's lifetime; its
                     // handle is dropped on purpose — nothing ever aborts
-                    // it, because nothing ever rebinds: the walk below
-                    // moves the *publication*, never the socket.
+                    // it, because nothing ever rebinds.
                     drop(crate::traced::spawn(async move {
                         if let Err(error) =
                             crate::net::answerer::serve(socket, serve_answerer).await
@@ -2443,9 +2365,7 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     // bundle's daemon-log tail can first read that half. The proxy half of
     // the line is read behind a settle window; see the function. The port
     // it names is the port the host's resolver reaches, the same one the
-    // discovery field above carries, so a VM whose publication walked to a
-    // host port of its own does not have its log point the host at a port
-    // the host never sees.
+    // discovery field above carries.
     crate::rpc::log_live_name_surface(&state, reached_port).await;
 }
 

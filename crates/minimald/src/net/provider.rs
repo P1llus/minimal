@@ -265,10 +265,7 @@ impl OwnAddressReporter {
     }
 
     /// The switch lease the attach reported for this box ([`Self::report`]),
-    /// or `None` before an attach reported one. On a VM host the daemon
-    /// builds the box's tap itself after the spawn
-    /// ([`TapMechanism::Privileged`]), so the launch's plan carries no tap to
-    /// read the lease from: this is where the lease is read there.
+    /// or `None` before an attach reported one.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn lease(&self) -> Option<Ipv4Addr> {
         self.registry
@@ -322,15 +319,13 @@ impl OwnAddressReporter {
 /// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
 /// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
 ///
-/// `policy` is the launch's whole session policy — the own-IP relay gate carries
-/// it in both directions (egress verdict per NET-062/063/064, inbound
-/// default-block per finding #2), while other modes have no relay to gate;
-/// `None` attaches ungated. The session launcher passes the box's *effective*
-/// policy (NET-074), and a task launch passes its session's effective egress
-/// alone when the rollout leaves one in force, `None` when the daemon opted
-/// out (or under the announced phase) — an ungated task keeps the open
-/// inbound it always had — because a task carries none of its session's
-/// ingress, the session's own PTask being attached at the same time.
+/// `policy` is the launch's whole session policy. The own-IP attach builds
+/// the box's ingress gate from it, and `None` attaches without one. The
+/// session launcher passes the box's *effective* policy (NET-074), and a
+/// task launch passes its session's effective egress alone when the rollout
+/// leaves one in force, `None` when the daemon opted out (or under the
+/// announced phase), because a task carries none of its session's ingress,
+/// the session's own PTask being attached at the same time.
 /// `own_address` carries the registry handle an own-address launch reports its
 /// lease through once the box attaches (NET-001); a task launch passes `None`
 /// for that too. `box_addresses` carries the switch and loopback addresses
@@ -338,8 +333,7 @@ impl OwnAddressReporter {
 /// address is what this `OwnIp` PTask attaches with instead of drawing one,
 /// because the host-side table's row is keyed by it. A task launch goes
 /// through [`task_network_for`] instead — the task's sandbox is not the box
-/// the registration named, and attaching it at the box's address would key
-/// its frames to the session's row.
+/// the registration named.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
@@ -496,20 +490,19 @@ fn own_ip_plan(subnet: crate::net::SwitchSubnet) -> NetPlan {
 struct Reserved {
     lease: crate::net::PtaskLease,
     subnet: crate::net::SwitchSubnet,
-    /// gvproxy's control channel: a local socket on DM2, host vsock on DM1/3/4.
+    /// What holds the box's forwards.
     control: ControlChannel,
 }
 
 /// An own-IP network: leases an address from the per-host gvproxy switch before
-/// the sandbox starts, then relays the sandbox's own tap onto that switch,
-/// gated by the session's policy — its declared egress enforced on the
-/// relay's outbound leg, its static ingress forwards applied and inbound
-/// ports gated on the other (R1.5/R2.3, NET-062).
+/// the sandbox starts, then connects the sandbox's namespace to that switch
+/// and applies its static ingress forwards.
 struct OwnIpNetwork {
     switch: Arc<Mutex<SwitchClient>>,
     /// Registered as the PTask's `*.min.internal` hostname on attach (R3.1).
     identity: String,
-    /// The launch's whole session policy, carried into the relay gate.
+    /// The launch's whole session policy. The attach builds the box's
+    /// ingress gate from it.
     policy: Option<boxes::BoxPolicy>,
     /// The registry handle the lease is reported through on attach, so the
     /// box's proxy route exists exactly while the lease does (NET-001). `None`
@@ -547,9 +540,8 @@ impl std::fmt::Debug for OwnIpNetwork {
 }
 
 impl Network for OwnIpNetwork {
-    /// Lease an address and make sure the switch is up, then describe the tap
-    /// the sandbox layer should build. Before the process starts, because the
-    /// sandbox layer assigns the address as it creates the tap.
+    /// Lease an address and make sure the switch is up. Before the process
+    /// starts, because the attach wires the namespace with the address.
     ///
     /// The lease is the host's handed address when the box was registered
     /// (T66) — the address the host-side table's row is keyed by — a free
@@ -559,7 +551,7 @@ impl Network for OwnIpNetwork {
         Box::pin(self.reserve())
     }
 
-    /// Relay the sandbox's tap onto the switch and apply its ingress. The
+    /// Connect the sandbox's namespace to the switch and apply its ingress. The
     /// reservation is read, not taken, until the attach has succeeded: a
     /// failed attach hands the release to [`abandon`](Self::abandon) (017-008).
     fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
@@ -625,8 +617,8 @@ impl OwnIpNetwork {
         Ok(own_ip_plan(subnet))
     }
 
-    /// The body of [`Network::attach`]: relays the tap and applies the
-    /// ingress from the reservation `plan` made.
+    /// The body of [`Network::attach`]: connects the namespace and applies
+    /// the ingress from the reservation `plan` made.
     async fn attach_reserved(&self, spawned: Spawned) -> Result<Box<dyn NetGuard>, NetworkError> {
         let Some(reserved) = self.reserved.lock().unwrap().clone() else {
             return Err(NetworkError::new(std::io::Error::other(
@@ -858,8 +850,7 @@ mod tests {
             &Resolver::Nameservers(vec![subnet.gateway()])
         );
 
-        // Own-address (the plan is transport-independent): the same gateway,
-        // whose static zone answers the name with the NAT'd host-alias address.
+        // Own-address (the plan is transport-independent): the same gateway.
         let own = own_ip_plan(subnet);
         assert_eq!(
             own.resolver(),

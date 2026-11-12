@@ -1502,7 +1502,13 @@ jobs:
             - name: Session e2e (shipped native minimald)
               # No E2E_* knobs: native target, host daemon, and the e2e seeds its
               # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
-              run: ./scripts/session-e2e.sh
+              # A native daemon enforces a box's network policy through the
+              # root-run policy loader, so the smoke finishes the install first.
+              run: |
+                  setup="$(mktemp)"
+                  min finalize-install --show --script > "$setup"
+                  sudo sh "$setup"
+                  ./scripts/session-e2e.sh
 
     smoke-linux-kvm:
         # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from

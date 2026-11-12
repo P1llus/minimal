@@ -3298,10 +3298,10 @@ async fn expose_ask_prompts_attached_human() {
     assert!(records[0].get("reason").is_none());
 }
 
-/// NET-044/NET-045: an `ask` answered yes admits the port at the box's relay
+/// NET-044/NET-045: an `ask` answered yes admits the port at the box's
 /// gate the way an `allow` does — the publish the human allowed is reachable
 /// — while a port nobody published stays refused. The gate is registered
-/// under the box's switch address the way its relay's spawn registers it.
+/// under the box's switch address the way its attach registers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
     let server = TestServer::new().await;

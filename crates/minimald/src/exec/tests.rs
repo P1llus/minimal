@@ -369,12 +369,11 @@ async fn a_task_takes_the_network_of_its_session() {
     );
     assert!(matches!(plan.resolver(), sandbox::Resolver::Nameservers(_)));
     // Its own identity on the switch, and the session's *effective*
-    // egress (NET-074) — resolved under the phase this build ships, so
-    // the same rules the session's own gate enforces, whatever the
-    // rollout leaves in force — but none of its ingress, because the
-    // session's PTask is attached at the same time. The gate exists only
-    // where that egress has rules, so the answer follows the shipped
-    // phase rather than a literal a cutover would invalidate.
+    // egress (NET-074), resolved under the phase this build ships, but
+    // none of its ingress, because the session's PTask is attached at the
+    // same time. The task carries a policy only where that egress has
+    // rules, so the answer follows the shipped phase rather than a literal
+    // a cutover would invalidate.
     let gated = crate::box_actor::effective_egress_section(
         &record.policy,
         record.network,
@@ -477,20 +476,16 @@ async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
 }
 
 /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
-/// egress default its session does, and nothing else changes with it. A
-/// gate is attached only where the effective egress has rules to enforce,
-/// because a gate with no ingress declaration blocks a task's *inbound*
-/// too. Under InForce, the shipped phase, a bare own-address task with no
-/// opt-out carries the deny-all gate. The retired announced arm, pinned
-/// here by name, attaches the same task ungated, as every task did before
-/// the deny-all default.
+/// egress default its session does, and nothing else changes with it. The
+/// task carries a policy only where the effective egress has rules. Under
+/// InForce, the shipped phase, a bare own-address task with no opt-out
+/// carries the deny-all section. The retired announced arm, pinned here by
+/// name, attaches the same task with no policy.
 ///
 /// The phase decides only the *default* for a box that declared nothing.
 /// A box that declared an `egress` section is enforced on its session's
 /// own PTask in every phase, so a task in such a session carries that
-/// declaration's gate under either phase — the same inbound posture the
-/// in-force case below accepts: a task PTask holds no ingress of its own,
-/// so its gate default-blocks unsolicited inbound.
+/// declaration under either phase.
 ///
 /// The phase is passed by name, not read from the shipped constant, so
 /// both arms stay proven whichever one ships. `own_ip_default_deny_all`
@@ -513,8 +508,7 @@ async fn a_task_gate_follows_the_egress_default() {
     let record = record_with(boxes::NetworkMode::OwnIp);
 
     // Announced, no opt-out: an absent section still allows all, so the
-    // task gets no gate at all — its inbound stays as open as it was
-    // before the default was announced.
+    // task carries no policy.
     assert_eq!(
         crate::box_actor::effective_egress_section(
             &record.policy,
@@ -538,7 +532,7 @@ async fn a_task_gate_follows_the_egress_default() {
     );
 
     // In force, no opt-out: the same absent section is the deny-all one,
-    // and the task carries the gate built from it.
+    // and the task carries it.
     assert_eq!(
         crate::box_actor::effective_egress_section(
             &record.policy,
@@ -562,10 +556,10 @@ async fn a_task_gate_follows_the_egress_default() {
     );
 
     // A box that *declared* an egress section is the other case where
-    // the task path attaches a gate, and the announcement does not defer
+    // the task carries a policy, and the announcement does not defer
     // it: the declaration is enforced on the session's own PTask in every
     // phase, so a task in that session resolves the same section its
-    // session's gate did — the declaration, not the deny-all section and
+    // session did — the declaration, not the deny-all section and
     // not nothing — under either phase. In force, the default also
     // decides the destination list the declaration left absent
     // (`allow_dns_hosts`): present and empty, granting nothing

@@ -1,20 +1,13 @@
 //! The one shape of a refused connection's answer (NET-014, NET-081).
 //!
-//! Three callers refuse connections — the daemon's switch relay, whose
-//! native and in-guest attach legs hold the same per-session gate, and the
-//! box egress proxy's stack peer — and this module is the only place any of
-//! them builds the reply or says the audit line. Everything here is bytes
-//! and arithmetic on an arriving frame: the crate carries no runtime and no
-//! feature the rest of the workspace must match, so the in-guest daemon and
-//! the host daemon link the same definitions and a refusal shaped on one leg
-//! reads identically in a bundle's log tail whichever leg refused it.
+//! This module is the only place that builds a refusal's reply or says its
+//! audit line. Everything here is bytes and arithmetic on an arriving
+//! frame: the crate carries no runtime and no feature the rest of the
+//! workspace must match, so the in-guest daemon and the host daemon link
+//! the same definitions.
 //!
-//! - [`classify`] reads one frame into a [`Segment`] — the one parser, so
-//!   every leg agrees on what a frame *is* before any of them answers it.
-//! - [`refused_tcp_reset`] builds the reply a refusal writes (RFC 793 §3.4):
-//!   the one shape, whether the refusing side is a relay leg answering a
-//!   port nothing is published on or the stack peer refusing a SYN its
-//!   pre-screen turned away.
+//! - [`classify`] reads one frame into a [`Segment`], the one parser.
+//! - [`refused_tcp_reset`] builds the reply a refusal writes (RFC 793 §3.4).
 //! - [`RefusalEmitter`] bounds and rates every refusal per source, renders
 //!   the one audit line ([`Outcome::Emit`]), and — driven by its caller —
 //!   says a window's final count at the window it belongs to when no
@@ -53,9 +46,6 @@ pub const TCP_ACK: u8 = 0x10;
 /// reply acknowledges everything the segment carried, data included).
 /// `tcp_flags`, `seq`, `ack` and `payload_len` are `0` for UDP, which no
 /// reply here is built for yet.
-///
-/// The one shape every leg reads a frame into, so a segment a gate parsed
-/// means the same thing on every leg that refuses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
     /// Source `ip:port`.
@@ -123,9 +113,7 @@ impl Segment {
 /// `None` for non-IPv4 (ARP/IPv6/VLAN), non-TCP/UDP, IP fragments, and
 /// short or malformed frames. Length-checked at every step and
 /// allocation-free, so a truncated or hostile frame yields `None` rather
-/// than an out-of-bounds read. The one parser: a leg that classifies with
-/// this knows what the frame carries, and a leg that does not has no
-/// business refusing it.
+/// than an out-of-bounds read.
 pub fn classify(frame: &[u8]) -> Option<Segment> {
     // Ethernet header + minimum (20-byte) IPv4 header.
     if frame.len() < ETH_HDR + 20 {
@@ -266,8 +254,7 @@ pub fn seq_acknowledging(seq: u32, payload_len: u16, flags: u8) -> u32 {
 /// `src` — the refusing address — back to `dst`, the refused connection's
 /// peer, with the reply's link addresses handed in directly (`eth_dst` is
 /// the reset's destination MAC, the peer's). The only place reset bytes are
-/// laid out, so a reset's shape has one definition across the daemon's
-/// relay legs and the box egress proxy's stack peer.
+/// laid out.
 ///
 /// `acknowledges` picks the flag byte RFC 793 §3.4 pairs with the numbers:
 /// a reply that acknowledges the refused segment carries RST|ACK; a reply
@@ -376,10 +363,9 @@ pub fn refused_tcp_reset_from(
     ))
 }
 
-/// The relay legs' shape of [`refused_tcp_reset_from`]: the frame arrived
-/// addressed to the refusing box — the switch steers a segment to it by
-/// addressing it there — so the MAC the frame arrived at is the box's own,
-/// and the one the reset is written from.
+/// [`refused_tcp_reset_from`] for a frame that arrived addressed to the
+/// refusing box: the MAC the frame arrived at is the box's own, and the one
+/// the reset is written from.
 pub fn refused_tcp_reset(frame: &[u8], segment: &Segment) -> Option<Vec<u8>> {
     let (leg_mac, _) = frame.split_first_chunk::<6>()?;
     refused_tcp_reset_from(*leg_mac, frame, segment)
@@ -605,8 +591,7 @@ struct Limiter {
     owed: Vec<String>,
 }
 
-/// The bounded, rate-limited refusal audit every refusal goes through —
-/// the stack peer's as much as the relay's.
+/// The bounded, rate-limited refusal audit every refusal goes through.
 ///
 /// Two bounds, one per axis:
 ///
@@ -900,9 +885,7 @@ impl RefusalEmitter {
 
     /// Every line any window still holds unsaid, live or ended: the teardown
     /// flush. An emitter going away says every count it holds, because
-    /// nothing after it exists to carry one — the count a closed session's
-    /// gate was still holding would otherwise be the audit's one silent
-    /// loss, dropped with the gate that counted it.
+    /// nothing after it exists to carry one.
     pub fn flush_pending(&self) -> Vec<String> {
         let mut limiter = self.limiter();
         self.drain(&mut limiter, None)
@@ -1143,7 +1126,7 @@ mod tests {
         assert_eq!(reset[6..12], leg_mac);
         assert_eq!(tcp_of(&reset)[8..12], 43u32.to_be_bytes());
         assert_checksums_verify_on_the_wire(&reset);
-        // The relay legs' shape of the same builder writes from the MAC the
+        // `refused_tcp_reset` writes from the MAC the
         // frame arrived addressed to — the box's own.
         let reset = refused_tcp_reset(&to_broadcast, &segment).expect("a SYN is answered");
         assert_eq!(&reset[6..12], &[0xff; 6]);

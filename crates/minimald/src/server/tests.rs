@@ -945,7 +945,7 @@ async fn wait_for_proxy_port(state: &ServerStateHandle) -> u16 {
 /// handed it on the boot line, and selects none of its own. The handed
 /// port is read exactly the way pid-1 reads it — off the environment
 /// the kernel passes through — and the startup is driven the way a VM
-/// daemon's is: bind 0.0.0.0, publish behind the host-loopback gate, then
+/// daemon's is: bind 0.0.0.0, then
 /// record the bound port for the discovery reply to carry. With a handed
 /// port held busy, the startup keeps retrying that port and never
 /// re-picks: the host's box table names it, so a silent move would strand
@@ -954,11 +954,6 @@ async fn wait_for_proxy_port(state: &ServerStateHandle) -> u16 {
 /// The handed port is the hostname proxy's alone: a VM-hosted daemon
 /// starts no zone answerer (NET-138 — the VM host daemon's host answerer
 /// owns the zone), so no answerer token exists to read or drive.
-///
-/// The host-loopback publish is the `Fixed(None)` stand-in — the real
-/// gate's decisions are proven from the gate side (`minvmd`'s
-/// `switch_request_refused_and_logged`); what is under test here is the
-/// port policy the handed values feed.
 // Env is process state: nextest runs every test in its own process.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -984,9 +979,8 @@ async fn vm_hosted_daemon_binds_handed_port() {
         .await
         .unwrap();
 
-    // The VM startup shape: bind UNSPECIFIED, publish behind the
-    // host-loopback gate, record the bound port. The compressed backoff
-    // keeps a failed attempt cheap should the box be noisy.
+    // The VM startup shape: bind UNSPECIFIED, record the bound port. The
+    // compressed backoff keeps a failed attempt cheap should the box be noisy.
     let retry = RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(100));
     crate::traced::spawn(drive_proxy_until_serving(
         state.clone(),
@@ -1054,8 +1048,8 @@ async fn vm_hosted_daemon_binds_handed_port() {
     drop(probe);
 }
 
-/// T65 (NET-009 on a VM host): a VM-hosted daemon starts no zone answerer
-/// and publishes none through the forwarder. The zone on a VM-backed host
+/// T65 (NET-009 on a VM host): a VM-hosted daemon starts no zone answerer.
+/// The zone on a VM-backed host
 /// is the VM host daemon's to answer — `minvmd`'s host answerer serves it
 /// on the host loopback, from the host-authored table (NET-138) — so an
 /// in-guest answerer behind the switch would only shadow it. What must
@@ -1103,8 +1097,7 @@ async fn vm_hosted_daemon_starts_no_answerer() {
     start_host_proxies(&state, true, None, Some(configured)).await;
 
     // The positive control: the hostname proxy's half ran — its listen
-    // address bindable line is the first thing the VM startup logs, well
-    // before the host publish this harness has no gvproxy to answer. What
+    // address bindable line is the first thing the VM startup logs. What
     // changed is the answerer, not the daemon's whole proxy half.
     let mut proxy_bound = false;
     for _ in 0..200 {
@@ -2088,13 +2081,13 @@ fn a_configured_octet_places_the_switch_inside_the_host_s_16() {
 
 /// The other half of the ownership rule [`switch_subnet_for`] states —
 /// the half the macOS e2e caught: a daemon in a microVM does not own its
-/// gvproxy (it attaches its boxes' taps to the one `minvmd` runs on the
+/// gvproxy (it attaches its boxes to the one `minvmd` runs on the
 /// host, whose config renders the default /16), so the guest must carry
 /// that switch's subnet, never derive a /24 of its own. Every address a
 /// guest daemon derives from its switch must be one that switch answers
 /// at: the gateway is where a box's default route and DNS server live
 /// (a host-address box's resolver is the switch's DNS server, an
-/// own-IP box's tap carries the subnet's gateway and netmask), and a
+/// own-IP box's interface carries the subnet's gateway and netmask), and a
 /// derived /24's gateway — `100.64.<octet>.1` — is an address no
 /// gvproxy answers, so every box in the VM lost egress, DNS first.
 /// Read off the daemon's own start line, which names the subnet its

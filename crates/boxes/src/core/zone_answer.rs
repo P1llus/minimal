@@ -36,8 +36,7 @@
 //! Every negative — NODATA and NXDOMAIN — is a negative the answerer is
 //! authoritative for, so it carries the zone's SOA in the reply's
 //! authority section for the host resolver to cache (NET-124, RFC 2308);
-//! REFUSED, a namespace that is not ours, carries nothing. The relays that
-//! answer an out-of-zone name NXDOMAIN cite [`out_of_zone_soa`]. The SOA, and
+//! REFUSED, a namespace that is not ours, carries nothing. The SOA, and
 //! the records the A answers come in, are wire things: the answerer that
 //! calls this decision builds them, at a TTL of at most
 //! [`ANSWER_TTL_SECS`] (NET-126).
@@ -62,15 +61,13 @@ pub const ANSWER_TTL_SECS: u32 = 15;
 /// past NET-126's bound fails the build rather than a test run.
 const _: () = assert!(ANSWER_TTL_SECS <= 15);
 
-/// The label of the host's node row (NET-003): the row the switch and
-/// the DNS gate resolve for the host itself, whose zone name is
+/// The label of the host's node row (NET-003), whose zone name is
 /// [`HOST_ROW_NAME`]. The store's reserved session names include this
 /// label, so a session cannot take the host row's name.
 pub const HOST_ROW_LABEL: &str = "host";
 
 /// The zone name of the host's node row (NET-003): the label under
-/// [`ZONE_APEX`] that the switch resolves for the host itself. The
-/// switch reads its spelling here rather than keeping a second one.
+/// [`ZONE_APEX`] that names the host itself.
 pub const HOST_ROW_NAME: &str = "host.min.internal";
 
 /// The label of the managed-node row the box registry keys its node
@@ -311,8 +308,8 @@ pub struct OutOfZoneSoa {
     pub ttl: u32,
 }
 
-/// The one SOA that every out-of-zone NXDOMAIN cites, the relay's and the
-/// in-VM listener's alike (NET-141, NET-079). See [`OutOfZoneSoa`].
+/// The one SOA that every out-of-zone NXDOMAIN cites (NET-141, NET-079).
+/// See [`OutOfZoneSoa`].
 #[must_use]
 pub const fn out_of_zone_soa() -> OutOfZoneSoa {
     OutOfZoneSoa {

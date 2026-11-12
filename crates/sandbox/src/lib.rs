@@ -534,9 +534,8 @@ impl Container {
 /// forked child and then execs the program `command` named.
 ///
 /// hakoniwa builds the namespaces, the mounts and the id map. These are the
-/// steps it has no option for: bringing `lo` up in a fresh network namespace
-/// that gets no tap, loading the seccomp profile, and waiting at the start
-/// gate.
+/// steps it has no option for: bringing `lo` up in a fresh network
+/// namespace, loading the seccomp profile, and waiting at the start gate.
 ///
 /// `command_from_closure` starts a fresh `Command`, so the working directory
 /// and environment already set on `command` are carried over to it: hakoniwa
@@ -585,8 +584,8 @@ pub(crate) fn with_box_closure(
 
 /// Brings the loopback interface up in the current network namespace.
 ///
-/// A fresh network namespace starts with `lo` down, and hakoniwa brings it
-/// up only where it builds a tap.
+/// A fresh network namespace starts with `lo` down, and hakoniwa leaves it
+/// down.
 #[cfg(target_os = "linux")]
 fn bring_lo_up() -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

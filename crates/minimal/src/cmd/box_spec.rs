@@ -273,10 +273,9 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
 
 /// The network and the host fact the preview reads, for a host of `kind`:
 /// the box's `--network` mode, and whether the host resolves that box's
-/// steered names: the switch's DNS gate for `own_ip`, and the box's own
-/// steering answerer for `host_ip` (BEP-081). Creation reads the same fact
-/// for the same mode, so `min box spec --network <mode>` refuses what `min
-/// session activate --network <mode>` refuses.
+/// steered names. Creation reads the same fact for the same mode, so `min
+/// box spec --network <mode>` refuses what `min session activate --network
+/// <mode>` refuses.
 pub(crate) fn preview_host(
     kind: paths::HostKind,
     args: &BoxSpecArgs,

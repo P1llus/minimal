@@ -165,9 +165,8 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
 /// NET-046 requires every decision recorded and an allow is the one decision
 /// that can still be taken back.
 ///
-/// A record that landed is also reported to the VM host daemon, in the
-/// background. One that did not land is not: the caller withdraws the
-/// allow it names, and records that withdrawal through [`append`].
+/// The caller of a record that did not land withdraws the allow it names,
+/// and records that withdrawal through [`append`].
 pub(crate) async fn try_append(state_dir: &Path, record: &DecisionRecord) -> std::io::Result<()> {
     try_append_capped(state_dir, record, MAX_LOG_BYTES).await
 }

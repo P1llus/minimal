@@ -415,9 +415,9 @@ pub enum EgressPosture {
 }
 
 impl EgressPosture {
-    /// The posture of `egress`, the effective egress the gate enforces,
-    /// for a box in `network` mode. A `none` box has no network, whatever
-    /// its egress resolves to, as `min session policy` says for it.
+    /// The posture of `egress`, the effective egress of a box in `network`
+    /// mode. A `none` box has no network, whatever its egress resolves to,
+    /// as `min session policy` says for it.
     #[must_use]
     pub fn of(egress: &boxes::EffectiveEgress, network: boxes::NetworkMode) -> Self {
         if network == boxes::NetworkMode::NoNet {
@@ -688,8 +688,8 @@ pub struct RegisteredBox {
     pub box_id: BoxId,
     /// The task addresses filed with the box ([`RegisterBoxRequest::task_slots`]):
     /// one switch address per task slot, each a row of its own carrying
-    /// the box's id and egress. Empty from a host that predates them, or
-    /// for a registration that asked for none.
+    /// the box's id. Empty from a host that predates them, or for a
+    /// registration that asked for none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_addresses: Vec<std::net::Ipv4Addr>,
 }
@@ -739,19 +739,18 @@ pub struct RegisterBoxRequest {
     /// The box's declaration of a credentialed upstream (NET-134), carried
     /// from the session's policy: `Some` marks the Box Egress Proxy's
     /// listener as the box's infrastructure — the one destination its
-    /// egress rules never decide — and `None`, the default, is no lane: the
-    /// row the host publishes refuses the box's frames to the proxy's
-    /// address under the box-to-host default-deny. The minimum of the proxy
-    /// document's field schema; a client that predates the field declares
-    /// nothing, exactly as one that never asked for a lane does.
+    /// egress rules never decide — and `None`, the default, is no lane.
+    /// The minimum of the proxy document's field schema; a client that
+    /// predates the field declares nothing, exactly as one that never
+    /// asked for a lane does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
     /// The box's dynamic-ingress stance (NET-045), from the same create
     /// inputs the session record holds: the stance half of the grant the
-    /// host-side row holds a runtime port report against — a report under
-    /// `allow` records in range, one under `ask` records what the attached
-    /// human answered yes to, and `deny`, the stance an absent declaration
-    /// carries, admits nothing. The host decides; the guest only reports.
+    /// host decides a run-time publish by. Under `allow` a port in range
+    /// is published, under `ask` a port the attached human answered yes
+    /// to, and `deny`, the stance an absent declaration carries, admits
+    /// nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_ingress: Option<DynamicIngress>,
     /// The range the stance admits runtime ports in, inclusive at both
@@ -773,9 +772,8 @@ pub struct RegisterBoxRequest {
     pub hold: bool,
     /// How many task addresses to register with the box (NET-138): the
     /// host draws one switch address per slot and files each as a row
-    /// carrying the box's id and egress, withdrawn with the box. Zero —
-    /// the default, and what a client that predates the field sends —
-    /// registers none.
+    /// carrying the box's id, withdrawn with the box. Zero — the default,
+    /// and what a client that predates the field sends — registers none.
     #[serde(default)]
     pub task_slots: u8,
     /// Whether the box is a `host_ip` box (BEP-082). The host mints a box
@@ -837,8 +835,8 @@ pub fn is_address_capacity_refusal(error: &str) -> bool {
 ///
 /// A withdrawal ends the row's admissions and returns its addresses: the
 /// switch address to the host's hand-out run, handed again only after its
-/// reuse quarantine (or at once for a row no frame ever crossed the gate
-/// under), and the published loopback address to the machine's answerer.
+/// reuse quarantine (or at once for a row the in-VM daemon never referred
+/// to), and the published loopback address to the machine's answerer.
 /// Because an address can be handed again, the withdrawal may name the
 /// row's [`BoxId`] — the epoch the pair was handed under — so a stale
 /// creator never removes a newer row holding the same name and addresses.
@@ -902,9 +900,8 @@ pub struct RenameBoxRequest {
 /// ([`BoxControlRequest::ResumeBox`], NET-138): the session that registered
 /// the box presenting the pair — and the id, when it holds one — the
 /// registration handed back, before it attaches to or runs in a box whose
-/// row may have been withdrawn while nothing carried its frames: the box's
-/// host ended and stayed down past the host's detach grace, or the VM host
-/// daemon restarted under it.
+/// row may have been withdrawn: the box's host ended, or the VM host daemon
+/// restarted under it.
 ///
 /// The pair is the proof and the lookup key, as for a withdrawal
 /// ([`WithdrawBoxRequest`]); every fact the reinstated row holds comes from
@@ -980,33 +977,31 @@ pub struct HoldBoxNameRequest {
     pub session_id: Option<boxes::SessionId>,
 }
 
-/// A `host_ip` box's egress policy, for the VM host's gate to hold while
-/// the box is resident ([`BoxControlRequest::AdmitHostIpBox`], NET-085).
+/// A `host_ip` box for the VM host to hold as resident
+/// ([`BoxControlRequest::AdmitHostIpBox`]).
 ///
 /// A `host_ip` box leaves the VM from the node's own address, so it has no
-/// row of its own. The guest marks its frames, and root in the guest can
-/// write the same mark on any frame. The host gate therefore decides a
-/// marked frame from the node address by the union of the rules this verb
-/// registers, and drops it when no `host_ip` box is resident. Keyed by the
-/// session id, so an unnamed box and a task box register the same way.
-/// Answered with [`BoxControlReply::HostIpBox`]; idempotent, and a second
-/// admit for the same session replaces the policy the first one held.
+/// row of its own. While it is resident its held name answers the node's
+/// address and the host mirrors its listeners. Keyed by the session id, so
+/// an unnamed box and a task box register the same way. Answered with
+/// [`BoxControlReply::HostIpBox`]; idempotent, and a second admit for the
+/// same session replaces what the first one declared.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostIpBoxRequest {
     /// The session the box runs as.
     pub session_id: boxes::SessionId,
     /// Whether the box declares a credentialed upstream (BEP-083): `true`
-    /// opens the cohort's lane to the Box Egress Proxy's listener while the
-    /// box is resident. `false`, the default and what a client that
-    /// predates the field sends, declares no lane.
+    /// lets the stream door carry the box's connections to the Box Egress
+    /// Proxy while the box is resident. `false`, the default and what a
+    /// client that predates the field sends, declares none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credentialed_upstream: bool,
 }
 
 /// The session whose `host_ip` box left the VM host's resident set
-/// ([`BoxControlRequest::RetireHostIpBox`]): its rules admit nothing from
-/// then on. Answered with [`BoxControlReply::HostIpBox`]; a session the set
-/// does not hold is the goal state already holding.
+/// ([`BoxControlRequest::RetireHostIpBox`]). Answered with
+/// [`BoxControlReply::HostIpBox`]; a session the set does not hold is the
+/// goal state already holding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RetireHostIpBoxRequest {
     /// The session the box ran as.
@@ -1081,16 +1076,7 @@ pub struct ReadRowRequest {
 }
 
 /// The read-only row verb's answer for a live box: the row's switch address
-/// — the key its reports carry — beside the facts the host holds about it:
-/// the egress allow-list derived from its declared rules, and its declared
-/// and runtime-admitted ports, so a host-side read can see both halves of
-/// what the gate admits for the box.
-///
-/// The allow-list is the row's compiled egress subnets as CIDR strings —
-/// `0.0.0.0/0` for the absent-policy allow-all, empty for a row that
-/// declared a policy no subnet passes — because the read is a person's
-/// surface: the strings are the policy as it was declared, not the
-/// compiled form only the gate reads.
+/// beside its declared and runtime-admitted ports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BoxRow {
     /// The name the row was registered under.
@@ -1108,15 +1094,15 @@ pub struct BoxRow {
     /// The external ports the box's ingress declaration admitted, in the
     /// order the registration carried them.
     pub declared_ports: Vec<u16>,
-    /// The ports the row holds as runtime-admitted — reported by the in-VM
-    /// daemon within the grant and not yet withdrawn — in report order.
+    /// The ports the row holds as runtime-admitted, in the order they
+    /// were admitted.
     pub runtime_ports: Vec<u16>,
 }
 
 /// A pending ask's identity on its host: 16 bytes — one UUIDv4, 32
 /// lowercase hex digits on the wire — minted by the VM host daemon when
-/// the in-VM daemon reports an ask (NET-045), never carried by any
-/// client: the offer hands the id to the attached host client, and the
+/// a publish raises an ask (NET-045), never carried by any client:
+/// the offer hands the id to the attached host client, and the
 /// recorded answer carries it back, so the id names one ask's whole
 /// lifetime — offered, answered, consumed — and no client can name an
 /// ask the host did not mint.
@@ -1618,18 +1604,10 @@ pub enum StreamRefusal {
     Busy,
 }
 
-/// The host-side port the in-VM daemon's box-port reports cross to: the
-/// vsock port the guest dials `VMADDR_CID_HOST` on to report a runtime
-/// admission or withdrawal into the host-held grant, pinned here because
-/// both ends — the in-VM daemon that dials it and the VM host daemon that
-/// bridges it to its guest control channel — depend on this crate, so the
-/// report channel cannot drift between them. Beside the boot-marker port
-/// (`minimald`'s `VM_HOST_MARKER_PORT`, 7350), one port per purpose: the
-/// marker is one-way and fire-and-forget, this one answers, because a report
-/// the grant refused must be refused *to the reporter* for the publish to
-/// unwind (NET-138). Not 7351: the timekeep bridge owns that number, in the
-/// opposite direction — the host dials *into* the guest on it — and one
-/// number serving two purposes is two channels one misroute away.
+/// The vsock port of the guest door: the in-VM daemon dials
+/// `VMADDR_CID_HOST` on it, and the VM host daemon answers each request
+/// line. Defined here because both ends depend on this crate. Not 7351:
+/// the timekeep bridge owns that number, in the opposite direction.
 pub const VM_HOST_BOX_REPORT_PORT: u32 = 7352;
 
 /// The one request line the control socket takes: which verb the client
@@ -1650,7 +1628,7 @@ pub const VM_HOST_BOX_REPORT_PORT: u32 = 7352;
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum BoxControlRequest {
     /// Register the box's declaration: allocate the box's addresses on the
-    /// host and fill the row the egress gate decides by.
+    /// host and fill its row.
     Register(RegisterBoxRequest),
     /// Withdraw the row a registration filled: the destroyed or failed
     /// session's creator presenting the pair the registration handed back.
@@ -1675,13 +1653,11 @@ pub enum BoxControlRequest {
     /// [`BoxControlReply::NameHeld`]; a name no hold kept is the goal
     /// state already holding.
     ReleaseBoxName(HoldBoxNameRequest),
-    /// Hold a resident `host_ip` box's egress policy on the host
-    /// ([`HostIpBoxRequest`], NET-085): the gate decides a box-marked frame
-    /// from the node address by the union of the policies held. Served on
-    /// the host's control socket only, answered with
+    /// Make a `host_ip` box resident on the host ([`HostIpBoxRequest`]).
+    /// Served on the host's control socket only, answered with
     /// [`BoxControlReply::HostIpBox`].
     AdmitHostIpBox(HostIpBoxRequest),
-    /// Drop the policy [`BoxControlRequest::AdmitHostIpBox`] holds for a
+    /// End the residency [`BoxControlRequest::AdmitHostIpBox`] began for a
     /// session: the box stopped or was destroyed. Answered with
     /// [`BoxControlReply::HostIpBox`].
     RetireHostIpBox(RetireHostIpBoxRequest),
@@ -1698,10 +1674,10 @@ pub enum BoxControlRequest {
     /// subscription lives exactly as long as the connection it arrived on.
     SubscribeAsks(SubscribeAsksRequest),
     /// Read one box's row by name — the read-only row verb: the row's
-    /// switch address, its derived egress allow-list, and its declared and
-    /// runtime-admitted ports, or [`BoxControlReply::NoRow`] when no live
-    /// box holds the name. Served on the host's control socket only, whose
-    /// owner-only file mode is its access control.
+    /// switch address and its declared and runtime-admitted ports, or
+    /// [`BoxControlReply::NoRow`] when no live box holds the name. Served
+    /// on the host's control socket only, whose owner-only file mode is
+    /// its access control.
     ReadRow(ReadRowRequest),
     /// Release the interim answerer (NET-122's handover to the host
     /// service): the daemon stops the answerer it hosts and frees the hook
@@ -1786,7 +1762,7 @@ pub enum ZoneAnswererStatus {
     /// something the guest could vouch for, and it is the CLI's only way to
     /// say *why* the proxy is down rather than that it merely is.
     ProxyNotServing {
-        /// The port the supervisor reserved and the guest could not publish.
+        /// The port the supervisor reserved and could not publish.
         port: u16,
         /// What kept the proxy from serving on that port.
         cause: ProxyDownCause,
@@ -1794,13 +1770,11 @@ pub enum ZoneAnswererStatus {
 }
 
 /// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
-/// the terminal publish outcomes the supervisor itself reached — the port
-/// it reserved is held by another process on the host, or the draws to find
-/// a free one ran out — or that its publish is unconfirmed, the one
-/// non-terminal state: the VM is up, the publish is not one the host saw. A
-/// host that merely has no switch to publish through says nothing here: that
-/// boot's proxy never attempted a publish, and its story stays the daemon
-/// log's, not a cause this status could name.
+/// the publish outcomes the supervisor itself reached — the port it
+/// reserved is held by another process on the host, or the draws to find a
+/// free one ran out. A host that merely has no switch to publish through
+/// says nothing here: that boot's proxy never attempted a publish, and its
+/// story stays the daemon log's, not a cause this status could name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyDownCause {
@@ -1809,20 +1783,15 @@ pub enum ProxyDownCause {
     /// it is what every redraw skipped.
     PortHeld,
     /// The drawn port's publish tries ran out: every port the reservation
-    /// drew was already taken when the guest tried to publish it.
+    /// drew was already taken.
     RedrawsRanOut,
-    /// The VM came up but the guest never reported the publish, and the
-    /// supervisor could not attribute the port to this VM's own forwarder:
-    /// nothing answers on it, or its holder is one the host does not let
-    /// this user see. Not a failure — the VM stays up — but not a publish
-    /// the host can vouch for either, so the surfaces say "unconfirmed"
-    /// rather than "serving" until the guest's late report clears it.
+    /// A publish the host cannot vouch for. This VM host daemon never
+    /// sends it. A client still decodes it from an older one.
     PublishUnconfirmed,
-    /// The VM came up with its publish unconfirmed, and the guest's late
-    /// report then said the port is held: the VM stays up with no hostname
-    /// proxy — not a start failure, so it never reads like one. Names the
-    /// holder as the host saw it when the report landed (`pid <pid>
-    /// (<exe>)`), or `None` when the host would not name it.
+    /// The supervisor could not bind the proxy's port on the host. The VM
+    /// stays up with no hostname proxy, so this is not a start failure.
+    /// Names the holder as the host saw it (`pid <pid> (<exe>)`), or `None`
+    /// when the host would not name it.
     PortHeldAfterStart {
         /// Who holds the port, when the host let the supervisor see it.
         holder: Option<String>,
@@ -1838,7 +1807,7 @@ pub enum ProxyDownCause {
 /// without either substituting for the other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyDown {
-    /// The port the supervisor reserved and the guest could not publish.
+    /// The port the supervisor reserved and could not publish.
     pub port: u16,
     /// What kept the proxy from serving on that port.
     pub cause: ProxyDownCause,
@@ -2015,15 +1984,14 @@ pub enum BoxControlReply {
     /// The verb succeeded: a withdrawal's echo of the pair the row went by,
     /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
-    /// An admit or a retire of a `host_ip` box's policy was answered: the
-    /// session back, `resident` saying which — `true` the gate holds the
-    /// box's policy now, `false` it holds none for the session. The
-    /// `resident` marker is this shape's own field, so no other reply
-    /// decodes as it.
+    /// An admit or a retire of a `host_ip` box was answered: the session
+    /// back, `resident` saying which — `true` the box is resident now,
+    /// `false` it is not. The `resident` marker is this shape's own field,
+    /// so no other reply decodes as it.
     HostIpBox {
         /// The session the admit or the retire was about.
         session_id: boxes::SessionId,
-        /// The marker: whether the gate holds the box's policy now.
+        /// The marker: whether the box is resident now.
         resident: bool,
     },
     /// A hold or a release was answered: the name back, `held` saying
@@ -2047,8 +2015,7 @@ pub enum BoxControlReply {
     /// the sibling.
     Status(AnswererStatusReply),
     /// The read-only row verb's answer for a live box: the row's switch
-    /// address, its derived egress allow-list, and its declared and
-    /// runtime-admitted ports ([`BoxRow`]).
+    /// address and its declared and runtime-admitted ports ([`BoxRow`]).
     Row(BoxRow),
     /// The read-only row verb's answer for a name no live box holds: the
     /// name back, with `no_row` marking the shape, so a reader cannot
@@ -3351,7 +3318,7 @@ impl OneshotSshRpc for GetSessionPolicy {
 
 /// An RPC to read the *effective* networking policy for a session: the same
 /// record [`GetSessionPolicy`] serves, with its egress half resolved to what
-/// the gate enforces (NET-075) — the answer `min session policy` renders.
+/// the box is held to (NET-075) — the answer `min session policy` renders.
 ///
 /// A separate response rather than a field on [`BoxPolicy`], so the
 /// strict declaration a client reads back stays exactly what the box was
@@ -3395,12 +3362,9 @@ pub struct LiveMapping {
     pub internal_port: u16,
     /// The transport the forward carries.
     pub proto: IpProto,
-    /// Whether the box's own relay gate has not admitted the port. A current
-    /// daemon admits a runtime publish at the gate in the same step it binds
-    /// the forward (NET-044), so it always answers `Some(false)`. Only a
-    /// daemon from before that change answers `Some(true)`: its gate admitted
-    /// only the declared ports, so a connection to such a row's `local` was
-    /// answered by the relay, not by the box.
+    /// Whether the forward is bound and the box does not yet admit the
+    /// port. This daemon always answers `Some(false)`. Only an older daemon
+    /// answers `Some(true)`.
     ///
     /// An `Option`, defaulted on the wire, so a reply from a daemon older
     /// than the field — one that carries no `pending` key — still decodes,
@@ -3410,10 +3374,9 @@ pub struct LiveMapping {
     /// text row, `null` in the JSON document); a daemon that does carry the
     /// field answers `Some(true)` or `Some(false)`, and only those.
     ///
-    /// Deprecated: daemons from the gate-admits-exposed-ports change onward
-    /// always send `Some(false)`, so the field carries information only from
-    /// an older daemon. Remove it, and the client's `pending` rendering, when
-    /// the support window for those older daemons ends.
+    /// Deprecated: the field carries information only from an older
+    /// daemon. Remove it, and the client's `pending` rendering, when the
+    /// support window for those older daemons ends.
     #[serde(default)]
     pub pending: Option<bool>,
 }

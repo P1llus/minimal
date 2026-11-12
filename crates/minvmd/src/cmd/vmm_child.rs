@@ -18,8 +18,8 @@
 //!    libkrun bridges to the host UNIX socket where the parent listens.
 //!    When the parent also bound the guest report door (T94), its path
 //!    arrives as `MINVMD_GUEST_REPORT_SOCK` and is registered for
-//!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's port
-//!    reports reach the VM host daemon's host-held grant. Likewise the
+//!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's
+//!    requests reach the VM host daemon. Likewise the
 //!    guest telemetry door (`MINVMD_GUEST_TELEMETRY_SOCK`, registered for
 //!    `VSOCK_TELEMETRY_PORT`), over which the in-VM daemon's telemetry
 //!    records reach the host's exporter (TEL-034).
@@ -137,7 +137,7 @@ fn run_vmm() -> Result<()> {
 
     // The guest report door's vsock port (T94, NET-138): the parent binds
     // the door and hands its path here, and this registration is what
-    // bridges the in-VM daemon's port reports to it — so it is made only
+    // bridges the in-VM daemon's requests to it — so it is made only
     // when the parent bound a door, which is what the env names. A
     // supervisor with no door (a bind failure, or a supervisor that binds
     // no box table) hands no env, and the guest's runtime publishes then

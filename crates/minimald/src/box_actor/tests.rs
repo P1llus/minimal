@@ -2921,9 +2921,9 @@ async fn a_failing_activate_hook_blocks_the_session() {
 
 // `on_attach` has no unit test here, deliberately. It is the one
 // transition that runs in the user's shell rather than headlessly, so
-// it goes through `Host::hook_plan`, which resolves the sandbox's
-// session leader out of `/proc` — and the mock launcher's program is a
-// plain childless `/bin/sh`, so there is no leader to find. Faking one
+// it goes through `Host::hook_plan`, which needs the box's first
+// process — and the mock launcher's program is a
+// plain childless `/bin/sh`, so there is none to find. Faking one
 // would need a second test seam in `InjectedCommands` and would then
 // prove only that the call happens, not the property the transition
 // exists for: that the hook's output reaches the attached terminal.
@@ -3534,10 +3534,9 @@ async fn box_has_no_idle_stop() {
 /// nothing outside itself, and this build ships the deny-all default in
 /// force (asserted first, so the constant cannot slip back unnoticed). The
 /// phase is also passed explicitly to the resolver, so the in-force posture
-/// is proven by name, and the launcher's gate policy under it is the
-/// deny-all section, whose compiled rules drop every external
-/// destination in every transport, while the resolver Minimal owns for the
-/// box still answers, at its address *and* its port (NET-079). The
+/// is proven by name, and the launcher's policy under it is the
+/// deny-all section, which denies every destination it does not list and
+/// lists none. The
 /// session-start line names the phase, the opt-out, and the posture this
 /// build actually leaves in force, so a diagnostics bundle's log tail can
 /// say why the box reaches what it does.
@@ -4408,8 +4407,7 @@ async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
 /// the row ends with it (NET-138), and only the box's creator resumes it. No
 /// VM host daemon answers here that the row stands — as for a client that
 /// does not resume, or a resume that failed — so re-minting a fresh host
-/// would re-attach "rowless": the host gate silently drops the box's frames
-/// from an unregistered source. The attach must refuse with the typed
+/// would re-attach "rowless". The attach must refuse with the typed
 /// `BoxHostRowEnded` refusal (surfaced to the client on the channel) instead
 /// of re-minting, and no second host may launch — the hands are the
 /// host-side creator's, and re-registering a row is exactly what a daemon
@@ -6722,10 +6720,11 @@ enum GateAnswer {
 ///
 /// The script is keyed by port: a request is answered by the first entry
 /// left for the port its `local` names, and a request for any other port is
-/// answered 200 without touching the script. The watcher reads the host's
-/// whole socket table, so a wildcard listener another test holds inside the
-/// box's range is published too; keyed, its request can never take the
-/// answer — or the hold — a phase scripted for its own port.
+/// answered 200 without touching the script. The watcher reads every
+/// listening socket this test process holds, so a wildcard listener another
+/// test holds inside the box's range is published too; keyed, its request
+/// can never take the answer — or the hold — a phase scripted for its own
+/// port.
 async fn gated_forwarder(
     sock: std::path::PathBuf,
     script: Vec<(u16, GateAnswer)>,
@@ -7017,8 +7016,8 @@ async fn expose_allow_publishes_and_lists() {
         .ensure_host("tester".to_string())
         .await
         .expect("the allowing box launches its host");
-    // The box's relay gate, registered under its switch address as the
-    // relay's spawn registers it, and the lease its attach reports to the
+    // The box's gate, registered under its switch address as its
+    // attach registers it, and the lease its attach reports to the
     // hostname registry: what a direct connection and the proxy both meet.
     let gate = crate::net::ingress_gate::IngressGate::detached(&boxes::BoxPolicy::default());
     crate::net::ingress_gate::register(switch, &gate);
@@ -7081,7 +7080,7 @@ async fn expose_allow_publishes_and_lists() {
 
     // The publish is listed where `min session policy` reads it, by name and
     // by id alike — and it reads as reachable: the publish admitted the port
-    // at the box's relay gate (NET-044).
+    // at the box's gate (NET-044).
     let listed = mapping.clone();
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
@@ -7175,11 +7174,11 @@ async fn expose_allow_publishes_and_lists() {
     );
 }
 
-/// NET-044: an expose decided `allow` admits its port at the box's relay
+/// NET-044: an expose decided `allow` admits its port at the box's
 /// gate in the same turn it publishes — reachable, never a bound forward the
 /// gate refuses — while a port nobody published stays refused, and the box's
 /// stop (the expose's revocation) withdraws the admission. The gate is
-/// registered under the box's switch address the way its relay's spawn
+/// registered under the box's switch address the way its attach
 /// registers it, so the publish finds it exactly as it does in production.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
@@ -7373,7 +7372,7 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
         ))
         .await;
     // The row reads as reachable: the publish admitted the port at the
-    // box's relay gate (NET-044).
+    // box's gate (NET-044).
     assert_eq!(
         live,
         minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
@@ -7987,7 +7986,7 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: boxes::IpProto::Tcp,
-            // The publish admitted the port at the box's relay gate
+            // The publish admitted the port at the box's gate
             // (NET-044), so the row is never pending.
             pending: Some(false),
         }]),
@@ -8116,7 +8115,7 @@ async fn expose_publishes_at_the_registered_address() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: boxes::IpProto::Tcp,
-            // The publish admitted the port at the box's relay gate
+            // The publish admitted the port at the box's gate
             // (NET-044), so the row is never pending.
             pending: Some(false),
         }]),
@@ -9192,8 +9191,8 @@ async fn expose_on_listen_published_port_answers_published_already() {
     // A closing listener's withdrawal refuses the port at the gate before
     // its row leaves the set. In that gap the expose is not answered as
     // published: the port is not reachable, so it is the refusal. The
-    // relay publishes its gate under the box's switch address at spawn;
-    // this harness has no relay, so the test publishes the plan's gate.
+    // attach registers its gate under the box's switch address;
+    // this harness attaches nothing, so the test registers the plan's gate.
     crate::net::ingress_gate::register(switch, &gate);
     gate.withdraw_published(port);
     match handle.expose_dynamic(port).await {
@@ -9592,8 +9591,8 @@ async fn listen_plan_travels_in_launched() {
         served_naming(&served, seeded_loopback, bare_port).is_empty(),
         "the seeded box's watcher leaves a port outside its range alone: {served_records:?}"
     );
-    // No watcher ever ran for the launch that carried no plan — not even one
-    // that could not resolve its leader: the bare box's name is on no
+    // No watcher ever ran for the launch that carried no plan: the bare
+    // box's name is on no
     // watcher line at all, of the phrases a watcher says on any path it has.
     let logged = capture.contents();
     let watcher_phrases = [
@@ -10384,8 +10383,8 @@ async fn respawn_frees_published_ports() {
 }
 
 /// A `Hooks`-origin host whose record holds a registered host-side row is not
-/// replaced for an attaching terminal: ending its PTask would end the shuttle
-/// connection the row is tied to, and the in-VM daemon cannot re-register it.
+/// replaced for an attaching terminal: ending its PTask would end the
+/// row, and the in-VM daemon cannot register it again.
 #[test]
 fn replaces_host_for_terminal_skips_a_registered_box() {
     use super::{HostOrigin, replaces_host_for_terminal};

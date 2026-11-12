@@ -9,12 +9,7 @@ pub(crate) async fn switch_control_of(
 }
 
 /// The rows `min session policy` lists as a box's live ingress (NET-044), by
-/// the runtime surface that published them. Kept apart because the two are
-/// read differently: a runtime expose binds before the box's relay gate
-/// admits its port, so whether its row is reachable is read off the gate's
-/// compile set when served, while a listen publication is admitted at the
-/// gate as its own publish's last step, so its row is reachable as it
-/// stands.
+/// the runtime surface that published them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct LiveIngressRows {
     /// The box's own `min net expose` publications, in publish order.
@@ -299,11 +294,8 @@ impl BoxActor {
     /// path that writes the log line and the audit record (NET-046).
     ///
     /// On a VM-backed host the binding renders nothing: the human who
-    /// answers is the one attached on the host, so the ask goes to the VM
-    /// host daemon over the report door ([`crate::net::listeners::report_ask`])
-    /// and its reply is the answer, with no deadline. A yes there was
-    /// recorded in the box's host row, so the publish that follows reports
-    /// nothing again. The native path is unchanged.
+    /// answers is the one attached on the host, so the VM host asks them as
+    /// part of the publish, with no deadline, and its yes carries the forward.
     pub(super) async fn route_ask(
         &mut self,
         record: Record,
@@ -338,12 +330,6 @@ impl BoxActor {
                 return;
             }
         };
-        // On a VM-backed host the human who answers is the one attached on
-        // the host, and the VM host daemon asks them (NET-045): this
-        // daemon's binding renders nothing, and the ask crosses the report
-        // door as the row key, the port and the protocol. The row key is
-        // the switch address the host handed the box; a box the host never
-        // handed one holds no row there to ask about.
         let control = self.switch_control().await;
         // In a VM the VM host asks whoever is attached on the host, as part
         // of the publish itself. The forward comes back with the yes.
@@ -593,7 +579,7 @@ impl BoxActor {
                 };
                 match crate::audit::try_append(&state_dir, &record).await {
                     Ok(()) => {
-                        // The record is written, so the box's relay gate
+                        // The record is written, so the box's gate
                         // admits the port now, before the caller hears the
                         // publish (NET-044): an answered publish is
                         // reachable, never a bound forward the gate
@@ -601,9 +587,8 @@ impl BoxActor {
                         // box's own kernel with a reset, so no gate state
                         // waits on a listener, and a listener closing later
                         // never withdraws this admission — the box's stop
-                        // does. A box with no relay gate (no switch
-                        // attached) has nothing in front of it to admit
-                        // through.
+                        // does. A box with no gate has nothing in front of
+                        // it to admit through.
                         if let Some(gate) = self
                             .reported_switch_address
                             .and_then(crate::net::ingress_gate::live_gate)
@@ -785,12 +770,9 @@ impl BoxActor {
     /// Fails an allow closed whose audit record could not be written
     /// (NET-046): the publish that stood is withdrawn — the gate's admission
     /// taken first, then the forward unbound, then the port given back in
-    /// the box's publication set, then the VM host daemon's row withdrawn,
-    /// because the host's gate retracts
-    /// a runtime port only while the row still holds it — and the caller
-    /// hears a failed publish that says why. The warn line is the refusal's
-    /// record of last resort: the audit log that refused the allow may
-    /// refuse the refusal too.
+    /// the box's publication set — and the caller hears a failed publish
+    /// that says why. The warn line is the refusal's record of last resort:
+    /// the audit log that refused the allow may refuse the refusal too.
     ///
     /// The withdrawal is fallible, and the forward is *retained* until it
     /// takes: an unexpose the switch refuses leaves a forward standing that
@@ -799,13 +781,10 @@ impl BoxActor {
     /// able to unexpose it again — the box's stop sweep
     /// ([`Self::stop_running`]) and the spawn's teardown both draw their
     /// retries from [`Self::live_ingress`]. The box's publication-set entry
-    /// and the VM host daemon's row entry are held back with it: a row
-    /// withdrawn while its forward still stands leaves the host holding a
-    /// port its retraction rule can no longer reach, so the withdrawal
-    /// follows the unexpose the way it does everywhere else. The one forward
-    /// that cannot be kept is one whose spawn ended mid-unbind: the cell
-    /// refuses it back, so it is unbound once more, best-effort, and the
-    /// port is given back like every detached publish's.
+    /// is held back with it. The one forward that cannot be kept is one
+    /// whose spawn ended mid-unbind: the cell refuses it back, so it is
+    /// unbound once more, best-effort, and the port is given back like every
+    /// detached publish's.
     pub(super) async fn withdraw_unaudited(
         &mut self,
         box_name: &str,
@@ -828,7 +807,7 @@ impl BoxActor {
         // publish admits only after its record is written, so an unaudited
         // allow was never admitted and this is a no-op kept as the
         // fail-closed backstop: an allow refused cannot be crossed while
-        // its forward unbinds. A relay already gone took its gate with it.
+        // its forward unbinds. An attach already gone took its gate with it.
         if let Some(gate) = self
             .reported_switch_address
             .and_then(crate::net::ingress_gate::live_gate)
@@ -839,8 +818,7 @@ impl BoxActor {
         if let Some(mut live) = live {
             match crate::net::policy::unexpose_forwarder(&control, &live.forwarder).await {
                 // Unbound: the switch holds no forward at its `local` any
-                // more, so the row entry and the publication-set entry go
-                // with it below.
+                // more, so the publication-set entry goes with it below.
                 Ok(()) => {}
                 Err(unexpose) => {
                     tracing::warn!(
@@ -851,11 +829,7 @@ impl BoxActor {
                          it stays recorded for the box's stop to unbind again"
                     );
                     unbound = false;
-                    // The forward stays recorded, and the row entry with
-                    // it: the host's gate retracts a runtime port only while
-                    // the row still holds it, so a withdrawal that ran
-                    // first would strand the forward — bound, and
-                    // retractable by nothing. Recorded back, mapping and
+                    // The forward stays recorded. Recorded back, mapping and
                     // all, rather than never taken, because the sweep that
                     // would retry the unexpose — [`Self::stop_running`] —
                     // draws from the same cell. The gate refuses the port,
@@ -871,7 +845,7 @@ impl BoxActor {
                         // unwind's unexpose; then the port is given back
                         // below, as every detached publish's is: no sweep
                         // is left to retry it, so holding the publication
-                        // and the row back would only strand them.
+                        // back would only strand it.
                         crate::net::policy::remove_ingress(
                             &control,
                             std::slice::from_ref(&unrecorded.forwarder),
@@ -904,14 +878,9 @@ impl BoxActor {
     /// watcher the launch started, whichever got there first. Everything
     /// the box can refuse without asking the switch runs first, so a
     /// refused request is refused with nothing bound and nothing asked
-    /// (NET-047). On a VM-backed host the VM host daemon's grant is asked
-    /// next (T94, NET-138): `source` names the runtime surface the report
-    /// carries — the expose request, an answered ask — and a publish its
-    /// grant refuses asks the switch nothing, because the egress gate in
-    /// front of the switch admits a bind only for a port the grant holds.
-    /// Only then is the switch asked to bind, and the forwarder is recorded
-    /// only once it accepted; a publish that does not stand from there
-    /// withdraws its report again.
+    /// (NET-047). Only then is the switch asked to bind, unless `opened`
+    /// carries the forward the VM host opened with a yes to its ask, and the
+    /// forwarder is recorded only once it stands.
     pub(super) async fn publish_exposed_port(
         &mut self,
         record: &Record,
@@ -1009,7 +978,7 @@ impl BoxActor {
                 // already, and the publication stands listed and admitted:
                 // what the request asks for is true, so it is answered as
                 // such, with the address the port answers at. Nothing is
-                // reserved, reported or bound for it, and the publication
+                // reserved or bound for it, and the publication
                 // stays the listener's, to be withdrawn when the listener
                 // closes (NET-017). A pending listen reservation, or one
                 // committed unlisted because its record was refused, is not
@@ -1081,17 +1050,13 @@ impl BoxActor {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
             proto: boxes::IpProto::Tcp,
-            // Never pending: the box's relay gate admits the port in the
+            // Never pending: the box's gate admits the port in the
             // same turn the mapping is recorded (NET-044, below). `Some`,
             // never the unknown `None` that a reply from a daemon older
             // than the field decodes as.
             pending: Some(false),
         };
         if !self.has_live_host() {
-            // Unexpose first, then withdraw the report: the host's gate
-            // applies a runtime port's retraction only while the box's row
-            // still holds the port, so a withdrawal that ran first would leave
-            // the forward bound and unretractable.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
         }
@@ -1106,10 +1071,6 @@ impl BoxActor {
             // the one it holds (design §7.1), and the caller hears the
             // box's spawn is gone, the answer a revoked publish shares with
             // the stale-spawn arm below.
-            // Unexpose first, then withdraw the report: the host's gate
-            // applies a runtime port's retraction only while the box's row
-            // still holds the port, so a withdrawal that ran first would leave
-            // the forward bound and unretractable.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
@@ -1126,16 +1087,9 @@ impl BoxActor {
             self.publications
                 .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
             crate::net::policy::remove_ingress(&control, &[stale.forwarder]).await;
-            // The withdrawal follows the unexpose for the same reason as above:
-            // the gate retracts a runtime port only while the row holds it.
-            // The host admitted this port a moment ago, so the box's spawn
-            // ending takes the admission with it: the row the report put in
-            // names a forward that is gone, and the withdrawal report clears
-            // it — best-effort, like the unexpose beside it, because there
-            // is no caller left to propagate a failure to.
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
-        // The publish stands, but the box's relay gate does not admit the
+        // The publish stands, but the box's gate does not admit the
         // port here: an allow is admitted only once its `Published` record
         // is written (NET-046), so the admission is
         // [`Self::answer_expose_because`]'s, made right after the record —

@@ -164,8 +164,14 @@ jobs:
       - name: Build minimal + minimald
         run: cargo build -p minimald --bin minimald -p minimal --bin min --locked
       - name: Session e2e (native minimald)
+        # A native daemon enforces a box's network policy through the
+        # root-run policy loader. Without it every box that has a policy is
+        # refused, so the lane finishes the install first.
         run: |
           export PATH="$PWD/target/debug:$PATH"
+          setup="$(mktemp)"
+          min finalize-install --show --script > "$setup"
+          sudo sh "$setup"
           ./scripts/session-e2e.sh
 
   minimald-root-integration:

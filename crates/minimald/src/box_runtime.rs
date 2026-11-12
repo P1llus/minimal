@@ -528,8 +528,8 @@ pub(crate) fn place_launch_proxy_env(
 }
 
 /// The host kind a launch reads from this daemon's switch transport: a
-/// switch reached over the VM's host shuttle means this daemon runs inside
-/// a VM, and every other transport is a native host.
+/// switch the VM host owns means this daemon runs inside a VM, and every
+/// other transport is a native host.
 pub(crate) fn host_kind_of(transport: crate::net::SwitchTransport) -> paths::HostKind {
     match transport {
         crate::net::SwitchTransport::HostShuttle { .. } => paths::HostKind::Minvmd,
@@ -752,22 +752,12 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // launch gathered is the box's whole publication surface — its
         // lease, the switch's published address, the gvproxy control
         // channel, the ingress gate the attach registered, and the
-        // publication set it shares with the runtime expose path. It polls
-        // the listening sockets of the process the launch names the box's
-        // leader (whose `/proc` entry reads the whole box's network
-        // namespace) and keeps the box's published ports in step with them
+        // publication set it shares with the runtime expose path. It keeps
+        // the box's published ports in step with its listening sockets
         // until the session ends. A launch that carried no plan — no
         // lease, no published address — starts no watcher, and none of its
         // ports is published by listening.
         //
-        // The leader itself is the watcher's to resolve, not this build's to
-        // have resolved: a resolution that fails here — a shell that is
-        // mid-spawn, a `/proc` that cannot answer for the moment — would
-        // otherwise drop the plan with it and silently cost the box its
-        // whole listen-published surface, so the build hands the container
-        // PID it holds and the watcher asks on every poll until the box's
-        // program is there to be found (the module's nothing-is-one-shot
-        // contract, held of its start).
         // The engine records the box's listening sockets. A box nothing
         // judges has no such record, and publishes none by listening.
         let listen_watcher = listen_plan.and_then(|plan| {

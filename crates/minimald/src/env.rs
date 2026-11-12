@@ -2518,10 +2518,7 @@ impl BoxChannel {
     /// process inside the box sends to publish one of its ports. The session
     /// that owns this channel decides it against the box's `dynamic_ingress`
     /// setting and publishes when it allows (NET-044); the reply carries the
-    /// address the port was published on and, said honestly, whether a
-    /// connection to it is answered by the box yet — bound on the host, but
-    /// a port the box did not declare waits for its relay gate to admit it,
-    /// and until then the relay answers, not the box — or the typed
+    /// address the port was published on, or the typed
     /// refusal's own reason.
     ///
     /// A box decided `ask` makes this wait (NET-045): the session routes the
@@ -2582,7 +2579,7 @@ impl BoxChannel {
         };
         match session.expose_dynamic(port_number).await {
             Ok(mapping) => {
-                // The publish admitted the port at the box's relay gate
+                // The publish admitted the port at the box's gate
                 // before it answered (NET-044), so the port is reachable
                 // now; nothing listening on it yet is answered by the box's
                 // own kernel, not by the gate.

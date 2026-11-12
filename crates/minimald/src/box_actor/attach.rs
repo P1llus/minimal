@@ -38,9 +38,8 @@ pub enum AttachError {
     /// This box carries host-handed addresses (T66), the launch that bound
     /// its host-side row no longer holds the slot — its loop ended, a later
     /// launch replaced it, or the daemon restarted — and the VM host daemon
-    /// holds no row for it (NET-138): the row was withdrawn after its detach
-    /// grace and its creator did not resume it. The host gate drops frames
-    /// from an unregistered source, so any host handed out now would be
+    /// holds no row for it (NET-138): the row was withdrawn and its creator
+    /// did not resume it, so any host handed out now would be
     /// "rowless". Only the box's creator registers or resumes a row, and the
     /// client resumes it before every attach and exec, so the message names
     /// a re-run as the way forward, and a new activation once the host no
@@ -346,8 +345,8 @@ impl BoxActor {
         // actually here. An `Exec`-minted host is deliberately not
         // replaced: a command is live inside that sandbox, and killing it to
         // improve `TERM` is a bad trade. A box the host registered is not
-        // replaced either, because ending its PTask ends the shuttle
-        // connection the host-side row is tied to. Both cases ride on the
+        // replaced either, because the end of its PTask ends the
+        // host-side row. Both cases ride on the
         // per-attach environment the host republishes instead; a kept hook
         // host's shell starts only now, when this attach releases its start
         // gate, so its startup still runs after the activate hooks (#2118).

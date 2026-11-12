@@ -49,8 +49,7 @@ pub const HANDED_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 /// The hostname-proxy port the VM host handed this daemon on the boot line,
 /// if it handed one. The daemon binds it as handed and never selects
 /// another: the host's box table already names exactly this port (NET-138),
-/// so a daemon-chosen replacement would publish a listener the host's gate
-/// refuses to carry (NET-081) — and strand every client pointed at the
+/// so a daemon-chosen replacement would strand every client pointed at the
 /// handed one.
 ///
 /// This is the only port the boot line hands: a VM-hosted daemon starts no

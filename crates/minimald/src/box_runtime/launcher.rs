@@ -741,11 +741,9 @@ pub(crate) struct SandboxLauncher {
     /// Shared per-host gvproxy switch. Used only for
     /// [`NetworkMode::OwnIp`] launches.
     pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    /// The session's whole network policy — declared egress enforced by the
-    /// switch relay's outbound leg (NET-062/063/064), static ingress port
-    /// mappings applied on the switch once this `OwnIp` PTask attaches and
-    /// inbound ports gated on its other leg, removed on exit. Unused by other
-    /// network modes.
+    /// The session's whole network policy. An `OwnIp` attach forwards and
+    /// opens the ports its ingress section declares, and removes them on
+    /// exit. Unused by other network modes.
     pub(crate) policy: boxes::BoxPolicy,
     /// The proxy-routing-table handle the `OwnIp` lease is reported through
     /// on attach, so the box's `<name>.min.internal` route exists exactly
@@ -1267,8 +1265,7 @@ impl BoxLauncher for SandboxLauncher {
         let mut process = SpawnedProcessGuard::new(process);
 
         // Step 3 (post-spawn): hand the process to the provider, which wires its
-        // namespace onto the switch; a tap the sandbox layer built travels here
-        // inside `Spawned`.
+        // namespace onto the switch.
         //
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
@@ -1288,7 +1285,7 @@ impl BoxLauncher for SandboxLauncher {
         // control channel its forwarder verbs ride (built the way the
         // provider's own-IP plan builds it), the published address the
         // switch granted this session (NET-010), the ingress gate the
-        // attach just registered for the relay, and the box's publication
+        // attach just registered, and the box's publication
         // set, shared with the runtime expose surface so neither binds a
         // port the other already holds. The plan rides [`Launched`] to the
         // host that runs the box, which starts the watcher when it builds

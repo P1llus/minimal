@@ -21,8 +21,7 @@
 //! nothing: the guest has no path that writes this table or reaches a
 //! mint, and the claim it could make is not a write. The acceptor that
 //! reads delivered connections holds a clone it
-//! looks up through and never writes — the same shape as the read-only row
-//! view the egress gate is handed — so a delivered connection is attributed
+//! looks up through and never writes, so a delivered connection is attributed
 //! only to a live box this table holds an attachment for.
 //!
 //! Every issue and withdrawal is said aloud, one info line each, naming the
@@ -161,8 +160,7 @@ impl fmt::Display for BoxIdText<'_> {
 /// writer — [`Attachments::issue`] and [`Attachments::withdraw`] are its
 /// verbs, called from the registration and withdrawal paths that own the
 /// row table — and the acceptor that reads delivered connections holds a
-/// clone it looks up through and never writes, the same shape as the
-/// read-only row view the egress gate is handed.
+/// clone it looks up through and never writes.
 #[derive(Debug, Clone, Default)]
 pub struct Attachments {
     rows: Arc<RwLock<BTreeMap<[u8; 4], Arc<Attachment>>>>,

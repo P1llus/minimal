@@ -13,15 +13,10 @@
 //! for, the reason and the status sent (NET-001), so the daemon log — and the
 //! diagnostics bundle's tail of it — names every refused request.
 //!
-//! A refusal the switch would make too is decided *here, before dialing*, by
-//! the same verdict the relay's gates apply (NET-069, NET-070, NET-071): a
-//! request to a port the target did not declare, or from a caller whose
-//! egress rules deny the target, is refused with the same rule name a direct
-//! connection's drop carries — the routing surface gives no reach a direct
-//! connection would not. The verdict is a pure function shared with the relay
-//! ([`super::switch::proxied_request_verdict`]), handed in by the daemon
-//! startup that serves this proxy (`server::start_host_proxies`), so the two
-//! surfaces cannot drift.
+//! A request is refused *here, before dialing*, when a direct connection
+//! would be refused too: a request from a box whose compiled policy denies
+//! the target, or to a port the target has not published. The routing
+//! surface gives no reach a direct connection would not.
 //!
 //! The proxy serves plain HTTP/1.1 and `CONNECT` tunnels only: the HTTPS/mTLS
 //! reverse proxy that once terminated TLS in front of this routing core is
@@ -83,10 +78,6 @@ const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
 /// host (with any `:port` already stripped) to the route its requests forward
 /// on, or `None` if no live PTask owns it. The host resolver is never consulted.
-///
-/// Beside the routing table itself, the lookup names a *caller*: the live
-/// session a request's peer address resolves to, whose egress rules the
-/// request is put to (NET-070).
 ///
 /// Factored as a trait so the routing core is decoupled from how the table is
 /// shared (the sessions manager owns the live registry).
@@ -281,9 +272,8 @@ impl BindFailure {
 /// it. `SO_REUSEPORT` is the licence to answer beside a live holder and is never
 /// asked for. The rule that two VMs never shadow one host port (NET-059) is
 /// not this bind's to carry: a microVM daemon binds inside its guest's own
-/// netns, where the two never meet, and the one port they do share — the
-/// host-loopback publication the walk in `server::drive_proxy_until_serving`
-/// takes — is minvmd's forwarded-port bind (#1814).
+/// netns, where the two never meet, and the host port that forwards to it is
+/// minvmd's bind.
 ///
 /// # Errors
 ///
@@ -444,8 +434,8 @@ struct ParsedRequest<'a> {
 
 /// Who a connection's requests are judged as.
 enum Asker {
-    /// A connection to the node's shared listener: a host program, or a
-    /// box with its own address, told apart by the peer address.
+    /// A connection to the node's shared listener, which no box's policy
+    /// judges.
     Shared,
     /// A connection to a box's own endpoint, which the engine attributed
     /// to that box. Its requests are judged by the box's compiled policy.
@@ -459,9 +449,7 @@ struct BoxAsker {
 
 /// Handles one client connection over any byte stream: reads its request
 /// head, routes it by authority, then answers a gateway error or splices it
-/// to the upstream box. `peer` is the client's address when the transport has
-/// one. On the shared listener it names the caller whose egress rules the
-/// request is put to.
+/// to the upstream box.
 ///
 /// Every refusal is logged as a warn line that names what is known about the
 /// request.
@@ -3725,20 +3713,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Refusals the switch would make too (NET-069 to NET-071): every request
-    // is put to the verdict the relay's gates apply, before the proxy dials
-    // anything — a hostname-routing surface with no reach a direct connection
-    // would not have, whose refusals carry the same rule names a direct
-    // connection's drops do.
+    // Refusals a direct connection would get too (NET-069 to NET-071): the
+    // proxy refuses before it dials anything, so the hostname-routing surface
+    // gives no reach a direct connection would not have.
     // -----------------------------------------------------------------------
 
     /// NET-069's verify line: a proxied request to a port the target box did
     /// not declare is refused with the same refusal a direct connection gets.
-    /// The two halves of the claim, from one declaration: the relay's own gate
-    /// for it admits exactly the ports it publishes (the port a connection
-    /// terminates on) and refuses anything else, and the proxy routes a
-    /// request naming a published port to exactly such a port while refusing
-    /// every other one with the same rule the gate's drop logs.
+    /// The two halves of the claim, from one declaration: the box's ingress
+    /// gate for it admits exactly the ports it publishes (the port a
+    /// connection terminates on) and refuses anything else, and the proxy
+    /// routes a request naming a published port to exactly such a port while
+    /// refusing every other one.
     #[tokio::test]
     async fn proxy_undeclared_port_refused_like_direct() {
         let backend_port = spawn_backend().await;
@@ -3777,9 +3763,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         crate::traced::spawn(serve(proxy, router));
 
-        // The direct half: the relay's own gate for the same declaration —
-        // the shared `declared_ingress_ports` derivation — admits the port
-        // the declaration's connections terminate on, and refuses any other.
+        // The direct half: the box's ingress gate for the same declaration
+        // admits the port the declaration's connections terminate on, and
+        // refuses any other.
         let gate = crate::net::ingress_gate::IngressGate::detached(&policy);
         assert!(
             gate.admits_tcp(backend_port),
@@ -3867,8 +3853,8 @@ mod tests {
         reg.report_own_address(target, "rtweb", RUNTIME_LEASE, BTreeMap::new());
         let router = Router::new(Arc::new(RwLock::new(reg)));
 
-        // The box's relay gate, registered under its lease as the relay's
-        // spawn registers it: the gate a direct connection meets.
+        // The box's ingress gate, registered under its lease as the attach
+        // registers it: the gate a direct connection meets.
         let gate = crate::net::ingress_gate::IngressGate::detached(&BoxPolicy::default());
         crate::net::ingress_gate::register(RUNTIME_LEASE, &gate);
 

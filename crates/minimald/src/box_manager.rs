@@ -1399,8 +1399,8 @@ impl BoxManager {
         // a clone is held by both the actor (which mutates it) and the handle
         // (which hands it to the proxies via `hostnames()`). Whether the
         // daemon sits on the gvproxy switch decides how an own-address box's
-        // name routes: straight to its lease on a VM host (the daemon holds a
-        // tap on the switch), or through the published-loopback forwarder on a
+        // name routes: straight to its lease on a VM host (the daemon is on
+        // the switch), or through the published-loopback forwarder on a
         // native host (NET-001).
         //
         // The registry mints its names under this daemon instance's host id —
@@ -2268,15 +2268,10 @@ impl BoxManager {
     ///
     /// A resumed box with an own address its VM handed it
     /// (`record.box_addresses`) also gets its host launched, detached from
-    /// this resume and unattached to any client: the host's launch is what
-    /// attaches the box's shuttle, whose lease announcement — a gratuitous
-    /// ARP from the box's address, the one frame an idle box sends — marks
-    /// the box's host-side row carried (minvmd's `BoxTable::carry`), and
-    /// the attach binds its declared ingress forwards — so the box's
-    /// published name keeps answering and its ingress binds without waiting
-    /// for a client's first exec or attach.
-    /// The row a reloaded host registry reinstated awaits this first frame
-    /// under its resume bound, which the VM's cold boot must fit inside.
+    /// this resume and unattached to any client. The launch attaches the
+    /// box to the network and publishes its declared ingress forwards, so
+    /// the box's published name keeps answering and its ingress binds
+    /// without waiting for a client's first exec or attach.
     ///
     /// Resuming through [`BoxActor::run`] keeps one registration path, with
     /// its collision rules.
@@ -2457,13 +2452,11 @@ impl BoxManager {
             }
             match BoxActor::run(self.session_config(handle)).await {
                 Ok(session) => {
-                    // An own-address box's host is what carries its shuttle,
-                    // and with the shuttle the row's first frame — the lease
-                    // announcement its attach sends (`net::switch`), the frame
-                    // that stands the reloaded row and binds the declared
-                    // ingress. Launched detached from this resume and never
-                    // attached to a client, so the next attach or exec finds
-                    // it and reuses it, as an exec-minted host is reused.
+                    // The host's launch attaches an own-address box to the
+                    // network and publishes its declared ingress. Launched
+                    // detached from this resume and never attached to a
+                    // client, so the next attach or exec finds it and reuses
+                    // it, as an exec-minted host is reused.
                     if matches!(record.network, boxes::NetworkMode::OwnIp)
                         && record.box_addresses.is_some()
                     {

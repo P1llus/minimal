@@ -5,7 +5,7 @@
 //! [`Config::with_network`](crate::Config::with_network). The built-in
 //! [`HostNet`]/[`NoNet`] cover the consumer-agnostic modes; richer modes (e.g.
 //! an own-IP gvproxy switch attach) are supplied by consumers as out-of-crate
-//! `impl Network`, keeping switch/tap/relay logic out of `sandbox`.
+//! `impl Network`.
 //!
 //! This respects the deployment-model ownership rule (spec R1.4): the gvproxy
 //! **process** is owned by `minimald` (DM2) or `minvmd` (DM1/3/4), never by

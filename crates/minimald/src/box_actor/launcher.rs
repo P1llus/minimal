@@ -71,14 +71,7 @@ impl BoxActor {
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
-        // Only an `OwnIp` PTask attaches to the switch, so the policy's relay
-        // halves — egress verdict and ingress forwards — are only consumed in
-        // that mode. `validate_policy` rejects egress rules only on `NoNet`: a
-        // host-address box may carry them (NET-120), and such a box never
-        // reaches the relay. Only the ingress half is own-address-only, and
-        // `validate_policy` has already rejected it on any other mode.
-        //
-        // NET-074: the gate enforces the *effective* egress — an absent
+        // The box runs under its *effective* egress — an absent
         // section on an own-address box is the deny-all section once the
         // default is in force, this daemon's opt-out excepted (NET-077) —
         // while the record keeps the declaration untouched for the strict

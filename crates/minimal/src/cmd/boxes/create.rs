@@ -1752,9 +1752,8 @@ fn refuse_unhonourable_grants(
 
 /// Whether the activation holds the box's name on the VM host daemon once
 /// the box is active. A `host_ip` box holds it for the zone (NET-128). A
-/// `none` box holds it so the host can name the box by its id when the
-/// in-VM daemon reports an expose decision (NET-046). An own-address box
-/// has a row, and a native host has no VM host daemon.
+/// `none` box holds it so the host has a record of the box's id. An
+/// own-address box has a row, and a native host has no VM host daemon.
 pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
     kind == paths::HostKind::Minvmd
         && matches!(
@@ -1766,12 +1765,8 @@ pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::Net
 /// Whether a box with `network` on a host of `kind` has its lookups go
 /// through a resolver that steers the credential module's names (BEP-017,
 /// BEP-062, BEP-081). This is a host fact and does not read the steering.
-/// On the VM host, an own-address box's lookups go through the VM host's
-/// switch, whose DNS gate steers them. A host-address box there resolves
-/// through a steering answerer of its own in the guest (BEP-086). Both
-/// answer a steered name with the proxy's address while the proxy's
-/// listener is live, and SERVFAIL while it is down. A native host has no
-/// proxy, so a steered name there always fails closed, and a `none` box
+/// A native host has no proxy, so a steered name there always fails
+/// closed, and a `none` box
 /// has no steered lookups of its own. `min box spec` reads it for the
 /// network its `--network` flag names. Where this is true, a `dns`-steered
 /// box opens TLS to the proxy's address on port 443, and the proxy routes
@@ -3925,10 +3920,7 @@ pub(crate) async fn activate_box(
                 let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
                 let box_name = box_name.as_deref().unwrap_or("-");
                 // T110: the box's ports answer at its own address unless the
-                // daemon put it on the `127.0.0.1` interim. That holds for a
-                // host-address box too: on a VM node before the range lands,
-                // it is not mirrored onto `127.0.0.1` and only the proxy
-                // reaches it, which `min ls` reads as the fallback as well.
+                // daemon put it on the `127.0.0.1` interim.
                 let at_own_address = !created.interim_loopback;
                 if proxy_cause.is_some() {
                     tracing::debug!(
@@ -4397,14 +4389,13 @@ pub(crate) async fn activate_box(
     // next attach or exec.
     //
     // A `none` box on a VM host takes the same hold (NET-046): it has no
-    // switch row, so the hold is the host's one record of its box id, and
-    // the in-VM daemon's expose decision report names the box by that id.
+    // switch row, so the hold is the host's one record of its box id.
     // Its name answers NODATA, as a `host_ip` box's does while it is not
     // resident. `min session destroy` and the dashboard's destroy release
     // it, `min session rename` moves it, and an attach or exec re-holds it
     // after a VM host daemon restart, because `holds_name` (vm_host.rs) is
     // true for a `none` box as for a `host_ip` box. An unnamed `none` box
-    // holds nothing, and the host refuses its report.
+    // holds nothing.
     ActivationStep::HoldName
         .run(async {
             if holds_name_with_vm_host(kind, request.config.network)

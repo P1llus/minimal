@@ -5,13 +5,11 @@
 //! box stops (NET-121) — but a port a permit range names has no forward to
 //! hold: it exists to the processes inside the box alone, so the story's
 //! shape is the kernel's socket table's. This module reads the box's
-//! listening sockets through its leader's `/proc` entry — one table per
-//! network namespace, so it names every listening socket in the box,
-//! whichever of its processes holds it — polls and diffs them, and:
+//! listening sockets from the engine's record ([`super::listens`]), diffs
+//! them, and:
 //!
 //! * **publishes** each new listening port the shared verdict permits
-//!   ([`IngressGate::listen_verdict`], the pure decision in
-//!   `boxes::core::egress` the Kani harness exhausts): a forward bound at
+//!   ([`IngressGate::listen_verdict`]): a forward bound at
 //!   the box's own address, at the port the process listens on — no
 //!   translation, the same number on both sides, exactly as a declaration's
 //!   mapping publishes its external port (NET-010) — and the port admitted
@@ -20,9 +18,7 @@
 //!   so a connection to it is refused at the box's address (NET-014) and
 //!   never forwarded by a listener nobody declared;
 //! * **withdraws** each published port whose listener closed: the gate
-//!   refuses it first — terminating the connections the publication held at
-//!   both ends, the same end a revoked declared forwarder's connections come
-//!   to — and the forward comes down after (NET-017).
+//!   refuses it first, and the forward comes down after (NET-017).
 //!
 //! The watcher owns only the runtime-published set. A declared port is
 //! never its to publish — its forward was bound before the box's name was
@@ -56,22 +52,10 @@
 //! lists nowhere — `min session policy` and the publication lines name a
 //! port only once its reservation is recorded.
 //!
-//! On a VM-backed host neither surface may bind until the VM host daemon
-//! has admitted the port (T94, NET-138): with the reservation held, the
-//! publish reports the port over the guest report door — the channel
-//! [`box_report_channel`] derives off the same control channel the
-//! forwarder verbs ride — and the grant the box's host-side registration
-//! holds decides it. Only an admitted port is asked of the switch, because
-//! the host's egress gate in front of the switch admits a forward only for
-//! a port the box's row holds. A report the grant refuses publishes
-//! nothing: the reservation releases, the switch is asked nothing, and the
-//! port is owed again on the backoff a refused publish earns. A publish
-//! that was admitted and then did not stand withdraws its report once its
-//! forward is down. The withdrawal reports its twin: a publication that
-//! comes down takes the host's row entry with it, best-effort the way the
-//! unexpose beside it is. A native host has no report channel, and its
-//! publishes stand exactly as they always did, admitted by the switch
-//! alone.
+//! In a VM the VM host holds the forward. The publish asks it through the
+//! guest door ([`ControlChannel::VmHost`]), and one it refuses publishes
+//! nothing: the reservation releases, and the port is owed again on the
+//! backoff a refused publish earns.
 //!
 //! The plan a launch gathers rides [`crate::box_runtime::Launched`] to the
 //! host that runs its box — no process-global table between them — so a
@@ -82,29 +66,17 @@
 //! table is read as the forward reads the box: a listener counts only when
 //! its bind can answer the dial a publication makes — to the box's lease —
 //! so a process bound to the box's loopback alone is not published at all
-//! ([`binds_for_the_lease`]); and nothing here is one-shot — a publication
-//! whose bind failed is retried on a per-port backoff that doubles off the
-//! poll interval, a withdrawal whose unexpose failed is retried on every
-//! poll the box still runs and through the stop's passes, so a transient
+//! ([`super::listens::reachable_ports`]); and nothing here is one-shot — a
+//! publication whose bind failed is retried on a per-port backoff that
+//! doubles off the poll interval, a withdrawal whose unexpose failed is
+//! retried on every poll the box still runs and through the stop's passes,
+//! so a transient
 //! refusal on the control channel never settles into a port that stays
-//! missing or a forward that stays bound, and a leader the box's host could
-//! not resolve when it built is asked for again on every poll ([`Leader`]),
-//! so a shell that was mid-spawn or a `/proc` that could not answer for the
-//! moment costs the moment between two polls and never the box's whole
-//! listen-published surface. Neither half says its failure
+//! missing or a forward that stays bound. Neither half says its failure
 //! more than once while it keeps failing: the first refusal of a streak
 //! is the line, and the line that ends a streak is the publication's or
 //! the withdrawal's own — so a forwarder that is down for as long as the
 //! box lives is waited for, not written over and over.
-//!
-//! Polling, not a socket-diagnostic netlink socket or an inotify watch, is
-//! the honest read here: `/proc/<pid>/net/tcp` emits no change notification
-//! there is to subscribe to, and a process inside the box can bind without
-//! the daemon ever being told — the table *is* the notification, and reading
-//! it on an interval is the only way the daemon has of learning a listener
-//! exists. The interval ([`LISTEN_POLL_INTERVAL`]) is a person-facing
-//! number: a server a developer starts is published inside the second they
-//! finish typing its port.
 //!
 //! One info line per publication and per withdrawal — each naming the port,
 //! the box, and whether the rules permitted it — so the diagnostics
@@ -172,7 +144,7 @@ const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 /// published address the forward binds — the box's own address (NET-010),
 /// wherever it was granted, read back the same way the attach path reads
 /// it — the gvproxy control channel the forwarder verbs ride, the box's
-/// session gate, which holds the shared permit decision
+/// ingress gate, which holds the shared permit decision
 /// ([`IngressGate::listen_verdict`]) and the admission a published port is
 /// given through, the box's publication set, shared with the runtime
 /// expose surface so neither binds a port the other already holds, and the
@@ -189,7 +161,7 @@ pub struct ListenPlan {
     /// The gvproxy control channel: `expose` to publish, `unexpose` to
     /// withdraw.
     control: ControlChannel,
-    /// The box's session gate: the permit decision and the admission.
+    /// The box's ingress gate: the permit decision and the admission.
     gate: Arc<IngressGate>,
     /// The box's publications, shared with the runtime expose surface
     /// ([`crate::box_actor::Session`]): the one set both read before they
@@ -217,11 +189,10 @@ impl ListenPlan {
     }
 
     /// Assembles the plan from the facts its launch holds. The gate must be
-    /// the one the box's relay registered — the gate the connections a
-    /// publication forwards are admitted by on their way through the
-    /// relay — and the publication set must be the one the session's
-    /// runtime expose surface reads, so the two surfaces never bind the
-    /// same port. `state_dir` is the daemon's state directory, the one the
+    /// the one the box's attach registered, which admits the connections a
+    /// publication forwards, and the publication set must be the one the
+    /// session's runtime expose surface reads, so the two surfaces never
+    /// bind the same port. `state_dir` is the daemon's state directory, the one the
     /// runtime expose path audits its decisions under, so both surfaces'
     /// records land in the one log.
     #[expect(
@@ -705,18 +676,10 @@ pub struct ListenWatcher {
 }
 
 impl ListenWatcher {
-    /// Starts the box's watcher: a loop that reads the listening sockets of
-    /// the process tree `leader` names — the box's leader, whose `/proc`
-    /// entry names the whole box's network namespace — and keeps the
-    /// box's publications in step with them. The first poll happens at
-    /// once, so a listener that outlived a previous host is published
-    /// before a person can look for it.
-    ///
-    /// `leader` may still be owed ([`Leader::Pending`]): the box's host
-    /// stages the container PID it holds and the watcher resolves the
-    /// program itself, so a box whose leader could not be found when its
-    /// host built — a shell mid-spawn, a `/proc` that could not answer —
-    /// publishes the moment the next poll finds it, rather than never.
+    /// Starts the box's watcher: a loop that reads the box's listening
+    /// sockets from `source` and keeps the box's publications in step with
+    /// them. The first poll happens at once, so a listener that outlived a
+    /// previous host is published before a person can look for it.
     #[must_use]
     pub(crate) fn start(plan: ListenPlan, source: Arc<dyn Listeners>) -> Self {
         let (stop, mut stop_rx) = watch::channel(false);
@@ -815,8 +778,7 @@ struct WatchState {
     /// The box's listening sockets.
     source: Arc<dyn Listeners>,
     /// Whether the streak of polls that could not read the box's socket
-    /// table has been said already — once per streak, the leader's own
-    /// discipline.
+    /// table has been said already, once per streak.
     reported_read_failure: bool,
     /// The listening ports the last table read named, for the debug line
     /// a change in them owes (so a poll that sees the same set says
@@ -932,12 +894,9 @@ impl WatchState {
         }
     }
 
-    /// One poll: resolve the box's leader when it is still owed, read the
-    /// box's listening sockets, publish what appeared, withdraw what
-    /// closed, and ask again for what a refusal has left owed. A poll that
-    /// has not found the leader publishes nothing and withdraws nothing —
-    /// it has no table to diff — and asks again on the next one. A
-    /// publication that failed to bind keeps its port out of the
+    /// One poll: read the box's listening sockets, publish what appeared,
+    /// withdraw what closed, and ask again for what a refusal has left
+    /// owed. A publication that failed to bind keeps its port out of the
     /// book ([`Self::listening`]), and so does a port another surface is
     /// reserving, so the next poll reads both as appeared again — neither
     /// appearance is consumed by what it came to, and neither a transient
@@ -948,11 +907,9 @@ impl WatchState {
         let listening = match self.source.listening() {
             Ok(listening) => super::listens::reachable_ports(&listening, self.plan.lease),
             Err(e) => {
-                // The leader's entry is gone or unreadable — the box's
-                // shell has exited, and the host stops the watcher with
-                // the session. Keep the last diff rather than publishing
-                // or withdrawing on a table that could not be read: the
-                // stop withdraws everything still standing. Said once per
+                // Keep the last diff rather than publishing or withdrawing
+                // on a table that could not be read: the stop withdraws
+                // everything still standing. Said once per
                 // streak at warn: a box whose table cannot be read
                 // publishes no listen at all.
                 if !self.reported_read_failure {
@@ -1288,9 +1245,7 @@ impl WatchState {
                         // refusals have earned. The reservation is the
                         // rollback's own key the whole way: it releases
                         // itself — by its token, never by the winner's
-                        // local — on every end but `record`. Every end
-                        // that leaves the port unpublished also withdraws
-                        // the report above, after the forward is down.
+                        // local — on every end but `record`.
                         match expose_mapping(
                             &self.plan.control,
                             self.plan.published,
@@ -1435,8 +1390,7 @@ impl WatchState {
                                 // drop, keyed by its token — and the port
                                 // is free again: the other surface's next
                                 // observation, or this watcher's own
-                                // retry, publishes it normally. The host's
-                                // row gives the reported port back too.
+                                // retry, publishes it normally.
                                 drop(reservation);
                                 if refusals == 0 {
                                     // The streak's one decision record
@@ -1531,8 +1485,6 @@ impl WatchState {
         crate::audit::append(
             &self.plan.state_dir,
             &self.listen_record(port, outcome, reason),
-            // A watched box reports through the route its watcher
-            // registered by switch address, so it needs no box id.
         )
         .await;
     }
@@ -1564,9 +1516,8 @@ impl WatchState {
     /// published — the watch's one decision that can still be taken back —
     /// taken down in the same order a listener's closing takes
     /// ([`Self::close`]): the gate refuses the port first, then the forward
-    /// comes down, then the report and the publication's entry go, so no
-    /// new connection crosses the gap and the switch holds nothing the
-    /// box's row still names. The port stays owed: the poll retries it on
+    /// comes down, then the publication's entry goes, so no new connection
+    /// crosses the gap. The port stays owed: the poll retries it on
     /// the backoff this refusal earns, and the publish that finds the log
     /// writable again ends the streak. `refusals` gates the line and the
     /// record to the streak's first refusal, the way every refusal the
@@ -1651,9 +1602,8 @@ impl WatchState {
 
     /// NET-017: one published listening port closed — or the box stopped,
     /// which closes all of them at once. The gate refuses the port first,
-    /// terminating the connections the publication held at both ends, so no
-    /// new connection crosses the gap between a listener already gone and a
-    /// forward still bound; the forward comes down after. The order a
+    /// so no new connection crosses the gap between a listener already gone
+    /// and a forward still bound; the forward comes down after. The order a
     /// revoked declared forwarder's own `revoke` holds (NET-121).
     ///
     /// `reason` names what ended the publication: the listener closing under
@@ -1866,7 +1816,8 @@ fn listening_ports_held_by(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<
     Ok(ports)
 }
 
-/// [`listening_ports`] for one `/proc` entry.
+/// The listening ports of one `/proc` entry that a forward to `lease` can
+/// reach.
 #[cfg(test)]
 fn listening_ports_in(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let mut ports = read_listening(&entry.join("net/tcp"), false, lease)?;
@@ -1972,8 +1923,8 @@ fn v4_word(word: &str) -> Option<Ipv4Addr> {
 const LISTEN_NOTICE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// The listen notices the in-VM daemon owes the VM host daemon for the
-/// host-address boxes (NET-138): the diff of one read of
-/// [`host_address_listening_ports`] against the ports the host holds as
+/// host-address boxes (NET-138): the diff of one read of the listening
+/// ports at the node's address against the ports the host holds as
 /// listening. A port moves into or out of that set only on a holding
 /// answer from the host ([`Self::answered`]). A notice the host refused or
 /// never answered stays owed, and is sent again after a per-port wait that
@@ -2271,11 +2222,10 @@ mod tests {
     }
 
     /// A bound, listening TCP socket in this process — the stand-in for the
-    /// server a box's process runs: the watcher reads the kernel's socket
-    /// table, and the test's own process is a leader whose table the port is
-    /// genuinely in. Bound to the any address, the one bind a publication's
-    /// dial can always reach at the box's lease, so the row is one the
-    /// watcher publishes.
+    /// server a box's process runs: the test's source reads this process's
+    /// socket table, and the port is genuinely in it. Bound to the any
+    /// address, the one bind a publication's dial can always reach at the
+    /// box's lease, so the row is one the watcher publishes.
     fn listening_socket() -> TcpListener {
         TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
             .expect("an ephemeral port binds on the any address")
@@ -2367,7 +2317,7 @@ mod tests {
     }
 
     /// The box's watcher against the fake forwarder bound at `sock`, with
-    /// its gate answering the given policy and the leader the test names.
+    /// its gate answering the given policy and the source the test names.
     /// The box's publication set is the watcher's alone here — no expose
     /// surface shares it in these proofs — so an empty one stands in for
     /// the set the launch would share.
@@ -2401,9 +2351,8 @@ mod tests {
             .to_path_buf()
     }
 
-    /// The box's watcher, this process its leader: the watcher's own `/proc`
-    /// entry is the table it reads, and the sockets the test binds are in
-    /// it — the shape a box whose host resolved its leader starts with.
+    /// The box's watcher, reading this process's own listening sockets: the
+    /// sockets the test binds are among them.
     fn watcher_at(sock: PathBuf, policy: &boxes::BoxPolicy) -> (ListenWatcher, Arc<IngressGate>) {
         watcher_with(sock, policy, held_here())
     }
@@ -4520,11 +4469,11 @@ mod tests {
         );
     }
 
-    /// The leader's process entry names its own listening sockets, and stops
-    /// naming them when they close: the table the watcher's whole story
-    /// reads, proved against the real kernel rather than a fixture — with
-    /// the bind shape the watcher distinguishes: a loopback-bound listener
-    /// is in the kernel's table but is never one of the box's publications.
+    /// A process entry names its own listening sockets, and stops naming
+    /// them when they close, proved against the real kernel rather than a
+    /// fixture — with the bind shape the watcher distinguishes: a
+    /// loopback-bound listener is in the kernel's table but is never one of
+    /// the box's publications.
     #[test]
     fn the_leader_entry_names_its_own_listeners() {
         let reachable = listening_socket();
@@ -4640,8 +4589,8 @@ mod tests {
     ///
     /// The stand-in box is this process: its listener is bound at its lease
     /// — the host's own loopback, the address a dial into this namespace
-    /// reaches — and the watcher reads this process's `/proc` entry as the
-    /// box's leader, the way every proof in this module does. The bind at
+    /// reaches — and the watcher reads this process's listening sockets as
+    /// the box's, the way every proof in this module does. The bind at
     /// the lease alone is what makes the proof's connect read the forward
     /// rather than the listener: a wildcard bind answers at every local
     /// address, the published one included, and the connect would reach

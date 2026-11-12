@@ -594,8 +594,8 @@ async fn supervise_switch(
 }
 
 /// Periodic datapath liveness monitor (NET-023): probe `socket` — the switch's
-/// `-listen` socket, the host-side attach point the guest shuttle reaches
-/// through libkrun's vsock bridge — every `check_interval`, and warn once when
+/// `-listen` socket, where the VM's uplink connects — every `check_interval`,
+/// and warn once when
 /// it stops accepting connections even though the gvproxy process is still
 /// running, which the exit detection cannot see. The warning names the switch
 /// socket so a diagnostic bundle's daemon log tail carries it; a later
@@ -1476,12 +1476,10 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    /// NET-081/NET-138: the switch the gate guards is configured with the
-    /// registry's subnet — the address plan the gate's rows compile against —
-    /// not a default the two halves merely share today. A registry built for
-    /// another plan hands the gate rows keyed to addresses that plan routes,
-    /// which is the only way a node row can keep matching the switch it
-    /// leaves frames on.
+    /// The switch is configured with the registry's subnet, not a default
+    /// the two merely share. A registry built for another plan holds rows
+    /// keyed to addresses that plan routes, so the switch must serve the
+    /// same plan.
     #[test]
     fn host_gvproxy_serves_the_subnet_it_is_given() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1503,7 +1501,7 @@ mod tests {
         .expect("spawn host gvproxy");
 
         // The config the runtime hands gvproxy carries that plan, so the
-        // switch serves the very subnet the gate's rows were keyed to.
+        // switch serves the very subnet the registry's rows are keyed to.
         let config = dir.path().join("gvproxy.yaml");
         let yaml = std::fs::read_to_string(&config).expect("the switch runtime wrote its config");
         assert!(

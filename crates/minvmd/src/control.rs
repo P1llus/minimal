@@ -4,9 +4,9 @@
 //! On a minvmd-backed host, `min session activate` registers every
 //! own-address box here before it creates the session: it writes one
 //! [`minimald_rpc::BoxControlRequest`] line asking `register`, the daemon
-//! allocates the box's switch and loopback addresses into the table — the
-//! row the host-side egress gate decides every frame by — and answers with
-//! the addresses the create request then carries, so the in-VM daemon
+//! allocates the box's switch and loopback addresses into the table and
+//! answers with the addresses the create request then carries, so the in-VM
+//! daemon
 //! attaches with the handed address instead of drawing its own. The same
 //! client withdraws the row when the session is destroyed or the activation
 //! fails after registering: one line asking `withdraw`, answered with the
@@ -24,19 +24,19 @@
 //! [`ProxyPublishStatus`]), so the CLI's surfaces say *why*, not just that.
 //! The read touches no row and mutates nothing. The read-only row verb
 //! (`read_row`, NET-138) is the same shape again: one live box's row — its
-//! switch address, its derived egress allow-list, its declared and
+//! switch address, its declared and
 //! runtime-admitted ports — answered for a name a live box holds, and the
 //! no-row marker for one nothing holds. A destroyed box's row answers
 //! nothing, because a withdrawn row is gone, not archived.
 //!
 //! Two doors, because two peers (NET-138). The host's control socket takes
 //! the registrations, their withdrawals, and both read-only verbs; the
-//! second door — [`GUEST_CONTROL_SOCK_FILE`] — is the in-VM daemon's
-//! control channel, bridged to the guest over vsock at
-//! [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (bound by T94 together with
-//! that bridge; this module serves its verbs but binds no socket for it
-//! yet), and it takes the port reports alone: `admit_port`, the guest's report that one of its boxes published
-//! a runtime port, and `withdraw_port`, its withdrawal. The verb decides
+//! second door — [`GUEST_CONTROL_SOCK_FILE`] — is the in-VM daemon's,
+//! bridged to the guest over vsock at
+//! [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`], and it takes the guest door's
+//! verbs alone ([`minimald_rpc::GuestDoorRequest`]): publishing and
+//! unpublishing a port for a box, a box's end, and what the guest daemon
+//! asks about a box. The verb decides
 //! which door answers it, never the peer: a registration that arrives on
 //! the guest's channel is refused the same way a port report that arrives
 //! on the host's is, because the host control socket's owner-only file
@@ -49,9 +49,9 @@
 //! (`audit/box-admissions.log`, in the same state dir the sockets live in).
 //!
 //! The ask verbs (NET-045) split across the doors the same way. The guest
-//! door takes `admit_ask`, the in-VM daemon's report that an expose was
-//! decided `ask`: the ask is recorded pending under an id this daemon
-//! mints, and the connection is held until the ask ends. The host socket
+//! door takes a publish under an `ask` stance: the ask is recorded pending
+//! under an id this daemon mints, and the connection is held until the ask
+//! ends. The host socket
 //! takes `subscribe_asks`, an attached client's subscription to one row's
 //! asks by the row's box id, over which the offers and dismissals are
 //! pushed, and `record_ask_answer`, the client's answer. A guest can raise
@@ -67,8 +67,7 @@
 //! long-lived host services whose failures must not take the daemon down
 //! with them: a failed registration answers the client with the reason and
 //! keeps serving, and a client that never reaches the socket (a supervisor
-//! predating this module) still activates, handed no addresses — with the
-//! egress gate dropping its frames under the unregistered rule (NET-085).
+//! predating this module) still activates, handed no addresses.
 //!
 //! The v1 posture, stated: the trust is the uid. The bind tightens the
 //! host dir to 0700 when the daemon owns it, refuses one it does not
@@ -85,11 +84,6 @@
 //! only its own thread, bounded by a 30-second read timeout, while every
 //! other request is accepted and served behind it. That is what v1 ships,
 //! not a design endpoint.
-//!
-//! A box whose row is gone — never registered, or withdrawn at destroy —
-//! is dropped by the gate's unregistered rule unconditionally (NET-085);
-//! the flip that lands with the last row source (T66's follow-up) decides
-//! only what the publish half admits, not a change this socket makes.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -117,12 +111,10 @@ use crate::net::publish::{Decision, Publisher};
 /// means something where `minvmd` supervises one.
 pub const CONTROL_SOCK_FILE: &str = "control.sock";
 
-/// The in-VM daemon's control channel's file name, beside the control
-/// socket in the same host dir: the door the port reports
-/// (NET-138) arrive on, bridged to the guest over vsock at
-/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the one channel from inside
-/// the microVM that answers, because a report the grant refused must be
-/// refused *to the reporter* for the publish to unwind.
+/// The guest door's file name, beside the control socket in the same host
+/// dir: the door the in-VM daemon's requests
+/// ([`minimald_rpc::GuestDoorRequest`]) arrive on, bridged to the guest over
+/// vsock at [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`].
 pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
 
 /// The env the supervisor hands the VMM child the guest report door's path
@@ -308,14 +300,12 @@ impl ProxyPublishStatus {
 }
 
 /// Whether the Box Egress Proxy's listener is live (BEP-062): the fact the
-/// guest report door answers [`BoxControlRequest::ProxyListening`] from.
+/// stream door reads before it carries a box's connection to the proxy.
 ///
 /// The doors are bound before the proxy starts, so the cell starts empty
 /// and the supervisor attaches the proxy's own `listening` flag once it
 /// starts one ([`Self::attach`]). An empty cell answers `false`: a boot
-/// that runs no proxy has no listener, and the in-VM daemon's DNS gate then
-/// answers a steered name SERVFAIL rather than an address that reaches
-/// nothing.
+/// that runs no proxy has no listener.
 #[derive(Clone, Default)]
 pub struct BepListening(Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>);
 
@@ -808,8 +798,7 @@ fn serve_request(
         // resident set together each time it builds its view, so the order
         // of a hold and an admit cannot change the answer. Each change pings
         // the answerer. Only the host's door serves these verbs: the guest
-        // must never say what a marked frame may reach (NET-085), nor that
-        // its box is running.
+        // must never say that its box is running.
         BoxControlRequest::AdmitHostIpBox(request) => {
             let resident =
                 boxes.admit_host_ip_box(request.session_id, request.credentialed_upstream);
@@ -1604,8 +1593,8 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
 
 /// Allocate the box into the table and build the reply — the addresses and
 /// the box id on success, the reason on a refusal. One info line per
-/// registration names the box, its id, both addresses and the declared
-/// egress the row carries: the diagnostic a bundle's VM host daemon log is
+/// registration names the box, its id and both addresses: the diagnostic a
+/// bundle's VM host daemon log is
 /// read for.
 ///
 /// The box's published address is the machine answerer's to hand out
@@ -1974,7 +1963,7 @@ fn write_reply(stream: &mut UnixStream, reply: &BoxControlReply) -> std::io::Res
 /// resolves to under the alias rule — the name is matched in its canonical
 /// form ([`crate::box_registry::canonical_box_name`]), and liveness is
 /// the table's own fact ([`BoxRegistry::row_by_name`]) — answered with its
-/// switch address, its derived egress allow-list, and its declared and
+/// switch address and its declared and
 /// runtime-admitted ports. A name no live box holds answers the no-row
 /// marker: a withdrawn row is gone, not archived, so a destroyed box's
 /// last row can never be read. The verb changes no state and writes no
@@ -2170,7 +2159,7 @@ fn watch_peer_close(
 /// shape.
 ///
 /// For the verbs that take their ticket right after the read — withdraw,
-/// admit_port, withdraw_port and record_ask_answer — the order is the
+/// rename and record_ask_answer among them — the order is the
 /// order the requests were read: a client writes its
 /// request line before it starts waiting for the reply, and the door's
 /// thread reads that line as soon as it runs, so what a client times out
@@ -3355,8 +3344,8 @@ mod tests {
 
     /// Spawns the control server on a temp path over a fresh registry and
     /// returns (path, handle keeping the server thread identified, the
-    /// registry the server serves — the same rows a gate the test brings up
-    /// later shares — and the answerer status the read-only verb answers
+    /// registry the server serves, and the answerer status the read-only
+    /// verb answers
     /// from, the same cell the daemon's acquisition loop writes). The
     /// proxy-publish cell is the same cell a supervisor writes a
     /// proxy-down cause into (T93), empty at the bind. The thread
@@ -6000,7 +5989,7 @@ mod tests {
     fn raced_registration_is_refused_without_waiting_out_the_revocation() {
         let host = SlowAllocation::start();
         // A subscriber that never acts holds every withdrawn row's
-        // revocation, the way a gate still unbinding forwards does.
+        // revocation, the way a publisher still unbinding forwards does.
         let table = host.boxes.table();
         let _revocations = table.subscribe_row_withdrawals();
         let old = host.register_live("web");
@@ -6972,8 +6961,8 @@ mod tests {
             "the id is a minted UUIDv7, never the all-zero non-id"
         );
 
-        // The registration's one info line names the box, its id, both
-        // addresses it handed back, and the declared egress the row carries.
+        // The registration's one info line names the box, its id and both
+        // addresses it handed back.
         let log = capture.contents();
         assert!(
             log.contains("registered box with the VM host daemon; addresses allocated"),

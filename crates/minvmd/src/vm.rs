@@ -37,11 +37,9 @@ pub(crate) const NODE_PROXY_PORT_ENV: &str = "MINVMD_NODE_PROXY_PORT";
 const HOSTNAME_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 
 /// The environment variable the operator sets to opt the VM out of the
-/// deny-all egress default (NET-077). Read twice: by the supervisor, whose
-/// host-side registry compiles an undeclared box's row by it, and by the VMM
-/// child, which writes it onto the kernel command line for the guest daemon
-/// to read (see `EGRESS_DENY_ALL_OPT_OUT_TOKEN`), so the gate on each side of
-/// the escape boundary keeps the same default. Inherited through the process
+/// deny-all egress default (NET-077). The VMM child writes it onto the
+/// kernel command line for the guest daemon to read (see
+/// `EGRESS_DENY_ALL_OPT_OUT_TOKEN`). Inherited through the process
 /// tree like [`OWN_IP_ENV`]: the operator sets it in the environment that
 /// starts `minvmd run`/`boot`, and the supervisor hands it to the VMM child
 /// by inheritance.
@@ -640,11 +638,10 @@ fn node_proxy_port_from_raw(proxy: Option<&str>) -> Result<Option<u16>, crate::e
 /// (NET-077), read from [`EGRESS_DENY_ALL_OPT_OUT_ENV`] through the parse the
 /// guest shares ([`boxes::egress_deny_all_opt_out_from_raw`]):
 /// `1`/`true`/`yes`/`on`, case-insensitive; unset or any other value is
-/// `false` — the build's egress default. Read by both processes that need it,
-/// as [`OWN_IP_ENV`] is: the supervisor, for the host-side registry's
-/// undeclared-row default, and the VMM child, which writes it onto the boot
-/// line. Both inherit the operator's environment, so the value set on the
-/// process that starts `minvmd run`/`boot` reaches each.
+/// `false` — the build's egress default. Read by the VMM child, which
+/// writes it onto the boot line. It inherits the operator's environment
+/// through the supervisor, so the value set on the process that starts
+/// `minvmd run`/`boot` reaches it.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn egress_deny_all_opt_out_from_env() -> bool {
     boxes::egress_deny_all_opt_out_from_raw(

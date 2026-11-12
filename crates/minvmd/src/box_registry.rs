@@ -1,31 +1,22 @@
-//! The host-side table of every published namespace (NET-138) — the rows the
-//! VM host daemon's egress gate decides by (NET-081).
+//! The host-side table of every published namespace: the rows the VM host
+//! daemon decides by.
 //!
-//! On a VM-backed host the guest cannot be trusted to say what its boxes may
-//! reach: the in-VM daemon is *inside* the escape boundary, and a process
-//! that breaks out of a box into the VM controls it. The per-box,
-//! source-addressed egress rules NET-081 asks for therefore live **outside**
-//! the VM, in `minvmd`, applied by [`crate::net::egress_gate`] between the
-//! guest's shuttle and the switch socket. This module is the table that gate
-//! reads: one row per published namespace, holding its name, its addresses on
-//! the switch and on the loopback, the ports it admitted, the names it
-//! declared, and its compiled [`EgressRules`] — the rules the gate decides
-//! every frame by, the same set the in-guest relay applies, now held where
-//! nothing inside the VM can change it. The publish half of the gate
-//! (NET-081's control verbs) reads the row's ports and names as the records
-//! it will admit a switch publish for; the frame half reads the rules alone.
+//! On a VM-backed host the guest cannot be trusted to say which host ports
+//! forward to its boxes: the in-VM daemon is *inside* the escape boundary,
+//! and a process that breaks out of a box into the VM controls it. The facts
+//! the host decides by therefore live **outside** the VM, in `minvmd`. This
+//! module is the table that holds them: one row per published namespace,
+//! with its name, its addresses on the switch and on the loopback, the ports
+//! it admitted and the names it declared.
 //!
 //! The trust boundary is the type boundary. Rows are filled **in this
 //! process**, from the host side — the host's own derivation of the guest
 //! node's namespace ([`BoxRegistry::register_node_namespace`]), and the
 //! client's box declarations carried over the host's control path — and never
-//! from anything the guest says. The gate is handed a [`BoxTable`], the
-//! read-only view whose only row operations are lookups, so the one component
-//! that reads guest frames cannot add, replace, or withdraw a row. The
-//! registration path that carries a client's box declarations into this
-//! registry is [`crate::control`] — the host daemon's control socket, over
-//! which the activating client registers a box and reads the addresses the
-//! allocation hands back.
+//! from anything the guest says. The registration path that carries a
+//! client's box declarations into this registry is [`crate::control`] — the
+//! host daemon's control socket, over which the activating client registers
+//! a box and reads the addresses the allocation hands back.
 //!
 //! This registry is also the proxy's attachment source (NET-133): when the
 //! host hands it the attachment table
@@ -36,25 +27,19 @@
 //!
 //! One dimension of a row is filled from the in-VM daemon's own reports —
 //! the **runtime-admitted ports** (NET-138's sanctioned exception, NET-045's
-//! decisions), reported over the daemon's control channel and recorded only
+//! decisions), asked for over the guest door and recorded only
 //! inside the grant the row's host-side registration holds: the box's
 //! dynamic-ingress stance, its allowed range, the per-row cap, and the
 //! per-row admit rate ([`BoxRegistry::admit_runtime_port`]). Everything the
 //! guest says still passes that check; a row's other facts stay host-sourced
 //! alone.
 //!
-//! A row's liveness is read at the host's end of the box's attachment
-//! (NET-138): a relay that carries a box's frames holds its row attached,
-//! and the end of the last such relay marks the row **detached** rather than
-//! withdrawing it at once. A detached row decides frames exactly as before;
-//! it is withdrawn once [`DETACH_GRACE`] passes with no relay carrying it
-//! again, so a box whose shuttle reconnects keeps its row. The client boxes'
-//! registrations — the creator's declarations, never anything the guest said
-//! — are persisted in this daemon's state dir ([`BoxRegistry::persisting_to`])
-//! and reloaded under the resume bound at start — a VM's cold boot
-//! outlasts the detach grace — and a creator whose box outlived its row
-//! asks for the row back from that persisted record
-//! ([`BoxRegistry::resume_client_box`]).
+//! A row stands until the guest reports its box's end or its creator
+//! withdraws it. The client boxes' registrations — the creator's
+//! declarations, never anything the guest said — are persisted in this
+//! daemon's state dir ([`BoxRegistry::persisting_to`]) and reloaded dormant
+//! at start, and a creator whose box outlived its row asks for the row back
+//! from that persisted record ([`BoxRegistry::resume_client_box`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::Ipv4Addr;
@@ -252,7 +237,7 @@ fn revocation_addrs(switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Vec<[u8; 
 /// One withdrawn row, as a row-withdrawal subscriber receives it
 /// ([`BoxTable::subscribe_row_withdrawals`]). It holds the row's addresses
 /// against reuse for as long as any subscriber keeps a copy: a registration
-/// at one of them is refused until every copy is dropped. The egress gate
+/// at one of them is refused until every copy is dropped. The publisher
 /// keeps its copy until it has unbound the box's forwards, so no new box is
 /// registered at an address an old box's forward still dials or listens on.
 #[derive(Debug, Clone)]
@@ -296,8 +281,8 @@ impl Drop for RevocationHold {
     }
 }
 
-/// The guest node namespace's name in the table: the in-VM daemon, whose own
-/// root-netns tap [`BoxRegistry::register_node_namespace`] publishes. Read
+/// The guest node namespace's name in the table: the in-VM daemon, whose
+/// row [`BoxRegistry::register_node_namespace`] publishes. Read
 /// from the sessions zone so the registry and the store's reserved names
 /// spell the one label the zone defines.
 const NODE_NAMESPACE: &str = zone_answer::NODE_ROW_LABEL;
@@ -316,8 +301,7 @@ pub fn node_zone_name() -> String {
     zone_name(NODE_NAMESPACE)
 }
 
-/// The published rows, keyed by switch address in wire octets — the key the
-/// gate's per-frame lookup uses, straight off the frame summary. A `BTreeMap`
+/// The published rows, keyed by switch address in wire octets. A `BTreeMap`
 /// because the row set's order escapes to diagnostics and to
 /// [`BoxTable::rows`], and the same declarations must produce the same order
 /// every time (a hash map's would vary run to run).
@@ -498,8 +482,7 @@ impl BoxRecord {
         self.box_id
     }
 
-    /// The namespace's address on the switch: the lease its frames must carry
-    /// (NET-084) and the key the gate resolves a frame's source through.
+    /// The namespace's address on the switch.
     #[must_use]
     pub fn switch_addr(&self) -> Ipv4Addr {
         self.switch_addr
@@ -512,56 +495,25 @@ impl BoxRecord {
     }
 
     /// The ports this namespace admitted, in the order the declaration
-    /// carried them.
-    ///
-    /// Two readings, both of them the declaration's own and neither one the
-    /// frame verdict's:
-    ///
-    /// * An **ingress** dimension — what may be sent *to* this namespace,
-    ///   which the host attaches it by on the registration path (T66's
-    ///   client-driven one, the same path that fills this table). The frame
-    ///   verdict reads [`Self::egress`] alone and never this.
-    /// * The **publish** dimension — the ports a switch publish at this
-    ///   namespace's address may name: the host-side listener a forwarder
-    ///   binds, the end the registration wire carries. A mapping's inside
-    ///   end is not a record of the publish — it is the port the forwarder
-    ///   dials on the target, governed by the target's own ingress
-    ///   declaration inside the VM, which no row here is compiled from. The
-    ///   gate's publish decision (NET-081's control verbs) reads this and
-    ///   [`Self::declared_names`] as the records it admits a publish by;
-    ///   nothing outside the declaration is publishable, so a row that names
-    ///   no ports publishes none.
-    ///
-    /// It is carried in the row because NET-138's row holds a namespace's
-    /// whole declaration, where both the attaching side and the publish
-    /// decision reach it without a second table.
+    /// carried them: the host ports a publish for this namespace may name
+    /// without a runtime grant. A row that names no ports publishes none.
     #[must_use]
     pub fn admitted_ports(&self) -> &[u16] {
         &self.admitted_ports
     }
 
     /// The zone names this namespace declared, in the order the declaration
-    /// carried them — the publish dimension's name half: the records a
-    /// `dns/add` at this namespace's address may carry. A row that names none
-    /// publishes none.
+    /// carried them.
     #[must_use]
     pub fn declared_names(&self) -> &[String] {
         &self.declared_names
     }
 
-    /// Whether this box's declaration named a credentialed upstream
-    /// (NET-134): `true` marks the Box Egress Proxy's listener as this
-    /// box's infrastructure — the one destination its compiled frame rules
-    /// never decide, because the credentials the proxy redeems are the
-    /// lane's own and no egress rule of the box's says anything about them.
-    /// `false`, the absent declaration, is no lane: the proxy's address
-    /// stays under the box-to-host default-deny like any other host-side
-    /// destination, whatever the box's rules would allow.
-    ///
-    /// The gate reads this beside the row's rules ([`crate::net::egress_gate`]),
-    /// never through them: the declaration is a fact about the box, reduced
-    /// from the session policy's own field at registration — nothing the
-    /// guest says can add a lane to a row behind the gate's back.
+    /// Whether this box's declaration named a credentialed upstream: `true`
+    /// lets the stream door carry the box's connections to the credential
+    /// proxy. The declaration is a fact about the box, reduced from the
+    /// session policy's own field at registration, so nothing the guest
+    /// says can add it to a row.
     #[must_use]
     pub fn declares_credentialed_upstream(&self) -> bool {
         self.credentialed_upstream
@@ -586,10 +538,9 @@ impl BoxRecord {
     }
 
     /// The row's runtime-admitted port numbers recorded under `proto`, in
-    /// report order: the runtime half of the set the gate admits the box's
-    /// publications in that protocol by — the declared half is
-    /// [`Self::admitted_ports`]. Keyed on the (port, protocol) pair the
-    /// report named, so a port admitted for udp never admits its tcp twin.
+    /// report order. The declared half is [`Self::admitted_ports`]. Keyed
+    /// on the (port, protocol) pair the report named, so a port admitted
+    /// for udp never admits its tcp twin.
     #[must_use]
     pub fn runtime_port_numbers_in(&self, proto: IpProto) -> Vec<u16> {
         let runtime = self
@@ -606,8 +557,7 @@ impl BoxRecord {
 
     /// The row's runtime-admitted ports, distinct port numbers in report
     /// order, across both protocols: the read-only row verb's answer's
-    /// runtime dimension. The gate decides by the protocol-keyed half
-    /// ([`Self::runtime_port_numbers_in`]). Reported by the in-VM daemon
+    /// runtime dimension. Reported by the in-VM daemon
     /// within the grant the registration holds
     /// ([`BoxRegistry::admit_runtime_port`]), removed by its withdrawal
     /// reports, and gone with the row itself when the row is withdrawn.
@@ -627,10 +577,9 @@ impl BoxRecord {
     }
 }
 
-/// A namespace's declaration as it arrives on the host, before any frame
-/// exists: the facts a row is compiled from. Builder-shaped (the crate's
-/// `VmEgressPolicy` style) because the addresses alone make a namespace and
-/// everything else is optional.
+/// A namespace's declaration as it arrives on the host: the facts a row is
+/// made from. Builder-shaped because the addresses alone make a namespace
+/// and everything else is optional.
 #[derive(Debug, Clone)]
 pub struct BoxRegistration {
     name: String,
@@ -647,11 +596,8 @@ pub struct BoxRegistration {
 
 impl BoxRegistration {
     /// A declaration for the namespace `name`, addressed at `switch_addr` on
-    /// the switch and `loopback_addr` on the guest's loopback. The egress
-    /// policy is absent (allow-all, the shipped default) until
-    /// [`with_egress_policy`](Self::with_egress_policy) declares one, and
-    /// the box's id is minted at registration
-    /// ([`crate::bep_attach::mint_box_id`]).
+    /// the switch and `loopback_addr` on the guest's loopback. The box's id
+    /// is minted at registration ([`crate::bep_attach::mint_box_id`]).
     #[must_use]
     pub fn new(name: impl Into<String>, switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Self {
         Self {
@@ -676,18 +622,15 @@ impl BoxRegistration {
         self
     }
 
-    /// The ports this namespace admitted — the ingress **and** publish
-    /// dimensions [`BoxRecord::admitted_ports`] documents, not a dimension
-    /// the gate's frame verdict reads.
+    /// The ports this namespace admitted ([`BoxRecord::admitted_ports`]).
     #[must_use]
     pub fn with_admitted_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
         self.admitted_ports = ports.into_iter().collect();
         self
     }
 
-    /// The zone names this namespace declared — the name half of the publish
-    /// dimension [`BoxRecord::declared_names`] documents. Names are matched
-    /// exactly, as the client's own client spells them.
+    /// The zone names this namespace declared
+    /// ([`BoxRecord::declared_names`]).
     #[must_use]
     pub fn with_declared_names(
         mut self,
@@ -697,12 +640,9 @@ impl BoxRegistration {
         self
     }
 
-    /// The namespace's declaration of a credentialed upstream (NET-134):
-    /// `Some` marks the Box Egress Proxy's listener as this box's
-    /// infrastructure, so the gate admits its address beside — never
-    /// through — whatever egress rules the declaration also carries. The
-    /// declaration is reduced to a lane in the row; its own content is the
-    /// proxy document's to extend, so nothing of it is retained here.
+    /// The namespace's declaration of a credentialed upstream
+    /// ([`BoxRecord::declares_credentialed_upstream`]). The row keeps only
+    /// whether one was declared.
     #[must_use]
     pub fn with_credentialed_upstream(mut self, declaration: boxes::CredentialedUpstream) -> Self {
         self.credentialed_upstream = Some(declaration);
@@ -742,11 +682,8 @@ pub struct ClientBoxSpec {
     /// expanded them.
     pub ingress_ports: Vec<u16>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
-    /// from the session's policy: `Some` makes the Box Egress Proxy's
-    /// listener this box's infrastructure — reachable whatever the egress
-    /// rules say — while `None` is no lane, and the proxy's address stays
-    /// refused under the box-to-host default-deny. The one field a client
-    /// that predates NET-134 sends absent, every time.
+    /// from the session's policy. The one field a client that predates
+    /// NET-134 sends absent, every time.
     pub credentialed_upstream: Option<boxes::CredentialedUpstream>,
     /// The box's dynamic-ingress stance (NET-045): the stance half of the
     /// grant the row holds a runtime port report against. `None` is the
@@ -765,8 +702,8 @@ pub struct ClientBoxSpec {
 /// the addresses and the box id the registration handed back, and whether
 /// a row stands for it. A creation lives from its registration until its
 /// creator withdraws the box ([`BoxRegistry::withdraw_client_box`]) or a
-/// new registration takes its name; a row withdrawn at the end of its
-/// detach grace or its resume bound leaves the creation **dormant**
+/// new registration takes its name; a row withdrawn when its box ends
+/// leaves the creation **dormant**
 /// (`standing: false`) for its creator to resume
 /// ([`BoxRegistry::resume_client_box`]). A new registration under a
 /// dormant creation's name takes the name (BOX-004) and leaves the dormant
@@ -952,8 +889,7 @@ fn write_registry_file(
 
 /// Reads the creations persisted at `path`: none when there is no file
 /// yet. A file that cannot be read, does not parse, or is of another
-/// version than [`REGISTRY_FILE_VERSION`] reloads no row — its boxes are
-/// unregistered sources the gate drops (NET-085): fail-closed — and is set
+/// version than [`REGISTRY_FILE_VERSION`] reloads no row and is set
 /// aside ([`set_aside_registry_file`]) rather than written over, said as an
 /// error line, so the creations it may still hold are there to recover.
 /// `None` when it could not be set aside: the caller then persists
@@ -1240,7 +1176,7 @@ pub const TASK_SLOT_FLOOR: usize = 16;
 /// is handed again only once its quarantine ([`SWITCH_REUSE_QUARANTINE`])
 /// has passed **and** no row and no withdrawn box's revocation still holds
 /// it — the registry checks both at the draw. A row withdrawn before it
-/// was ever attributed — no frame of its box ever crossed the gate — comes
+/// was ever attributed ([`BoxRecord::was_used`]) comes
 /// back with no quarantine: nothing on the host keyed state by it, so an
 /// activation that withdraws and re-registers (an autogen name's retry)
 /// spends nothing.
@@ -1266,9 +1202,9 @@ struct SwitchAddressBook {
     /// its quarantine ([`Self::take`]).
     ///
     /// Not persisted: a minvmd restart is a VM restart, and every
-    /// switch-keyed host-side state the quarantine outlasts — the gate's
-    /// reply flows and DNS pins, the proxy's attachments, gvproxy's
-    /// neighbour entries — lives in this process and the VM it supervises,
+    /// switch-keyed host-side state the quarantine outlasts — the proxy's
+    /// attachments, gvproxy's neighbour entries — lives in this process and
+    /// the VM it supervises,
     /// and ends with them, so a book reloaded at start
     /// ([`BoxRegistry::persisting_to`]) holds only what reloaded rows hold.
     free: VecDeque<(u32, Instant, BoxId)>,
@@ -2739,19 +2675,13 @@ fn record_ask_yes(
 
 /// The writable half of the host-side table, held by the host process: the
 /// registration surface — the host's own node-namespace row, and T66's
-/// client-driven path — and the source of the read-only [`BoxTable`] the
-/// gate reads.
+/// client-driven path — and the source of the read-only [`BoxTable`].
 ///
 /// Cheap to clone, and every clone shares the rows, the hand-out book,
-/// and the withdrawal channel: the table the gate holds is the same one every
-/// later registration lands in, which is how a box published after the gate
-/// started is decided by its rules from that moment on, an address a
-/// registration takes on one clone is never handed twice, and a report any
-/// handle files reaches the one drainer. The subnet a registry is built with
-/// fixes the address plan its rows compile against — the resolver the
-/// carve-out is keyed to, the node address, and the runs the client-driven
-/// allocation draws from — so it must be the same subnet the gate's switch
-/// serves.
+/// and the withdrawal channel, so an address a registration takes on one
+/// clone is never handed twice. The subnet a registry is built with fixes
+/// the node address and the runs the client-driven allocation draws from,
+/// so it must be the same subnet the VM's switch serves.
 #[derive(Debug)]
 pub struct BoxRegistry {
     subnet: SwitchSubnet,
@@ -2770,10 +2700,8 @@ pub struct BoxRegistry {
     /// frees only that session's hold, never a newer session's under the
     /// same name.
     held_names: Arc<RwLock<BTreeMap<String, Option<boxes::SessionId>>>>,
-    /// The resident `host_ip` boxes' compiled egress, by session
-    /// ([`Self::admit_host_ip_box`], NET-085), shared by every clone and
-    /// every [`BoxTable`]: the union the gate decides a box-marked frame
-    /// from the node address by.
+    /// The resident `host_ip` boxes, by session
+    /// ([`Self::admit_host_ip_box`]), shared by every clone.
     host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
     /// The ids minted for `host_ip` boxes ([`Self::register_host_ip_box`],
     /// BEP-082), shared by every clone. A `host_ip` box has no row in the
@@ -2804,7 +2732,7 @@ pub struct BoxRegistry {
     table_pings: Arc<Mutex<Vec<std::sync::mpsc::Sender<()>>>>,
     /// The row-withdrawal subscribers ([`BoxTable::subscribe_row_withdrawals`]):
     /// told the switch address of every row removed, whichever path removed
-    /// it. The egress gate subscribes, to unbind a withdrawn box's forwards.
+    /// it. The publisher subscribes, to unbind a withdrawn box's forwards.
     row_withdrawals: RowWithdrawals,
     /// The addresses withdrawn boxes' revocations still hold against reuse
     /// ([`Revoking`]), shared by every clone and every [`BoxTable`].
@@ -3270,11 +3198,7 @@ fn exchange_control(
     Ok(reply)
 }
 
-/// A clone shares the live rows, the hand-out book, and the withdrawal
-/// channel but not the receiver: only the registry that created the channel —
-/// the one [`Self::spawn_withdrawal_drainer`] (or a test) drains — holds the
-/// receiving end, so a clone can register, allocate, and file reports like
-/// the original but has nothing to take.
+/// A clone shares the live rows and the hand-out book with the original.
 impl Clone for BoxRegistry {
     fn clone(&self) -> Self {
         BoxRegistry {
@@ -3481,23 +3405,12 @@ impl BoxRegistry {
     /// Persists this registry's client-box creations at `path` — the
     /// supervisor passes [`REGISTRY_FILE`] in its VM's state dir — and
     /// reloads what a previous run persisted there first. Returns `self`,
-    /// for the supervisor's call chain, and is the chain's last link: a
-    /// reloaded row is compiled under the egress default and issues its
-    /// proxy attachment exactly as a registration does, so both must be
-    /// set before.
+    /// for the supervisor's call chain.
     ///
-    /// Every creation whose row stood at the last write is reinstated at
-    /// its own addresses with its own box id, compiled from its creator's
-    /// declaration as a registration is, and awaits its box's first frame
-    /// under [`RESUME_ATTACH_BOUND`] from this instant ([`RowLiveness`]):
-    /// the VM the row's box ran in ended with the previous run, so the
-    /// box's host is not launched in the new VM until the guest daemon
-    /// starts, and the row is withdrawn once the bound passes unless the
-    /// box's shuttle carries a frame from its address again. A resume
-    /// does not extend that bound; once the row has gone, its creator's
-    /// resume reinstates it ([`Self::resume_client_box`]). A
-    /// dormant creation stays dormant. The hand-out book takes every
-    /// creation's switch and task addresses, dormant ones' included, so a
+    /// Every creation loads dormant: the VM its box ran in ended with the
+    /// previous run, and its row comes back when its creator resumes the
+    /// box ([`Self::resume_client_box`]). The hand-out book takes every
+    /// creation's switch and task addresses, so a
     /// fresh book hands none of them to a new box; their quarantine is not
     /// persisted ([`SwitchAddressBook`]). A creation whose addresses the
     /// book will not give — an address outside the run, or one an earlier
@@ -3511,7 +3424,7 @@ impl BoxRegistry {
     /// written to a temporary file and renamed over the last
     /// ([`write_registry_file`]), versioned ([`REGISTRY_FILE_VERSION`]).
     /// A write that fails is a warn line, and the creations stay held in
-    /// this process: the rows decide frames from memory, and the file only
+    /// this process: the rows are read from memory, and the file only
     /// outlives the process. A file found unusable is set aside, never
     /// written over ([`read_registry_file`]); when it cannot be, this
     /// registry persists nothing.
@@ -3854,8 +3767,8 @@ impl BoxRegistry {
 
     /// Returns a removed row's switch address to the hand-out book:
     /// quarantined when the row was ever attributed
-    /// ([`BoxRecord::was_attributed`]), at once when no frame of its box
-    /// ever crossed the gate. Called after the row lock that removed it is
+    /// ([`BoxRecord::was_used`]), at once when it never was. Called after
+    /// the row lock that removed it is
     /// dropped. An address the book did not draw is not returned.
     fn give_back_switch_addr(&self, addr: Ipv4Addr, quarantine: bool, returned_by: BoxId) {
         let now = self.now();
@@ -3882,24 +3795,13 @@ impl BoxRegistry {
             .collect()
     }
 
-    /// Publishes one namespace: compiles the declaration into a row keyed by
-    /// its switch address — the lease the shared verdict checks every
-    /// frame's source against (NET-084) — and returns it. Registering an
-    /// address that is already published replaces that row with the newest
-    /// declaration, whatever it holds: the table compares no policy against
-    /// the row it holds — a rule set's absent dimensions are allow-all, so
-    /// there is not even a widest one to rank against — and a re-registration
-    /// can widen a namespace's reach as readily as narrow it. Whether a
-    /// re-declaration may widen is the registering side's contract to enforce
-    /// (T66's client-driven path, which decides whether re-declaring a live
-    /// namespace is even possible); what this table enforces is NET-138's
-    /// boundary — only the host process holding this registry can publish at
-    /// all, so nothing inside the VM can change a row behind the gate's back.
-    ///
-    /// A row that declared DNS hosts carries those names in the row itself
-    /// ([`BoxRecord::allow_dns_hosts`]), beside the rules: the name-based
-    /// admission is decided against them, on the host, by the gate's DNS
-    /// admission table ([`crate::net::dns_pins`]).
+    /// Publishes one namespace: makes the declaration into a row keyed by
+    /// its switch address and returns it. Registering an address that is
+    /// already published replaces that row with the newest declaration,
+    /// whatever it holds. Whether a re-declaration may widen is for the
+    /// registering side to enforce. This table enforces that only the host
+    /// process holding this registry can publish, so nothing inside the VM
+    /// can change a row.
     ///
     /// # Errors
     ///
@@ -4050,8 +3952,6 @@ impl BoxRegistry {
         for task in &task_rows {
             rows.insert(task.switch_addr.octets(), Arc::clone(task));
         }
-        // Under the write that published the rows: a relay that reads the
-        // new epoch finds them ([`BoxTable::carry`]).
         let created = creation.is_some();
         // BOX-004: a registration under a dormant creation's name takes the
         // name over. The creation it replaces is superseded, not ended: it
@@ -4154,17 +4054,8 @@ impl BoxRegistry {
     }
 
     /// Withdraws the row published for `switch_addr`, returning it when one
-    /// was held. From here on the gate holds no namespace at that address, and
-    /// no rules are decided by it: withdrawing is how the host retires a
-    /// namespace's declaration, never a way to leave its address attributed.
-    ///
-    /// What the address's frames do next is unconditional
-    /// ([`crate::net::egress_gate`]): an address inside the plan's lease block
-    /// is an unregistered source the gate drops (NET-085), so a withdrawal
-    /// inside that block ends the address's reach at once, and outside it the
-    /// frames were already an unknown source's refusal (NET-081's failure
-    /// case). The row is gone either way, and a re-registration starts from
-    /// the newest declaration.
+    /// was held: how the host retires a namespace's declaration. A
+    /// re-registration starts from the newest declaration.
     pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
         // The box's end is observed here, so the withdrawal's own line
         // measures itself against this instant (NET-133's bound).
@@ -4241,7 +4132,7 @@ impl BoxRegistry {
     /// attributed to a namespace the table no longer holds.
     ///
     /// `box_ended` is the instant this process observed the box's end —
-    /// the drainer's arrival of the relay's report, or the creator's
+    /// the guest's report of it, or the creator's
     /// withdrawal request reaching the control socket — and the one line
     /// the withdrawal logs measures itself against, so a tail can see a
     /// withdrawal that did not keep the requirement's bound.
@@ -4268,22 +4159,12 @@ impl BoxRegistry {
     /// the registration's failure, naming the live, quarantined and total
     /// counts.
     ///
-    /// Every path that removes a row returns its switch address — the
-    /// drainer's [`Self::withdraw`], the creator's
+    /// Every path that removes a row returns its switch address —
+    /// [`Self::withdraw`], the creator's
     /// [`Self::withdraw_client_box`], and a refusal after the draw — and a
-    /// returned address is handed again only after its quarantine and once
-    /// nothing holds it. A withdrawn address's host-side state — the gate's
-    /// reply flows and DNS pins, the BEP leg's neighbour entry — is keyed
-    /// by it, and the quarantine outlasts every one of those timers
-    /// ([`SWITCH_REUSE_QUARANTINE`]), so a re-handed address starts clean.
-    /// A row never attributed keyed nothing, and its address comes back at
-    /// once.
-    ///
-    /// While a row this registration filled stands, the box's frames are
-    /// decided by its rules; a box with **no** row — one whose registration
-    /// never reached the daemon, or whose row was withdrawn — is an
-    /// unregistered source the gate drops unconditionally (NET-085), so no
-    /// egress default phase changes it, and this registration makes none.
+    /// returned address is handed again only after its quarantine
+    /// ([`SWITCH_REUSE_QUARANTINE`]) and once nothing holds it. A row never
+    /// attributed comes back at once.
     ///
     /// The published loopback address is not this registry's to pick:
     /// allocation is host-global (design §7.1), so `loopback_addr` comes from
@@ -4593,9 +4474,9 @@ impl BoxRegistry {
         let creation = Creation::new(&spec, switch_addr, loopback_addr, task_addrs.clone(), id);
         let registration =
             self.client_registration(spec, switch_addr, loopback_addr, task_addrs.clone(), id);
-        // A refusal after the draw publishes no row, so no frame of the box
-        // was ever attributed: the addresses go straight back, with no
-        // quarantine, and the refusal spends nothing.
+        // A refusal after the draw publishes no row, so the box never ran
+        // at its addresses: they go straight back, with no quarantine, and
+        // the refusal spends nothing.
         self.try_register_since(registration, generation, Some(creation))
             .inspect_err(|_| {
                 for &addr in std::iter::once(&switch_addr).chain(&task_addrs) {
@@ -4607,8 +4488,7 @@ impl BoxRegistry {
     /// The registration a client box's declaration compiles to at its
     /// addresses, as box `id`: the one compile a registration, a reload
     /// ([`Self::persisting_to`]) and a resume ([`Self::resume_client_box`])
-    /// all run, so a reinstated row is the row its declaration registers
-    /// under this registry's egress default.
+    /// all run, so a reinstated row is the row its declaration registers.
     fn client_registration(
         &self,
         spec: ClientBoxSpec,
@@ -4829,8 +4709,7 @@ impl BoxRegistry {
     ///
     /// The withdrawn switch address returns to the hand-out book
     /// ([`SwitchAddressBook`]): quarantined when the row was ever
-    /// attributed, at once when it never was. What the address's frames do
-    /// next is the gate phase's to say ([`Self::withdraw`]). The box's
+    /// attributed, at once when it never was. The box's
     /// proxy attachment goes with the row (NET-133), retired under the same
     /// row lock that removes it.
     ///
@@ -4977,7 +4856,7 @@ impl BoxRegistry {
         // landing after cannot retire the new box's attachment, and one
         // landing before is the row the proof above matched. The paths
         // that hold a row lock across the attachment table's — this one
-        // and the drainer's ([`Self::withdraw_where`]) — take the row lock
+        // and [`Self::withdraw_where`] — take the row lock
         // first, and no path takes them the other way, so the order never
         // inverts.
         self.retire_proxy_attachment(switch_addr, Instant::now());
@@ -5032,8 +4911,8 @@ impl BoxRegistry {
     /// creation are re-keyed to the new name under one write of the row
     /// lock, the creations are persisted, and the table pings its
     /// subscribers: the zone then answers the box's address under the new
-    /// name and nothing under the old one, the gate's name rules read the
-    /// new name, and a later withdrawal or resume finds the box under it.
+    /// name and nothing under the old one, and a later withdrawal or resume
+    /// finds the box under it.
     /// The row's identity (its id, its addresses, its liveness and its
     /// runtime ports) is untouched: a rename is not a re-registration.
     ///
@@ -5276,26 +5155,20 @@ impl BoxRegistry {
     /// registered as box `name`, handed the pair `(switch_addr,
     /// loopback_addr)` — and, when the creator knows it, created as
     /// `box_id` — reinstated from the registry's own creation ([`Creation`])
-    /// when the row was withdrawn after its detach grace, or held as it
+    /// when the row was withdrawn, or held as it
     /// stands when it was not. The pair is the creator's proof, as for a
     /// withdrawal ([`Self::withdraw_client_box`]), and the lookup key: every
     /// fact the row holds comes from the creation this host kept — the
-    /// declaration its creator registered, compiled under this registry's
-    /// egress default — never from the request, and never from the guest.
+    /// declaration its creator registered — never from the request, and
+    /// never from the guest.
     ///
-    /// A row that stands is answered as it stands ([`RowLiveness`]): a
-    /// detached row's grace keeps running from its attachment's end, so a
-    /// resume never holds it past [`NET_138_WITHDRAWAL_BOUND`]. A dormant
+    /// A row that stands is answered as it stands. A dormant
     /// creation's row is published at its own switch address and task
     /// addresses, which the creation kept reserved while it was dormant
     /// ([`Creation`]), and at the published loopback address the answerer
     /// holds for the name now, `allocated_loopback`, which must be the one
     /// the box was created with. The creation is found by `box_id` when
-    /// the resume names one, so a session renamed since still resumes it. The reinstated row is awaiting, under its original id: no
-    /// grace runs until a relay that carried it ends, and a row no relay
-    /// carries — neither its box nor any of its task rows — within
-    /// [`RESUME_ATTACH_BOUND`] is withdrawn as at a grace's end, its
-    /// creation kept for a later resume.
+    /// the resume names one, so a session renamed since still resumes it.
     ///
     /// `generation` is the name's withdrawal generation read before the
     /// answerer allocated ([`Self::begin_registration`]): a withdrawal that
@@ -5405,7 +5278,7 @@ impl BoxRegistry {
     /// Retires a removed row's side facts: its pending asks are cancelled
     /// (NET-045), its stopped mark is stale with the row gone, the
     /// row-withdrawal subscribers are each handed a copy of `withdrawal`
-    /// (design §7.1: the gate unbinds the box's forwards, holding the row's
+    /// (the publisher unbinds the box's forwards, holding the row's
     /// addresses until it has), and the change is a ping like any other. A
     /// subscriber that is gone drops its copy, so it holds nothing.
     fn retired(&self, removed: &Option<Arc<BoxRecord>>, withdrawal: Option<RowWithdrawal>) {
@@ -5575,8 +5448,8 @@ impl BoxRegistry {
     }
 
     /// Applies the in-VM daemon's withdrawal report of one runtime-published
-    /// port: the port leaves the row's runtime set, so the gate no longer
-    /// admits a retraction of it and the read-only row verb no longer lists
+    /// port: the port leaves the row's runtime set, so the read-only row
+    /// verb no longer lists
     /// it. Never refused — the cap and the rate are the admit path's bounds,
     /// and removing a fact the row holds (or already lacks) is always the
     /// goal state — and never counted against the rate. Answers the row the
@@ -5796,8 +5669,7 @@ impl BoxRegistry {
     /// or exec'd into loses its hold until its next attach or exec makes
     /// it again. Each drop is
     /// decided again under the held names' write, so a hold re-made since
-    /// the scan stays. Run on the withdrawal drainer's sweep
-    /// ([`Self::spawn_withdrawal_drainer`]).
+    /// the scan stays. Run by [`Self::spawn_upkeep`].
     pub fn expire_unconfirmed_holds(&self) -> usize {
         let now = self.now();
         let due =
@@ -5946,7 +5818,7 @@ impl BoxRegistry {
     }
 
     /// Publishes the guest **node's** own namespace: the in-VM daemon's
-    /// root-netns tap, the plane design §5.1 names node-plane. The address is
+    /// address on the switch. The address is
     /// the host's own derivation from the subnet it configured the switch
     /// with ([`SwitchSubnet::daemon_ip`]) — the guest is neither asked nor
     /// able to influence what this row holds.
@@ -5961,13 +5833,6 @@ impl BoxRegistry {
     /// starts no answerer — the host answerer serves the zone — so an
     /// answerer port on this row would be an admitted port with nothing
     /// behind it, a standing grant.
-    ///
-    /// The rules are the allow-all interim the absent-policy default ships:
-    /// the node-plane baseline set is un-enrolled until NET-130's enumeration
-    /// lands, and until then the daemon keeps the reach it had before the
-    /// gate existed — its own package fetches above all, which is the
-    /// VM-side shape of NET-080. NET-130 tightens this row to the categories
-    /// design §5.1 enumerates.
     ///
     /// # Errors
     ///
@@ -6021,12 +5886,8 @@ impl BoxRegistry {
         }
     }
 
-    /// The read-only view the egress gate decides by — the same rows this
-    /// registry holds, shared, so every later registration reaches the
-    /// running gate. The view carries a clone of the withdrawal reports'
-    /// sender with it: filing one is the view's single write-shaped act, and
-    /// it is a report to this process, not a row operation — see
-    /// [`BoxTable`].
+    /// The read-only view of the rows this registry holds ([`BoxTable`]),
+    /// shared, so it sees every later registration.
     #[must_use]
     pub fn table(&self) -> BoxTable {
         BoxTable {
@@ -6123,14 +5984,14 @@ impl BoxRegistry {
         )
     }
 
-    /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
-    /// its box stopped or was destroyed, as `end` says, so its rules admit
-    /// nothing from now on. A session the set does not hold is the goal
+    /// Ends the residency [`Self::admit_host_ip_box`] made for a session:
+    /// its box stopped or was destroyed, as `end` says. A session the set
+    /// does not hold is the goal
     /// state already holding. Only a destroy revokes: a destroyed box that
     /// declared a credentialed upstream under an id this registry minted
     /// has its id revoked at the Box Egress Proxy (BEP-043). A stopped box
-    /// keeps its id, because a restart brings it back. Returns whether a
-    /// box's rules were dropped.
+    /// keeps its id, because a restart brings it back. Returns whether the
+    /// box was resident.
     pub fn retire_host_ip_box(
         &self,
         session_id: boxes::SessionId,
@@ -6160,7 +6021,7 @@ impl BoxRegistry {
         ids.by_name.retain(|_, named| named.id != id);
         let name_withdrawn = ids.by_name.len() != named_before;
         let minted = ids.ids.contains(&id);
-        // A stop drops the rules, so a later destroy of the stopped box
+        // A stop ends the residency, so a later destroy of the stopped box
         // finds none. The id set keeps whether the box was credentialed,
         // for that destroy to revoke, across a restart too.
         let (credentialed, ids_changed) = match end {
@@ -7217,7 +7078,7 @@ struct HostIpIds {
     by_name: BTreeMap<String, HostIpName>,
     /// The minted ids admitted with a credentialed lane, until their box
     /// is destroyed. Their destroy revokes them, though a stop or a
-    /// restart dropped the rules that said so (BEP-043).
+    /// restart dropped the residency that said so (BEP-043).
     credentialed: BTreeSet<BoxId>,
 }
 
@@ -7323,24 +7184,12 @@ fn in_reserved_local_range(addr: Ipv4Addr) -> bool {
     u32::from(network) & mask == u32::from(addr) & mask
 }
 
-/// The read-only view of the published rows the egress gate decides by: the
-/// lookup a frame's source address resolves through, and nothing else that
-/// touches a row. The registry hands the gate this view because its row
-/// operations are lookups only — the component that reads guest frames
-/// cannot add, replace, or withdraw a row (NET-138: the table is filled on
-/// the host, never from the guest).
+/// The read-only view of the published rows: lookups, and nothing else that
+/// touches a row. A holder of this view cannot add, replace, or withdraw a
+/// row (NET-138: the table is filled on the host, never from the guest).
 ///
-/// What the view carries beside the lookups is one channel: filing a
-/// withdrawal report at a relay's end. It is deliberately **not** a row
-/// operation — the report leaves this process as a fact the host acts on
-/// ([`BoxRegistry::detach`] through the drainer, then the withdrawal once
-/// the grace passes unreattributed), so the guest's
-/// influence on the table is still bounded by what it can make the host
-/// observe: that a connection whose relayed traffic named an address is
-/// over. Which is the withdrawal NET-133 asks for, and nothing more.
-///
-/// Cheap to clone; every clone shares the registry's rows, carries the
-/// registry's plan beside them, and files its reports into the one channel.
+/// Cheap to clone; every clone shares the registry's rows and carries the
+/// registry's plan beside them.
 #[derive(Debug, Clone)]
 pub struct BoxTable {
     rows: Arc<RwLock<Rows>>,
@@ -7352,15 +7201,13 @@ pub struct BoxTable {
 impl BoxTable {
     /// Subscribes to row withdrawals: the receiver gets the switch address
     /// of every row the registry removes from here on, whichever path
-    /// removed it (the drainer's grace sweep, [`BoxRegistry::withdraw`] or
-    /// the creator's
-    /// [`BoxRegistry::withdraw_client_box`]). Like the withdrawal report,
-    /// this is a fact the host observed, never a row operation: the
-    /// subscriber learns that a box ended and cannot add, replace or
-    /// withdraw a row. The egress gate subscribes, so that it unbinds a
-    /// withdrawn box's forwards and terminates their connections (design
-    /// §7.1, host-side ingress revocation). A subscriber that drops its
-    /// receiver is pruned on the next withdrawal.
+    /// removed it ([`BoxRegistry::withdraw`] or the creator's
+    /// [`BoxRegistry::withdraw_client_box`]). This is a fact the host
+    /// observed, never a row operation: the subscriber learns that a box
+    /// ended and cannot add, replace or withdraw a row. The publisher
+    /// subscribes, so that it unbinds a withdrawn box's forwards and
+    /// terminates their connections. A subscriber that drops its receiver
+    /// is pruned on the next withdrawal.
     ///
     /// Each [`RowWithdrawal`] holds the row's addresses against reuse until
     /// the subscriber drops it, so a subscriber keeps it exactly as long as
@@ -7376,7 +7223,7 @@ impl BoxTable {
     }
 
     /// Whether a withdrawn box's revocation still holds `addr` against
-    /// reuse ([`RowWithdrawal`]): the gate refuses a publish there until
+    /// reuse ([`RowWithdrawal`]): the publisher refuses a publish there until
     /// the revocation ends, so that it never unbinds a forward that a later
     /// publish at the same address bound.
     #[must_use]
@@ -7387,10 +7234,7 @@ impl BoxTable {
 
 impl BoxTable {
     /// The published namespace holding the switch address `src`, when one
-    /// does. This is the whole of the gate's per-frame routing: an address a
-    /// row holds is decided by that row's rules, and an address no row holds
-    /// is the phase's to decide ([`crate::net::egress_gate`]), never a
-    /// rule's.
+    /// does.
     #[must_use]
     pub fn by_source(&self, src: [u8; 4]) -> Option<Arc<BoxRecord>> {
         self.rows
@@ -7409,13 +7253,9 @@ impl BoxTable {
     /// self-allocation reserve included, which an in-VM daemon no longer
     /// draws from (NET-138), so a source there is an unregistered one; the
     /// host hands registered boxes and their task addresses only from the
-    /// upper half (`hand_out_run`). The subnet's own infrastructure sits outside that
-    /// run: the gateway the resolver carve-out is keyed to, the host alias,
-    /// and the guest daemon's own tap, which the registry publishes a row for
-    /// itself. The gate's unregistered drop (NET-085) refuses a source only
-    /// from here, so no amount of it can borrow the plan's infrastructure as
-    /// a source, and this predicate is what keeps that drop and the
-    /// unknown-source refusal one address range apart.
+    /// upper half (`hand_out_run`). The subnet's own infrastructure sits
+    /// outside that run: the gateway, the host alias, and the guest daemon's
+    /// own address, which the registry publishes a row for itself.
     #[must_use]
     pub fn is_allocatable(&self, src: [u8; 4]) -> bool {
         let addr = u32::from(Ipv4Addr::from(src));
@@ -7442,12 +7282,8 @@ impl BoxTable {
             .is_empty()
     }
 
-    /// The plan's lease run — `first_ptask` through `last_ptask` — as the
-    /// octet arrays the publish decision compares a request's switch address
-    /// by. The same bounds [`Self::is_allocatable`] decides frames by; the
-    /// publish decision needs them as values because its table is an owned,
-    /// pure one ([`boxes::core::switch_request`]), built fresh per
-    /// request.
+    /// The plan's lease run — `first_ptask` through `last_ptask` — as octet
+    /// arrays: the bounds [`Self::is_allocatable`] checks.
     #[must_use]
     pub fn ptask_run(&self) -> ([u8; 4], [u8; 4]) {
         (
@@ -7458,22 +7294,13 @@ impl BoxTable {
 
     /// The switch's own address — the plan's gateway, the address the
     /// resolver answers at ([`SwitchSubnet::dns_server`], which is the same
-    /// address) — as the octet array a frame's destination is compared by.
-    /// The one destination inside the fabric that is a control surface, not
-    /// a destination a box's egress rules decide: the gate refuses every
-    /// frame headed here but a TCP or UDP query to the resolver's port,
-    /// before any row or phase is consulted — a row's admitted ports are its
-    /// own ingress, never a flow to the gateway.
+    /// address) — as an octet array.
     #[must_use]
     pub fn gateway(&self) -> [u8; 4] {
         self.subnet.gateway().octets()
     }
 
-    /// The subnet the rows live in — the node's own switch block, the one
-    /// slice of the fabric plane a box's frames may name as local reach
-    /// (a sibling, the host alias, the daemon), decided by the row's own
-    /// rules and the target's ingress rather than by the gate's
-    /// infrastructure rule ([`crate::net::egress_gate`]).
+    /// The subnet the rows live in: the node's own switch block.
     #[must_use]
     pub fn subnet(&self) -> SwitchSubnet {
         self.subnet
@@ -7775,7 +7602,7 @@ mod tests {
     }
 
     /// A row-withdrawal subscriber is told every removed row's address,
-    /// whichever path removed it: the drainer's withdrawal and the
+    /// whichever path removed it: the guest-reported end and the
     /// creator's. A withdrawal that removes nothing tells it nothing, and a
     /// subscriber that dropped its receiver is pruned without failing the
     /// withdrawal.
@@ -8031,7 +7858,7 @@ mod tests {
 
     /// Its creator's destroy of the client box `row` is: the creator's
     /// withdrawal, which ends the creation and returns its addresses — a
-    /// row the drainer withdraws leaves them reserved ([`Creation`]).
+    /// row withdrawn at its box's end leaves them reserved ([`Creation`]).
     fn destroy(registry: &BoxRegistry, row: &BoxRecord) {
         assert!(
             registry
@@ -8724,7 +8551,7 @@ mod tests {
         assert_eq!(resumed.box_id(), web.box_id());
     }
 
-    /// The task rows filed with `web`, as the gate resolves them by source.
+    /// The task rows filed with `web`, looked up by source.
     fn task_rows_of(registry: &BoxRegistry, web: &BoxRecord) -> Vec<Arc<BoxRecord>> {
         let table = registry.table();
         web.task_addrs()

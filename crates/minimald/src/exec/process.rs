@@ -142,9 +142,7 @@ pub(crate) fn engine_box(
 }
 
 /// The network a task gets: the provider for its session's mode (017-005),
-/// carrying the session's *effective* egress (NET-074) — a task in an
-/// own-address session runs under whatever the session's own gate enforces:
-/// the deny-all default in force, allow-all behind the opt-out — and none of
+/// carrying the session's *effective* egress (NET-074) and none of
 /// its ingress. Shared by the two ways a
 /// task starts — over an exec channel here, and from inside the session
 /// (`env::BoxChannel::run_task`).
@@ -160,15 +158,6 @@ pub(crate) fn engine_box(
 /// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
 /// the launcher did.
-///
-/// A gate is attached only where that egress has rules to enforce: the
-/// deny-all section the in-force default resolves an absent declaration to,
-/// or the box's own declaration. An absent section — the allow-all the
-/// opt-out (or the announced phase) leaves in place — passes `None`, as
-/// every task did before the deny-all default: a gate with no ingress
-/// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
-/// so attaching one where nothing needs gating would change behaviour the
-/// opt-out exists to keep.
 pub(crate) fn task_network(
     record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -190,8 +179,8 @@ pub(crate) fn task_network(
         &format!("{session}-task"),
         egress.map(|section| boxes::BoxPolicy::new(Some(section), None)),
         // Never the record's handed box addresses (T66): the task's sandbox
-        // is not the box the registration named — attaching it at the
-        // session box's address would key its frames to the session's row.
+        // is not the box the registration named, and the session's box
+        // holds that address.
         // A task attaches at one of the task addresses the same
         // registration filed with the box (NET-138), each a host-side row
         // carrying the box's id and egress, so no daemon-side draw happens

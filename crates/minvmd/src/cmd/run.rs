@@ -754,10 +754,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // from the host side — the same host-side argument the answerer's read
     // already makes.
     let proxy_publish = crate::control::ProxyPublishStatus::new();
-    // Whether the Box Egress Proxy listens (BEP-062): the cell the guest
-    // report door answers the in-VM daemon's proxy-listening read from.
-    // Empty until the proxy below starts, so a boot without one answers
-    // `false` and the guest's DNS gate fails steered names closed.
+    // Whether the Box Egress Proxy listens (BEP-062): the cell the stream
+    // door reads before it carries a connection to the proxy. Empty until
+    // the proxy below starts, so a boot without one answers `false`.
     let bep_listening = crate::control::BepListening::new();
 
     // The host-side door to the box table (T66): the control socket the
@@ -769,9 +768,8 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // beside it (T94, NET-138). Both are bound before the guest boots, so a
     // session activated against this VM can only ever be handed an address
     // this table holds. A bind failure of either is fatal (#1790): with no
-    // control socket no own-address box can register, and the gate admits
-    // no unregistered source, so a VM booted without it would run boxes
-    // that reach nothing — the supervisor exits naming the socket instead.
+    // control socket no own-address box can register, so the supervisor
+    // exits naming the socket instead.
     let (_control, guest_report_door) = bind_box_doors(
         &control_sock,
         &boxes,
@@ -2568,25 +2566,6 @@ fn fallback_port(
     ))
 }
 
-// ── T93: the marker gate, the publish watch ────────────────────────────────
-//
-// The boot-marker channel is the one existing control path from inside a
-// microVM to this daemon the guest can *initiate*: the guest dials the vsock
-// port the host bridges to the marker socket, writes, and hangs up. T93
-// extends what travels it — the guest's publish reports join the boot beacon
-// — and the gate below is the host half: one thread owning the listener for
-// the supervisor's life, classifying each connection by the first line it
-// peeks, handing each event to the supervisor over one channel.
-
-/// Bind the host's two box doors beside each other before the guest boots
-/// (T66, T94, NET-138): the box-registration control socket at
-/// `control_sock_path`, whose accept loop's handle the caller holds for the
-/// daemon's life, and the guest report door beside it, answered as the env
-/// pair the VMM child registers the door's vsock port from. Either bind
-/// failing is the supervisor's startup error, naming the socket and the
-/// cause (#1790): under the in-force gate a box with no host row reaches
-/// nothing, so there is no interim a boot without its doors could degrade
-/// to.
 /// Publishes the node's hostname proxy before the VM boots: a forward from
 /// the host's loopback at the node's port to the same port at the guest
 /// node. A port another program took since the draw is drawn again with
@@ -2649,6 +2628,13 @@ fn publish_node_proxy(
     }
 }
 
+/// Bind the host's two box doors beside each other before the guest boots
+/// (T66, T94, NET-138): the box-registration control socket at
+/// `control_sock_path`, whose accept loop's handle the caller holds for the
+/// daemon's life, and the guest report door beside it, answered as the env
+/// pair the VMM child registers the door's vsock port from. Either bind
+/// failing is the supervisor's startup error, naming the socket and the
+/// cause (#1790).
 #[cfg_attr(
     not(minvmd_libkrun),
     allow(
@@ -2776,8 +2762,7 @@ fn wait_boot_beacon(
     }
 }
 
-/// The marker socket's file, removed at the supervisor's exit (T93): the
-/// gate keeps the listener accepting past the first beacon, so the path is
+/// The marker socket's file, removed at the supervisor's exit: the path is
 /// held for the supervisor's life and taken away once at whatever exit it
 /// takes — a failed start, a stop, or a crash that ends the process anyway.
 #[cfg(minvmd_libkrun)]

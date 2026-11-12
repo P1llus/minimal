@@ -139,8 +139,8 @@ impl SupervisorStart {
 }
 
 /// The span for a task or thread that outlives the supervisor's start
-/// phase (the switch's supervision and datapath monitor, the egress gate's
-/// accept loop, the late-report watcher): `supervisor.task`, a root of its
+/// phase (such as the switch's supervision and datapath monitor):
+/// `supervisor.task`, a root of its
 /// own that follows from the span it was spawned in, carrying `vm` and the
 /// task's name, so its records stay attributable in the shared log.
 ///

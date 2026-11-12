@@ -19,7 +19,7 @@ fn warn_port_refusal(
     );
 }
 
-/// The egress *section* the gate compiles for a session: the materialized
+/// The egress *section* a session runs under: the materialized
 /// form of [`boxes::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
 /// in-force default (NET-074), and a declaration with the destination lists
@@ -30,7 +30,7 @@ fn warn_port_refusal(
 /// prove does not hang on that constant. `opt_out` is the daemon's deny-all
 /// opt-out (NET-077), threaded from the server config.
 ///
-/// Shared by the session launcher (the box's own gate) and the task path
+/// Shared by the session launcher and the task path
 /// ([`crate::exec::task_network`]), so a task runs under the same egress
 /// its session does.
 pub(crate) fn effective_egress_section(
@@ -143,7 +143,7 @@ impl sandbox::Network for OwnAddressBuildNetwork {
     }
 }
 
-/// The policy the gate enforces for a session: its declared ingress, and its
+/// The policy a session runs under: its declared ingress, and its
 /// egress resolved to the section [`effective_egress_section`] names — the
 /// deny-all section for an own-address box with no `egress` section once the
 /// default is in force (NET-074), the allow-all default for everything an
@@ -164,11 +164,10 @@ pub(crate) fn effective_session_policy(
         // The credentialed-upstream declaration (NET-134) resolves nothing —
         // the lane it opens is decided host-side, by the row the client's
         // registration fills — so it is carried verbatim, like the ingress:
-        // the effective policy a box's gate reads keeps the lane the box
-        // declared beside it.
+        // the effective policy keeps the lane the box declared beside it.
         credentialed_upstream: policy.credentialed_upstream.clone(),
         // BEP-018: the declared `quic443` stance resolves nothing here
-        // either. The gate resolves it, so it is carried verbatim.
+        // either, so it is carried verbatim.
         quic443: policy.quic443,
     }
 }

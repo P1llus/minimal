@@ -449,9 +449,8 @@ pub(crate) async fn release_held_name_after_attach(
 /// either way. Only a named `host_ip` or `none` session without a box
 /// row needs it: a box that registered a row owns its name through the
 /// row, which `resume_box_row` re-sends, and an `own_ip` session holds
-/// nothing. A `none` box's hold is the host's record of its box id, so a
-/// hold lost to a restart leaves the host refusing its expose decision
-/// reports (NET-046). Only a `host_ip` box has egress to re-admit.
+/// nothing. A `none` box's hold is the host's record of its box id. Only a
+/// `host_ip` box has egress to re-admit.
 ///
 /// The record was read before the hold, so a destroy another client
 /// issues in between can release the session's holds first and leave
@@ -577,8 +576,7 @@ fn rehold_undo(
 /// an address there. A `host_ip` box uses the host's own address, so the
 /// host only reserves the name for it (a lookup returns no address), and
 /// the record carries no `box_addresses`. A `none` box holds its name too
-/// (NET-046): the hold is the host's one record of its box id, which the
-/// in-VM daemon's expose decision report names.
+/// (NET-046): the hold is the host's one record of its box id.
 pub(crate) fn holds_name(record: &boxes::Record) -> bool {
     matches!(
         record.network,
@@ -1426,9 +1424,9 @@ mod tests {
 
     /// NET-045/NET-138: the host-side registration carries the box's
     /// dynamic-ingress grant — the stance and the range — from the same
-    /// create inputs the session record holds, so the host-side row holds
-    /// every runtime port report against the grant the box was created
-    /// with, never against one the guest could bring with its report. A
+    /// create inputs the session record holds, so the host judges
+    /// every publish request against the grant the box was created
+    /// with, never against one the guest could bring with its request. A
     /// declaration that carries no grant carries nothing, and the host's
     /// row fills the deny default in: nothing is permitted.
     #[tokio::test]

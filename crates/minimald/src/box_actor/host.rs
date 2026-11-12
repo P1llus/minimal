@@ -404,13 +404,13 @@ pub(super) enum HostOrigin {
 /// Whether replacing a live host for an attaching terminal is safe for the
 /// box it serves. A [`HostOrigin::Hooks`] host is replaceable — nothing of
 /// the user's runs in it — unless the record holds a registered host-side
-/// row: on a VM-backed host, ending that host's PTask ends the shuttle
-/// connection the row is tied to, and the in-VM daemon cannot re-register
-/// it, so a respawn would strand the box with no row. The guard is the
-/// record's handed `box_addresses`, not a VM check, so any registered box is
-/// kept, native ones included: keeping costs nothing, because the terminal
-/// rides the per-attach environment the host republishes, exactly as it does
-/// for an [`HostOrigin::Exec`] host.
+/// row: on a VM-backed host, the end of that host's PTask tells the VM host
+/// that the box ended, which withdraws the row, and the in-VM daemon cannot
+/// register it again, so a respawn would leave the box with no row. The
+/// guard is the record's handed `box_addresses`, not a VM check, so any
+/// registered box is kept, native ones included: keeping costs nothing,
+/// because the terminal rides the per-attach environment the host
+/// republishes, exactly as it does for an [`HostOrigin::Exec`] host.
 pub(super) fn replaces_host_for_terminal(
     origin: HostOrigin,
     declares_terminal: bool,
@@ -526,7 +526,7 @@ impl BoxActor {
             // The expose's revocation withdraws its admission at the box's
             // gate first (NET-044), so no new connection crosses the gap
             // between a port the gate still admits and a forward that is
-            // coming down. A relay already gone took its gate with it.
+            // coming down. An attach already gone took its gate with it.
             if let Some(gate) = self
                 .reported_switch_address
                 .and_then(crate::net::ingress_gate::live_gate)
@@ -537,21 +537,6 @@ impl BoxActor {
             }
             let control = self.switch_control().await;
             crate::net::policy::remove_ingress(&control, &forwarders).await;
-            // The VM host daemon's row entries go with the forwards (T94,
-            // NET-138): each port this box admitted against the host-held
-            // grant is withdrawn once its forward is down — best-effort like
-            // the unexpose beside it, because a report that fails leaves a
-            // stale row entry, never a live forward, and the box's own
-            // destroy clears the row whole. The revocation takes both runtime
-            // surfaces' publishes down in one sweep and the runtime cell does
-            // not keep which surface published what, so every withdrawal
-            // rides the expose label: a withdrawal is never refused, and the
-            // host removes the port whatever the label says — it is the
-            // log's word, not the row's key.
-            // The address the publishes were admitted under, kept from the
-            // publish; the record's handed address only when no publish of
-            // this surface was admitted (a listen-published port's watcher
-            // withdraws its own).
         }
 
         for ask in std::mem::take(&mut self.pending_asks) {
@@ -901,7 +886,7 @@ impl BoxActor {
             AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
         })?;
         // The confirmation was a read, not a reservation: the VM host daemon
-        // may have withdrawn the row at its grace's end between that read
+        // may have withdrawn the row between that read
         // and this launch (NET-138). Read it again now the new host is up,
         // before the slot is marked as holding it; a row gone in between
         // ends the launch as the read before it would have.
@@ -970,14 +955,12 @@ impl BoxActor {
     /// launch's host alive. The row lives exactly as long as the binding
     /// launch's switch attachment and the daemon never registers it again,
     /// so a box in this state must not be handed a host — every one would
-    /// be rowless, and the host gate silently drops a rowless box's frames.
+    /// be rowless.
     /// False for a box that carries no host-handed addresses, and for a
     /// registered box no launch has bound yet: its first launch binds it.
     ///
     /// When the binding launch's host is gone, the VM host daemon is asked
-    /// whether its row still stands ([`crate::net::listeners::host_row_standing`]):
-    /// the host detaches a row at the end of its box's attachment and
-    /// withdraws it only after a grace, and the box's creator may resume a
+    /// whether its row still stands: the box's creator may resume a
     /// withdrawn one, so a row that stands is the host's own word that a
     /// relaunch rejoins the switch under it. The answer is the host's
     /// table, never a fact this daemon asserts; a host that cannot be asked
@@ -1003,11 +986,8 @@ impl BoxActor {
         !standing
     }
 
-    /// Whether the VM host daemon says this registered box's row stands
-    /// ([`crate::net::listeners::host_row_standing`]), read for the box id
-    /// the record names. A record naming no box id cannot be told from
-    /// another box handed its address, so it reads as no row without
-    /// asking: fail-closed. A host that cannot be asked reads as no row.
+    /// Whether the VM host daemon says this registered box's row stands.
+    /// A host that cannot be asked reads as no row.
     pub(super) async fn host_row_stands(&mut self, record: &Record) -> bool {
         if record.box_addresses.is_none() {
             return false;

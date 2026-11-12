@@ -126,12 +126,7 @@ impl MockLauncher {
     }
 
     /// This mock with `listen_plan` attached, so a test can drive a box's
-    /// listener watcher under whatever else its launch mirrors. The mock has
-    /// no sandbox and no network namespace of its own, so the watcher
-    /// resolves the box's leader as the sole child its shell runs — the
-    /// shape a real container's supervisor gives the resolution — and the
-    /// leader's socket table is the daemon's own, where the listening
-    /// sockets the test binds in its process are the box's.
+    /// listener watcher under whatever else its launch mirrors.
     pub(crate) fn and_listen_plan(
         mut self,
         listen_plan: crate::net::listeners::ListenPlan,
@@ -177,12 +172,9 @@ impl BoxLauncher for MockLauncher {
         let entrypoint = self.entrypoint()?;
         let pty = Pty::open(sz)?;
 
-        // A launch that carries a listen plan starts a watcher that
-        // resolves its box's leader, and a mock box's leader is the sole
-        // child of its shell — so the script runs one (`sleep`, doing
-        // nothing but holding the shape) beside its echo loop. The child
-        // is never a job-control one — the mock's shell is not interactive
-        // — so it reads no tty and touches no foreground rights.
+        // The child is not a job-control one, because the mock's shell is
+        // not interactive, so it reads no tty and touches no foreground
+        // rights.
         let leader_child = if self.listen_plan.is_some() {
             "sleep 60 & "
         } else {

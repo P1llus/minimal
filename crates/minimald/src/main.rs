@@ -634,8 +634,8 @@ async fn async_main() -> Result<(), MainError> {
                 // minvmd. Always listen: the guest cannot see what the
                 // host runs.
                 timekeep_listener_port: Some(guest::TIMEKEEP_PORT),
-                // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
-                // vsock shuttle, so no in-guest gvproxy binary path is needed.
+                // In-VM (DM1/3/4) the PTask attaches to the host gvproxy, so no
+                // in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
                 // The node ports are the host's, not the daemon's: minvmd
                 // assigns them before the VM boots (NET-025) and hands them
@@ -1013,7 +1013,7 @@ async fn async_main() -> Result<(), MainError> {
         // `listen_args` borrow, so it cannot be held across that mutation.
         gvproxy_bin: cli.listen_args().unwrap().gvproxy_bin.clone(),
         // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
-        // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
+        // `OwnIp` PTask must attach to the host gvproxy,
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,

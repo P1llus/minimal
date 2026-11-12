@@ -461,8 +461,7 @@ async fn serve_create_session(
             // NET-081's host-table rule: on a VM-backed node a box's
             // addresses are allocated host-side and handed in, so an
             // own-address create that carries none is refused here, before
-            // any record exists, rather than started as a box whose every
-            // frame the host gate drops.
+            // any record exists.
             if let Err(refused) = refuse_unhanded_vm_box(
                 in_microvm,
                 req.config.network,
@@ -604,9 +603,7 @@ fn user_namespace_refusal(restriction: crate::server::UsernsRestriction) -> Stri
 /// The refusal an own-address create gets on a VM-backed node when it
 /// carries no handed addresses (NET-081): the VM host allocates every
 /// box-plane address and hands it in through the registration its control
-/// socket serves, so the guest never mints one — a box created without a
-/// row would start with every frame dropped at the host gate as an
-/// unregistered source (NET-085), a box that is silently dark. `in_microvm`
+/// socket serves, so the guest never mints one. `in_microvm`
 /// is the daemon's own [`crate::server::Config::in_microvm`]. A native node
 /// keeps NET-010's own allocator, and a box that is not own-address has no
 /// box-plane address to hand. Pure over its inputs, so the gate is pinned
@@ -1791,7 +1788,7 @@ async fn serve_get_session_policy(
 }
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
-/// mode: the egress half resolved to what the gate enforces, the ingress half
+/// mode: the egress half resolved to what the engine enforces, the ingress half
 /// verbatim, and the credentialed-upstream lane (NET-134) verbatim.
 ///
 /// The reply rule: the policy struct is `deny_unknown_fields`, so an older
@@ -1822,14 +1819,14 @@ pub(crate) fn effective_policy_reply(
 
 /// `GetEffectiveSessionPolicy`: the same record
 /// [`serve_get_session_policy`] serves, with the egress half resolved to what
-/// the gate enforces — the answer `min session policy` renders (NET-075).
+/// the engine enforces — the answer `min session policy` renders (NET-075).
 ///
 /// Resolved here rather than in the client because the inputs are this
 /// daemon's own facts: the rollout phase its build ships
 /// ([`boxes::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
 /// own-address box with no `egress` section answers `deny_all` with the
 /// default in force (NET-074) and `allow_all` behind the opt-out; a declared
-/// section answers as the gate resolves it — the lists it declared
+/// section answers as it is enforced — the lists it declared
 /// verbatim, and under the in-force default, on a box of any network mode,
 /// a destination list it left absent present and empty, the wire meaning
 /// being "what this box is held to", never "what it wrote"; the strict
@@ -1887,7 +1884,7 @@ async fn serve_get_effective_session_policy(
 /// publish lives only while its box does.
 ///
 /// Every row reads not pending: a runtime publish admits its port at the
-/// box's relay gate in the same turn it records the mapping (NET-044), so a
+/// box's gate in the same turn it records the mapping (NET-044), so a
 /// listed publish is reachable. The `pending` field stays on the wire so a
 /// client can still tell this daemon's rows from an older daemon's. The
 /// listen watcher's rows — the in-range listens the box's `allow` stance

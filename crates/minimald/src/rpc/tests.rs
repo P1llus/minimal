@@ -1419,21 +1419,8 @@ async fn absent_range_publishes_interim_and_readvises() {
     );
 }
 
-/// NET-123 on a VM-backed daemon, after `min finalize-install`: the
-/// create handler asks the forwarder's walk of the host's loopback, not the
-/// guest's own `lo`. Each session start walks again, whatever verdict
-/// landed last. The walk after the host gains the range lands present: the
-/// box standing at the `127.0.0.1` interim moves onto a range address, the
-/// new box's grant comes from the range, and its reply clears the interim
-/// flag. A present verdict is walked again too. When the range goes away
-/// under the running VM, the next walk lands absent: the reply carries the
-/// interim flag and the earlier box moves back to `127.0.0.1`. The stand-in
-/// walk stands in for the host forwarder, which a harness daemon does not
-/// have.
 #[allow(clippy::await_holding_lock)]
 #[cfg(target_os = "linux")]
-// Multi-thread: the held-forward step runs the real forwarder walk from
-// inside the sync stand-in, through `block_in_place`.
 /// NET-018: once the answerer is serving beside the proxy, the replies
 /// report the one fact that is the daemon's to know — its answerer
 /// bound — and the one log line, emitted the moment the answerer binds,
@@ -1654,7 +1641,7 @@ async fn own_ip_session(client: &mut TestClient, name: &str, policy: BoxPolicy) 
 }
 
 /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
-/// SSH wire, what the gate enforces. The wire half asserts the reply the
+/// SSH wire, what the engine enforces. The wire half asserts the reply the
 /// shipped phase resolves — in force, so `deny_all` — and the in-force
 /// posture is also proven by passing the phase explicitly to the same
 /// resolver the handler serves. In force, an own-address box with no
@@ -1773,7 +1760,7 @@ async fn effective_policy_response_round_trips() {
         "the strict policy reply must keep the declaration as launched",
     );
 
-    // A declared section round-trips as the gate resolves it, ingress
+    // A declared section round-trips as it is enforced, ingress
     // beside it: the effective reply is what the box is held to, so the
     // names list the declaration left absent comes back present and
     // empty (NET-074, in force on an own-address box), while the

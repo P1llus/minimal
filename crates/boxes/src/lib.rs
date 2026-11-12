@@ -179,10 +179,10 @@ impl EgressPolicy {
     /// Returns the first `allow_dns_hosts` entry that is not a valid DNS
     /// hostname, or `None` when every entry is valid (or none are configured).
     ///
-    /// Used at launch to name a hostname that can never match the DNS gate's
-    /// exact-match lookup — a name with whitespace, an over-long label, or a
-    /// character outside `[A-Za-z0-9-_.]` — where it can be fixed, rather than
-    /// storing it verbatim as an allow rule that admits nothing.
+    /// Used at launch to name a hostname that no lookup can match — a name
+    /// with whitespace, an over-long label, or a character outside
+    /// `[A-Za-z0-9-_.]` — where it can be fixed, rather than storing it
+    /// verbatim as an allow rule that admits nothing.
     #[must_use]
     pub fn first_invalid_dns_host(&self) -> Option<&str> {
         self.allow_dns_hosts
@@ -196,12 +196,8 @@ impl EgressPolicy {
     /// The deny-all section: `Some(vec![])` on every `allow_*` dimension —
     /// the shape `--deny-all-egress` writes, which admits nothing — with
     /// nothing denied, because there is nothing left to subtract from. The materialized form of
-    /// [`EffectiveEgress::DenyAll`], built as a real section so the gate
-    /// compiles the default through the same path a declared one takes.
-    ///
-    /// The resolver carve-out (NET-079) is not in the section: it lives in
-    /// the verdict, which admits the resolver Minimal owns for a box at
-    /// DNS's port whatever the rules say.
+    /// [`EffectiveEgress::DenyAll`], built as a real section so the default
+    /// compiles through the same path a declared one takes.
     #[must_use]
     pub fn deny_all() -> Self {
         Self {
@@ -321,8 +317,8 @@ impl IngressPolicy {
 
 /// A box's declaration of a credentialed upstream (NET-134): the fact that
 /// the Box Egress Proxy — the node-local listener a box's credentialed
-/// traffic is steered through — is this box's infrastructure, reached at the
-/// proxy's own address on the switch whatever the box's egress rules say.
+/// traffic is steered through — is this box's infrastructure, reached
+/// whatever the box's egress rules say.
 ///
 /// The declaration carries the Box Egress Proxy settings: the
 /// `[network.bep]` table and the `[secrets]` grants ([`core::bep`]). The
@@ -331,9 +327,7 @@ impl IngressPolicy {
 /// empty, so a declaration with no settings serializes as `{}`, exactly as
 /// it did before the settings existed, and an old `{}` reads as no settings.
 /// A policy that carries `Some` declaration puts its box on a credentialed
-/// lane; one that carries `None` declares nothing, and its box's frames to
-/// the proxy's address are refused under the box-to-host default-deny, never
-/// decided by its egress rules.
+/// lane; one that carries `None` declares nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // An unknown field is one the proxy document has not bound here — refused
 // like every other field the policy schemas do not know (the same
@@ -373,13 +367,11 @@ impl CredentialedUpstream {
     }
 
     /// Whether a declared lane takes effect in a box of this network mode
-    /// on a host of this kind (BEP-085). An own-address box reaches the
-    /// proxy through the switch's gate on every host. A host-address box
-    /// reaches it only on a VM host, where the host-side gate admits the
-    /// box's cohort to the proxy's listener. On a native host a
-    /// host-address box shares the host's network, and no gate admits it.
-    /// A `none` box has no network. A declaration that is not in effect
-    /// stays on the record and is still shown, marked as not in effect.
+    /// on a host of this kind (BEP-085): for an own-address box on every
+    /// host, for a host-address box only on a VM host, and never for a
+    /// `none` box, which has no network. A declaration that is not in
+    /// effect stays on the record and is still shown, marked as not in
+    /// effect.
     #[must_use]
     pub fn in_effect(network: NetworkMode, host: paths::HostKind) -> bool {
         match network {
@@ -445,9 +437,8 @@ pub struct BoxPolicy {
     /// The `[session.network] quic443` stance, `None` when the project
     /// declares none. `None` reads as `auto`. `block` and `allow` override
     /// the `auto` resolution on the lane's grants and steering (BEP-018).
-    /// It is a setting of every box, lane or not, so a declared `block`
-    /// reaches the gate of a box with no credentialed upstream. Skipped when
-    /// `None`, so a policy that declares none serializes as it did before.
+    /// It is a setting of every box, lane or not. Skipped when `None`, so
+    /// a policy that declares none serializes as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic443: Option<core::bep::Quic443>,
 }
@@ -512,8 +503,8 @@ pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce
 
 /// The egress a box's traffic is actually held to: its declared section when
 /// it has one, otherwise the default [`effective_egress`] resolves for an
-/// absent one. This is what the gate enforces and what `min session policy`
-/// shows; the declaration itself stays untouched on the record, so the
+/// absent one. This is what `min session policy` shows;
+/// the declaration itself stays untouched on the record, so the
 /// strict [`BoxPolicy`] a client reads back is exactly what the box was
 /// launched with.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -871,7 +862,7 @@ fn is_valid_cidr(s: &str) -> bool {
 /// whole name at most 253 bytes, every character in `[A-Za-z0-9-_.]`, and no
 /// label starting or ending with a hyphen (RFC 1035), since no query name can
 /// carry one.
-/// One trailing dot is tolerated because the DNS gate strips it before
+/// One trailing dot is tolerated because the resolver strips it before
 /// matching, so `example.com.` and `example.com` name the same host.
 pub fn is_valid_dns_host(s: &str) -> bool {
     if s.chars().any(char::is_whitespace) {
@@ -1416,8 +1407,7 @@ pub struct Record {
     /// address the host side names the box by. Persisted so a re-attach —
     /// including after a daemon restart — attaches with the same address
     /// the host table still holds a row for; drawing a fresh one would
-    /// silently orphan the row and drop the box to the egress gate's
-    /// unregistered-source interim. Defaults to `None` for records that
+    /// silently orphan the row. Defaults to `None` for records that
     /// predate the field (every pre-T66 session): on a VM-backed host such
     /// a box is refused at launch and must be re-activated, since the
     /// in-VM daemon draws no address of its own once its switch is the
@@ -1427,8 +1417,8 @@ pub struct Record {
 
     /// The task addresses the same registration handed (NET-138): the
     /// switch addresses this box's task runs attach at, one run per
-    /// address at a time. Each is a row on the host carrying the box's id
-    /// and egress, withdrawn with the box. Kept off [`BoxAddresses`] so
+    /// address at a time. Each is a row on the host carrying the box's id,
+    /// withdrawn with the box. Kept off [`BoxAddresses`] so
     /// that pair stays `Copy`. Empty for every record that handed no box
     /// addresses, and for one that predates the field — a VM-backed task
     /// run under such a record is refused and the session must be
@@ -3030,7 +3020,7 @@ mod tests {
     fn invalid_egress_dns_host_is_rejected() {
         // An allow_dns_hosts entry that is not a valid DNS hostname is rejected
         // at launch, naming the offending string, rather than being stored
-        // verbatim as an allow rule that can never match the DNS gate.
+        // verbatim as an allow rule that no lookup can match.
         for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
             for host in [
                 "",
@@ -3058,8 +3048,8 @@ mod tests {
 
     #[test]
     fn valid_egress_dns_hosts_are_accepted() {
-        // A trailing dot is tolerated (the DNS gate strips it before matching),
-        // and underscores are permitted, matching the gate's normalization.
+        // A trailing dot is tolerated (the resolver strips it before matching),
+        // and underscores are permitted.
         let egress = EgressPolicy {
             allow_dns_hosts: Some(vec![
                 "github.com".into(),

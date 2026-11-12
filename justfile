@@ -743,6 +743,9 @@ e2e: _kvm artifacts gvproxy initramfs minimal-cli zoned-build minvmd-build
 
 # CI: ci-linux-native.yml `native-daemon-e2e`.
 #
+# Needs the network policy engine on this host (`min finalize-install`):
+# without it every box that has a network policy is refused.
+#
 # The SAME session e2e against a host-native minimald (no VM).
 [linux]
 e2e-native:

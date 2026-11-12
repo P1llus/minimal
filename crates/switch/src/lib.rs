@@ -55,11 +55,9 @@ pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duratio
 /// ([`MacAddr::for_switch_ip`]) on the one switch.
 ///
 /// It must outlast every record that can still name a released address once
-/// its holder is gone: [`BEP_NEIGHBOUR_CACHE_LIFETIME`] (asserted below), and
-/// each allocator's own flow and admission timers, which each side asserts
-/// against this constant where those timers live. Waiting it out is
-/// necessary, not sufficient: each allocator also skips an address its own
-/// live state still names.
+/// its holder is gone: [`BEP_NEIGHBOUR_CACHE_LIFETIME`] (asserted below).
+/// Waiting it out is necessary, not sufficient: each allocator also skips an
+/// address its own live state still names.
 pub const SWITCH_ADDRESS_REUSE_QUARANTINE: std::time::Duration =
     std::time::Duration::from_secs(300);
 
@@ -69,13 +67,9 @@ const _: () = assert!(
 );
 
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
-/// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
-/// host gvproxy switch (DM1/3/4).
+/// `VMADDR_CID_HOST == 2`.
 pub const VSOCK_HOST_CID: u32 = 2;
 
-/// vsock port the per-PTask shuttle connects to on the host to reach the host
-/// gvproxy switch. libkrun bridges this guest-initiated connection to the host
-/// gvproxy `-listen` socket.
 pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
 
 /// Default gvproxy switch subnet: the RFC 6598 (CGNAT) `100.64.0.0/16` block.
@@ -370,7 +364,7 @@ impl SwitchSubnet {
     }
 
     /// The daemon address (the address below [`Self::host_alias`],
-    /// `broadcast - 2`): the guest root netns' primary tap, which gives
+    /// `broadcast - 2`): the guest node's own address, which gives
     /// `minimald` itself egress through the host gvproxy (so it can fetch
     /// upstream packages). Reserved from the top so the PTask range still
     /// starts at `network + 2` and never collides with it.

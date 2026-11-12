@@ -628,11 +628,9 @@ pub struct BoxActor {
     /// none — and one that is not running — holds an empty list.
     live_ingress: crate::net::provider::RuntimeIngress,
 
-    /// The switch address the VM host daemon admitted this box's runtime
-    /// publishes under (T94), kept from the publish so the stop's withdrawal
-    /// sweep reports against the row it admitted them in without re-reading
-    /// the record — a read that fails there would skip the sweep and leave
-    /// the host's row naming ports nothing publishes.
+    /// The switch address this box's runtime publishes deliver to, kept from
+    /// the publish so the stop finds the gate that admitted them without
+    /// reading the record again.
     reported_switch_address: Option<std::net::Ipv4Addr>,
 
     /// This box's runtime publications, whichever of the two runtime surfaces
@@ -892,7 +890,7 @@ impl BoxActor {
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
-            // No runtime publish has been admitted at a VM host yet.
+            // No runtime publish was made yet.
             reported_switch_address: None,
             // And for the publications every runtime surface reads: empty
             // until a launch hands its box one, and then whatever the spawn

@@ -38,7 +38,7 @@ impl BoxActor {
     /// already on file and the name re-registers against it, carrying the
     /// ports the session's ingress declaration publishes (NET-069) — an empty
     /// set, and so a deny-all gate, when the box declares no ingress: that is
-    /// the posture its own relay gate gives a direct connection, and the
+    /// the posture its own gate gives a direct connection, and the
     /// proxy's must match on every host form (NET-071). A NoNet
     /// PTask exposes no services, so it is not registered — and neither is a
     /// `Draft` session, which has nothing to route to until its composition

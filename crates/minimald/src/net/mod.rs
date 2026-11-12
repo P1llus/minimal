@@ -2,16 +2,11 @@
 //!
 //! This module owns the per-host gvproxy ("gvisor-tap-vsock") switch process
 //! and the address book that backs it. An `OwnIp` PTask gets its own network
-//! namespace plus a tap device that is bridged into the switch by an async
-//! relay (see [`switch`]); from the switch's point of view every PTask is one
-//! more L2 client on the same subnet, so two `OwnIp` PTasks on the same host
-//! can talk directly (UC6) while a `NoNet` PTask — which never gets a tap or a
-//! relay — sees only an empty namespace and cannot egress (UC1).
-//!
-//! The concrete attachment protocol (HTTP `POST /connect` on the control
-//! socket, then HyperKit-framed Ethernet frames — no SCM_RIGHTS fd passing)
-//! was pinned by the gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
-//! and is implemented in [`switch`].
+//! namespace, which `net::attach` connects to the switch. From the switch's
+//! point of view every PTask is one more L2 client on the same subnet, so two
+//! `OwnIp` PTasks on the same host can talk directly (UC6). A `NoNet` PTask
+//! is never connected, so it sees only an empty namespace and cannot egress
+//! (UC1).
 //!
 //! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation, each
 //! address to one live attach at a time, reused only under an allocation epoch
@@ -60,8 +55,6 @@ use tokio::sync::watch;
 // The gvproxy-switch primitives (subnet arithmetic, MAC derivation, wire
 // constants, `-config` rendering) live in the shared `switch` crate.
 // Re-exported here so `minimald::net::{SwitchSubnet, MacAddr, …}` keeps working.
-// `::switch` (leading `::`) is the extern crate, disambiguated from the sibling
-// `crate::net::switch` relay module.
 pub use ::switch::{
     DEFAULT_MTU, DEFAULT_SUBNET, InvalidPrefix, MacAddr, SwitchSubnet, VSOCK_GVPROXY_SHUTTLE_PORT,
     VSOCK_HOST_CID, render_gvproxy_config,
@@ -75,10 +68,9 @@ use ::switch::AddressPlan;
 ///
 /// On DM2 (native Linux) `minimald` owns gvproxy: it is spawned locally and
 /// PTask taps attach over its `-listen` UNIX socket. On DM1/3/4 (a libkrun VM)
-/// `minvmd` owns the host gvproxy; the in-guest `minimald` does **not** spawn
-/// gvproxy — each PTask tap attaches over an AF_VSOCK shuttle to the host
-/// switch. Keeping the two as an enum (rather than an `Option<sock>` plus a
-/// bool) makes the illegal "spawn locally *and* shuttle to host" state
+/// `minvmd` owns the host gvproxy and the in-guest `minimald` does **not**
+/// spawn one. Keeping the two as an enum (rather than an `Option<sock>` plus
+/// a bool) makes the illegal "spawn locally *and* use the host's" state
 /// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -87,8 +79,8 @@ pub enum SwitchTransport {
     /// control socket.
     #[default]
     LocalSpawn,
-    /// DM1/3/4: gvproxy runs on the host (owned by `minvmd`); taps attach over a
-    /// vsock shuttle to `(cid, port)`. `minimald` never spawns gvproxy here.
+    /// DM1/3/4: gvproxy runs on the host (owned by `minvmd`). `minimald`
+    /// never spawns gvproxy here.
     HostShuttle { cid: u32, port: u32 },
 }
 
@@ -105,7 +97,7 @@ pub enum NetError {
     /// The daemon's self-allocation reserve — the sub-run of the plan's PTask
     /// run a native daemon draws its task sandboxes and boxes from — has no
     /// address free: every one is held by a live attach, still inside its
-    /// reuse quarantine, or still named by a live gate row or flow.
+    /// reuse quarantine, or a live ingress gate is still registered at it.
     #[error(
         "the self-allocation reserve on subnet {0} is exhausted; no daemon-side address is free"
     )]
@@ -120,9 +112,8 @@ pub enum NetError {
         subnet: SwitchSubnet,
     },
     /// The host handed the box a switch address an attach still holds (T66):
-    /// two taps on one address would key one PTask's frames to the other's
-    /// host-side row, so the collision is refused, never shared. Every lease
-    /// is withdrawn when its attach ends ([`IpAllocator::release`], via
+    /// the collision is refused, never shared. Every lease is withdrawn when
+    /// its attach ends ([`IpAllocator::release`], via
     /// [`SwitchClient::detach`]), so the same box re-attaching — the
     /// re-attach an in-process host rebuild produces, where this allocator
     /// survives the rebuild — re-hands its own address instead of meeting
@@ -213,8 +204,7 @@ pub struct PtaskLease {
 pub struct AttachResult {
     /// The allocated IP/MAC for this PTask's tap device.
     pub lease: PtaskLease,
-    /// Fires (`true`) when gvproxy exits unexpectedly; the PTask should tear
-    /// down its tap relay on receipt.
+    /// Fires (`true`) when gvproxy exits unexpectedly.
     pub exit_signal: watch::Receiver<bool>,
 }
 
@@ -248,12 +238,12 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// How long a released drawn address waits before it may be handed again.
 ///
 /// It outlasts every record that can still name the address once its
-/// holder is gone: a peer's replied-UDP flow (the relay's UDP flow TTL) and
-/// the Box Egress Proxy leg's neighbour-cache entry, which would otherwise
-/// answer the new holder, wearing the same derived MAC, from the old
-/// holder's entry. Both are asserted below at compile time. Waiting out the
-/// quarantine is necessary but not sufficient: [`IpAllocator`] also skips an
-/// address any live gate row or flow still names.
+/// holder is gone: a pin another box holds for it and the Box Egress Proxy
+/// leg's neighbour-cache entry, which would otherwise answer the new holder,
+/// wearing the same derived MAC, from the old holder's entry. Both are
+/// asserted below at compile time. Waiting out the quarantine is necessary
+/// but not sufficient: [`IpAllocator`] also skips an address a live ingress
+/// gate is still registered at.
 ///
 /// The value is the switch crate's one quarantine
 /// ([`::switch::SWITCH_ADDRESS_REUSE_QUARANTINE`]), shared with the VM host
@@ -296,8 +286,8 @@ const _: () = assert!(
 ///
 /// A drawn address is reused, never shared. Release returns it to the
 /// reserve's free queue, and [`Self::allocate`] hands it again only when
-/// [`REUSE_QUARANTINE`] has passed since its release **and** no live gate
-/// row or flow still names it. Addresses are handed longest-free first: the
+/// [`REUSE_QUARANTINE`] has passed since its release **and** no live ingress
+/// gate is registered at it. Addresses are handed longest-free first: the
 /// cursor's never-drawn addresses before any released one, then released
 /// ones in release order, so the quarantine is the normal case rather than
 /// the edge. A handed address, by contrast, is the registered box's — the
@@ -366,9 +356,7 @@ impl IpAllocator {
     /// A never-drawn address is taken first, in order. Once the reserve has
     /// been drawn through, the released address free longest is reused,
     /// provided [`REUSE_QUARANTINE`] has passed since its release and no
-    /// live gate row or flow on this daemon's relays still names it, so a
-    /// stale frame or flow from a torn-down PTask can never be delivered to
-    /// or admitted for a freshly-attached one.
+    /// live ingress gate is registered at it.
     ///
     /// # Errors
     ///
@@ -379,7 +367,7 @@ impl IpAllocator {
     }
 
     /// [`Self::allocate`] at `now`, with `referenced` saying whether a live
-    /// gate row or flow still names an address — the clock and the check
+    /// ingress gate is registered at an address — the clock and the check
     /// injected so the quarantine can be driven without waiting it out.
     fn allocate_at(
         &mut self,
@@ -440,11 +428,10 @@ impl IpAllocator {
     ///   the run above the reserve, so one there means the two sides
     ///   disagree about the split;
     /// * an address a recorded lease still holds
-    ///   ([`NetError::HandedAddressCollision`]) — two taps on one address
-    ///   would key one PTask's frames to the other's host-side row. What the
-    ///   refusal guards is a live attach: the lease of an attach that ended
-    ///   is withdrawn ([`Self::release`]), so the same box's re-attach
-    ///   re-hands its own address instead of meeting this refusal.
+    ///   ([`NetError::HandedAddressCollision`]). What the refusal guards is
+    ///   a live attach: the lease of an attach that ended is withdrawn
+    ///   ([`Self::release`]), so the same box's re-attach re-hands its own
+    ///   address instead of meeting this refusal.
     ///
     /// # Errors
     ///
@@ -487,10 +474,6 @@ impl IpAllocator {
     /// does. A drawn address joins the reserve's free queue, to be handed
     /// again under a new epoch once [`Self::allocate`]'s quarantine and
     /// reference check both pass.
-    ///
-    /// The caller ends the lease's relay first (see the own-IP guard's
-    /// teardown), so its gate row, flows and admission windows go with it;
-    /// the reference check covers a relay still winding down.
     ///
     /// Returns whether a lease was withdrawn.
     pub(crate) fn release(&mut self, lease: PtaskLease) -> bool {
@@ -542,13 +525,12 @@ pub struct SwitchClient {
     /// Signals attached PTasks when gvproxy exits unexpectedly. Replaced
     /// on each unexpected exit so new attachers get a fresh receiver.
     exit_tx: watch::Sender<bool>,
-    /// How PTask taps reach the switch: local spawn (DM2) or a
-    /// vsock shuttle to the host gvproxy (DM1/3/4).
+    /// Whose gvproxy the switch is: spawned here (DM2) or the VM host's
+    /// (DM1/3/4).
     transport: SwitchTransport,
     /// Which daemon instance this switch belongs to, as a hostname label:
-    /// the daemon's own id, which the `OwnIp` attach path registers its
-    /// DNS names under so two daemons on one host mint distinct ones
-    /// (NET-027). Defaults to the single-daemon id `local`.
+    /// the daemon's own id, which its hostname registry answers under.
+    /// Defaults to the single-daemon id `local`.
     host_id: String,
     /// Whether [`Self::attach`] may draw on a [`SwitchTransport::HostShuttle`]
     /// switch: never in production (NET-138), and only for a test that
@@ -590,26 +572,25 @@ impl SwitchClient {
         }
     }
 
-    /// Names this daemon instance's DNS registrations under a host id other
-    /// than the single-daemon default. The daemon passes its own instance
-    /// id, so a second daemon on the same host registers under its own
-    /// label instead of overwriting the first's records.
+    /// Sets a host id label other than the single-daemon default. The
+    /// daemon passes its own instance id, which its hostname registry
+    /// answers under.
     #[must_use]
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
         self.host_id = host_id.into();
         self
     }
 
-    /// The host id this daemon's `OwnIp` DNS names register under.
+    /// The host id label of this daemon instance.
     #[must_use]
     pub fn host_id(&self) -> &str {
         &self.host_id
     }
 
-    /// Sets how PTask taps reach the switch. The DM2 default is
+    /// Sets whose gvproxy the switch is. The DM2 default is
     /// [`SwitchTransport::LocalSpawn`]; in a libkrun VM (DM1/3/4) the caller sets
-    /// [`SwitchTransport::HostShuttle`] so this `minimald` attaches taps to the
-    /// host-owned gvproxy over vsock instead of spawning gvproxy in-guest.
+    /// [`SwitchTransport::HostShuttle`] so this `minimald` uses the host-owned
+    /// gvproxy instead of spawning one in-guest.
     #[must_use]
     pub fn with_transport(mut self, transport: SwitchTransport) -> Self {
         self.transport = transport;
@@ -637,7 +618,7 @@ impl SwitchClient {
         matches!(self.transport, SwitchTransport::LocalSpawn)
     }
 
-    /// How this switch's PTask taps reach the gvproxy switch.
+    /// Whose gvproxy this switch is.
     #[must_use]
     pub fn transport(&self) -> SwitchTransport {
         self.transport
@@ -685,8 +666,7 @@ impl SwitchClient {
     /// gvproxy is running, and bumps the attach count.
     ///
     /// Returns an [`AttachResult`] with the allocated lease and a receiver that
-    /// fires `true` when gvproxy exits unexpectedly; the caller should tear down
-    /// the PTask's tap relay when the signal fires.
+    /// fires `true` when gvproxy exits unexpectedly.
     ///
     /// Only a native switch draws ([`SwitchTransport::LocalSpawn`],
     /// NET-102). On a switch the VM host owns, every address is the host's
@@ -733,11 +713,8 @@ impl SwitchClient {
     /// address comes from the host's persisted row — the registration
     /// allocated it into the host-side table — and detach never touches that
     /// row: the daemon-side lease ends with the attach, the host-side row
-    /// does not. The row goes when the box's shuttle connection ends (the
-    /// box's PTask stops) or when its creator withdraws it, so a re-attach
-    /// here after the previous PTask ended finds no row unless the creator
-    /// registers again. What this daemon cannot yet check is that the
-    /// address it is handed is still the row's for this box: the host-row
+    /// does not. What this daemon cannot yet check is that the address it
+    /// is handed is still the row's for this box: the host-row
     /// check by box id — the same address for the same box, a refusal on
     /// mismatch — lands with the box id in the registration (T44, #1660,
     /// NET-133), which names it as the gap; until then this daemon attaches
@@ -869,7 +846,7 @@ impl SwitchClient {
     async fn ensure_running(&mut self) -> Result<(), NetError> {
         if let Some(child) = &mut self.child {
             // Detect a switch that died out from under us so the caller does
-            // not relay onto a dead socket (R1.4 unexpected-exit handling).
+            // not connect to a dead socket (R1.4 unexpected-exit handling).
             match child.try_wait() {
                 Ok(Some(status)) => {
                     tracing::error!(
@@ -933,7 +910,7 @@ impl SwitchClient {
 
         // If the control socket never appears, tear the half-started child down
         // so its timeout cannot leave gvproxy orphaned and a later attach does
-        // not relay onto a process that never bound.
+        // not connect to a process that never bound.
         if let Err(e) = self.wait_for_socket(&sock).await {
             let _ = self.stop().await;
             return Err(e);
@@ -947,7 +924,7 @@ impl SwitchClient {
             // Probe with an actual connect rather than just checking file
             // existence: bind() creates the socket file before listen() is
             // called, so sock.exists() can return true while ECONNREFUSED
-            // would still occur in attach_to_switch on a scheduler stall
+            // would still occur on the first connect, on a scheduler stall
             // between gvproxy's bind and listen.
             match tokio::net::UnixStream::connect(sock).await {
                 Ok(_) => return Ok(()),
@@ -1209,9 +1186,8 @@ mod tests {
 
     #[test]
     fn hand_refuses_an_address_a_local_lease_holds() {
-        // An address a recorded lease still holds refuses a second hand:
-        // two taps on one address would key one PTask's frames to the
-        // other's host-side row. What the refusal guards is a live attach —
+        // An address a recorded lease still holds refuses a second hand.
+        // What the refusal guards is a live attach:
         // `handed_lease_releases_on_detach_and_the_box_rehands` covers the
         // release that lets the same box re-attach. With the run split, a
         // locally-drawn lease always sits in the daemon's reserve
@@ -1600,7 +1576,7 @@ mod tests {
             ),
             Err(NetError::SubnetExhausted(_))
         ));
-        // Past the quarantine, but a live gate row or flow still names it.
+        // Past the quarantine, but a live ingress gate is registered at it.
         assert!(matches!(
             a.allocate_at(t0 + REUSE_QUARANTINE, |ip| ip == lease.ip),
             Err(NetError::SubnetExhausted(_))

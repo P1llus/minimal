@@ -78,8 +78,8 @@ struct OwnIpAttach {
     wired: Wired,
     /// The shared switch, locked on teardown to detach this PTask.
     switch: Arc<Mutex<SwitchClient>>,
-    /// gvproxy's control channel (local socket on DM2, host vsock on DM1/3/4),
-    /// used on teardown to remove this PTask's ingress forwards before detaching.
+    /// What holds the box's forwards, asked on teardown to remove this
+    /// PTask's ingress forwards before detaching.
     control: ControlChannel,
     /// The declared ports' forwarders (NET-121) this attach bound — the
     /// forwards the box's name is published beside, held until the box
@@ -354,7 +354,7 @@ async fn finish_own_ip_attach(
         }
         (Some(_), None) => {
             // A declared ingress with no address handed: fail the attach with
-            // the same rollback as a failed bind — the relay is dropped, the
+            // the same rollback as a failed bind — the wiring is dropped, the
             // route never reported, and the name finalize registered is
             // withdrawn, so the box never publishes at an address nobody
             // chose for it and its name never answers for ports that are
@@ -469,9 +469,7 @@ mod tests {
     /// the shape a VM-backed host's daemon carries. Carries the same
     /// instance host id the NET-121 proofs build their registry with
     /// (`aaaa1`), the pairing the daemon itself makes
-    /// (`box_manager.rs` builds its registry from this switch's `host_id`),
-    /// so the attach's per-id `/services/dns/add` publishes — its own id
-    /// beside the deprecated `local` one — are the two the proofs count.
+    /// (`box_manager.rs` builds its registry from this switch's `host_id`).
     fn vm_host_switch() -> Arc<Mutex<SwitchClient>> {
         Arc::new(Mutex::new(
             SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
@@ -533,7 +531,7 @@ mod tests {
     /// attach's binds and registrations happened in. The `/connect` upgrade
     /// is hijacked the way the real switch hijacks it: no response is
     /// written, and the upgraded stream is handed to the test, which becomes
-    /// the switch side of the box's relay for as long as it holds it.
+    /// the switch side of the box's pump for as long as it holds it.
     ///
     /// Abort the returned handle when the test is done; the fake accepts
     /// until then.
@@ -554,7 +552,7 @@ mod tests {
                 };
                 if head.starts_with("POST /connect") {
                     // The real switch hijacks the connection and writes no
-                    // response; the relay legs take it from here.
+                    // response; the pump takes it from here.
                     handed
                         .send(sock)
                         .await
@@ -651,11 +649,9 @@ mod tests {
     }
 
     /// One failed-bind scenario's pieces: the control path its stand-in
-    /// listens on, the registry the box's name would publish in, the
-    /// reporter that would report it, and the relay's own two ends — the
-    /// box's half held for its life, never read, so the box stays reachable
-    /// for as long as the scenario runs — everything but the fake that
-    /// answers and the attach itself.
+    /// listens on, the registry the box's name would publish in, and the
+    /// reporter that would report it. Everything but the fake that answers
+    /// and the attach itself.
     struct AttachScenario {
         control_path: PathBuf,
         registry: Arc<std::sync::RwLock<dns::HostnameRegistry>>,
@@ -737,8 +733,7 @@ mod tests {
 
     /// NET-121's sub 2, both shapes of a bind that did not land:
     ///
-    /// A *gate refusal* — the switch answering an expose with a refusal, the
-    /// way the session gate answers a port the box's row does not declare —
+    /// A *refusal* — the switch answering an expose with a refusal —
     /// is a failed bind exactly like a bind that errored: the attach fails,
     /// neither the name nor any substitute address is published for the
     /// refused port, and the refusal's own reason reaches the caller beside
@@ -762,8 +757,7 @@ mod tests {
         let capture = crate::test_harness::captured_log();
         let dir = tempfile::TempDir::new().unwrap();
 
-        // Shape one: the gate refuses the third of three declared ports,
-        // with the reason a real gate refusal carries.
+        // Shape one: the switch refuses the third of three declared ports.
         let refused = attach_scenario(&dir, "gvproxy.sock");
         let (refused_events_tx, mut refused_events_rx) = mpsc::channel(64);
         let (handed_tx, _handed_rx) = mpsc::channel(4);
@@ -870,7 +864,7 @@ mod tests {
              substitute address stands in for the refused bind: {held:?}"
         );
         // The refusal is the log's own fact, said per port: the declared
-        // number, and the reason the gate gave, in the same warn line.
+        // number, and the reason the switch gave, in the same warn line.
         let log = capture.contents();
         assert!(
             log.contains("binding declared ingress port failed")
@@ -1028,9 +1022,8 @@ mod tests {
             "no published address handed for box web",
             "the failure says what was missing, not a default it invented: {err}"
         );
-        // Zero forwarders, zero names: the failure is decided before any
-        // bind, so no expose and no name registration ever reached the
-        // control channel — only the connect upgrade did.
+        // Zero forwarders: the failure is decided before any bind, so no
+        // expose ever reached the control channel.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let mut seen = Vec::new();
         while let Ok(event) = events_rx.try_recv() {
@@ -1454,7 +1447,7 @@ mod tests {
                     internal_port: forwarder.internal_port(),
                     proto: boxes::IpProto::Tcp,
                     // The gate-less runtime publish this test drives reads
-                    // as reachable — there is no relay gate to have
+                    // as reachable — there is no ingress gate to have
                     // admitted the port — so the field says so outright
                     // rather than defaulting to the unknown.
                     pending: Some(false),

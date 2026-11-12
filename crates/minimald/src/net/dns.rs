@@ -35,8 +35,8 @@
 //! - A `HostNet` PTask's listeners are on host loopback, so its name routes
 //!   there (R3.6).
 //! - An `OwnIp` PTask (R3.1) depends on where the daemon sits relative to the
-//!   gvproxy switch. On a VM host (DM1/3/4) the daemon holds its own tap on the
-//!   switch, so the name routes **straight to the box's lease** (NET-001), with
+//!   gvproxy switch. On a VM host (DM1/3/4) the daemon is on the switch, so
+//!   the name routes **straight to the box's lease** (NET-001), with
 //!   the box's ingress declaration carried as an external→internal port map so
 //!   a URL naming a published port reaches the internal one behind it. A URL
 //!   naming a port the declaration does not publish routes nowhere: the proxy
@@ -73,10 +73,9 @@ pub const HOSTNAME_SUFFIX: &str = boxes::core::zone_answer::ZONE_APEX;
 
 /// Whether `name` is a box-zone name — the zone apex itself or any name under
 /// it (NET-072). `name` is an already-normalized qname in presentation form:
-/// lowercased, no root dot, exactly what [`super::dns_gate`]'s gate asks
-/// about. The match is by labels, not by string suffix: a single label
-/// holding an escaped dot, `evil\.min` under `internal`, renders as
-/// `evil\.min.internal` but sits under `internal`, not under the zone. A
+/// lowercased, no root dot. The match is by labels, not by string suffix: a
+/// single label holding an escaped dot, `evil\.min` under `internal`, renders
+/// as `evil\.min.internal` but sits under `internal`, not under the zone. A
 /// name that does not parse is not the zone.
 #[must_use]
 pub fn is_zone_name(name: &str) -> bool {
@@ -180,22 +179,21 @@ pub struct Route {
     /// for a host-address box, whose direct connections no surface gates, so a
     /// proxied request to it gates nothing either; `Some(…)` for every
     /// own-address target, from the declaration of record
-    /// ([`super::switch::declared_request_ports`] at registration, or the
-    /// applied external→internal map the attach path reports) — empty when the
+    /// ([`declared_request_ports`] at registration, or the applied
+    /// external→internal map the attach path reports) — empty when the
     /// box declares no ingress, which is the own-IP deny-all posture, never an
     /// open gate. Carried on the route, not read from the policy at request
     /// time, so the target's declaration decides it on both halves of the
-    /// proxy's verdict and the relay's port gate stays the one derivation
-    /// ([`super::switch::declared_ingress_ports`]).
+    /// proxy's verdict.
     declared: Option<BTreeSet<u16>>,
     /// The ports the target published at runtime (NET-044, NET-016): the
     /// ports a `min net expose` decided `allow` and the ports a listener
-    /// published, read from the box's own relay gate when the name is
+    /// published, read from the box's own ingress gate when the name is
     /// resolved ([`HostnameRegistry::resolve`]). The same set the gate admits
     /// a direct connection on beside the declared ports, so the proxy's
     /// verdict and the direct connection's read one published set
     /// (NET-069, NET-071). Empty for a host-address box, whose route gates
-    /// nothing, and for a box with no live relay. A runtime port is the
+    /// nothing, and for a box with no live gate. A runtime port is the
     /// same number outside and inside the box: an expose and a listen
     /// publication both bind `port` to `port`.
     runtime: BTreeSet<u16>,
@@ -379,9 +377,8 @@ impl Route {
     /// published ports bind on, or the box's lease on the switch. Every
     /// route's address is IPv4 — the switch fabric is, and so is the host
     /// loopback a host-address box's listeners sit on — which is what lets
-    /// the caller's egress verdict, an IPv4 frame decision, be asked about
-    /// it directly (NET-070). Also the address the R3.5 tracing events
-    /// carry.
+    /// the caller's egress verdict be asked about it directly (NET-070). Also
+    /// the address the R3.5 tracing events carry.
     #[must_use]
     pub fn address(&self) -> Ipv4Addr {
         match &self.target {
@@ -633,12 +630,7 @@ pub struct HostnameRegistry {
     /// ([`Self::register_host_net`]). On a VM node the host answers their
     /// names, so this registry's zone holds no address for them.
     host_net: HashSet<SessionId>,
-    /// The lease-to-session map that names a caller (NET-070): the switch
-    /// address a proxied request's peer resolves to a session with. Reserved
-    /// switch addresses never appear in it — the switch hands a PTask a lease
-    /// inside its lease range, never one of its own reserved addresses (the
-    /// gateway, the host alias, the daemon) — so a peer at a reserved address
-    /// is never misread as a box.
+    /// The session holding each reported lease.
     by_lease: HashMap<Ipv4Addr, SessionId>,
     /// The zone table's change count and the installed answerer's
     /// acknowledgement of it (NET-011, NET-012): what lets a registration
@@ -763,10 +755,7 @@ impl ZoneChangeWaiter {
 /// The `<host-id>` labels one daemon answers for: its own instance id, and
 /// `local` — the label of the pre-instance zone, which every daemon keeps
 /// answering so a `<name>.local.min.internal` that routed before the ids
-/// existed still routes (NET-002, NET-027). The same pair is what
-/// [`register_dns_name`](crate::net::policy::register_dns_name) publishes
-/// into the gvproxy zone, so the DNS side and the routing side answer for
-/// the same names.
+/// existed still routes (NET-002, NET-027).
 #[must_use]
 pub fn host_ids_for(host_id: &str) -> Vec<String> {
     let mut ids = vec![host_id.to_string()];
@@ -929,7 +918,7 @@ impl HostnameRegistry {
     /// A box nobody handed an address registers nothing: `None`, the name
     /// absent until the creator's hand publishes one. `declared` is the
     /// session's own ingress declaration as the ports a request may name
-    /// ([`super::switch::declared_request_ports`]) — a plain set, because an
+    /// ([`declared_request_ports`]) — a plain set, because an
     /// own-address box is always gated and a declaration of none is the
     /// deny-all posture, not an open gate; this is the half of the route that
     /// keeps the proxy's refusals identical to the direct connection's on a
@@ -1012,12 +1001,9 @@ impl HostnameRegistry {
     /// handed — no address, no registration (`None`, the name absent). The
     /// lease is kept by the stable `session_id` — a later rename re-registers
     /// against the same lease without a fresh report — until
-    /// [`Self::forget_own_address`] drops it at session end. Reporting also
-    /// joins the lease onto the session's caller facts ([`Self::by_lease`]),
-    /// so a proxied request from this box is checked against its own egress
-    /// declaration (NET-070); the applied external→internal map the attach
-    /// path hands over is the route's declared set here — the declaration of
-    /// record in translation form.
+    /// [`Self::forget_own_address`] drops it at session end. The applied
+    /// external→internal map the attach path hands over is the route's
+    /// declared set here, the declaration of record in translation form.
     pub fn report_own_address(
         &mut self,
         session_id: SessionId,
@@ -1025,7 +1011,7 @@ impl HostnameRegistry {
         lease: Ipv4Addr,
         ports: BTreeMap<u16, u16>,
     ) -> Option<Hostname> {
-        // Retire the session's previous lease from the caller map, if it had
+        // Retire the session's previous lease from the lease map, if it had
         // one: a re-attach takes a new lease and the old one must not name a
         // session that no longer holds it.
         if let Some(old) = self.own.get(&session_id) {
@@ -1050,13 +1036,12 @@ impl HostnameRegistry {
             .map(|route| self.register(session_id, session_name, route))
     }
 
-    /// Drops an ended session's lease fact — and its caller fact with it. The
-    /// route itself was already withdrawn by [`Self::deregister`]; this keeps
-    /// the registry from outliving the box it pointed at, so a later session
-    /// reusing the stable id — or the name — cannot route at a dead address,
-    /// and its address cannot name a caller that is gone. Not called by
-    /// `deregister` itself: a rename withdraws and re-registers against the
-    /// same lease.
+    /// Drops an ended session's lease fact. The route itself was already
+    /// withdrawn by [`Self::deregister`]; this keeps the registry from
+    /// outliving the box it pointed at, so a later session reusing the stable
+    /// id — or the name — cannot route at a dead address.
+    /// Not called by `deregister` itself: a rename withdraws and re-registers
+    /// against the same lease.
     pub fn forget_own_address(&mut self, session_id: SessionId) {
         if let Some(own) = self.own.remove(&session_id) {
             self.by_lease.remove(&own.lease);
@@ -1643,15 +1628,15 @@ impl HostnameRegistry {
             })
     }
 
-    /// The ports `route`'s box published at runtime, read from its live relay
-    /// gate (NET-044, NET-016, NET-069): the ports a `min net expose` decided
-    /// `allow` and the ports a listener published — the set the gate admits
-    /// a direct connection on beside the declared ports. Read at resolve
+    /// The ports `route`'s box published at runtime, read from its live
+    /// ingress gate (NET-044, NET-016, NET-069): the ports a `min net expose`
+    /// decided `allow` and the ports a listener published — the set the gate
+    /// admits a direct connection on beside the declared ports. Read at resolve
     /// time, so a publish is reachable through the proxy from the moment its
     /// gate admits it, and a withdrawal is refused from the moment the gate
     /// drops it, without a second copy of the set to keep in step. Empty for
     /// a host-address route (it gates nothing), for a box that has reported
-    /// no lease, and for a box whose relay is gone.
+    /// no lease, and for a box whose gate is gone.
     fn runtime_published(&self, route: &Route) -> BTreeSet<u16> {
         if route.declared_ports().is_none() {
             return BTreeSet::new();
@@ -2908,11 +2893,10 @@ mod tests {
         assert_eq!(sandbox::HOST_MIN_INTERNAL, HOST_ROW_NAME);
     }
 
-    /// NET-072's name boundary: the zone the gate carves out of the
-    /// infrastructure deny set is the zone's own apex and the names under it —
-    /// never a name that merely carries the zone's words. The matcher mirrors
-    /// the answerer's `in_zone` suffix match, so the two layers cannot drift
-    /// apart on a lookalike.
+    /// NET-072's name boundary: the zone is its own apex and the names under
+    /// it, never a name that merely carries the zone's words. The matcher
+    /// mirrors the answerer's `in_zone` suffix match, so the two layers cannot
+    /// drift apart on a lookalike.
     #[test]
     fn is_zone_name_matches_the_zone_apex_and_its_names_only() {
         assert!(is_zone_name(HOSTNAME_SUFFIX), "the apex is the zone");
@@ -3089,7 +3073,7 @@ mod tests {
     }
 
     /// The declared ingress ports of [`leased_ports`] as the session actor
-    /// passes them ([`crate::net::switch::declared_request_ports`] over the
+    /// passes them ([`declared_request_ports`] over the
     /// session's policy): the published external ports.
     fn declared_ports() -> BTreeSet<u16> {
         BTreeSet::from([18080])

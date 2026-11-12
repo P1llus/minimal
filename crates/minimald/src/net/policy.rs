@@ -1,24 +1,12 @@
-//! Static ingress port-mapping via gvproxy's forwarder API (R2.3, R2.4-static)
-//! and rate-limited policy-violation warning plumbing (R2.7).
+//! Forwards for a box's published ports, and rate-limited policy-violation
+//! warning plumbing.
 //!
-//! The gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md` §5)
-//! pinned two load-bearing facts this module is built on:
-//!
-//! * The forwarder / management API is reachable **only** on the host-side
-//!   control socket (the same unix socket [`switch`](super::switch) connects to
-//!   for `POST /connect`), **not** the in-PTask gateway IP. So minimald drives
-//!   ingress from the daemon side, where it already holds the control socket.
-//! * gvproxy exposes `POST /services/forwarder/expose` and
-//!   `POST /services/forwarder/unexpose` there to add and remove static port
-//!   forwards.
-//!
-//! The same spike established that gvproxy v0.8.9 has **no per-client egress
-//! ACL API**, so egress *enforcement* (R2.2, NET-062) lives in the relay
-//! layer ([`switch`](super::switch)) — it inspects each frame against the
-//! pure verdict in `boxes::core::egress` and drops what the box did not
-//! declare. What this module carries for that enforcement is the warning
-//! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
-//! rule, and [`Proto`], the transport a dropped frame is logged under.
+//! A forward listens on the host and carries connections to a box's address
+//! on the virtual network. A native node asks its own gvproxy at the control
+//! socket, with `POST /services/forwarder/expose` and
+//! `POST /services/forwarder/unexpose`. In a VM the VM host holds every
+//! forward, and the daemon asks it through the guest door
+//! ([`ControlChannel`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -368,15 +356,13 @@ impl ExposedMapping {
     }
 }
 
-/// A declared port's forwarder, owned by the daemon (NET-121): the mapping the
-/// switch bound for it, the internal port it forwards to, and — when the box
-/// carries a session gate — that gate, which the forwarder's own
-/// [`revoke`](Self::revoke) drives. `revoke` refuses the port at the relay's
-/// ingress legs, terminates the connections the gate holds, and only then
-/// unexposes. The patched switch's unexpose closes the forward's listener and
-/// then the connections that forward accepted, so the host-side ends of a
-/// revoked port's connections close with it, while a sibling forward to the
-/// same internal port keeps its own (NET-017).
+/// A declared port's forwarder, owned by the daemon: the mapping the switch
+/// bound for it, the internal port it forwards to, and the box's ingress
+/// gate when it has one. [`revoke`](Self::revoke) closes the port at the
+/// gate and then unexposes. The patched switch's unexpose closes the
+/// forward's listener and then the connections that forward accepted, so the
+/// host-side ends of a revoked port's connections close with it, while a
+/// sibling forward to the same internal port keeps its own (NET-017).
 #[derive(Clone)]
 pub struct PortForwarder {
     mapping: ExposedMapping,
@@ -458,28 +444,22 @@ impl PortForwarder {
         self.revoked.load(Ordering::Acquire)
     }
 
-    /// Unbinds the forwarder (NET-121): the gate refuses its port from here
-    /// on — terminating the connections it holds — and the switch unexposes
-    /// the forward. The gate first, so no new connection can cross the gap
-    /// between a port the gate still admits and a listener already gone: a
-    /// refused port is answered by the box, not left hanging at a listener
-    /// that no longer exists.
+    /// Unbinds the forwarder: the gate closes its port, and the switch
+    /// unexposes the forward.
     ///
     /// `keep_admitted` names the internal ports that must stay admitted
     /// because another *live* forwarder still forwards to them — the shape
     /// two mappings make when both publish the same in-box port. The gate
-    /// refuses by internal port alone (a box's inbound frames carry no trace
-    /// of which external forward they arrived through), so a revocation whose
-    /// internal port is in the set *withholds* the gate's termination rather
-    /// than end a sibling forwarder's connections with it. The unbind still
+    /// closes a port by internal port alone, so a revocation whose internal
+    /// port is in the set leaves the gate as it is. The unbind still
     /// ends this forward's own connections: the switch tracks what each
     /// forward accepted, so its unexpose closes this forward's connections
     /// and leaves the sibling's open (NET-017).
     ///
     /// # Errors
     ///
-    /// The unexpose error, after the termination has run: the caller decides
-    /// whether a failed unbind stops its path.
+    /// The unexpose error, after the gate has closed the port: the caller
+    /// decides whether a failed unbind stops its path.
     pub async fn revoke(
         &self,
         control: &ControlChannel,
@@ -489,10 +469,8 @@ impl PortForwarder {
         if let Some(gate) = &self.gate {
             if keep_admitted.contains(&self.internal_port) {
                 // A live sibling forwarder still maps another external port
-                // to this internal port: terminating here would end its
-                // connections with this port's, and the gate cannot tell the
-                // two apart. Withheld, and said so — the log tail names each
-                // revocation with its port and its reason (NET-121).
+                // to this internal port, and closing the port at the gate
+                // would refuse the sibling's new connections too.
                 tracing::info!(
                     host,
                     port = external_port,
@@ -546,10 +524,9 @@ impl PortForwarder {
 /// forward (R2.3, R2.4-static, NET-121). The dynamic range, if any, is not
 /// applied here — dynamic port-mapping is split to #553.
 ///
-/// `gate` is the box's session gate, carried into every forwarder so a later
-/// revocation can end its connections (NET-121); `None` for a caller whose
-/// box has no relay — the netns proofs — where a forwarder simply has no
-/// gate to revoke through.
+/// `gate` is the box's ingress gate, carried into every forwarder so a later
+/// revocation can close the port there. With `None` a forwarder has no gate
+/// to revoke through.
 ///
 /// `yielded` is the ports the box yields at a shared address (NET-129,
 /// first-come): another box holds each one, so its forward is known state,
@@ -625,9 +602,8 @@ pub async fn apply_ingress_naming_holders(
 /// the same typed refusal the native probe gives. A failure rolls back as
 /// [`apply_ingress`] does.
 ///
-/// The bound forwards stay on the host. The box's first attach posts the
-/// same exposes again, and the host's switch answers each one that the
-/// listener is already bound, which the attach takes as bound. The host
+/// The bound forwards stay on the host. The box's first attach asks for the
+/// same forwards again, which the host already holds for it. The host
 /// unbinds the forwards when it withdraws the box's row, as it does for
 /// every declared forward ([`release_declared_ingress`]).
 ///
@@ -862,9 +838,7 @@ pub fn port_holder(
 }
 
 /// The body the forwarder answers an expose with when a forward is already
-/// bound at the listener, as an HTTP 500. On a VM-backed host the egress
-/// gate gives the same answer to a publish whose listener another box's row
-/// still holds, and keeps the publish to bind when that row is withdrawn.
+/// bound at the listener, as an HTTP 500.
 const ALREADY_RUNNING_BODY: &str = "proxy already running";
 
 /// Binds the forward of a declared port this box took over at a shared
@@ -943,9 +917,8 @@ pub async fn unexpose_forwarder(
         return Ok(());
     }
     let closed = unexpose_mapping(control, &forwarder.mapping).await?;
-    // The callers withdraw an unaudited publish or unbind the forward a move
-    // left behind, and each says why in its own line. This line carries the
-    // switch's count, and claims no withdrawal.
+    // The caller says why in its own line. This line carries the switch's
+    // count, and claims no withdrawal.
     let (host, port) = forwarder.mapping.host_port().unwrap_or(("", 0));
     tracing::info!(
         host,
@@ -1003,9 +976,8 @@ pub async fn expose_mapping(
 
 /// How many accepted connections the switch closed when it unexposed a
 /// forward: the `closed` field of the patched switch's `/unexpose` reply
-/// (`vendor/gvproxy/patches/`). `None` when the reply carries no count — an
-/// unpatched switch, or a channel that relays no body — so the log says
-/// unknown rather than zero.
+/// (`vendor/gvproxy/patches/`). `None` when the reply carries no count, so
+/// the log says unknown rather than zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosedConnections(pub Option<u64>);
 
@@ -1414,12 +1386,9 @@ pub async fn expose_dynamic(
 /// `POST`s `body` as JSON to `path` on gvproxy's control socket over a fresh
 /// HTTP/1.1 keep-alive connection, succeeding on a 2xx status.
 ///
-/// gvproxy's control socket speaks HTTP; the relay's `POST /connect` upgrade in
-/// [`switch`](super::switch) is the data-plane verb, while the forwarder verbs
-/// here are ordinary request/response. The exchange is framed by `Content-Length`
-/// (not read-to-EOF) with **no** `Connection: close`, so the server never closes
-/// the socket first — required for the response to survive the KVM vsock shuttle
-/// (see [`exchange`] and the request-builder comment below for the G-N8 detail).
+/// The forwarder verbs are ordinary request/response. The exchange is framed
+/// by `Content-Length` (not read-to-EOF) with **no** `Connection: close` (see
+/// [`exchange`]).
 pub(crate) async fn post_json<T: Serialize>(
     control: &std::path::Path,
     path: &str,
@@ -1429,10 +1398,7 @@ pub(crate) async fn post_json<T: Serialize>(
 }
 
 /// [`post_json`] with the exchange's bound injected: the publish verbs run at
-/// [`GVPROXY_CONTROL_TIMEOUT`], while the range probe's walk runs at its own
-/// tighter [`RANGE_PROBE_REQUEST_BUDGET`] — one round per address of the range
-/// is not a launch-path request to a live box, and a channel that cannot answer
-/// one round in that bound is not a fact about the host's loopback either way.
+/// [`GVPROXY_CONTROL_TIMEOUT`].
 pub(crate) async fn post_json_within<T: Serialize>(
     control: &std::path::Path,
     path: &str,
@@ -1455,13 +1421,8 @@ pub(crate) async fn post_json_reply_within<T: Serialize>(
 ) -> io::Result<Vec<u8>> {
     let body = serde_json_lenient::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
-    // HTTP/1.1 keep-alive (no `Connection: close`): gvproxy must respond *without*
-    // closing the connection. On the KVM libkrun `add_vsock_port2(listen=false)`
-    // shuttle, a server-initiated close drops the still-buffered response bytes as
-    // it propagates to the guest (the guest reads an immediate EOF → 0 bytes →
-    // `malformed gvproxy status line: ""`, even though the forward *was* applied —
-    // G-N8). Keeping the connection open lets the response drain to the guest,
-    // which then reads exactly `Content-Length` bytes and closes from its side.
+    // HTTP/1.1 keep-alive (no `Connection: close`): `exchange` reads exactly
+    // `Content-Length` bytes and this side closes the connection.
     request.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());
     request.extend_from_slice(b"Host: localhost\r\n");
     request.extend_from_slice(b"Content-Type: application/json\r\n");
@@ -1470,9 +1431,7 @@ pub(crate) async fn post_json_reply_within<T: Serialize>(
     request.extend_from_slice(&body);
 
     // Bound the whole exchange: a gvproxy that accepts the socket and then
-    // stalls must not hang the launch or teardown path indefinitely. The control
-    // socket is local (DM2) or the host gvproxy over vsock (DM1/3/4); both speak
-    // the same HTTP/1.0 request/response on a fresh connection.
+    // stalls must not hang the launch or teardown path indefinitely.
     let response = tokio::time::timeout(timeout, async {
         exchange(UnixStream::connect(control).await?, &request).await
     })
@@ -1508,17 +1467,13 @@ pub(crate) async fn post_json_reply_within<T: Serialize>(
 }
 
 /// Writes `request` to a freshly-connected control stream and reads the response
-/// framed by its `Content-Length`. Transport-agnostic so the unix (DM2) and vsock
-/// (DM1/3/4) control channels share one exchange.
+/// framed by its `Content-Length`.
 ///
 /// We must **not** read to EOF: the request is HTTP/1.1 keep-alive (see
 /// [`post_json`]), so gvproxy holds the connection open after responding and an
 /// EOF-terminated read would block until the [`GVPROXY_CONTROL_TIMEOUT`]. Instead
 /// we read the status line + headers, take `Content-Length` body bytes, and let
-/// the caller drop the stream (closing from the *guest* side). This avoids the
-/// server-initiated close that the KVM libkrun vsock splice mishandles by dropping
-/// the buffered response (G-N8). We deliberately do not `shutdown()` the write
-/// side for the same reason.
+/// the caller drop the stream.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     request: &[u8],
@@ -1721,10 +1676,7 @@ impl fmt::Display for Proto {
 /// The rate limit is keyed by **box and rule** (NET-062: "first drop per
 /// PTask per rule per minute"): one box's flood never silences another box's
 /// single drop, and a box hitting several rules in the same minute is still
-/// heard once per rule. The relay's egress enforcement
-/// ([`switch`](super::switch)) and its ingress counterpart share one limiter
-/// per session gate, each under its own rule key — with the one exception
-/// that a DNS refusal adds the refused name to its key
+/// heard once per rule. A DNS refusal adds the refused name to its key
 /// ([`warn_dns_refusal`](Self::warn_dns_refusal)), because its requirement
 /// is the name and the answer per refusal.
 #[derive(Debug, Default)]
@@ -2328,11 +2280,10 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_frames_by_content_length_without_a_server_close() {
-        // Regression for G-N8: the response must be framed by `Content-Length`,
-        // never by the server closing the socket. On the KVM libkrun vsock shuttle
-        // a server-initiated close drops the still-buffered response, so `exchange`
-        // must return the full reply from a peer that stays open. If it ever
-        // reverts to read-to-EOF, this test hangs (the peer never closes).
+        // The response is framed by `Content-Length`, never by the server
+        // closing the socket, so `exchange` must return the full reply from a
+        // peer that stays open. If it ever reverts to read-to-EOF, this test
+        // hangs (the peer never closes).
         let (client, mut server) = tokio::io::duplex(1024);
         let server = crate::traced::spawn(async move {
             let mut buf = [0u8; 256];
@@ -2358,7 +2309,6 @@ mod tests {
         drop(server.await.unwrap());
     }
 
-    // ---- NET-123's forwarder-conducted range probe -----------------------
     /// NET-017: a withdrawn publish's unexpose reads how many accepted
     /// connections the switch closed and logs it, and the sibling publish
     /// of the same in-box port is never asked to come down.
@@ -2558,7 +2508,7 @@ mod tests {
         /// Reads one control request off `sock`: its head up to the
         /// end-of-head marker, then exactly its `Content-Length` body — the
         /// mirror of `post_json`'s keep-alive framing, so the fake forwarder
-        /// never blocks reading past what the probe sent.
+        /// never blocks reading past what the client sent.
         pub(super) async fn read_request(sock: &mut UnixStream) -> Vec<u8> {
             let mut buf = Vec::with_capacity(256);
             let mut scratch = [0u8; 512];
@@ -2605,11 +2555,7 @@ mod tests {
 
         /// Serves a gvproxy-shaped control channel at `path`: every request
         /// is read in full, then answered with the status `decide` picks for
-        /// the `local` address its body names — the stand-in for the host
-        /// gvproxy whose loopback carries only the aliases `decide` accepts,
-        /// where a bind on a missing alias is answered `500` the way the real
-        /// forwarder answers an `EADDRNOTAVAIL`. `delay` parks each answer,
-        /// for the one test that needs a forwarder slower than its budget.
+        /// the `local` address its body names. `delay` parks each answer.
         /// Every round's `local` is handed to the returned receiver; the
         /// returned handle aborts the server when the test is done with it.
         pub(super) fn spawn_forwarder_answering(
@@ -2621,8 +2567,6 @@ mod tests {
             let (tx, rx) = mpsc::channel(512);
             let decide = std::sync::Arc::new(decide);
             let handle = crate::traced::spawn(async move {
-                // Sequential on purpose: the probe is a walk, one request per
-                // address, so one connection served at a time is its shape.
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         return;
@@ -2752,7 +2696,7 @@ mod tests {
         use super::forwarder_probe::spawn_forwarder_answering;
 
         /// A declared forwarder bound at `local`, as `apply_ingress` builds
-        /// one, with no session gate behind it.
+        /// one, with no ingress gate behind it.
         pub(super) fn declared_at(local: &str) -> PortForwarder {
             PortForwarder {
                 mapping: ExposedMapping {

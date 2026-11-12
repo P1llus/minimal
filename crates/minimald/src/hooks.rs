@@ -7,7 +7,7 @@
 //! distinction matters: a new sandbox would share the rootfs and the
 //! persistent home/workspace mounts, but get its own `/tmp`, its own
 //! `/dev`, and its own network namespace. On an own-IP session the
-//! fresh netns has no tap relayed to the switch, so a hook that fetches
+//! fresh netns has no link to the switch, so a hook that fetches
 //! anything would fail there and succeed on a host-net session — the
 //! same declaration behaving differently for reasons nobody connected
 //! to hooks. Joining the live session avoids all of it.

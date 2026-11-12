@@ -378,12 +378,12 @@ pub fn format_policy_on_host(
 /// (NET-044): one row a publish — the address its forward is bound on, and
 /// the in-box port it forwards to — shaped like the declared mapping rows
 /// above it, so the two read as one surface: what the box declared, and what
-/// it went on to publish. A current daemon admits every runtime publish at
-/// the box's relay gate as it binds it (NET-044), so its rows carry no
-/// caveat. A row marked pending comes only from an older daemon whose gate
-/// did not admit runtime publishes, and says so rather than reading as
-/// reachable. A row from a daemon older than the `pending` field — one that
-/// could not classify the port either way — says *unknown* and why, never
+/// it went on to publish. A current daemon admits every runtime publish as
+/// it binds it, so its rows carry no caveat. A row marked pending comes only
+/// from an older daemon that did not admit runtime publishes, and says so
+/// rather than reading as reachable. A row from a daemon older than the
+/// `pending` field — one that could not classify the port either way —
+/// says *unknown* and why, never
 /// the reachable reading a missing state must not default itself into. A
 /// box that published nothing prints no section: an empty header would
 /// claim a distinction between "nothing published" and "nothing
@@ -633,7 +633,7 @@ impl<'a> PolicyEgressJson<'a> {
 ///
 /// The live mappings ride as the wire's own rows, `pending` included, since
 /// carrying that state is half of what the mode is for: a published port
-/// the relay gate has not admitted yet must not read as reachable to
+/// the daemon has not admitted yet must not read as reachable to
 /// something parsing this.
 #[derive(serde::Serialize)]
 struct PolicyJson<'a> {
@@ -2100,9 +2100,8 @@ mod tests {
         );
     }
 
-    /// A daemon older than NET-044's gate admission bound a runtime mapping
-    /// without admitting its port at the box's relay gate, so its row is a
-    /// fact with a caveat. Both
+    /// An older daemon bound a runtime mapping without admitting its port,
+    /// so its row is a fact with a caveat. Both
     /// surfaces `min session policy` reads say it: the rendered text marks
     /// the row pending rather than letting it read as reachable, and the
     /// mapping's JSON — the shape any client of the RPC reads, and the data
@@ -2122,8 +2121,8 @@ mod tests {
             pending: Some(false),
         };
 
-        // The text: the pending row says so — bound, but the box's gate has
-        // not admitted the port yet — and the admitted row reads as reachable.
+        // The text: the pending row says so, bound but not admitted yet, and
+        // the admitted row reads as reachable.
         let mut out = Vec::new();
         write_live_ingress(&mut out, &[pending.clone(), admitted.clone()]).unwrap();
         let rendered = String::from_utf8(out).unwrap();

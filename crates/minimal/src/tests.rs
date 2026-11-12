@@ -5345,12 +5345,7 @@ async fn attach_refuses_a_box_name_two_vms_know() {
 /// export at. A log line alone is not the report.
 ///
 /// Both surfaces render the daemon's *reported* port, the one its
-/// `ListSessions`/`CreateSession` replies carry — which is what makes the walk
-/// visible client-side at all. The daemon-side half — a publication refused on
-/// the proposed port walking to the next rung, and that rung landing in the
-/// reported field the replies read — is pinned by
-/// `two_vms_hostnames_route_concurrently` in minimald, whose second VM's rung
-/// is the port this test puts in alpha's reply. Here the fact under test is the
+/// `ListSessions`/`CreateSession` replies carry. Here the fact under test is the
 /// rendering: each VM's routing line names the VM and the real port, the two
 /// surfaces agree on the address, and the port the recipes assume appears
 /// nowhere on the walked VM.
@@ -5378,9 +5373,8 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         }
     };
 
-    // The walked shape: the first VM holds the port the recipes name; the
-    // second's publication took the next rung — one stride up, the daemon's
-    // own walk when a host port is refused.
+    // The walked shape: the first VM holds the port the recipes name, and the
+    // second serves on another port.
     const RECIPES_PORT: u16 = 7654;
     const NEXT_RUNG: u16 = RECIPES_PORT + 1_000;
     let listings = vec![

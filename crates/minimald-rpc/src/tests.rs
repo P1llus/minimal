@@ -402,8 +402,8 @@ fn live_ingress_response_round_trips_and_decodes_daemon_error() {
             local: "127.0.64.2:3000".to_string(),
             internal_port: 3000,
             proto: IpProto::Tcp,
-            // A runtime publish the relay gate has not admitted yet:
-            // bound on the host, but the box's own gate still refuses it.
+            // What an older daemon sends for a publish it has bound on
+            // the host and not admitted to the box.
             pending: Some(true),
         },
         LiveMapping {
@@ -1501,13 +1501,6 @@ fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
     assert!(older.sessions[0].shared_port_collisions.is_empty());
 }
 
-/// The port-report verbs (NET-138) round-trip as the fixed, size-bounded
-/// messages they are: the tagged line names its verb, the request carries
-/// the row key, the port, the protocol and the reporting source, and the
-/// one reply both verbs answer with cannot be mistaken for any other
-/// reply shape — the discrimination the untagged reply depends on, since
-/// a report the grant refused is answered as `Error` and a publish that
-/// unwinds must be able to tell which it got.
 /// A withdrawal's box id is optional on the wire: a client that
 /// predates it sends none and decodes as `None`, and `None` is not
 /// written, so a daemon that predates it reads the line it always did.
@@ -1537,14 +1530,11 @@ fn withdraw_box_id_is_optional_on_the_wire() {
     assert_eq!(decoded, with_id);
 }
 
-/// The ask verbs' offer half (NET-045) round-trips: the guest's ask
-/// admit carries only the row key, the port and the protocol — no name
-/// or free text a guest could smuggle a prompt with — the subscription
+/// The ask verbs' offer half (NET-045) round-trips: the subscription
 /// keys itself by the row's box id, and the offer the daemon pushes to
 /// an attached client carries the host row's own fields. Every ask
 /// reply stays distinct from every older shape in the untagged order —
-/// an offered ask is never a recorded port, and a registration's
-/// id-carrying answer is never a subscription's.
+/// a registration's id-carrying answer is never a subscription's.
 #[test]
 fn box_control_pending_ask_offer_round_trip() {
     let box_id = BoxId::from_bytes([
@@ -1588,8 +1578,7 @@ fn box_control_pending_ask_offer_round_trip() {
     );
 
     // The offer: the host row's own fields — ask id, box id, name,
-    // port, protocol — and a document of it decodes as nothing else,
-    // the recorded-port reply its fields are a superset of included.
+    // port, protocol — and a document of it decodes as nothing else.
     let ask_id = AskId::from_bytes([
         0x9f, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f, 0x1a, 0x2b, 0x3c, 0x4d,
         0x5e,
@@ -1638,9 +1627,7 @@ fn box_control_pending_ask_offer_round_trip() {
 /// The ask verbs' answer half (NET-045) round-trips: the client's
 /// recorded answer carries the offer's ask id and one of the three
 /// answers — a human's yes, a human's no, a render that found no
-/// terminal — and the admit's reply carries the ask's end, as a
-/// `ask`-tagged document the recorded-port reply cannot be mistaken
-/// for in either direction.
+/// terminal.
 #[test]
 fn box_control_record_ask_answer_round_trip() {
     let ask_id = AskId::from_bytes([
