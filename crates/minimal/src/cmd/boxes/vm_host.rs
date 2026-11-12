@@ -1502,16 +1502,13 @@ mod tests {
         }
     }
 
-    /// NET-133/BEP-070: the CLI, the row and the attachment carry one id per
-    /// box. The registration presents no id, so the host mints one for this
-    /// creation and the reply returns it — and the id the CLI then records
-    /// is the id the published row's attachment carries, the one a delivered
-    /// connection is attributed by. The autospawn retry's shape — the row
-    /// withdrawn, then a re-registration — is a new creation: the reply
-    /// carries a new id, never the first one, and the CLI's record, the new
-    /// row and the new attachment all agree on it.
+    /// The CLI and the host's row carry one id per box. The registration
+    /// presents no id, so the host mints one for this creation and the
+    /// reply returns it. A row withdrawn and registered again, as an
+    /// autospawn retry does, is a new creation: the reply carries a new id,
+    /// and the CLI's record and the new row agree on it.
     #[tokio::test]
-    async fn attachment_carries_the_registered_box_id() {
+    async fn the_row_carries_the_registered_box_id() {
         let policy = boxes::BoxPolicy {
             egress: None,
             ingress: None,
@@ -1519,18 +1516,15 @@ mod tests {
             quic443: None,
         };
 
-        // The real host tables and the real control server the daemon boots
-        // beside them — a registry feeding real attachments — so the id the
-        // CLI holds is compared against the attachment a real registration
-        // issued, not a stand-in's reply.
+        // The real host table and the real control server the daemon boots
+        // beside it, so the id the CLI holds is compared against the row a
+        // real registration published, not a stand-in's reply.
         let dir = tempfile::TempDir::new().unwrap();
         let host_dir = dir.path().join("providers").join("local-minvmd0");
         std::fs::create_dir_all(&host_dir).unwrap();
         let sock_path = host_dir.join("control.sock");
         let subnet = switch::SwitchSubnet::default();
-        let attachments = minvmd::bep_attach::Attachments::new();
-        let registry = minvmd::box_registry::BoxRegistry::new(subnet)
-            .feeding_proxy_attachments(attachments.clone());
+        let registry = minvmd::box_registry::BoxRegistry::new(subnet);
         let _server = minvmd::control::spawn(
             sock_path.clone(),
             registry.clone(),
@@ -1565,17 +1559,7 @@ mod tests {
             "the id is the box's own minted UUIDv7, never the all-zero non-id"
         );
 
-        // The attachment the registration issued carries that id, and so
-        // does the row the reply speaks for: the CLI, the row and the
-        // attachment hold the one id per box.
-        let attachment = attachments
-            .by_source(first.addresses.switch_address.octets())
-            .expect("the registration issued the box's attachment");
-        assert_eq!(
-            id,
-            minimald_rpc::BoxId::from_bytes(attachment.box_id()),
-            "the id the CLI holds is the id the attachment carries"
-        );
+        // The row the reply speaks for carries that id.
         let row = registry
             .table()
             .by_source(first.addresses.switch_address.octets())
@@ -1619,16 +1603,8 @@ mod tests {
             "the recreation draws a never-drawn address before any returned one"
         );
 
-        // The CLI's record, the new row and the new attachment agree on the
-        // new id; the first id is held nowhere.
-        let reattached = attachments
-            .by_source(again.addresses.switch_address.octets())
-            .expect("the re-registration issued the box's attachment");
-        assert_eq!(
-            new_id,
-            minimald_rpc::BoxId::from_bytes(reattached.box_id()),
-            "the id the CLI records is the id the new attachment carries"
-        );
+        // The CLI's record and the new row agree on the new id, and the
+        // first id names no row.
         let new_row = registry
             .table()
             .by_source(again.addresses.switch_address.octets())
@@ -1639,8 +1615,8 @@ mod tests {
             "the id the CLI records is the id the new row holds"
         );
         assert!(
-            !attachments.holds_id(id.to_bytes()),
-            "the withdrawn box's id is held by no attachment"
+            registry.row_by_box_id(id.to_bytes()).is_none(),
+            "the withdrawn box's id names no row"
         );
     }
 

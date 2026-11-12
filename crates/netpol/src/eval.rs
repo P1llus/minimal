@@ -102,9 +102,11 @@ impl Compiled {
     }
 
     /// Judges a new flow. `pinned` is the engine's table of pinned
-    /// addresses for the box: the set an address is in right now, a name's
-    /// or [`SetId::OWN`], and `None` for an address in no set or with a pin
-    /// that has run out. `Handles::pinned_set` in `boxbpf` is that table.
+    /// addresses for the box: the sets an address is in right now, those of
+    /// the names it was answered for or [`SetId::OWN`], and none for an
+    /// address with no pin or one that has run out. `Handles::pinned_sets`
+    /// in `boxbpf` is that table. An address in several sets is judged by
+    /// their merged set ([`Compiled::merged`]).
     ///
     /// The kernel judges new flows only: a TCP segment after the SYN, a UDP
     /// packet to a peer the other direction admitted, and an ICMP echo reply
@@ -114,27 +116,19 @@ impl Compiled {
     /// `0.0.0.0` or `::` is judged as the address the kernel dials for it.
     /// A bind to port 0 asks for an ephemeral port and is not judged.
     #[must_use]
-    pub fn evaluate(&self, flow: &Flow, pinned: impl Fn(IpAddr) -> Option<SetId>) -> Decision {
-        let mut remote = canonical(flow.remote);
-        if flow.direction == Direction::Egress {
-            remote = dialled(remote, flow.local);
-        }
+    pub fn evaluate(&self, flow: &Flow, pinned: impl Fn(IpAddr) -> Vec<SetId>) -> Decision {
+        let Some(remote) = self.judged_remote(flow, &pinned) else {
+            return Decision {
+                verdict: FlowVerdict::Deny,
+                rule: None,
+                reason: Reason::SourceAddress,
+            };
+        };
         if flow.direction == Direction::Bind && flow.port == 0 {
             return Decision {
                 verdict: FlowVerdict::Allow,
                 rule: None,
                 reason: Reason::EphemeralPort,
-            };
-        }
-        if flow.direction == Direction::Egress
-            && self.config.source_check
-            && let Some(local) = flow.local.map(canonical)
-            && !Self::source_ok(local, pinned(local) == Some(SetId::OWN), flow)
-        {
-            return Decision {
-                verdict: FlowVerdict::Deny,
-                rule: None,
-                reason: Reason::SourceAddress,
             };
         }
 
@@ -145,24 +139,61 @@ impl Compiled {
             .max_by_key(|e| e.prefix.len())
             .and_then(|e| first_match(&e.rules, flow, None))
             .map(|slot| (slot, Reason::Rule));
-        let by_set = pinned(remote)
-            .and_then(|id| self.set_rules(id, flow.direction))
-            .and_then(|rules| first_match(rules, flow, by_prefix.map(|(slot, _)| slot.prio)))
-            .map(|slot| (slot, Reason::SetRule));
+        let below = by_prefix.map(|(slot, _)| slot.prio);
+        let sets = pinned(remote);
+        let by_set = match sets.as_slice() {
+            [] => None,
+            [one] => self
+                .set_rules(*one, flow.direction)
+                .and_then(|rules| first_match(rules, flow, below)),
+            many => self
+                .merged(many)
+                .entries
+                .iter()
+                .find(|entry| entry.direction == flow.direction)
+                .and_then(|entry| first_match(&entry.rules, flow, below)),
+        }
+        .map(|slot| (slot, Reason::SetRule));
 
-        let Some((slot, reason)) = by_set.or(by_prefix) else {
-            let verdict = match self.config.defaults.of(flow.direction) {
-                Verdict::Allow => FlowVerdict::Allow,
-                Verdict::Deny => FlowVerdict::Deny,
-            };
-            return Decision {
-                verdict,
-                rule: None,
-                reason: Reason::Default,
-            };
+        match by_set.or(by_prefix) {
+            Some((slot, reason)) => self.decided(remote, slot.prio, slot.action, reason),
+            None => self.by_default(flow.direction),
+        }
+    }
+
+    /// The address a flow is judged by, or `None` for an egress flow from
+    /// an address that is not the box's.
+    fn judged_remote(&self, flow: &Flow, pinned: &impl Fn(IpAddr) -> Vec<SetId>) -> Option<IpAddr> {
+        let mut remote = canonical(flow.remote);
+        if flow.direction == Direction::Egress {
+            remote = dialled(remote, flow.local);
+        }
+        if flow.direction == Direction::Egress
+            && self.config.source_check
+            && let Some(local) = flow.local.map(canonical)
+            && !Self::source_ok(local, pinned(local).contains(&SetId::OWN), flow)
+        {
+            return None;
+        }
+        Some(remote)
+    }
+
+    fn by_default(&self, direction: Direction) -> Decision {
+        let verdict = match self.config.defaults.of(direction) {
+            Verdict::Allow => FlowVerdict::Allow,
+            Verdict::Deny => FlowVerdict::Deny,
         };
-        let rule = Some(slot.prio);
-        match slot.action {
+        Decision {
+            verdict,
+            rule: None,
+            reason: Reason::Default,
+        }
+    }
+
+    /// The decision of the rule at `prio` for a flow to `remote`.
+    fn decided(&self, remote: IpAddr, prio: u16, action: Action, reason: Reason) -> Decision {
+        let rule = Some(prio);
+        match action {
             Action::Allow => Decision {
                 verdict: FlowVerdict::Allow,
                 rule,
@@ -195,6 +226,68 @@ impl Compiled {
             }
         }
     }
+
+    /// Judges a flow by the policy's list with some of its rules left out:
+    /// what the rest of the list says about a flow that one of the rules
+    /// in `skip` took. A service behind a redirect asks this to learn
+    /// whether the box's other rules let the flow exist at all.
+    ///
+    /// This reads the ordered list and not the compiled entries, which
+    /// leave out a rule that an earlier one always beats.
+    #[must_use]
+    pub fn evaluate_skipping(
+        &self,
+        flow: &Flow,
+        pinned: impl Fn(IpAddr) -> Vec<SetId>,
+        skip: impl Fn(&Rule) -> bool,
+    ) -> Decision {
+        let Some(remote) = self.judged_remote(flow, &pinned) else {
+            return Decision {
+                verdict: FlowVerdict::Deny,
+                rule: None,
+                reason: Reason::SourceAddress,
+            };
+        };
+        if flow.direction == Direction::Bind && flow.port == 0 {
+            return Decision {
+                verdict: FlowVerdict::Allow,
+                rule: None,
+                reason: Reason::EphemeralPort,
+            };
+        }
+        let sets = pinned(remote);
+        // A rule by name judges an address in a set whose pattern the
+        // rule's pattern covers, as the compiler lays the sets out.
+        let patterns: Vec<&NamePattern> =
+            sets.iter().filter_map(|id| pattern_of(self, *id)).collect();
+        let around: Vec<&Prefix> = self
+            .protected
+            .iter()
+            .filter(|range| flow.direction == Direction::Egress && range.contains(remote))
+            .collect();
+        let hit = self.rules.iter().zip(0u16..).find(|(r, _)| {
+            r.direction == flow.direction
+                && !skip(r)
+                && r.matches_l4(flow.protocol, flow.port)
+                && around.iter().all(|range| r.reaches_into(range))
+                && match &r.target {
+                    Target::Any => true,
+                    Target::Net(p) => p.contains(remote),
+                    Target::Names(pattern) => patterns.iter().any(|set| pattern.covers(set)),
+                    Target::OwnAddresses => sets.contains(&SetId::OWN),
+                }
+        });
+        match hit {
+            Some((r, prio)) => {
+                let reason = match r.target {
+                    Target::Names(_) | Target::OwnAddresses => Reason::SetRule,
+                    Target::Any | Target::Net(_) => Reason::Rule,
+                };
+                self.decided(remote, prio, r.action, reason)
+            }
+            None => self.by_default(flow.direction),
+        }
+    }
 }
 
 /// What the engine's table of pinned addresses says about the remote
@@ -202,8 +295,8 @@ impl Compiled {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pinned<'a> {
     No,
-    /// Pinned for this name.
-    Name(&'a str),
+    /// Pinned for these names: one, or several that resolve to the address.
+    Names(&'a [&'a str]),
     /// One of the box's own addresses.
     Own,
 }
@@ -242,7 +335,9 @@ pub fn evaluate_ordered(
             && match (&r.target, pinned) {
                 (Target::Any, _) => true,
                 (Target::Net(p), _) => p.contains(remote),
-                (Target::Names(pattern), Pinned::Name(name)) => pattern.matches(name),
+                (Target::Names(pattern), Pinned::Names(names)) => {
+                    names.iter().any(|name| pattern.matches(name))
+                }
                 (Target::OwnAddresses, Pinned::Own) => true,
                 (Target::Names(_) | Target::OwnAddresses, _) => false,
             }
@@ -288,8 +383,8 @@ mod tests {
     use crate::{
         base::{BasePolicy, RESOLVER},
         compile::{Options, compile},
-        model::{Endpoint, Origin, PortRange, Protocols},
-        policy::BoxPolicy,
+        model::{Endpoint, EndpointIndex, Origin, PortRange, Protocols},
+        policy::{BoxAction, BoxPolicy, BoxRule},
     };
 
     fn base() -> BasePolicy {
@@ -327,32 +422,34 @@ mod tests {
             ..BoxPolicy::default()
         };
         let c = compile(&base(), &policy, Options::default()).unwrap();
-        let d = c.evaluate(&egress(Protocol::Tcp, "10.1.1.1", 80), |_| None);
+        let d = c.evaluate(&egress(Protocol::Tcp, "10.1.1.1", 80), |_| Vec::new());
         assert_eq!(
             (d.verdict, d.rule, d.reason),
             (FlowVerdict::Allow, Some(1), Reason::Rule)
         );
-        let d = c.evaluate(&egress(Protocol::Tcp, "10.1.2.1", 80), |_| None);
+        let d = c.evaluate(&egress(Protocol::Tcp, "10.1.2.1", 80), |_| Vec::new());
         assert_eq!((d.verdict, d.rule), (FlowVerdict::Deny, Some(0)));
-        let d = c.evaluate(&egress(Protocol::Tcp, "10.2.0.1", 80), |_| None);
+        let d = c.evaluate(&egress(Protocol::Tcp, "10.2.0.1", 80), |_| Vec::new());
         assert_eq!(
             (d.verdict, d.rule, d.reason),
             (FlowVerdict::Deny, None, Reason::Default)
         );
         assert_eq!(
-            c.evaluate(&egress(Protocol::Udp, "fd00:1::9", 53), |_| None)
+            c.evaluate(&egress(Protocol::Udp, "fd00:1::9", 53), |_| Vec::new())
                 .verdict,
             FlowVerdict::Allow
         );
         // A v4-mapped address is judged as IPv4.
         assert_eq!(
-            c.evaluate(&egress(Protocol::Tcp, "::ffff:10.1.1.1", 80), |_| None)
-                .verdict,
+            c.evaluate(&egress(Protocol::Tcp, "::ffff:10.1.1.1", 80), |_| Vec::new(
+            ))
+            .verdict,
             FlowVerdict::Allow
         );
         assert_eq!(
-            c.evaluate(&egress(Protocol::Tcp, "::ffff:10.1.2.1", 80), |_| None)
-                .verdict,
+            c.evaluate(&egress(Protocol::Tcp, "::ffff:10.1.2.1", 80), |_| Vec::new(
+            ))
+            .verdict,
             FlowVerdict::Deny
         );
     }
@@ -365,16 +462,16 @@ mod tests {
             ..BoxPolicy::default()
         };
         let c = compile(&base(), &policy, Options::default()).unwrap();
-        let set = c.set_for_name("example.com");
-        let d = c.evaluate(&egress(Protocol::Tcp, "198.51.100.7", 443), |_| set);
+        let set = || c.set_for_name("example.com").into_iter().collect();
+        let d = c.evaluate(&egress(Protocol::Tcp, "198.51.100.7", 443), |_| set());
         assert_eq!((d.verdict, d.reason), (FlowVerdict::Allow, Reason::SetRule));
         assert_eq!(
-            c.evaluate(&egress(Protocol::Tcp, "198.51.100.7", 443), |_| None)
+            c.evaluate(&egress(Protocol::Tcp, "198.51.100.7", 443), |_| Vec::new())
                 .verdict,
             FlowVerdict::Deny
         );
         // The deny prefix is earlier in the list than the name.
-        let d = c.evaluate(&egress(Protocol::Tcp, "203.0.113.7", 443), |_| set);
+        let d = c.evaluate(&egress(Protocol::Tcp, "203.0.113.7", 443), |_| set());
         assert_eq!((d.verdict, d.reason), (FlowVerdict::Deny, Reason::Rule));
     }
 
@@ -409,23 +506,203 @@ mod tests {
             .protocols(Protocols::TCP),
         );
         let c = compile(&b, &BoxPolicy::default(), Options::default()).unwrap();
-        let d = c.evaluate(&egress(Protocol::Udp, "8.8.8.8", 53), |_| None);
+        let d = c.evaluate(&egress(Protocol::Udp, "8.8.8.8", 53), |_| Vec::new());
         assert_eq!(d.verdict, FlowVerdict::Redirect(SocketAddr::V4(v4)));
         // A pinned IPv6 address of a steered name, and no IPv6 endpoint.
         let set = c.set_for_name("steered.example");
-        let d = c.evaluate(&egress(Protocol::Tcp, "2001:db8::1", 443), |_| set);
+        let d = c.evaluate(&egress(Protocol::Tcp, "2001:db8::1", 443), |_| {
+            set.into_iter().collect()
+        });
         assert_eq!(
             (d.verdict, d.reason),
             (FlowVerdict::Deny, Reason::NoEndpoint)
         );
     }
 
+    fn name_rule(action: BoxAction, port: u16, name: &str) -> BoxRule {
+        BoxRule {
+            action,
+            protocols: Protocols::TCP,
+            ports: PortRange::one(port),
+            to: Target::Names(name.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn an_address_of_two_names_is_judged_by_the_rules_of_both_in_list_order() {
+        let policy = BoxPolicy {
+            rules: vec![name_rule(BoxAction::Deny, 22, "a.test")],
+            names: vec!["a.test".parse().unwrap(), "b.test".parse().unwrap()],
+            ..BoxPolicy::default()
+        };
+        let c = compile(&base(), &policy, Options::default()).unwrap();
+        let a = c.set_for_name("a.test").unwrap();
+        let b = c.set_for_name("b.test").unwrap();
+        let mut both = vec![a, b];
+        both.sort_unstable();
+        let to = |port: u16, sets: &[SetId]| {
+            let d = c.evaluate(&egress(Protocol::Tcp, "198.51.100.7", port), |_| {
+                sets.to_vec()
+            });
+            (d.verdict, d.rule)
+        };
+        // The deny for one name comes before the allow for the other.
+        assert_eq!(to(22, &both), (FlowVerdict::Deny, Some(0)));
+        assert_eq!(to(22, &[b]), (FlowVerdict::Allow, Some(2)));
+        assert_eq!(to(443, &both), (FlowVerdict::Allow, Some(1)));
+        // The list read rule by rule gives the same for both names.
+        for port in [22, 443] {
+            let flow = egress(Protocol::Tcp, "198.51.100.7", port);
+            let (index, _) = evaluate_ordered(
+                &c.rules,
+                &c.protected,
+                &c.config.defaults,
+                &flow,
+                Pinned::Names(&["a.test", "b.test"]),
+            );
+            assert_eq!(to(port, &both).1.map(usize::from), index, "port {port}");
+        }
+        let merged = c.merged(&both);
+        assert_eq!(merged.id, crate::pins::merged_id(&both));
+        assert_eq!(merged.overflow, []);
+        assert!(c.sets.iter().all(|set| set.id != merged.id));
+    }
+
+    #[test]
+    fn a_merged_list_that_does_not_fit_keeps_its_first_rules_and_refuses_the_rest() {
+        // Twenty rules for each of two names, and one for every address.
+        let mut rules = vec![BoxRule {
+            action: BoxAction::Allow,
+            protocols: Protocols::TCP,
+            ports: PortRange::one(9000),
+            to: Target::Any,
+        }];
+        for i in 0..20 {
+            rules.push(name_rule(BoxAction::Allow, 100 + i, "a.test"));
+            rules.push(name_rule(BoxAction::Allow, 200 + i, "b.test"));
+        }
+        let policy = BoxPolicy {
+            rules,
+            default: Some(Verdict::Allow),
+            ..BoxPolicy::default()
+        };
+        let c = compile(&base(), &policy, Options::default()).unwrap();
+        let mut both = vec![
+            c.set_for_name("a.test").unwrap(),
+            c.set_for_name("b.test").unwrap(),
+        ];
+        both.sort_unstable();
+        let merged = c.merged(&both);
+        assert_eq!(
+            merged.overflow,
+            [crate::compile::Overflow {
+                direction: Direction::Egress,
+                rules: 40,
+                cut: 32,
+            }]
+        );
+        let [entry] = merged.entries.as_slice() else {
+            panic!("one direction has rules: {merged:?}");
+        };
+        assert_eq!(entry.rules.len(), crate::abi::RULES_MAX);
+        assert!(entry.rules.windows(2).all(|w| w[0].prio < w[1].prio));
+        // The first rule left out is rule 32 of the list: the one for
+        // every address, then 31 of the names' rules.
+        let last = entry.rules.last().unwrap();
+        assert_eq!((last.prio, last.action), (32, Action::Deny));
+
+        let names = Pinned::Names(&["a.test", "b.test"]);
+        let mut refused_where_the_list_allows = 0;
+        for port in (90..230).chain([9000, 9001]) {
+            let flow = egress(Protocol::Tcp, "198.51.100.7", port);
+            let got = c.evaluate(&flow, |_| both.clone());
+            let (index, action) =
+                evaluate_ordered(&c.rules, &c.protected, &c.config.defaults, &flow, names);
+            match index {
+                // A rule before the cut decides as the list says.
+                Some(index) if index < 32 => {
+                    assert_eq!(got.rule.map(usize::from), Some(index), "port {port}");
+                    assert_eq!(got.verdict, FlowVerdict::Allow, "port {port}");
+                }
+                // Everything else is refused at the cut, also what a rule
+                // left out or the default would allow.
+                _ => {
+                    assert_eq!(action, Action::Allow, "port {port}");
+                    assert_eq!(
+                        (got.verdict, got.rule, got.reason),
+                        (FlowVerdict::Deny, Some(32), Reason::SetRule),
+                        "port {port}"
+                    );
+                    refused_where_the_list_allows += 1;
+                }
+            }
+        }
+        assert!(refused_where_the_list_allows > 100);
+        // One name alone is judged by its own list, which fits.
+        let alone = c.evaluate(&egress(Protocol::Tcp, "198.51.100.7", 119), |_| {
+            vec![c.set_for_name("a.test").unwrap()]
+        });
+        assert_eq!(alone.verdict, FlowVerdict::Allow);
+    }
+
+    #[test]
+    fn a_rule_an_earlier_one_always_beats_still_judges_when_that_one_is_left_out() {
+        let steered: NamePattern = "steered.test".parse().unwrap();
+        let v4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 80, 1), 20481);
+        let mut b = base();
+        b.endpoints.push((
+            EndpointIndex(1),
+            Endpoint {
+                v4: Some(v4),
+                v6: None,
+            },
+        ));
+        b.before.push(
+            Rule::new(
+                Direction::Egress,
+                Target::Names(steered.clone()),
+                Action::Redirect(EndpointIndex(1)),
+                Origin::Steering,
+            )
+            .protocols(Protocols::TCP)
+            .ports(PortRange::one(8443)),
+        );
+        let listed = BoxPolicy {
+            names: vec![steered],
+            ..BoxPolicy::default()
+        };
+        let refusing = BoxPolicy {
+            rules: vec![name_rule(BoxAction::Deny, 8443, "steered.test")],
+            ..listed.clone()
+        };
+        let flow = egress(Protocol::Tcp, "198.51.100.7", 8443);
+        let steering = |r: &Rule| r.origin == Origin::Steering;
+        for (policy, rest, rule) in [
+            (&listed, FlowVerdict::Allow, Some(1)),
+            (&refusing, FlowVerdict::Deny, Some(1)),
+        ] {
+            let c = compile(&b, policy, Options::default()).unwrap();
+            let set = || vec![c.set_for_name("steered.test").unwrap()];
+            assert_eq!(
+                c.evaluate(&flow, |_| set()).verdict,
+                FlowVerdict::Redirect(SocketAddr::V4(v4))
+            );
+            let d = c.evaluate_skipping(&flow, |_| set(), steering);
+            assert_eq!((d.verdict, d.rule, d.reason), (rest, rule, Reason::SetRule));
+            // An address the name was never answered for has no rule.
+            let unpinned = c.evaluate_skipping(&flow, |_| Vec::new(), steering);
+            assert_eq!(unpinned.verdict, FlowVerdict::Deny);
+        }
+    }
+
     /// A table of pinned addresses that holds these as the box's own.
-    fn own(list: &'static [&'static str]) -> impl Fn(IpAddr) -> Option<SetId> {
+    fn own(list: &'static [&'static str]) -> impl Fn(IpAddr) -> Vec<SetId> {
         move |addr| {
             list.iter()
                 .any(|a| a.parse::<IpAddr>().unwrap() == addr)
                 .then_some(SetId::OWN)
+                .into_iter()
+                .collect()
         }
     }
 
@@ -452,7 +729,7 @@ mod tests {
         // An address pinned for a name is not the box's own.
         let name = SetId(77);
         assert_eq!(
-            c.evaluate(&flow, |_| Some(name)).reason,
+            c.evaluate(&flow, |_| vec![name]).reason,
             Reason::SourceAddress
         );
     }
@@ -555,7 +832,7 @@ mod tests {
         };
         let c = compile(&base(), &policy, Options::default()).unwrap();
         for to in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
-            let d = c.evaluate(&egress(Protocol::Tcp, to, 80), |_| None);
+            let d = c.evaluate(&egress(Protocol::Tcp, to, 80), |_| Vec::new());
             assert_eq!(
                 (d.verdict, d.reason),
                 (FlowVerdict::Deny, Reason::Rule),
@@ -565,7 +842,7 @@ mod tests {
         // An IPv4 socket bound to an address dials that address.
         let mut bound = egress(Protocol::Tcp, "0.0.0.0", 80);
         bound.local = Some("10.1.2.3".parse().unwrap());
-        let d = c.evaluate(&bound, |_| None);
+        let d = c.evaluate(&bound, |_| Vec::new());
         assert_eq!((d.verdict, d.rule), (FlowVerdict::Allow, Some(2)));
         // A bind to the unspecified address is a wildcard bind, not a flow
         // to loopback.
@@ -573,7 +850,10 @@ mod tests {
             direction: Direction::Bind,
             ..egress(Protocol::Tcp, "0.0.0.0", 8080)
         };
-        assert_eq!(c.evaluate(&wildcard, |_| None).reason, Reason::Default);
+        assert_eq!(
+            c.evaluate(&wildcard, |_| Vec::new()).reason,
+            Reason::Default
+        );
     }
 
     #[test]
@@ -591,11 +871,14 @@ mod tests {
             direction: Direction::Bind,
             ..egress(Protocol::Tcp, "127.0.0.1", port)
         };
-        let d = c.evaluate(&bind(0), |_| None);
+        let d = c.evaluate(&bind(0), |_| Vec::new());
         assert_eq!(
             (d.verdict, d.rule, d.reason),
             (FlowVerdict::Allow, None, Reason::EphemeralPort)
         );
-        assert_eq!(c.evaluate(&bind(8080), |_| None).verdict, FlowVerdict::Deny);
+        assert_eq!(
+            c.evaluate(&bind(8080), |_| Vec::new()).verdict,
+            FlowVerdict::Deny
+        );
     }
 }

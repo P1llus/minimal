@@ -1003,7 +1003,7 @@ fn mint_box_id_reply(
             }
             (box_id, "host_ip registration")
         }
-        (None, None) => (crate::bep_attach::mint_record_box_id(), "fresh"),
+        (None, None) => (crate::box_id::mint_record_box_id(), "fresh"),
         (Some(switch_address), _) => {
             let row_id = boxes
                 .table()
@@ -1627,7 +1627,7 @@ fn register_box(
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
-                box_id = %crate::bep_attach::BoxIdText(&record.box_id()),
+                box_id = %crate::box_id::BoxIdText(&record.box_id()),
                 switch_address = %record.switch_addr(),
                 loopback_address = %record.loopback_addr(),
                 task_addresses = ?record.task_addrs(),
@@ -1685,7 +1685,7 @@ fn register_host_ip_box(boxes: &BoxRegistry, request: &RegisterBoxRequest) -> Bo
         Ok(id) => {
             tracing::info!(
                 box = %request.name,
-                box_id = %crate::bep_attach::BoxIdText(&id),
+                box_id = %crate::box_id::BoxIdText(&id),
                 network = "host_ip",
                 switch_address_allocated = false,
                 credentialed_upstream = request.credentialed_upstream.is_some(),
@@ -2817,7 +2817,7 @@ fn serve_asked_publish(
     tracing::info!(
         %ask_id,
         box = %recorded.facts.name,
-        box_id = %crate::bep_attach::BoxIdText(&recorded.facts.box_id),
+        box_id = %crate::box_id::BoxIdText(&recorded.facts.box_id),
         port = recorded.facts.port,
         proto = %recorded.facts.proto,
         "recorded a pending ask from the in-VM daemon"
@@ -2898,7 +2898,7 @@ fn serve_ask_subscription(
     let (pushes, pushed) = std::sync::mpsc::channel();
     let Some((subscriber, standing)) = boxes.subscribe_asks(box_id, pushes) else {
         tracing::info!(
-            box_id = %crate::bep_attach::BoxIdText(&box_id),
+            box_id = %crate::box_id::BoxIdText(&box_id),
             "refused an ask subscription: no live row holds the box id"
         );
         let _ = write_reply(
@@ -2906,14 +2906,14 @@ fn serve_ask_subscription(
             &BoxControlReply::Error {
                 error: format!(
                     "no running box has id {}, so there are no port prompts to wait for",
-                    crate::bep_attach::BoxIdText(&box_id)
+                    crate::box_id::BoxIdText(&box_id)
                 ),
             },
         );
         return;
     };
     tracing::info!(
-        box_id = %crate::bep_attach::BoxIdText(&box_id),
+        box_id = %crate::box_id::BoxIdText(&box_id),
         subscriber,
         "a host client attached to the box's pending asks"
     );
@@ -2953,10 +2953,10 @@ fn serve_ask_subscription(
 
 /// End one client's subscription and log the asks the detach cancelled.
 /// Idempotent: a second call for the same subscriber finds nothing to end.
-fn unsubscribe_and_log(boxes: &BoxRegistry, box_id: crate::bep_attach::BoxId, subscriber: u64) {
+fn unsubscribe_and_log(boxes: &BoxRegistry, box_id: crate::box_id::BoxId, subscriber: u64) {
     let cancelled = boxes.unsubscribe_asks(box_id, subscriber);
     tracing::info!(
-        box_id = %crate::bep_attach::BoxIdText(&box_id),
+        box_id = %crate::box_id::BoxIdText(&box_id),
         subscriber,
         cancelled = cancelled.len(),
         "a host client detached from the box's pending asks"
@@ -6176,7 +6176,7 @@ mod tests {
     /// log-line form.
     #[test]
     fn ask_audit_line_spells_box_id_as_32_hex() {
-        let box_id: crate::bep_attach::BoxId = [
+        let box_id: crate::box_id::BoxId = [
             0x01, 0x9a, 0x2b, 0x3c, 0x4d, 0x5e, 0x7f, 0x60, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6,
             0xe7, 0xf8,
         ];

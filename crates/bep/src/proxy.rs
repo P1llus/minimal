@@ -1,10 +1,12 @@
 //! The proxy's request shell: what a box's connection asks for, and the TLS
 //! the proxy terminates for it (BEP-029, BEP-073, BEP-075).
 //!
-//! A box whose steering is `proxy_env` reaches the proxy as an HTTP proxy.
-//! Its connection arrives through the listener ([`crate::listener`]), and
-//! its first bytes are an HTTP/1.1 request head, which [`Proxy::serve`]
-//! parses with the strict parser ([`crate::http::parse_request`]):
+//! A connection arrives through the listener ([`crate::listener`]) with a
+//! delivery that says how the box's flow entered, and it is served as that.
+//!
+//! A box that dialled the proxy uses it as an HTTP proxy. Its first bytes
+//! are an HTTP/1.1 request head, which [`Proxy::serve`] parses with the
+//! strict parser ([`crate::http::parse_request`]):
 //!
 //! - `CONNECT host:port` asks for a tunnel. When the authority is in the
 //!   admitted set, the proxy opens a TLS connection to the upstream, answers
@@ -20,16 +22,17 @@
 //! - A head that is not HTTP/1.1 is refused. A flow that opens with the
 //!   HTTP/2 prior-knowledge preface is closed (BEP-074).
 //!
-//! A box whose steering is `dns` reaches the proxy as the upstream itself:
-//! the box resolver gives a credentialed name the proxy's address, and the
-//! box opens TLS to it on port 443. A connection whose first byte opens a
-//! TLS handshake record takes its authority from the ClientHello's SNI at
-//! the port the box connected to, and then enters the same admission,
-//! termination, substitution and egress re-check as a CONNECT to that
-//! authority (BEP-080). A ClientHello with no SNI, or with an SNI outside
-//! the admitted set, is closed and the audit log records it `off_module`.
-//! The span's `entry` field says which form a connection took: `connect`
-//! or `direct_tls`.
+//! A redirected flow is one the box made to an upstream, which its node
+//! sent here in the upstream's place. It opens with a TLS handshake. Its
+//! authority is the ClientHello's SNI at the port the box connected to,
+//! and it then enters the same admission, termination, substitution and
+//! egress re-check as a CONNECT to that authority. A ClientHello with no
+//! SNI, or with an SNI outside the admitted set, is closed and the audit
+//! log records it `off_module`. The span's `entry` field says which form a
+//! connection took: `connect` or `direct_tls`.
+//!
+//! A flow that does not open as it entered is closed: a redirected one that
+//! is not TLS, and a dialled one that is.
 //!
 //! The admitted set is the union of the configured modules' host sets and
 //! the registered store authorities ([`Admission`]). A CONNECT or an
@@ -74,7 +77,7 @@ use crate::audit::{AuditLog, Decision, Kind, Mapping, NO_SNI, Outcome};
 use crate::ca::{Ca, CaError, CaKey, Leaf};
 use crate::forward::{self, Flow, HalfEnd, Redeemer, Unwired, UpstreamError, Validated};
 use crate::http::{self, CloseReason, Parse};
-use crate::listener::Delivery;
+use crate::listener::{Delivery, Entry};
 use crate::module::Module;
 use crate::redeem;
 use crate::store::HostStore;
@@ -98,9 +101,16 @@ pub const ALPN_UNSUPPORTED: &str = "alpn_unsupported";
 /// The entry form of a box connection that opened with a CONNECT head.
 pub const ENTRY_CONNECT: &str = "connect";
 
-/// The entry form of a box connection that opened with a TLS ClientHello,
-/// as `dns` steering sends it to port 443 (BEP-080).
+/// The entry form of a box connection that opened with a TLS ClientHello:
+/// one the box made to the upstream and its node redirected here.
 pub const ENTRY_DIRECT_TLS: &str = "direct_tls";
+
+/// The outcome of a redirected connection that did not open with TLS.
+pub const REDIRECTED_NOT_TLS: &str = "redirected_not_tls";
+
+/// The outcome of a dialled connection that opened with TLS in place of a
+/// proxy request.
+pub const DIALLED_NOT_A_REQUEST: &str = "dialled_not_a_proxy_request";
 
 /// The content type of a TLS handshake record, the first byte of a
 /// ClientHello.
@@ -375,22 +385,20 @@ impl fmt::Debug for Proxy {
 
 /// The `box_connection` span of one box connection. It carries the box id,
 /// the entry form (`connect` or `direct_tls`), the authority the box asked
-/// for, the upstream's validation outcome, the
-/// last substitution decision, whether an admission was cohort-attributed,
+/// for, the upstream's validation outcome, the last substitution decision
 /// and the outcome. When a store reference is redeemed it also carries the
 /// `store` and the `identifier`, with the names the audit record uses
 /// (BEP-028, Gatehouse 6.10). It never carries a credential or a stored
 /// value.
-pub(crate) fn connection_span(box_id: &str, source: &dyn std::fmt::Display) -> tracing::Span {
+pub(crate) fn connection_span(box_id: &str, delivered: &dyn std::fmt::Display) -> tracing::Span {
     tracing::info_span!(
         "box_connection",
         box_id = %box_id,
-        source = %source,
+        delivered = %delivered,
         entry = tracing::field::Empty,
         authority = tracing::field::Empty,
         upstream_tls = tracing::field::Empty,
         substitution = tracing::field::Empty,
-        cohort_attributed = tracing::field::Empty,
         store = tracing::field::Empty,
         identifier = tracing::field::Empty,
         outcome = tracing::field::Empty,
@@ -458,10 +466,9 @@ impl Proxy {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let box_id = delivery.box_id_text();
-        let span = connection_span(&box_id, &delivery.source);
+        let span = connection_span(&box_id, &delivery.entry);
         async {
-            let port = delivery.destination.port();
-            let outcome = self.serve_inner(&box_id, port, stream).await;
+            let outcome = self.serve_inner(&box_id, delivery.entry, stream).await;
             tracing::Span::current().record("outcome", outcome.word());
             tracing::debug!(outcome = outcome.word(), "box connection ended");
         }
@@ -469,15 +476,13 @@ impl Proxy {
         .await;
     }
 
-    async fn serve_inner<S>(&self, box_id: &str, port: u16, mut stream: S) -> Ended
+    async fn serve_inner<S>(&self, box_id: &str, entry: Entry, mut stream: S) -> Ended
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // One deadline covers the first byte and the rest of the head, so
         // HEAD_TIMEOUT stays the whole time the box has to send it.
         let head_deadline = tokio::time::Instant::now() + HEAD_TIMEOUT;
-        // BEP-080: a connection that opens with a TLS handshake record is a
-        // box whose `dns` steering sent it here as the upstream itself.
         let mut first = [0u8; 1];
         let read = match tokio::time::timeout_at(head_deadline, stream.read(&mut first)).await {
             Err(_) => return Ended::Closed("head_timeout"),
@@ -485,8 +490,19 @@ impl Proxy {
             Ok(Ok(read)) => read,
         };
         let mut stream = Prefixed::new(first[..read].to_vec(), stream);
-        if read == 1 && first[0] == TLS_HANDSHAKE_RECORD {
-            return self.direct_tls(box_id, port, stream).await;
+        let opens_tls = read == 1 && first[0] == TLS_HANDSHAKE_RECORD;
+        match entry {
+            // The flow was on its way to the upstream, so it opens as one
+            // to the upstream does. Nothing else can be answered: the box
+            // did not ask a proxy.
+            Entry::Redirected { destination } if opens_tls => {
+                return self.direct_tls(box_id, destination.port(), stream).await;
+            }
+            Entry::Redirected { .. } => return Ended::Closed(REDIRECTED_NOT_TLS),
+            // A box that dials its proxy asks it in HTTP. TLS to the proxy
+            // itself names no upstream port.
+            Entry::Dialled if opens_tls => return Ended::Closed(DIALLED_NOT_A_REQUEST),
+            Entry::Dialled => {}
         }
         let (request, rest) =
             match tokio::time::timeout_at(head_deadline, read_head(&mut stream)).await {
@@ -700,7 +716,7 @@ impl Proxy {
         self.relay_flow(box_id, host, port, boxed, upstream).await
     }
 
-    /// BEP-080: a box connection that opens with a TLS ClientHello. The
+    /// A redirected box connection, which opens with a TLS ClientHello. The
     /// authority is the SNI at the port the box connected to, and it enters
     /// the same admission, termination, substitution and egress re-check a
     /// CONNECT to that authority enters. A refusal closes the connection,
@@ -1244,7 +1260,7 @@ pub(crate) mod tests {
     use crate::audit::{LogReader, segment_name};
     use crate::ca::Union;
     use crate::keys::{HeldKey, KeyError, Role};
-    use crate::listener::{Listener, PeerAttested, TOKEN_LEN};
+    use crate::listener::{Listener, TOKEN_LEN};
     use crate::module::GITHUB;
     use crate::seal::ProxyPublicKey;
 
@@ -1400,11 +1416,11 @@ pub(crate) mod tests {
 
     const BOX: [u8; 16] = [0x42; 16];
 
+    /// A connection of a box that dialled the proxy.
     pub(crate) fn delivery() -> Delivery {
         Delivery {
             box_id: BOX,
-            source: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 7), 40_000),
-            destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 3), 8118),
+            entry: Entry::Dialled,
         }
     }
 
@@ -1567,14 +1583,14 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("listener.sock");
         let token = [0x5a; TOKEN_LEN];
-        let listener = Listener::bind(&path, token, Arc::new(PeerAttested)).unwrap();
+        let listener = Listener::bind(&path, token).unwrap();
         let proxy = Arc::clone(&h.proxy);
         tokio::spawn(listener.run(move |delivery, stream| {
             let proxy = Arc::clone(&proxy);
             async move { proxy.serve(delivery, stream).await }
         }));
 
-        // The switch peer's delivery, then the box's own bytes.
+        // The delivery, then the box's own bytes.
         let mut stream = UnixStream::connect(&path).await.unwrap();
         stream.write_all(&token).await.unwrap();
         stream.write_all(&delivery().emit()).await.unwrap();
@@ -1952,16 +1968,19 @@ pub(crate) mod tests {
                 identifier: "github:member".to_owned(),
                 mapping: Mapping::ModuleUnmapped,
                 renewed: false,
-                marker: None,
-                cohort_attributed: false,
             }
         }
     }
 
-    /// A box connection that `dns` steering sent to the proxy's port 443.
+    /// A connection a box made to port 443 of an upstream, redirected to
+    /// the proxy.
     fn direct_tls_connection(proxy: &Arc<Proxy>) -> tokio::io::DuplexStream {
-        let mut delivery = delivery();
-        delivery.destination.set_port(443);
+        let delivery = Delivery {
+            entry: Entry::Redirected {
+                destination: "140.82.112.3:443".parse().unwrap(),
+            },
+            ..delivery()
+        };
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let proxy = Arc::clone(proxy);
         tokio::spawn(async move { proxy.serve(delivery, theirs).await });
@@ -2029,6 +2048,39 @@ pub(crate) mod tests {
                 && d.box_id == "42".repeat(16)),
             "{records:?}"
         );
+    }
+
+    // A flow is served as it entered. A redirected one was headed for the
+    // upstream, so a proxy request on it gets no tunnel. One a box dialled
+    // asks in HTTP, so TLS to the proxy itself goes nowhere. Each is closed
+    // with nothing dialed and nothing answered.
+    #[tokio::test]
+    async fn a_flow_that_does_not_open_as_it_entered_is_closed() {
+        let h = harness().await;
+
+        let mut redirected = direct_tls_connection(&h.proxy);
+        redirected.write_all(CONNECT_GITHUB).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), redirected.read_to_end(&mut answer))
+            .await
+            .expect("the proxy closes the connection")
+            .unwrap();
+        assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
+
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let proxy = Arc::clone(&h.proxy);
+        tokio::spawn(async move { proxy.serve(delivery(), theirs).await });
+        let name = ServerName::try_from("api.github.com").unwrap();
+        let dialled = tokio::time::timeout(
+            Duration::from_secs(10),
+            box_tls(&h.root, &[ALPN_HTTP11]).connect(name, ours),
+        )
+        .await
+        .expect("the proxy closes the connection");
+        assert!(dialled.is_err(), "TLS to the proxy itself completed");
+
+        assert_eq!(h.resolver.1.load(Ordering::SeqCst), 0);
+        assert!(h.audit.lock().unwrap().is_empty());
     }
 
     // BEP-080 with BEP-029: a ClientHello with an SNI outside the module

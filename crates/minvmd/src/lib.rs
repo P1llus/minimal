@@ -10,7 +10,7 @@
 //! cfg; the portable surface (errors, state, image resolution) compiles
 //! everywhere.
 
-pub mod bep_attach;
+pub mod box_id;
 pub mod box_registry;
 pub mod cmd;
 pub mod config;

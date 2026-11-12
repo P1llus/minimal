@@ -18,13 +18,6 @@
 //! host daemon's control socket, over which the activating client registers
 //! a box and reads the addresses the allocation hands back.
 //!
-//! This registry is also the proxy's attachment source (NET-133): when the
-//! host hands it the attachment table
-//! ([`BoxRegistry::feeding_proxy_attachments`]), every box row it publishes
-//! is an attachment issued ahead of the row and every retirement takes the
-//! attachment with it — the same host-side facts, the same trust boundary,
-//! the one writer.
-//!
 //! One dimension of a row is filled from the in-VM daemon's own reports —
 //! the **runtime-admitted ports** (NET-138's sanctioned exception, NET-045's
 //! decisions), asked for over the guest door and recorded only
@@ -53,7 +46,7 @@ use boxes::core::zone_answer;
 use boxes::{DynamicIngress, IpProto};
 use switch::SwitchSubnet;
 
-use crate::bep_attach::BoxId;
+use crate::box_id::BoxId;
 
 /// The per-row cap on runtime-admitted ports (NET-138): the row's
 /// runtime-published set answers to this bound, so a report storm cannot
@@ -475,8 +468,7 @@ impl BoxRecord {
     /// OS CSPRNG. Unique per creation, so a box recreated with the same
     /// name and addresses carries a different id, and the id never
     /// returns to use: a revocation scoped to it stays scoped forever.
-    /// This is what the proxy's attachment names the box by and a
-    /// delivered connection's header carries (NET-133).
+    /// A connection delivered to the credential proxy carries it.
     #[must_use]
     pub fn box_id(&self) -> BoxId {
         self.box_id
@@ -597,7 +589,7 @@ pub struct BoxRegistration {
 impl BoxRegistration {
     /// A declaration for the namespace `name`, addressed at `switch_addr` on
     /// the switch and `loopback_addr` on the guest's loopback. The box's id
-    /// is minted at registration ([`crate::bep_attach::mint_box_id`]).
+    /// is minted at registration ([`crate::box_id::mint_box_id`]).
     #[must_use]
     pub fn new(name: impl Into<String>, switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Self {
         Self {
@@ -1202,9 +1194,9 @@ struct SwitchAddressBook {
     /// its quarantine ([`Self::take`]).
     ///
     /// Not persisted: a minvmd restart is a VM restart, and every
-    /// switch-keyed host-side state the quarantine outlasts — the proxy's
-    /// attachments, gvproxy's neighbour entries — lives in this process and
-    /// the VM it supervises,
+    /// switch-keyed host-side state the quarantine outlasts, such as
+    /// gvproxy's neighbour entries, lives in this process and the VM it
+    /// supervises,
     /// and ends with them, so a book reloaded at start
     /// ([`BoxRegistry::persisting_to`]) holds only what reloaded rows hold.
     free: VecDeque<(u32, Instant, BoxId)>,
@@ -1414,18 +1406,18 @@ pub enum AllocationError {
     #[error("the address plan does not serve subnet {0}; no box address can be allocated")]
     UnplannedSubnet(SwitchSubnet),
     /// The id minted for the registration is already held by a live row, a
-    /// kept creation, an attachment or a revocation record the Box Egress
-    /// Proxy retains: one id names one box (BEP-070), so the registration
+    /// kept creation, a `host_ip` box or a revocation record the Box Egress
+    /// Proxy retains: one id names one box, so the registration
     /// is refused — never re-minted — before any address is spent, so the
     /// refusal leaves no new fact on the host.
     #[error(
-        "box id {} is already in use. A running box, a stopped box that can resume, a Box \
-         Egress Proxy attachment, or a revocation record of the Box Egress Proxy holds it",
-        crate::bep_attach::BoxIdText(id)
+        "box id {} is already in use. A running box, a stopped box that can resume, or a \
+         revocation record of the Box Egress Proxy holds it",
+        crate::box_id::BoxIdText(id)
     )]
     CollidingBoxId {
-        /// The id a live row, a kept creation, an attachment or a retained
-        /// revocation record already holds.
+        /// The id a live row, a kept creation, a `host_ip` box or a
+        /// retained revocation record already holds.
         id: BoxId,
     },
     /// The Box Egress Proxy answers its control socket but did not list the
@@ -1436,7 +1428,7 @@ pub enum AllocationError {
     #[error(
         "the box was not created. The Box Egress Proxy did not list its revocation records, so \
          box id {} was not checked against them: {why}",
-        crate::bep_attach::BoxIdText(id)
+        crate::box_id::BoxIdText(id)
     )]
     RevocationsUnread {
         /// The minted id the check did not finish on.
@@ -1451,7 +1443,7 @@ pub enum AllocationError {
     #[error(
         "the box was not created. Box id {} was not checked against the revocation records in \
          the Box Egress Proxy audit log in {audit}: {why}",
-        crate::bep_attach::BoxIdText(id)
+        crate::box_id::BoxIdText(id)
     )]
     AuditUnread {
         /// The minted id the check did not finish on.
@@ -1579,8 +1571,8 @@ pub enum ResumeError {
     /// named: a newer creation took the name and its addresses.
     #[error(
         "box {name:?} is box id {}, not the {} the resume named",
-        crate::bep_attach::BoxIdText(held_box_id),
-        crate::bep_attach::BoxIdText(asked_box_id)
+        crate::box_id::BoxIdText(held_box_id),
+        crate::box_id::BoxIdText(asked_box_id)
     )]
     NotTheBoxId {
         /// The name the resume presented.
@@ -1677,8 +1669,8 @@ pub enum WithdrawError {
     #[error(
         "the row at switch address {switch_addr} is box id {}, not the {} the withdrawal \
          named; it is a newer box under the same name and addresses",
-        crate::bep_attach::BoxIdText(held_box_id),
-        crate::bep_attach::BoxIdText(asked_box_id)
+        crate::box_id::BoxIdText(held_box_id),
+        crate::box_id::BoxIdText(asked_box_id)
     )]
     NotTheBoxId {
         /// The switch address the withdrawal named.
@@ -1699,8 +1691,8 @@ pub enum RenameError {
     /// client is not its creator.
     #[error(
         "the row at switch address {switch_addr} is box id {}, not the {} the rename named",
-        crate::bep_attach::BoxIdText(held_box_id),
-        crate::bep_attach::BoxIdText(asked_box_id)
+        crate::box_id::BoxIdText(held_box_id),
+        crate::box_id::BoxIdText(asked_box_id)
     )]
     NotTheBoxId {
         /// The switch address the rename named.
@@ -1715,7 +1707,7 @@ pub enum RenameError {
     #[error(
         "box id {} was handed switch address {held_switch} and loopback address \
          {held_loopback}, not the {asked_switch} and {asked_loopback} the rename presented",
-        crate::bep_attach::BoxIdText(box_id)
+        crate::box_id::BoxIdText(box_id)
     )]
     NotTheHandedPair {
         /// The id the rename named.
@@ -2762,12 +2754,6 @@ pub struct BoxRegistry {
     /// (the node's own row among them), it just cannot allocate for a
     /// client box.
     loopback_slice: Option<switch::LoopbackSlice>,
-    /// The proxy's attachment table this registry feeds (NET-133), when the
-    /// host handed one over: every box row published here is an attachment
-    /// first and every row retired here retires its attachment with it.
-    /// `None` for a registry that feeds no proxy — a table-less registry
-    /// still publishes rows, it just gives no attachments.
-    attachments: Option<crate::bep_attach::Attachments>,
     /// The record of pending asks (NET-045): the unresolved asks by their
     /// host-minted ids, each row's queue of them, and the attached host
     /// clients by the box id each subscribed to — shared by every clone,
@@ -2880,15 +2866,15 @@ fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId, end: BoxEnd) {
                     box_id = %id,
                     error = %revoke,
                     "{completed} without a revocation from the Box Egress Proxy: \
-                     the proxy forgot the box, and the withdrawn attachment refuses its values"
+                     the proxy forgot the box, and the stream door opens no stream for it"
                 ),
                 (Err(revoke), Err(forget)) => tracing::warn!(
                     box_id = %id,
                     revoke_error = %revoke,
                     forget_error = %forget,
                     "{completed} without a revocation from the Box Egress Proxy \
-                     and without the proxy forgetting the box: the withdrawn attachment \
-                     refuses its values"
+                     and without the proxy forgetting the box: the stream door opens no \
+                     stream for it"
                 ),
                 (Ok(()), Err(forget)) => tracing::warn!(
                     box_id = %id,
@@ -2946,8 +2932,6 @@ enum IdHolder {
     LiveRow,
     /// A kept creation, live or dormant.
     KeptCreation,
-    /// The proxy's attachment table.
-    Attachment,
     /// A `host_ip` box's minted id ([`BoxRegistry::register_host_ip_box`]).
     HostIpBox,
     /// A revocation record the proxy retains.
@@ -2968,7 +2952,6 @@ impl IdHolder {
         match self {
             IdHolder::LiveRow => "live row",
             IdHolder::KeptCreation => "kept creation",
-            IdHolder::Attachment => "attachment",
             IdHolder::HostIpBox => "host_ip box",
             IdHolder::RevocationRecord => "revocation record",
             IdHolder::AuditedRevocation { .. } => "revocation record in the audit log",
@@ -3003,7 +2986,7 @@ fn audit_revocation_holding(
 ) -> Result<Option<IdHolder>, AllocationError> {
     let unread = |why: String| {
         tracing::warn!(
-            box_id = %crate::bep_attach::BoxIdText(&id),
+            box_id = %crate::box_id::BoxIdText(&id),
             audit = %audit.display(),
             why = %why,
             "refused a box registration: the Box Egress Proxy's audit log was not read whole, \
@@ -3218,7 +3201,6 @@ impl Clone for BoxRegistry {
             #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
-            attachments: self.attachments.clone(),
             asks: Arc::clone(&self.asks),
             ask_gauges: Arc::clone(&self.ask_gauges),
             withdrawal_generations: Arc::clone(&self.withdrawal_generations),
@@ -3258,7 +3240,6 @@ impl BoxRegistry {
                 loopback_slice.map_or(0, |slice| box_loopback_run(slice).0),
             )),
             loopback_slice,
-            attachments: None,
             asks: Arc::new(Mutex::new(AskBook::default())),
             ask_gauges: Arc::new(AskGauges::default()),
             withdrawal_generations: Arc::new(Mutex::new(HashMap::new())),
@@ -3380,26 +3361,6 @@ impl BoxRegistry {
 
     fn generations(&self) -> MutexGuard<'_, HashMap<String, NameRegistrations>> {
         lock_generations(&self.withdrawal_generations)
-    }
-
-    /// Hands this registry the proxy's attachment table to feed
-    /// (NET-133): from here on every box row it publishes is an attachment
-    /// issued ahead of the row — the proxy holds the box before its first
-    /// connection could arrive — and every row it retires takes the
-    /// attachment with it, ahead of the row's own removal. Returns `self`,
-    /// for the supervisor's call chain.
-    ///
-    /// The table is the host's own; feeding it is the registry's one write
-    /// path, so the attachments stay sourced from the host-side creator
-    /// alone: nothing the guest says reaches either table (NET-138's
-    /// boundary, which NET-133 borrows for the proxy).
-    #[must_use]
-    pub fn feeding_proxy_attachments(
-        mut self,
-        attachments: crate::bep_attach::Attachments,
-    ) -> Self {
-        self.attachments = Some(attachments);
-        self
     }
 
     /// Persists this registry's client-box creations at `path` — the
@@ -3811,7 +3772,7 @@ impl BoxRegistry {
     /// check and the insert happen under one write of the row lock, and a
     /// withdrawal takes its hold under the same lock, so no row can land at
     /// an address between its withdrawal and the end of its revocation. A
-    /// refused registration leaves nothing behind: no row and no attachment.
+    /// refused registration leaves no row behind.
     ///
     /// # Panics
     ///
@@ -3841,12 +3802,11 @@ impl BoxRegistry {
         // minted and checked ([`Self::register_client_box_at`]), or a fresh
         // UUIDv7 minted here for this creation — never a counter, never a
         // digest of the declaration below, never one a client presented.
-        // Minted once, before anything else, so the row and the attachment
-        // it issues hold the one identity this registration created the
-        // box with.
+        // Minted once, before anything else: the one identity this
+        // registration creates the box with.
         let box_id = registration
             .box_id
-            .unwrap_or_else(crate::bep_attach::mint_box_id);
+            .unwrap_or_else(crate::box_id::mint_box_id);
         // The dynamic-ingress grant (NET-045, NET-138): the stance and range
         // the host holds every runtime port report against, from the same
         // create inputs the session record holds. Absent is deny with no
@@ -3894,21 +3854,10 @@ impl BoxRegistry {
             task_row_of: None,
             task_addrs: registration.task_addrs,
         });
-        // NET-133: the box's proxy attachment is issued from the row's own
-        // host facts — the name, both addresses, and the box's own id
-        // minted above — and issued **before** the row is visible, so the
-        // proxy holds the box ahead of its first connection: the box-egress
-        // pool's listeners are partitioned by rows, a delivered connection
-        // can only exist once the row made the box a share, and the share
-        // comes a pool turn after the row. The guest node's own namespace
-        // is not a box: its row buys no share in the pool (the same one
-        // address `RegisteredBoxes` excludes) and no attachment either —
-        // the plan keeps that address outside the run every client box is
-        // handed from, so excluding it names exactly the node row.
-        //
-        // Both happen under the row lock, after the revocation check: a
-        // withdrawal takes its hold under the same lock, so an address is
-        // either still a live row's or held until its revocation ends.
+        // The insert happens under the row lock, after the revocation
+        // check: a withdrawal takes its hold under the same lock, so an
+        // address is either still a live row's or held until its
+        // revocation ends.
         #[expect(
             clippy::unwrap_in_result,
             reason = "the expect is the lock's poison guard, not this function's error \
@@ -3937,17 +3886,6 @@ impl BoxRegistry {
             drop(rows);
             return Err(AllocationError::WithdrawnWhileAllocating);
         }
-        if let Some(attachments) = &self.attachments
-            && record.switch_addr != self.subnet.daemon_ip()
-        {
-            attachments.issue(
-                &record.name(),
-                record.box_id(),
-                record.switch_addr,
-                record.loopback_addr,
-                record.declares_credentialed_upstream(),
-            );
-        }
         rows.insert(record.switch_addr.octets(), Arc::clone(&record));
         for task in &task_rows {
             rows.insert(task.switch_addr.octets(), Arc::clone(task));
@@ -3973,8 +3911,8 @@ impl BoxRegistry {
         if let Some((name, old_id)) = &replaced {
             tracing::info!(
                 box = %name,
-                replaced = %crate::bep_attach::BoxIdText(old_id),
-                by = %crate::bep_attach::BoxIdText(&record.box_id()),
+                replaced = %crate::box_id::BoxIdText(old_id),
+                by = %crate::box_id::BoxIdText(&record.box_id()),
                 "a new box took over a stopped box's name; the stopped box keeps its creation \
                  and its addresses, and resumes by its box id once no running box holds the name"
             );
@@ -4056,39 +3994,22 @@ impl BoxRegistry {
     /// Withdraws the row published for `switch_addr`, returning it when one
     /// was held: how the host retires a namespace's declaration. A
     /// re-registration starts from the newest declaration.
-    pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
-        // The box's end is observed here, so the withdrawal's own line
-        // measures itself against this instant (NET-133's bound).
-        self.withdraw_where(switch_addr, |_, _| Some(Instant::now()))
-    }
-
-    /// Withdraws the row at `switch_addr` when `ended_at` says its box
-    /// ended — the instant it ended — deciding under the write of the row
-    /// lock the row leaves under, so nothing that changes the row's
-    /// liveness lands between the decision and the removal. The proxy
-    /// attachment is retired inside the same critical section, as the
-    /// creator's withdrawal retires it ([`Self::withdraw_client_box`]);
-    /// the row's creation, when it is a client box's, goes dormant
-    /// ([`Creation`]) and is persisted; and the switch address returns to
+    ///
+    /// The row's creation, when it is a client box's, goes dormant
+    /// ([`Creation`]) and is persisted, and the switch address returns to
     /// the hand-out book, quarantined when the row was ever attributed.
     ///
-    /// It sends the proxy no revocation (BEP-043). A live client row always
-    /// has its standing creation, because a registration under a held name
-    /// is refused. So a row this removes goes dormant, and its creator can
-    /// resume it under the same box id, which a revocation refuses for good
-    /// (BEP-071). Only the creator's destroy of a live box revokes it
+    /// It sends the proxy no revocation. A live client row always has its
+    /// standing creation, because a registration under a held name is
+    /// refused. So a row this removes goes dormant, and its creator can
+    /// resume it under the same box id, which a revocation refuses for
+    /// good. Only the creator's destroy of a live box revokes it
     /// ([`Self::withdraw_client_box`]).
-    fn withdraw_where(
-        &self,
-        switch_addr: Ipv4Addr,
-        ended_at: impl FnOnce(&Rows, &BoxRecord) -> Option<Instant>,
-    ) -> Option<Arc<BoxRecord>> {
+    pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
         let mut rows = self
             .rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let box_ended = ended_at(&rows, rows.get(&switch_addr.octets())?)?;
-        self.retire_proxy_attachment(switch_addr, box_ended);
         let removed = rows.remove(&switch_addr.octets());
         let mut rowless = false;
         let mut task_rows = Vec::new();
@@ -4124,24 +4045,6 @@ impl BoxRegistry {
         removed
     }
 
-    /// Retires the proxy attachment issued for `switch_addr`, when this
-    /// registry feeds a table and one is held: the host-side half of the
-    /// requirement's "the attachment is the box's row, withdrawn with it"
-    /// (NET-133). Retired **before** the row it goes with, so a delivery
-    /// racing the box's end finds no attachment and is refused rather than
-    /// attributed to a namespace the table no longer holds.
-    ///
-    /// `box_ended` is the instant this process observed the box's end —
-    /// the guest's report of it, or the creator's
-    /// withdrawal request reaching the control socket — and the one line
-    /// the withdrawal logs measures itself against, so a tail can see a
-    /// withdrawal that did not keep the requirement's bound.
-    fn retire_proxy_attachment(&self, switch_addr: Ipv4Addr, box_ended: Instant) {
-        if let Some(attachments) = &self.attachments {
-            attachments.withdraw(switch_addr, box_ended);
-        }
-    }
-
     /// Registers a client box: allocates its switch address from the plan's
     /// lease run and its published loopback address from the slice this
     /// subnet's switch serves at, then fills the row from `spec` — the same
@@ -4174,11 +4077,11 @@ impl BoxRegistry {
     /// self-assign.
     ///
     /// The box's id is always minted here, for this creation
-    /// ([`crate::bep_attach::mint_box_id`]): a spec carries none, so no
+    /// ([`crate::box_id::mint_box_id`]): a spec carries none, so no
     /// client can present an id, and a re-registration under the same
     /// name and addresses is a new box with a new id. Ids are never reused.
-    /// A mint that collides with an id a live row, a kept creation, an
-    /// attachment or a revocation record the proxy retains already holds
+    /// A mint that collides with an id a live row, a kept creation, a
+    /// `host_ip` box or a revocation record the proxy retains already holds
     /// is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
     /// never re-minted — before any address is spent, and said as one warn
     /// line naming the id. A name that folds to one a live row already
@@ -4190,13 +4093,7 @@ impl BoxRegistry {
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
-        self.register_client_box_as(
-            spec,
-            loopback_addr,
-            0,
-            crate::bep_attach::mint_box_id(),
-            None,
-        )
+        self.register_client_box_as(spec, loopback_addr, 0, crate::box_id::mint_box_id(), None)
     }
 
     /// [`Self::register_client_box_at`] for a registration that read its
@@ -4204,7 +4101,7 @@ impl BoxRegistry {
     /// ([`Self::begin_registration`]) before the answerer allocated
     /// `loopback_addr`. When a withdrawal under the name
     /// landed since, the registration is refused with
-    /// [`AllocationError::WithdrawnWhileAllocating`]: no row, no attachment,
+    /// [`AllocationError::WithdrawnWhileAllocating`]: no row,
     /// and the caller hands the address back to the answerer unless
     /// something else owns it ([`Self::release_unless_owned`]).
     ///
@@ -4226,7 +4123,7 @@ impl BoxRegistry {
             spec,
             loopback_addr,
             task_slots,
-            crate::bep_attach::mint_box_id(),
+            crate::box_id::mint_box_id(),
             Some(generation),
         )
     }
@@ -4235,8 +4132,8 @@ impl BoxRegistry {
     /// from the node's own address, so it gets no switch address and no row
     /// in the address table. The id is recorded in [`Self::host_ip_ids`].
     /// The id takes the collision check an own-address box's id takes
-    /// ([`Self::holds_box_id`]): live rows, kept creations, attachments and
-    /// the proxy's revocation records. A colliding mint is refused, never
+    /// ([`Self::holds_box_id`]): live rows, kept creations, `host_ip` boxes
+    /// and the proxy's revocation records. A colliding mint is refused, never
     /// re-minted.
     ///
     /// # Errors
@@ -4248,7 +4145,7 @@ impl BoxRegistry {
     /// admitted ([`Self::admit_host_ip_box_with_lane`]) is live for
     /// [`HOST_IP_UNADMITTED_NAME_BOUND`] from its register.
     pub fn register_host_ip_box(&self, name: &str) -> Result<BoxId, AllocationError> {
-        self.register_host_ip_box_as(name, crate::bep_attach::mint_box_id())
+        self.register_host_ip_box_as(name, crate::box_id::mint_box_id())
     }
 
     /// [`Self::register_host_ip_box`] with the freshly minted `id`, split
@@ -4257,10 +4154,10 @@ impl BoxRegistry {
         if let Some(holder) = self.holds_box_id(id)? {
             tracing::warn!(
                 box = %name,
-                box_id = %crate::bep_attach::BoxIdText(&id),
+                box_id = %crate::box_id::BoxIdText(&id),
                 held_by = holder.as_str(),
                 "refused a host_ip box registration whose id is already held: the check \
-                 reads live rows, kept creations, attachments and the proxy's revocation \
+                 reads live rows, kept creations, host_ip boxes and the proxy's revocation \
                  records"
             );
             return Err(AllocationError::CollidingBoxId { id });
@@ -4307,7 +4204,7 @@ impl BoxRegistry {
             tracing::info!(
                 asked = %name,
                 held = %held,
-                stale_box_id = %crate::bep_attach::BoxIdText(&named.id),
+                stale_box_id = %crate::box_id::BoxIdText(&named.id),
                 bound = ?HOST_IP_UNADMITTED_NAME_BOUND,
                 "withdrew a host_ip registration name no box was admitted under within the bound"
             );
@@ -4391,7 +4288,7 @@ impl BoxRegistry {
     ) -> Result<Arc<BoxRecord>, AllocationError> {
         // One id names one box (BEP-070): the check runs before any
         // address is spent, so a refused registration leaves nothing
-        // behind — no row, no share, no attachment, no spent address.
+        // behind: no row and no spent address.
         // A colliding mint is refused, never re-minted: a collision means
         // the mint is broken, and a second draw would hide it.
         if let Some(holder) = self.holds_box_id(id)? {
@@ -4402,12 +4299,12 @@ impl BoxRegistry {
                 _ => ("", String::new()),
             };
             tracing::warn!(
-                box_id = %crate::bep_attach::BoxIdText(&id),
+                box_id = %crate::box_id::BoxIdText(&id),
                 held_by = holder.as_str(),
                 record,
                 audit,
                 "refused a box registration whose id is already held: the check reads live \
-                 rows, kept creations, attachments and the proxy's revocation records"
+                 rows, kept creations, host_ip boxes and the proxy's revocation records"
             );
             return Err(AllocationError::CollidingBoxId { id });
         }
@@ -4563,13 +4460,13 @@ impl BoxRegistry {
             spec,
             loopback_addr,
             task_slots,
-            crate::bep_attach::mint_box_id(),
+            crate::box_id::mint_box_id(),
             None,
         )
     }
 
-    /// Which record already holds `id`, if any (BEP-070): a live row, a
-    /// kept creation, an attachment, or a revocation record the Box Egress
+    /// Which record already holds `id`, if any: a live row, a kept
+    /// creation, a `host_ip` box, or a revocation record the Box Egress
     /// Proxy retains. It is the collision check every client-driven
     /// registration runs on the id it minted. A dormant creation
     /// ([`Creation`]) is a retained box record: its id stays its box's
@@ -4602,13 +4499,6 @@ impl BoxRegistry {
         if self.host_ip_id_set().ids.contains(&id) {
             return Ok(Some(IdHolder::HostIpBox));
         }
-        if self
-            .attachments
-            .as_ref()
-            .is_some_and(|attachments| attachments.holds_id(id))
-        {
-            return Ok(Some(IdHolder::Attachment));
-        }
         let Some(path) = self.proxy_control.as_deref() else {
             return Ok(None);
         };
@@ -4637,7 +4527,7 @@ impl BoxRegistry {
             // record holds the id, so it fails closed.
             Err(error) => {
                 tracing::warn!(
-                    box_id = %crate::bep_attach::BoxIdText(&id),
+                    box_id = %crate::box_id::BoxIdText(&id),
                     %error,
                     "refused a box registration: the Box Egress Proxy did not list its \
                      revocation records, so the box id check did not finish"
@@ -4709,9 +4599,7 @@ impl BoxRegistry {
     ///
     /// The withdrawn switch address returns to the hand-out book
     /// ([`SwitchAddressBook`]): quarantined when the row was ever
-    /// attributed, at once when it never was. The box's
-    /// proxy attachment goes with the row (NET-133), retired under the same
-    /// row lock that removes it.
+    /// attributed, at once when it never was.
     ///
     /// This is the host-side half of the withdrawal a destroyed or failed
     /// activation sends over the control socket
@@ -4851,15 +4739,6 @@ impl BoxRegistry {
                 asked_box_id: asked,
             });
         }
-        // The attachment goes with the row (NET-133), retired inside the
-        // same critical section that removes the row: a registration
-        // landing after cannot retire the new box's attachment, and one
-        // landing before is the row the proof above matched. The paths
-        // that hold a row lock across the attachment table's — this one
-        // and [`Self::withdraw_where`] — take the row lock
-        // first, and no path takes them the other way, so the order never
-        // inverts.
-        self.retire_proxy_attachment(switch_addr, Instant::now());
         let removed = rows.remove(&switch_addr.octets());
         // The row's own name, which is the presented one unless the
         // session was renamed since its registration.
@@ -5026,7 +4905,7 @@ impl BoxRegistry {
             if let Some(superseded) = creations.remove(&new_key) {
                 tracing::info!(
                     box = %superseded.name,
-                    by = %crate::bep_attach::BoxIdText(&box_id),
+                    by = %crate::box_id::BoxIdText(&box_id),
                     "a renamed box took over a stopped box's name; the stopped box keeps its \
                      creation and its addresses"
                 );
@@ -5114,7 +4993,7 @@ impl BoxRegistry {
         if superseded && let Some(held) = self.held_name_for(&creation.name) {
             tracing::info!(
                 box = %creation.name,
-                box_id = %crate::bep_attach::BoxIdText(&creation.id()),
+                box_id = %crate::box_id::BoxIdText(&creation.id()),
                 "refused the resume of a stopped box: a running box holds its name"
             );
             return Err(AllocationError::NameAlreadyHeld { held }.into());
@@ -5492,7 +5371,7 @@ impl BoxRegistry {
     /// the same name until the older one's withdrawal lands.
     /// While both are held, the alias resolves to the newest creation —
     /// the row with the greatest id, because every id is a UUIDv7 this
-    /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
+    /// process minted ([`crate::box_id::mint_box_id`]), and the crate
     /// orders those by creation within a process. The name is matched in
     /// its canonical form ([`canonical_box_name`]):
     /// the answerer keys the box's published address by that form, so the
@@ -7507,8 +7386,8 @@ mod tests {
         );
     }
 
-    /// BEP-070, one id names one box, so a registration whose minted id a
-    /// live row or attachment already holds is refused — never re-minted,
+    /// One id names one box, so a registration whose minted id a live row
+    /// already holds is refused — never re-minted,
     /// and before any address is spent, so the refusal leaves no new fact
     /// on the host — and said as one warn line naming the id. A real mint
     /// does not collide, so the test drives the collision through the
@@ -7516,8 +7395,7 @@ mod tests {
     #[test]
     fn colliding_box_id_refused() {
         let (log, _guard) = crate::test_support::capture_log();
-        let attachments = crate::bep_attach::Attachments::new();
-        let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
+        let registry = BoxRegistry::new(SUBNET);
         let web = registry
             .register_client_box(ClientBoxSpec {
                 name: "web".to_string(),
@@ -7527,11 +7405,6 @@ mod tests {
                 dynamic_allowed_range: None,
             })
             .expect("the plan has an address for the first box");
-        assert!(
-            attachments.holds_id(web.box_id()),
-            "the box's id is held by its row's attachment, the half of the live \
-             set a source's delivery resolves through"
-        );
 
         // A registration whose mint landed on the live row's id would name
         // the web box: refused, and the refusal names the colliding id.
@@ -7595,7 +7468,7 @@ mod tests {
         assert!(
             logged.contains(&format!(
                 "box_id={}",
-                crate::bep_attach::BoxIdText(&web.box_id())
+                crate::box_id::BoxIdText(&web.box_id())
             )),
             "the warn line names the colliding id, got: {logged}"
         );
@@ -9122,8 +8995,7 @@ mod tests {
     /// second box.
     #[test]
     fn re_registration_never_reuses_an_id() {
-        let attachments = crate::bep_attach::Attachments::new();
-        let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
+        let registry = BoxRegistry::new(SUBNET);
         let spec = || ClientBoxSpec {
             name: "web".to_string(),
             ingress_ports: vec![8080],
@@ -9168,10 +9040,10 @@ mod tests {
             "a box on the same name and addresses is a new box with a new id"
         );
         assert!(
-            !attachments.holds_id(first.box_id())
-                && attachments.holds_id(second.box_id())
-                && attachments.holds_id(third.box_id()),
-            "the live attachments carry the new ids; the withdrawn id is never handed out again"
+            registry.row_by_box_id(first.box_id()).is_none()
+                && registry.row_by_box_id(second.box_id()).is_some()
+                && registry.row_by_box_id(third.box_id()).is_some(),
+            "the rows carry the new ids, and the withdrawn id names no row"
         );
     }
 
@@ -10158,13 +10030,13 @@ mod tests {
 
     // BEP-070: a minted id that only a revocation record holds is refused.
     // The proxy wrote the record at a destroy, and its next start restored
-    // it from the audit log. No row, creation or attachment holds the id,
+    // it from the audit log. No row or creation holds the id,
     // so the proxy's control socket is the only source that names it.
     #[test]
     fn a_minted_id_a_revocation_holds_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let audit_dir = dir.path().join("audit");
-        let id = crate::bep_attach::mint_box_id();
+        let id = crate::box_id::mint_box_id();
         let hex = super::box_id_hex(id);
 
         // The proxy's first run revokes the box and records it in the log.
@@ -10203,13 +10075,12 @@ mod tests {
         assert_eq!(refused, AllocationError::CollidingBoxId { id });
         let text = refused.to_string();
         assert!(
-            text.contains(&crate::bep_attach::BoxIdText(&id).to_string()),
+            text.contains(&crate::box_id::BoxIdText(&id).to_string()),
             "{text}"
         );
         for source in [
             "running box",
             "stopped box that can resume",
-            "attachment",
             "revocation record",
         ] {
             assert!(text.contains(source), "the refusal names {source}: {text}");
@@ -10248,7 +10119,7 @@ mod tests {
                 .unwrap();
         });
         let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(path));
-        let id = crate::bep_attach::mint_box_id();
+        let id = crate::box_id::mint_box_id();
         let refused = registry
             .register_client_box_as(client_spec("web"), Ipv4Addr::new(127, 0, 0, 2), 0, id, None)
             .expect_err("an unfinished id check refuses the registration");
@@ -10281,7 +10152,7 @@ mod tests {
         let bep_dir = dir.path().join("bep");
         let audit_dir = bep_dir.join("audit");
         let socket = bep_dir.join("control.sock");
-        let id = crate::bep_attach::mint_box_id();
+        let id = crate::box_id::mint_box_id();
         let hex = super::box_id_hex(id);
 
         // A proxy revoked the box and recorded it in the log, then stopped.
@@ -10330,7 +10201,7 @@ mod tests {
         let mut bytes = std::fs::read(&segment).unwrap();
         bytes.extend_from_slice(b"not a record\n");
         std::fs::write(&segment, bytes).unwrap();
-        let other = crate::bep_attach::mint_box_id();
+        let other = crate::box_id::mint_box_id();
         let refused = registry
             .register_client_box_as(
                 client_spec("api"),

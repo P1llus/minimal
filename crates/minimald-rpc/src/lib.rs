@@ -1565,14 +1565,22 @@ pub struct StreamOpen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StreamPurpose {
-    /// A box's connection for the credential proxy. `destination` is where
-    /// the box meant to connect, and `source_port` the box's own port.
-    CredentialProxy {
-        source_port: u16,
-        destination: std::net::SocketAddrV4,
-    },
+    /// A box's connection for the credential proxy.
+    CredentialProxy { entry: ProxyEntry },
     /// A box's connection to the host alias at `port`.
     HostPort { port: u16 },
+}
+
+/// How a box's connection came to its credential proxy endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "via", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProxyEntry {
+    /// The box connected to `destination`, and the engine sent the
+    /// connection to the endpoint. The proxy does not connect there: it
+    /// reads the port from it and resolves the server's name itself.
+    Redirected { destination: std::net::SocketAddr },
+    /// The box dialled the endpoint as its HTTP proxy.
+    Dialled {},
 }
 
 /// The one line the VM host answers a [`StreamOpen`] with. After `open` the

@@ -325,8 +325,8 @@ mod guest {
                         port: flow_port,
                         local: None,
                     };
-                    let expect_deny =
-                        live.compiled().evaluate(&flow, |_| None).verdict == FlowVerdict::Deny;
+                    let expect_deny = live.compiled().evaluate(&flow, |_| Vec::new()).verdict
+                        == FlowVerdict::Deny;
                     total += 1;
                     denied += usize::from(out == refused);
                     if (out == refused) != expect_deny {

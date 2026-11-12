@@ -52,8 +52,10 @@ impl BoxId {
 /// would fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Rule entries of one policy: its prefixes and name sets. While a
-    /// policy is being replaced the box holds the old entries too.
+    /// Rule entries of one policy: its prefixes, its name sets, and the
+    /// merged sets made for addresses that names of several sets resolve
+    /// to. While a policy is being replaced the box holds the old entries
+    /// too.
     pub rule_entries: usize,
     /// Addresses pinned at one time.
     pub pins: usize,
@@ -72,8 +74,11 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub rule_entries: usize,
+    /// Sets made for addresses that names of several sets resolve to.
+    /// Their entries are part of `rule_entries`.
+    pub merged_sets: usize,
     pub pins: usize,
-    /// Pins refused so far because the box was at its limit.
+    /// Pins refused so far because the box was at a limit.
     pub pins_refused: u64,
     /// Sockets of the box with a flow to one of its endpoints, as the
     /// programs count them.
@@ -81,6 +86,30 @@ pub struct Usage {
     /// Listening sockets of the box the programs know.
     pub listens: u32,
 }
+
+/// A merged list that did not fit: the address it was made for and the
+/// names that resolve to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetOverflow {
+    pub address: IpAddr,
+    pub names: Vec<String>,
+    pub overflow: netpol::compile::Overflow,
+}
+
+/// A set made for the addresses that names of the same several sets
+/// resolve to.
+#[derive(Debug)]
+struct Merged {
+    members: Vec<SetId>,
+    /// Its entries in the generation in force.
+    keys: Vec<abi::SetKey>,
+    /// How many pins name it. With the last one it goes.
+    addresses: usize,
+    /// Where its lists that did not fit refuse.
+    overflow: Vec<netpol::compile::Overflow>,
+}
+
+type MergedSets = StdHashMap<SetId, Merged>;
 
 /// What this process wrote for one box.
 struct Held {
@@ -90,12 +119,276 @@ struct Held {
     /// The entries of that generation.
     keys: abi::BoxKeys,
     /// The kernel map is the truth for the programs. This copy says which
-    /// set an address is pinned to, what to delete, and when.
+    /// sets an address is pinned to, what to delete, and when.
     pins: PinTable,
     pins_refused: u64,
     /// The box's own addresses. They are in the kernel's pin map too, in
     /// the set [`SetId::OWN`].
     own: BTreeSet<IpAddr>,
+    merged: MergedSets,
+    /// The first merged list of the box that did not fit, until
+    /// [`Handles::take_set_overflow`] hands it out. A box is told once.
+    overflow: Option<SetOverflow>,
+    overflow_told: bool,
+}
+
+impl Held {
+    fn rule_entries(&self) -> usize {
+        abi::rule_entries(&self.compiled) + merged_entries(&self.merged)
+    }
+
+    /// Keeps the first merged list that did not fit, for the daemon to
+    /// report.
+    fn note_overflow(&mut self, addr: IpAddr, overflow: Option<netpol::compile::Overflow>) {
+        let Some(overflow) = overflow else { return };
+        if self.overflow.is_none() && !self.overflow_told {
+            self.overflow = Some(SetOverflow {
+                address: addr,
+                names: self
+                    .pins
+                    .names(addr)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                overflow,
+            });
+        }
+    }
+}
+
+fn merged_entries(merged: &MergedSets) -> usize {
+    merged.values().map(|set| set.keys.len()).sum()
+}
+
+type PinMap = HashMap<MapData, Raw<abi::PinKey>, Raw<abi::PinVal>>;
+type SetMap = HashMap<MapData, Raw<abi::SetKey>, Raw<abi::Rules>>;
+
+/// Where the entries of merged sets are written for one policy of a box.
+struct Merging<'a> {
+    set_rules: &'a mut SetMap,
+    compiled: &'a Compiled,
+    box_id: u64,
+    generation: u32,
+    /// The most rule entries the box may have under this policy.
+    limit: usize,
+}
+
+impl Merging<'_> {
+    /// Makes sure `merged` has the set for `members`, with its entries in
+    /// the map. Returns the overflow of a set made now.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RuleEntryLimit`] when the set would take the box past its
+    /// limit, [`Error::MergedSetClash`] when its id is taken, and the map's
+    /// error. The set is then not in `merged`, and its address must have
+    /// no pin.
+    fn ensure(
+        &mut self,
+        merged: &mut MergedSets,
+        members: &[SetId],
+    ) -> Result<Option<netpol::compile::Overflow>, Error> {
+        let made = self.compiled.merged(members);
+        if let Some(known) = merged.get(&made.id) {
+            return if known.members == members {
+                Ok(None)
+            } else {
+                Err(Error::MergedSetClash)
+            };
+        }
+        if self.compiled.sets.iter().any(|set| set.id == made.id) {
+            return Err(Error::MergedSetClash);
+        }
+        let needed = abi::rule_entries(self.compiled) + merged_entries(merged) + made.entries.len();
+        if needed > self.limit {
+            return Err(Error::RuleEntryLimit {
+                needed,
+                limit: self.limit,
+            });
+        }
+        let mut keys = Vec::with_capacity(made.entries.len());
+        for entry in &made.entries {
+            let (key, value) = abi::set_entry(entry, self.box_id, self.generation);
+            if let Err(error) = self.set_rules.insert(&Raw(key), &Raw(value), 0) {
+                for key in keys {
+                    let _gone = self.set_rules.remove(&Raw(key));
+                }
+                return Err(Error::map("set_rules")(error));
+            }
+            keys.push(key);
+        }
+        merged.insert(
+            made.id,
+            Merged {
+                members: members.to_vec(),
+                keys,
+                addresses: 0,
+                overflow: made.overflow.clone(),
+            },
+        );
+        Ok(made.overflow.first().copied())
+    }
+}
+
+/// Takes one pin away from a merged set, and the set with its last pin.
+fn release(merged: &mut MergedSets, set_rules: &mut SetMap, set: SetId) {
+    let Some(held) = merged.get_mut(&set) else {
+        return;
+    };
+    held.addresses = held.addresses.saturating_sub(1);
+    if held.addresses == 0
+        && let Some(gone) = merged.remove(&set)
+    {
+        // Nothing names the set any more, so an entry a delete fails on
+        // judges nothing. The box's removal takes its generation's keys.
+        for key in gone.keys {
+            let _gone = set_rules.remove(&Raw(key));
+        }
+    }
+}
+
+/// Writes or deletes the pin of one address.
+fn write_pin(
+    pins: &mut PinMap,
+    id: BoxId,
+    addr: IpAddr,
+    placement: Option<&pins::Placement>,
+) -> Result<(), Error> {
+    let key = Raw(abi::pin_key(id.0, addr));
+    match placement {
+        Some(p) => pins
+            .insert(&key, &Raw(abi::pin_val(p.set(), p.expiry_ns)), 0)
+            .map_err(Error::map("pins")),
+        None => absent_ok(pins.remove(&key))
+            .map(drop)
+            .map_err(Error::map("pins")),
+    }
+}
+
+/// Makes the engine's entry for `addr` what the box's pin table wants at
+/// `now`: the set of its one live name, the merged set of several, or no
+/// entry.
+///
+/// # Errors
+///
+/// What kept the entry from being written. The address then has no pin:
+/// nothing judges it by name until it is placed again.
+fn place(
+    held: &mut Held,
+    pins: &mut PinMap,
+    set_rules: &mut SetMap,
+    limit: usize,
+    id: BoxId,
+    addr: IpAddr,
+    now: u64,
+) -> Result<(), Error> {
+    let wanted = held.pins.wanted(addr, now);
+    let placed = held.pins.placed(addr).cloned();
+    if wanted == placed {
+        return Ok(());
+    }
+    let mut merging = Merging {
+        set_rules,
+        compiled: &held.compiled,
+        box_id: id.0,
+        generation: held.generation,
+        limit,
+    };
+    let merged = match wanted.as_ref().filter(|w| w.is_merged()) {
+        Some(w) => merging.ensure(&mut held.merged, &w.members).map(Some),
+        None => Ok(None),
+    };
+    let written = merged.and_then(|overflow| {
+        write_pin(pins, id, addr, wanted.as_ref())?;
+        Ok(overflow)
+    });
+    let (now_placed, result) = match written {
+        Ok(overflow) => {
+            held.note_overflow(addr, overflow.flatten());
+            (wanted, Ok(()))
+        }
+        Err(error) => {
+            // Without its set the address must not keep the pin it had.
+            let _gone = write_pin(pins, id, addr, None);
+            (None, Err(error))
+        }
+    };
+    // The new set gets its pin before the old one loses it, so a set both
+    // name is never taken away in between.
+    if let Some(p) = now_placed.as_ref().filter(|p| p.is_merged())
+        && let Some(set) = held.merged.get_mut(&p.set())
+    {
+        set.addresses += 1;
+    }
+    if let Some(p) = placed.filter(pins::Placement::is_merged) {
+        release(&mut held.merged, set_rules, p.set());
+    }
+    // A set made for a pin that was then not written has no pin.
+    held.merged.retain(|_, set| {
+        if set.addresses > 0 {
+            return true;
+        }
+        for key in set.keys.drain(..) {
+            let _gone = set_rules.remove(&Raw(key));
+        }
+        false
+    });
+    held.pins.set_placed(addr, now_placed);
+    result
+}
+
+/// Places every address of a box anew for `compiled` at `generation`: the
+/// merged sets are written under that generation into `merged`, and each
+/// pin that changes is rewritten. An address whose merged set does not fit
+/// the box's limit loses its pin and is counted as refused.
+///
+/// # Errors
+///
+/// A map's error. What was written so far is in `merged`.
+#[allow(clippy::too_many_arguments)]
+fn place_all(
+    held: &mut Held,
+    pins: &mut PinMap,
+    set_rules: &mut SetMap,
+    limit: usize,
+    id: BoxId,
+    compiled: &Compiled,
+    generation: u32,
+    merged: &mut MergedSets,
+) -> Result<(), Error> {
+    let now = sys::boot_time_ns();
+    let mut merging = Merging {
+        set_rules,
+        compiled,
+        box_id: id.0,
+        generation,
+        limit,
+    };
+    let mut addrs: Vec<IpAddr> = held.pins.addresses().collect();
+    addrs.sort_unstable();
+    for addr in addrs {
+        let mut wanted = held.pins.wanted(addr, now);
+        if let Some(w) = wanted.as_ref().filter(|w| w.is_merged()) {
+            match merging.ensure(merged, &w.members) {
+                Ok(overflow) => {
+                    if let Some(set) = merged.get_mut(&w.set()) {
+                        set.addresses += 1;
+                    }
+                    held.note_overflow(addr, overflow);
+                }
+                Err(Error::RuleEntryLimit { .. } | Error::MergedSetClash) => {
+                    held.pins_refused += 1;
+                    wanted = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if wanted.as_ref() != held.pins.placed(addr) {
+            write_pin(pins, id, addr, wanted.as_ref())?;
+        }
+        held.pins.set_placed(addr, wanted);
+    }
+    Ok(())
 }
 
 /// A box whose policy is in the maps, with what is needed to change it.
@@ -268,8 +561,8 @@ pub struct Handles {
     box_cfg: HashMap<MapData, u64, Raw<abi::BoxCfg>>,
     rules4: lpm_trie::LpmTrie<MapData, [u8; 20], Raw<abi::Rules>>,
     rules6: lpm_trie::LpmTrie<MapData, [u8; 32], Raw<abi::Rules>>,
-    pins: HashMap<MapData, Raw<abi::PinKey>, Raw<abi::PinVal>>,
-    set_rules: HashMap<MapData, Raw<abi::SetKey>, Raw<abi::Rules>>,
+    pins: PinMap,
+    set_rules: SetMap,
     endpoints: HashMap<MapData, Raw<abi::EndpointKey>, Raw<abi::Endpoint>>,
     stats: PerCpuHashMap<MapData, u64, Raw<abi::Stats>>,
     box_use: HashMap<MapData, u64, Raw<abi::Usage>>,
@@ -438,28 +731,48 @@ impl Handles {
             .map_err(Error::map("stats"))
     }
 
-    /// Makes the box's pins fit `compiled`: a pin of a name the policy has
-    /// no rule for goes, and a pin whose name a more specific pattern now
-    /// covers moves to that pattern's set.
-    fn rebind_pins(&mut self, id: BoxId, compiled: &Compiled) -> Result<(), Error> {
+    /// Deletes the entries of merged sets no pin names.
+    fn discard_merged(&mut self, merged: MergedSets) {
+        let keys = merged.into_values().flat_map(|set| set.keys).collect();
+        self.discard(abi::BoxKeys {
+            sets: keys,
+            ..abi::BoxKeys::default()
+        });
+    }
+
+    /// Makes the box's pins fit `compiled` at `generation`. A name the
+    /// policy has no rule for goes, and one a more specific pattern now
+    /// covers moves to that pattern's set. Then every address is placed
+    /// again: the rules of a set, and so of a merged set, differ from one
+    /// policy to the next. The merged sets of the generation come back.
+    fn rebind_pins(
+        &mut self,
+        id: BoxId,
+        compiled: &Compiled,
+        generation: u32,
+    ) -> Result<MergedSets, Error> {
+        let mut merged = MergedSets::new();
         let Some(held) = self.boxes.get_mut(&id.0) else {
-            return Ok(());
+            return Ok(merged);
         };
-        let rebound = held.pins.rebind(|name| compiled.set_for_name(name));
-        for addr in rebound.dropped {
-            absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
-                .map_err(Error::map("pins"))?;
+        held.pins.rebind(|name| compiled.set_for_name(name));
+        let placed = place_all(
+            held,
+            &mut self.pins,
+            &mut self.set_rules,
+            self.limits.rule_entries,
+            id,
+            compiled,
+            generation,
+            &mut merged,
+        );
+        match placed {
+            Ok(()) => Ok(merged),
+            Err(error) => {
+                self.discard_merged(merged);
+                Err(error)
+            }
         }
-        for (addr, set, expiry) in rebound.moved {
-            self.pins
-                .insert(
-                    &Raw(abi::pin_key(id.0, addr)),
-                    &Raw(abi::pin_val(set, expiry)),
-                    0,
-                )
-                .map_err(Error::map("pins"))?;
-        }
-        Ok(())
     }
 
     /// Everything of [`Self::apply`] up to and including the switch.
@@ -469,18 +782,23 @@ impl Handles {
         first: bool,
         compiled: &Compiled,
         entries: &abi::BoxEntries,
-    ) -> Result<(), Error> {
+    ) -> Result<MergedSets, Error> {
         self.write(entries)?;
         if first {
             self.zero_stats(id)?;
         }
         // Before the switch: a pin of a name the new policy dropped must
         // not live into it. Until the switch such a pin admits nothing
-        // more than the old policy did.
-        self.rebind_pins(id, compiled)?;
-        self.box_cfg
-            .insert(&id.0, &Raw(entries.cfg), 0)
-            .map_err(Error::map("box_cfg"))
+        // more than the old policy did, and a pin moved to a set only the
+        // new policy has admits nothing.
+        let merged = self.rebind_pins(id, compiled, entries.cfg.generation)?;
+        match self.box_cfg.insert(&id.0, &Raw(entries.cfg), 0) {
+            Ok(()) => Ok(merged),
+            Err(error) => {
+                self.discard_merged(merged);
+                Err(Error::map("box_cfg")(error))
+            }
+        }
     }
 
     /// Puts a policy in force for a box: its first, or one that replaces
@@ -508,21 +826,27 @@ impl Handles {
         let generation = current.map_or(1, |g| g.wrapping_add(1));
         let entries = abi::entries(&compiled, id.0, generation);
         let keys = entries.keys();
-        if let Err(error) = self.switch_to(id, current.is_none(), &compiled, &entries) {
-            self.discard(keys);
-            if current.is_none() {
-                // Nothing reads the counters of a box that never started.
-                let _absent = self.stats.remove(&id.0);
-                let _absent = self.box_use.remove(&id.0);
+        let merged = match self.switch_to(id, current.is_none(), &compiled, &entries) {
+            Ok(merged) => merged,
+            Err(error) => {
+                self.discard(keys);
+                if current.is_none() {
+                    // Nothing reads the counters of a box that never started.
+                    let _absent = self.stats.remove(&id.0);
+                    let _absent = self.box_use.remove(&id.0);
+                }
+                self.keep_policy(id);
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         match self.boxes.get_mut(&id.0) {
             Some(held) => {
                 held.generation = generation;
                 held.compiled = compiled;
                 let replaced = std::mem::replace(&mut held.keys, keys);
+                let replaced_merged = std::mem::replace(&mut held.merged, merged);
                 self.discard(replaced);
+                self.discard_merged(replaced_merged);
             }
             None => {
                 self.boxes.insert(
@@ -534,11 +858,43 @@ impl Handles {
                         pins: PinTable::new(),
                         pins_refused: 0,
                         own: BTreeSet::new(),
+                        merged,
+                        overflow: None,
+                        overflow_told: false,
                     },
                 );
             }
         }
         Ok(())
+    }
+
+    /// After a policy change that failed: the pins were made to fit the
+    /// policy that did not come, so they are made to fit the one the box
+    /// keeps. A name the other policy dropped stays dropped.
+    fn keep_policy(&mut self, id: BoxId) {
+        let Some(held) = self.boxes.get_mut(&id.0) else {
+            return;
+        };
+        let compiled = Arc::clone(&held.compiled);
+        let generation = held.generation;
+        held.pins.rebind(|name| compiled.set_for_name(name));
+        let mut merged = MergedSets::new();
+        // What this cannot place has no pin, which admits nothing.
+        let _placed = place_all(
+            held,
+            &mut self.pins,
+            &mut self.set_rules,
+            self.limits.rule_entries,
+            id,
+            &compiled,
+            generation,
+            &mut merged,
+        );
+        // The sets were written under the same keys again. Those the pins
+        // no longer name go.
+        let mut old = std::mem::replace(&mut held.merged, merged);
+        old.retain(|set, _| !held.merged.contains_key(set));
+        self.discard_merged(old);
     }
 
     /// Takes a box out of the maps. The config entry goes first, so the
@@ -547,6 +903,7 @@ impl Handles {
         absent_ok(self.box_cfg.remove(&id.0)).map_err(Error::map("box_cfg"))?;
         if let Some(held) = self.boxes.remove(&id.0) {
             self.discard(held.keys);
+            self.discard_merged(held.merged);
             for addr in held.pins.addresses().chain(held.own.iter().copied()) {
                 absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr))))
                     .map_err(Error::map("pins"))?;
@@ -618,6 +975,9 @@ impl Handles {
                 0,
             )
             .map_err(Error::map("pins"))?;
+        if let Some(placed) = held.pins.placed(addr).filter(|p| p.is_merged()) {
+            release(&mut held.merged, &mut self.set_rules, placed.set());
+        }
         held.pins.remove(addr);
         held.own.insert(addr);
         Ok(())
@@ -635,20 +995,32 @@ impl Handles {
         Ok(())
     }
 
-    /// Pins an address the resolver answered for `name` to the set of that
-    /// name in the box's policy, for `ttl` from now. A pin of the same
-    /// address replaces the earlier one.
+    /// Pins an address the resolver answered for `name`, for `ttl` from
+    /// now. The address is then judged by the rules of that name's set in
+    /// the box's policy. When names of other sets are live for the address
+    /// too, it is judged by the rules of all of them in the order of the
+    /// policy's list, through a merged set this makes for it.
     ///
     /// The name is kept with the pin: when the box's policy changes, the
     /// pin follows the name to its new set or goes with it.
     ///
-    /// A box at its pin limit gets [`Error::PinLimit`], and the refusal is
-    /// counted in [`Self::usage`].
-    ///
     /// One of the box's own addresses stays its own: a name that resolves
     /// to the box itself needs no pin, since a box may always reach itself.
+    ///
+    /// # Errors
+    ///
+    /// Each of these is counted in [`Self::usage`], and each leaves the
+    /// address without what the name would have added:
+    ///
+    /// - [`Error::PinLimit`] for a box at its pin limit. The address is
+    ///   not pinned.
+    /// - [`Error::NamesPerAddress`], [`Error::RuleEntryLimit`] and
+    ///   [`Error::MergedSetClash`] when the address cannot be judged by the
+    ///   rules of all its names. It then has no pin at all, since the rules
+    ///   left out could be the ones that refuse.
     pub fn pin(&mut self, id: BoxId, addr: IpAddr, name: &str, ttl: Duration) -> Result<(), Error> {
         let limit = self.limits.pins;
+        let rule_entries = self.limits.rule_entries;
         let now = sys::boot_time_ns();
         let Some(held) = self.boxes.get_mut(&id.0) else {
             return Err(Error::UnknownBox);
@@ -661,27 +1033,45 @@ impl Handles {
         }
         if held.pins.len() >= limit && !held.pins.contains(addr) {
             // Pins that have run out give their room back first.
-            for dead in held.pins.take_expired(now) {
-                absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, dead))))
-                    .map_err(Error::map("pins"))?;
+            for lost in held.pins.expire(now) {
+                let _placed = place(
+                    held,
+                    &mut self.pins,
+                    &mut self.set_rules,
+                    rule_entries,
+                    id,
+                    lost,
+                    now,
+                );
             }
             if held.pins.len() >= limit {
                 held.pins_refused += 1;
                 return Err(Error::PinLimit { limit });
             }
         }
-        let expiry = pins::expiry(now, ttl);
-        self.pins
-            .insert(
-                &Raw(abi::pin_key(id.0, addr)),
-                &Raw(abi::pin_val(set, expiry)),
-                0,
-            )
-            .map_err(Error::map("pins"))?;
-        held.pins.insert(addr, name, set, expiry);
-        Ok(())
+        let recorded = held
+            .pins
+            .insert(addr, name, set, pins::expiry(now, ttl), now)
+            .map_err(|_| Error::NamesPerAddress {
+                limit: pins::NAMES_PER_ADDRESS,
+            });
+        let placed = place(
+            held,
+            &mut self.pins,
+            &mut self.set_rules,
+            rule_entries,
+            id,
+            addr,
+            now,
+        );
+        let result = recorded.and(placed);
+        if result.is_err() {
+            held.pins_refused += 1;
+        }
+        result
     }
 
+    /// Takes every pin of `addr` away, whatever names it was for.
     pub fn unpin(&mut self, id: BoxId, addr: IpAddr) -> Result<(), Error> {
         let Some(held) = self.boxes.get_mut(&id.0) else {
             return Ok(());
@@ -690,36 +1080,112 @@ impl Handles {
             return Ok(());
         }
         absent_ok(self.pins.remove(&Raw(abi::pin_key(id.0, addr)))).map_err(Error::map("pins"))?;
+        if let Some(placed) = held.pins.placed(addr).filter(|p| p.is_merged()) {
+            release(&mut held.merged, &mut self.set_rules, placed.set());
+        }
         held.pins.remove(addr);
         Ok(())
     }
 
-    /// The set an address is in right now: the set of the name it is
+    /// The sets an address is in right now: those of the names it is
     /// pinned for, or [`SetId::OWN`] for one of the box's own addresses.
     /// This is the table the evaluator asks.
     #[must_use]
-    pub fn pinned_set(&self, id: BoxId, addr: IpAddr) -> Option<SetId> {
-        let held = self.boxes.get(&id.0)?;
+    pub fn pinned_sets(&self, id: BoxId, addr: IpAddr) -> Vec<SetId> {
+        let Some(held) = self.boxes.get(&id.0) else {
+            return Vec::new();
+        };
         if held.own.contains(&netpol::eval::canonical(addr)) {
-            return Some(SetId::OWN);
+            return vec![SetId::OWN];
         }
         held.pins.live(addr, sys::boot_time_ns())
     }
 
-    /// Deletes pins whose time has passed. The programs already ignore
-    /// them. This gives the space back. Returns how many were deleted.
+    /// Drops the names whose time has passed and places their addresses
+    /// again: an address with no live name loses its pin, and one that
+    /// names of fewer sets are live for is judged by those. The programs
+    /// already ignore a pin from the moment its first set runs out.
+    /// Returns how many addresses were placed again.
     pub fn sweep_pins(&mut self) -> Result<usize, Error> {
         self.collect();
         let now = sys::boot_time_ns();
+        let rule_entries = self.limits.rule_entries;
         let mut swept = 0;
         for (box_id, held) in &mut self.boxes {
-            for addr in held.pins.take_expired(now) {
-                absent_ok(self.pins.remove(&Raw(abi::pin_key(*box_id, addr))))
-                    .map_err(Error::map("pins"))?;
+            for addr in held.pins.expire(now) {
+                let placed = place(
+                    held,
+                    &mut self.pins,
+                    &mut self.set_rules,
+                    rule_entries,
+                    BoxId(*box_id),
+                    addr,
+                    now,
+                );
+                match placed {
+                    Ok(()) => {}
+                    // The address has no pin now, which is what a limit
+                    // asks for.
+                    Err(Error::RuleEntryLimit { .. } | Error::MergedSetClash) => {
+                        held.pins_refused += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
                 swept += 1;
             }
         }
         Ok(swept)
+    }
+
+    /// How long until a pin runs out for an address that another name is
+    /// still live for. Nothing judges that address from then until
+    /// [`Self::sweep_pins`] has placed it again, so a daemon sweeps then.
+    #[must_use]
+    pub fn next_pin_change(&self) -> Option<Duration> {
+        let next = self
+            .boxes
+            .values()
+            .filter_map(|held| held.pins.next_change())
+            .min()?;
+        Some(Duration::from_nanos(
+            next.saturating_sub(sys::boot_time_ns()),
+        ))
+    }
+
+    /// Whether a refusal of a flow to `addr` at rule number `rule` came
+    /// from a merged list that did not fit: such a list refuses in the
+    /// place of the first rule left out of it, and that rule refused
+    /// nothing.
+    #[must_use]
+    pub fn refused_at_overflow(
+        &self,
+        id: BoxId,
+        addr: IpAddr,
+        direction: netpol::Direction,
+        rule: u16,
+    ) -> bool {
+        let Some(held) = self.boxes.get(&id.0) else {
+            return false;
+        };
+        held.pins
+            .placed(addr)
+            .filter(|placed| placed.is_merged())
+            .and_then(|placed| held.merged.get(&placed.set()))
+            .is_some_and(|set| {
+                set.overflow
+                    .iter()
+                    .any(|o| o.direction == direction && o.cut == rule)
+            })
+    }
+
+    /// The first merged list of the box that did not fit one set, once.
+    /// Such a list keeps its first rules and refuses every flow the rest
+    /// would have judged. `None` when there was none, or the box was told.
+    pub fn take_set_overflow(&mut self, id: BoxId) -> Option<SetOverflow> {
+        let held = self.boxes.get_mut(&id.0)?;
+        let overflow = held.overflow.take()?;
+        held.overflow_told = true;
+        Some(overflow)
     }
 
     /// What the box holds of the shared maps. `None` for an unknown box.
@@ -727,7 +1193,8 @@ impl Handles {
     pub fn usage(&self, id: BoxId) -> Option<Usage> {
         let Raw(counted) = self.box_use.get(&id.0, 0).unwrap_or_default();
         self.boxes.get(&id.0).map(|held| Usage {
-            rule_entries: held.keys.rules4.len() + held.keys.rules6.len() + held.keys.sets.len(),
+            rule_entries: held.rule_entries(),
+            merged_sets: held.merged.len(),
             pins: held.pins.len(),
             pins_refused: held.pins_refused,
             flows: counted.flows,

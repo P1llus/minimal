@@ -380,16 +380,12 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
-/// The supervisor's box registry: it feeds the proxy attachments, persists
-/// to `registry_file`, and sends a destroyed box's revocation to the
-/// credential proxy's control socket under the home directory.
+/// The supervisor's box registry: it persists to `registry_file`, and
+/// sends a destroyed box's revocation to the credential proxy's control
+/// socket under the home directory.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn supervisor_registry(
-    proxy_attachments: crate::bep_attach::Attachments,
-    registry_file: std::path::PathBuf,
-) -> crate::box_registry::BoxRegistry {
+fn supervisor_registry(registry_file: std::path::PathBuf) -> crate::box_registry::BoxRegistry {
     crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments)
         .with_proxy_control(crate::box_registry::home_proxy_control())
         .persisting_to(registry_file)
 }
@@ -655,13 +651,8 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         .context("setting listener to blocking")?;
 
     // The box table: what each box's creator registered with this host, and
-    // the addresses the host handed out. The credential proxy's attachment
-    // table is fed from it.
-    let proxy_attachments = crate::bep_attach::Attachments::new();
-    let boxes = supervisor_registry(
-        proxy_attachments.clone(),
-        state_dir.dir().join(crate::box_registry::REGISTRY_FILE),
-    );
+    // the addresses the host handed out.
+    let boxes = supervisor_registry(state_dir.dir().join(crate::box_registry::REGISTRY_FILE));
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
     // A stale gvproxy from a killed supervisor still holds the hostname
     // proxy's port bound, so it is reaped before the port is drawn.
@@ -4149,8 +4140,7 @@ mod tests {
     fn the_supervisors_registry_reports_to_the_credential_proxy_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("boxes.json");
-        let registry =
-            super::supervisor_registry(crate::bep_attach::Attachments::new(), file.clone());
+        let registry = super::supervisor_registry(file.clone());
         assert_eq!(
             registry.proxy_control().map(std::path::Path::to_path_buf),
             crate::box_registry::home_proxy_control(),

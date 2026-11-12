@@ -783,14 +783,7 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
         }
     }
     for set in &compiled.sets {
-        let key = SetKey {
-            box_id,
-            set_id: set.id.0,
-            generation,
-            dir: set.direction.code(),
-            _pad: [0; 3],
-        };
-        out.sets.push((key, rules_value(&set.rules)));
+        out.sets.push(set_entry(set, box_id, generation));
     }
     for (index, e) in &compiled.endpoints {
         let value = Endpoint {
@@ -810,6 +803,20 @@ pub fn entries(compiled: &Compiled, box_id: u64, generation: u32) -> BoxEntries 
         ));
     }
     out
+}
+
+/// The map entry of one set's rules for one direction, under a generation
+/// of the box's policy.
+#[must_use]
+pub fn set_entry(set: &crate::compile::SetEntry, box_id: u64, generation: u32) -> (SetKey, Rules) {
+    let key = SetKey {
+        box_id,
+        set_id: set.id.0,
+        generation,
+        dir: set.direction.code(),
+        _pad: [0; 3],
+    };
+    (key, rules_value(&set.rules))
 }
 
 /// The key of a pin.

@@ -115,6 +115,30 @@ pub struct SetEntry {
     pub rules: Vec<Slot>,
 }
 
+/// The rules of an address that names of several sets resolve to: the
+/// rules of all of those sets, in the order of the policy's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedSet {
+    /// [`crate::pins::merged_id`] of the members.
+    pub id: SetId,
+    /// One entry for each direction the members have rules for.
+    pub entries: Vec<SetEntry>,
+    /// One for each direction whose rules did not fit one list.
+    pub overflow: Vec<Overflow>,
+}
+
+/// A merged list that did not fit. It holds the rules that did and then
+/// refuses the rest: every flow the missing rules would have judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    pub direction: Direction,
+    /// How many rules the members have for the direction between them.
+    pub rules: usize,
+    /// The position of the first rule left out. The list refuses there,
+    /// so a refusal with this rule number is the list's and not the rule's.
+    pub cut: u16,
+}
+
 /// The settings of a box that are not rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoxConfig {
@@ -496,6 +520,61 @@ impl Compiled {
             .map(|(_, e)| e)
     }
 
+    /// The set that judges an address in every one of `members`: more
+    /// than one set of this policy, sorted. A member this policy has no
+    /// rules for adds nothing.
+    ///
+    /// A list holds [`abi::RULES_MAX`] rules. Where the members have more
+    /// for a direction, the list keeps those that come first and ends with
+    /// a deny in the place of the first one left out. A flow that an
+    /// earlier rule decides is judged as before, and no other flow passes.
+    #[must_use]
+    pub fn merged(&self, members: &[SetId]) -> MergedSet {
+        let id = crate::pins::merged_id(members);
+        let mut entries = Vec::new();
+        let mut overflow = Vec::new();
+        for direction in Direction::ALL {
+            let mut slots: Vec<Slot> = members
+                .iter()
+                .filter_map(|member| self.set_rules(*member, direction))
+                .flatten()
+                .copied()
+                .collect();
+            // A rule for a pattern that covers two members is in both lists.
+            slots.sort_unstable_by_key(|slot| slot.prio);
+            slots.dedup_by_key(|slot| slot.prio);
+            let mut rules = prune(slots.into_iter());
+            if let Some(first_left_out) = rules.get(abi::RULES_MAX - 1).copied()
+                && rules.len() > abi::RULES_MAX
+            {
+                overflow.push(Overflow {
+                    direction,
+                    rules: rules.len(),
+                    cut: first_left_out.prio,
+                });
+                rules.truncate(abi::RULES_MAX - 1);
+                rules.push(Slot {
+                    prio: first_left_out.prio,
+                    protocols: Protocols::ALL,
+                    ports: PortRange::ALL,
+                    action: Action::Deny,
+                });
+            }
+            if !rules.is_empty() {
+                entries.push(SetEntry {
+                    id,
+                    direction,
+                    rules,
+                });
+            }
+        }
+        MergedSet {
+            id,
+            entries,
+            overflow,
+        }
+    }
+
     pub(crate) fn set_rules(&self, id: SetId, direction: Direction) -> Option<&[Slot]> {
         self.sets
             .iter()
@@ -693,7 +772,10 @@ mod tests {
         d.services.credential_proxy = Some(at(20481));
         d.services.hostname_proxy = Some(at(20482));
         d.services.host_relay = Some(at(20483));
-        d.steered = vec!["api.example.com".parse().unwrap()];
+        d.steered = vec![crate::base::Steered {
+            name: "api.example.com".parse().unwrap(),
+            port: 443,
+        }];
         d.node_hostname_proxy = vec!["127.0.0.1:7654".parse().unwrap()];
         d.endpoint_ranges = vec![EndpointRange {
             prefix: p("127.0.80.1/32"),
@@ -857,7 +939,7 @@ mod tests {
             port: 443,
             local: None,
         };
-        c.evaluate(&flow, |_| pinned).verdict
+        c.evaluate(&flow, |_| pinned.into_iter().collect()).verdict
     }
 
     #[test]
@@ -895,7 +977,7 @@ mod tests {
                 port: 443,
                 local: None,
             },
-            |_| None,
+            |_| Vec::new(),
         );
         let by = &c.rules[usize::from(d.rule.unwrap())];
         assert_eq!(

@@ -69,7 +69,7 @@ pub struct PortOf {
 pub struct Services {
     /// All DNS of the box is redirected here.
     pub resolver: Option<Endpoint>,
-    /// TCP 443 to steered names is redirected here.
+    /// TCP to steered authorities is redirected here.
     pub credential_proxy: Option<Endpoint>,
     /// Where the box's requests to the node's hostname proxy end up.
     pub hostname_proxy: Option<Endpoint>,
@@ -84,6 +84,13 @@ pub struct Services {
 pub struct EndpointRange {
     pub prefix: Prefix,
     pub ports: PortRange,
+}
+
+/// A name and port whose TCP connections go through the credential proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Steered {
+    pub name: NamePattern,
+    pub port: u16,
 }
 
 /// What the base policy is built from.
@@ -102,8 +109,8 @@ pub struct Deployment {
     pub published: Vec<PortOf>,
     pub services: Services,
     pub endpoint_ranges: Vec<EndpointRange>,
-    /// Names whose TCP 443 goes through the credential proxy.
-    pub steered: Vec<NamePattern>,
+    /// The authorities whose TCP goes through the credential proxy.
+    pub steered: Vec<Steered>,
     /// Where the node's hostname proxy listens for programs outside boxes.
     /// A box that dials one of these gets its own proxy endpoint instead.
     pub node_hostname_proxy: Vec<SocketAddr>,
@@ -298,13 +305,13 @@ fn resolver(endpoint: Option<Endpoint>, out: &mut Vec<Rule>) {
     }
 }
 
-/// TCP 443 to a steered name goes through the credential proxy. UDP 443 is
-/// refused so that a client falls back from QUIC at once.
-fn steering(proxy: Option<Endpoint>, names: &[NamePattern], out: &mut Vec<Rule>) {
+/// TCP to a steered authority goes through the credential proxy. UDP to it
+/// is refused, so that a client falls back from QUIC at once.
+fn steering(proxy: Option<Endpoint>, steered: &[Steered], out: &mut Vec<Rule>) {
     if proxy.is_none() {
         return;
     }
-    for name in names {
+    for Steered { name, port } in steered {
         let target = Target::Names(name.clone());
         out.push(
             egress(
@@ -313,12 +320,12 @@ fn steering(proxy: Option<Endpoint>, names: &[NamePattern], out: &mut Vec<Rule>)
                 Origin::Steering,
             )
             .protocols(Protocols::TCP)
-            .ports(PortRange::one(443)),
+            .ports(PortRange::one(*port)),
         );
         out.push(
             egress(target, Action::Deny, Origin::Steering)
                 .protocols(Protocols::UDP)
-                .ports(PortRange::one(443)),
+                .ports(PortRange::one(*port)),
         );
     }
 }
@@ -737,9 +744,12 @@ mod tests {
     }
 
     #[test]
-    fn steering_needs_a_proxy_endpoint() {
+    fn steering_needs_a_proxy_endpoint_and_follows_the_authority_s_port() {
         let mut d = own_ip();
-        d.steered = vec!["api.example.com".parse().unwrap()];
+        d.steered = vec![Steered {
+            name: "api.example.com".parse().unwrap(),
+            port: 8443,
+        }];
         assert!(
             base_policy(&d)
                 .before
@@ -762,6 +772,16 @@ mod tests {
             Action::Redirect(CREDENTIAL_PROXY)
         );
         assert_eq!(steer.last().unwrap().action, Action::Deny);
+        // Each rule is for the authority's own port and one transport.
+        let l4: Vec<(Protocols, PortRange)> =
+            steer.iter().map(|r| (r.protocols, r.ports)).collect();
+        assert_eq!(
+            l4,
+            [
+                (Protocols::TCP, PortRange::one(8443)),
+                (Protocols::UDP, PortRange::one(8443))
+            ]
+        );
     }
 
     #[test]

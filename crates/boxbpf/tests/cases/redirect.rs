@@ -9,7 +9,7 @@ use std::{
 
 use netpol::{
     Endpoint, FlowVerdict, PortRange, Prefix, Protocol,
-    base::{CREDENTIAL_PROXY, Deployment, EndpointRange, RESOLVER},
+    base::{CREDENTIAL_PROXY, Deployment, EndpointRange, RESOLVER, Steered},
     policy::BoxPolicy,
 };
 
@@ -175,7 +175,7 @@ fn dns_is_redirected_to_the_box_endpoint_and_boxes_are_isolated() {
         local: None,
     };
     assert_eq!(
-        box_a.compiled().evaluate(&flow, |_| None).verdict,
+        box_a.compiled().evaluate(&flow, |_| Vec::new()).verdict,
         FlowVerdict::Redirect(SocketAddr::V4(ep_a.v4.expect("v4")))
     );
 }
@@ -210,7 +210,10 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
 
     let mut deployment = host_ip();
     deployment.services.credential_proxy = Some(proxy);
-    deployment.steered = vec!["steered.test".parse().expect("name")];
+    deployment.steered = vec![Steered {
+        name: "steered.test".parse().expect("name"),
+        port: 443,
+    }];
     let policy = BoxPolicy {
         names: vec!["allowed.test".parse().expect("name")],
         ..BoxPolicy::default()
@@ -321,7 +324,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
     h.handles
         .pin(id, target, "allowed.test", Duration::from_millis(900))
         .expect("pin");
-    assert_eq!(h.handles.pinned_set(id, target), Some(allowed));
+    assert_eq!(h.handles.pinned_sets(id, target), [allowed]);
     assert!(
         h.probe("c", &["tcp", &target_s, &banner, "300"])
             .ends_with("data=hello")
@@ -329,7 +332,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
     let mut open_flow = h.hold_probe("c", &["hold-udp", &target_s, &echo]);
     std::thread::sleep(Duration::from_millis(1100));
 
-    assert_eq!(h.handles.pinned_set(id, target), None);
+    assert_eq!(h.handles.pinned_sets(id, target), []);
     assert_eq!(
         h.probe("c", &["tcp", &target_s, &banner, "300"]),
         refused(),

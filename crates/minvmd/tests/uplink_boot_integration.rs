@@ -504,7 +504,7 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
     // The credential proxy: only for a box registered with a grant.
     let proxy = |id: &minimald_rpc::BoxId| {
         format!(
-            r#"{{"box_id":"{id}","purpose":{{"kind":"credential_proxy","source_port":51234,"destination":"140.82.112.3:443"}}}}"#
+            r#"{{"box_id":"{id}","purpose":{{"kind":"credential_proxy","entry":{{"via":"redirected","destination":"140.82.112.3:443"}}}}}}"#
         )
     };
     let no_grant = shell.stream(&proxy(&web.box_id));
@@ -521,8 +521,8 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
     assert!(delivered.contains(r#"{"stream":"open"}"#), "{delivered}");
     assert!(
         delivered.contains(&format!(
-            "source={}:51234 destination=140.82.112.3:443",
-            granted.switch_address
+            "box_id={} entry=redirected destination=140.82.112.3:443",
+            granted.box_id
         )),
         "{delivered}"
     );

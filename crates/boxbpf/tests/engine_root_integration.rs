@@ -13,6 +13,7 @@ mod support;
 
 mod cases {
     pub mod loader;
+    pub mod merged;
     pub mod netns;
     pub mod parity;
     pub mod reconfigure;

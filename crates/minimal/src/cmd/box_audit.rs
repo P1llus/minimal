@@ -858,19 +858,19 @@ mod tests {
     // the hyphenated id a person sees in `min ls`.
     #[test]
     fn box_audit_reads_a_record_the_proxy_wrote_for_a_minted_id() {
-        use bep::listener::Delivery;
-        use std::net::{Ipv4Addr, SocketAddrV4};
+        use bep::listener::{Delivery, Entry};
 
         let minted = boxes::SessionId::mint();
         let other = boxes::SessionId::mint();
         let dir = tempfile::tempdir().unwrap();
         let mut log = AuditLog::open(dir.path().join(segment_name(1))).unwrap();
         for (box_id, authority) in [(minted, "mine.example:443"), (other, "other.example:443")] {
-            // As the switch peer writes the header and `bep serve` reads it.
+            // As the VM host writes the header and `bep serve` reads it.
             let sent = Delivery {
                 box_id: box_id.to_bytes(),
-                source: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40000),
-                destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 443),
+                entry: Entry::Redirected {
+                    destination: "140.82.112.3:443".parse().unwrap(),
+                },
             };
             let delivery = Delivery::parse(&sent.emit()).unwrap();
             let mut record = decision(A, authority);

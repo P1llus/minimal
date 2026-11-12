@@ -415,7 +415,7 @@ mod tests {
             local: None,
         };
         assert_eq!(
-            compiled.evaluate(&flow, |_| None).verdict,
+            compiled.evaluate(&flow, |_| Vec::new()).verdict,
             FlowVerdict::Deny
         );
     }
@@ -447,7 +447,7 @@ mod tests {
                 port: 7654,
                 local: None,
             };
-            compiled.evaluate(&flow, |_| None).verdict
+            compiled.evaluate(&flow, |_| Vec::new()).verdict
         };
         let redirected = FlowVerdict::Redirect(SocketAddr::V4(endpoint));
         // The guest's listener accepts on every address, and a box can
@@ -485,10 +485,12 @@ mod tests {
             local: None,
         };
         assert!(matches!(
-            compiled.evaluate(&to(53, Protocol::Udp), |_| None).verdict,
+            compiled
+                .evaluate(&to(53, Protocol::Udp), |_| Vec::new())
+                .verdict,
             FlowVerdict::Redirect(_)
         ));
-        let api = compiled.evaluate(&to(80, Protocol::Tcp), |_| None);
+        let api = compiled.evaluate(&to(80, Protocol::Tcp), |_| Vec::new());
         assert_eq!(api.verdict, FlowVerdict::Deny);
         let rule = &compiled.rules[usize::from(api.rule.expect("a rule decided"))];
         assert_eq!(
