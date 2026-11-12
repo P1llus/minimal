@@ -9480,6 +9480,121 @@ async fn box_restart_until_stopped_restarts_same_id_and_name() {
     }
 }
 
+/// A stand-in for the VM host daemon beside `host`: it answers the admit
+/// and the retire of a `host_ip` box and records them in order.
+async fn vm_host_residency(
+    host: &LocalHost,
+) -> std::sync::Arc<std::sync::Mutex<Vec<minimald_rpc::BoxControlRequest>>> {
+    use minimald_rpc::{BoxControlReply, BoxControlRequest};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let sock = cmd::control_sock_beside(&host.sock).expect("the host's socket has a directory");
+    let listener = tokio::net::UnixListener::bind(sock).expect("bind the control socket");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut lines = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            if lines.read_line(&mut line).await.is_err() {
+                continue;
+            }
+            let Ok(request) = serde_json_lenient::from_str::<BoxControlRequest>(line.trim()) else {
+                continue;
+            };
+            let (session_id, resident) = match &request {
+                BoxControlRequest::AdmitHostIpBox(admit) => (admit.session_id, true),
+                BoxControlRequest::RetireHostIpBox(retire) => (retire.session_id, false),
+                _ => continue,
+            };
+            recorded.lock().unwrap().push(request);
+            let reply = serde_json_lenient::to_string(&BoxControlReply::HostIpBox {
+                session_id,
+                resident,
+            })
+            .expect("a reply serializes");
+            let mut stream = lines.into_inner();
+            let _sent = stream.write_all(format!("{reply}\n").as_bytes()).await;
+        }
+    });
+    seen
+}
+
+/// A restart runs the box's program. On a VM-backed host a `host_ip` box
+/// is therefore resident on the VM host before the restart request goes
+/// out, also after `min box stop` retired it. A stopped box whose restart
+/// does not happen is retired again.
+#[tokio::test]
+async fn box_restart_admits_a_host_ip_box_before_it_runs() {
+    use minimald_rpc::{BoxControlRequest, Errorable, HostIpBoxEnd, RestartBoxResponse};
+
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let residency = vm_host_residency(&alpha.host).await;
+    let mut daemon = alpha.server.connect().await;
+    let id = create_box_with_spec(
+        &mut daemon,
+        "api",
+        alpha.project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilStopped)),
+    )
+    .await;
+    alpha.stop("api").await;
+
+    let mut resident_at_restart = Vec::new();
+    cmd::restart_box_on_hosts_with(
+        vec![alpha.host.clone()],
+        &mut Vec::new(),
+        "api",
+        async |_client, _request| {
+            resident_at_restart.clone_from(&residency.lock().unwrap());
+            Ok(Errorable::Ok(RestartBoxResponse::Restarted {
+                was_running: false,
+            }))
+        },
+    )
+    .await
+    .expect("the restart succeeds");
+    assert!(
+        matches!(
+            resident_at_restart.as_slice(),
+            [BoxControlRequest::AdmitHostIpBox(admit)] if admit.session_id == id
+        ),
+        "the box is admitted before the request that runs it: {resident_at_restart:?}"
+    );
+    assert_eq!(
+        residency.lock().unwrap().len(),
+        1,
+        "a box that runs again stays resident"
+    );
+
+    residency.lock().unwrap().clear();
+    cmd::restart_box_on_hosts_with(
+        vec![alpha.host.clone()],
+        &mut Vec::new(),
+        "api",
+        async |_client, _request| {
+            Ok(Errorable::Err {
+                error: "the box cannot start".to_owned(),
+            })
+        },
+    )
+    .await
+    .expect_err("the daemon did not restart the box");
+    let after = residency.lock().unwrap().clone();
+    assert!(
+        matches!(
+            after.as_slice(),
+            [
+                BoxControlRequest::AdmitHostIpBox(admit),
+                BoxControlRequest::RetireHostIpBox(retire),
+            ] if admit.session_id == id
+                && retire.session_id == id
+                && retire.end == HostIpBoxEnd::Stopped
+        ),
+        "a stopped box that did not start is retired again: {after:?}"
+    );
+}
+
 /// BCLI-074: `min box restart` of a box that runs to completion fails with
 /// exit 2 and names `min box run <entry>`, the hint BCLI-009 chooses by
 /// `lifetime`. The box is left as it was, running or stopped.

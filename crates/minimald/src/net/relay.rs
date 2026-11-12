@@ -74,9 +74,6 @@ pub(crate) struct Kind {
     pub(crate) source: Source,
     /// The streams one box holds through endpoints of this kind at once.
     pub(crate) most: usize,
-    /// The refusal as an event names it, when a rule of the user's is
-    /// behind it. A service that is not running is no rule.
-    pub(crate) reason: fn(&Refused) -> Option<&'static str>,
 }
 
 /// The reason of the event for a stream past [`Kind::most`].
@@ -87,13 +84,6 @@ pub(crate) static HOST_RELAY: Kind = Kind {
     service: Service::HostRelay,
     source: Source::HostRelay,
     most: minimald_rpc::MAX_HOST_PORT_STREAMS,
-    reason: |refused| match refused {
-        Refused::NotExposed | Refused::Door(StreamRefusal::PortNotExposed) => {
-            Some("host_port_not_exposed")
-        }
-        Refused::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
-        Refused::Denied | Refused::Unreachable(_) | Refused::Door(_) => None,
-    },
 };
 
 /// The endpoint a box's connections for the credential proxy arrive at:
@@ -103,13 +93,6 @@ pub(crate) static CREDENTIAL_PROXY: Kind = Kind {
     service: Service::CredentialProxy,
     source: Source::CredentialProxy,
     most: minimald_rpc::MAX_CREDENTIAL_PROXY_STREAMS,
-    reason: |refused| match refused {
-        // No rule either, but nothing else tells the user why every
-        // request with a secret fails.
-        Refused::Door(StreamRefusal::ProxyDown) => Some("credential_proxy_down"),
-        Refused::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
-        Refused::NotExposed | Refused::Denied | Refused::Unreachable(_) | Refused::Door(_) => None,
-    },
 };
 
 /// The streams one box holds, for each kind of endpoint.
@@ -191,6 +174,30 @@ pub(crate) enum Refused {
     Unreachable(io::Error),
     /// The VM host decided against the stream.
     Door(StreamRefusal),
+}
+
+impl Refused {
+    /// The refusal as the box's event names it. `None` when a rule of the
+    /// box refused, which was reported with the rule, and when nothing
+    /// accepted the connection: the box's own connection then fails as it
+    /// would at the port itself.
+    ///
+    /// Every decision of the VM host's door is named. The door tells only
+    /// the daemon, so without an event the box's user sees a closed
+    /// connection and no cause.
+    pub(crate) const fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotExposed | Self::Door(StreamRefusal::PortNotExposed) => {
+                Some("host_port_not_exposed")
+            }
+            Self::Door(StreamRefusal::UnknownBox) => Some("unknown_box"),
+            Self::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
+            Self::Door(StreamRefusal::ProxyDown) => Some("credential_proxy_down"),
+            Self::Door(StreamRefusal::Busy) => Some(TOO_MANY_STREAMS),
+            Self::Door(StreamRefusal::Malformed) => Some("malformed_stream_request"),
+            Self::Denied | Self::Unreachable(_) | Self::Door(StreamRefusal::ConnectFailed) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -509,7 +516,6 @@ async fn relay(
             peer,
             from,
             original,
-            kind,
             slot,
             Arc::clone(&dial),
             Arc::clone(&report),
@@ -559,13 +565,11 @@ impl Drop for Ends {
 /// Carries one connection of the box until either end closes it, the
 /// dialler takes its permission back, or the endpoint that accepted it is
 /// removed. `slot` is its place in the box's count.
-#[expect(clippy::too_many_arguments, reason = "one call site, which names each")]
 async fn carry(
     mut ends: Ends,
     peer: SocketAddr,
     from: BoxId,
     original: SocketAddr,
-    kind: &'static Kind,
     slot: Slot,
     dial: Arc<dyn Dial>,
     report: Arc<Report>,
@@ -581,7 +585,7 @@ async fn carry(
         }
         Err(refused) => {
             tracing::debug!(box_id = %from, %original, %refused, "a relayed connection was refused");
-            if let Some(reason) = (kind.reason)(&refused) {
+            if let Some(reason) = refused.reason() {
                 report(original, reason);
             }
             // The box sees what a closed port answers.
@@ -672,7 +676,6 @@ mod tests {
         service: Service::HostRelay,
         source: Source::HostRelay,
         most: 2,
-        reason: HOST_RELAY.reason,
     };
 
     async fn until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -992,11 +995,14 @@ mod tests {
             let StreamPurpose::HostPort { port } = open.purpose else {
                 panic!("{open:?}")
             };
-            if port != 5432 {
-                stream
-                    .write_all(b"{\"stream\":\"refused\",\"reason\":\"port_not_exposed\"}\n")
-                    .await
-                    .unwrap();
+            // The door holds no box for port 80's stream yet.
+            let refusal: Option<&[u8]> = match port {
+                5432 => None,
+                80 => Some(b"{\"stream\":\"refused\",\"reason\":\"unknown_box\"}\n"),
+                _ => Some(b"{\"stream\":\"refused\",\"reason\":\"port_not_exposed\"}\n"),
+            };
+            if let Some(refusal) = refusal {
+                stream.write_all(refusal).await.unwrap();
                 return;
             }
             stream.write_all(b"{\"stream\":\"open\"}\n").await.unwrap();
@@ -1013,12 +1019,22 @@ mod tests {
         client.shutdown().await.unwrap();
         assert_eq!(read_to_end(client).await, (b"cba".to_vec(), false));
 
-        let closed = bench(dial, alias(22)).await;
+        let closed = bench(Arc::clone(&dial), alias(22)).await;
         let client = TcpStream::connect(closed.at).await.unwrap();
         assert!(read_to_end(client).await.1);
         assert_eq!(
             *closed.reports.lock().unwrap(),
             [(alias(22), "host_port_not_exposed")]
+        );
+
+        // Whatever the door decides against a stream reaches the box's
+        // events under the door's reason.
+        let unknown = bench(dial, alias(80)).await;
+        let client = TcpStream::connect(unknown.at).await.unwrap();
+        assert!(read_to_end(client).await.1);
+        assert_eq!(
+            *unknown.reports.lock().unwrap(),
+            [(alias(80), "unknown_box")]
         );
     }
 

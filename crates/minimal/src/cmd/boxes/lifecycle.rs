@@ -1091,13 +1091,51 @@ pub(crate) async fn restart_box_on_hosts_with(
     let resolved = resolve_box_on_hosts(hosts, target, "box restart").await?;
     let mut client = gated_box_host_client(&resolved.host).await?;
     crate::output::record_box_id(&resolved.box_id.to_string());
+    // A restart runs the box's program, as an attach and an exec do. A
+    // `host_ip` box that `min box stop` retired is not resident on the VM
+    // host any more, whose stream door refuses a box it does not hold, so
+    // the box is admitted before the request that runs it.
+    let control_sock = box_host_control_sock(&resolved.host);
+    let stopped_host_ip_box = if control_sock.is_some() {
+        let record = attached_box_record(&resolved.host.sock, resolved.box_id)
+            .await
+            .ok()
+            .flatten();
+        rehold_held_name_before_attach(
+            paths::HostKind::Minvmd,
+            &resolved.host.sock,
+            resolved.box_id,
+            record.as_ref(),
+        )
+        .await;
+        record.is_some_and(|record| {
+            record.network == boxes::NetworkMode::HostNet
+                && matches!(
+                    record.status,
+                    boxes::BoxState::Stopped | boxes::BoxState::Exited
+                )
+        })
+    } else {
+        false
+    };
     let request = minimald_rpc::RestartBoxRequest {
         id: resolved.box_id,
     };
     let answer = send(&mut client, request)
         .await
-        .context("RestartBox RPC failed")?;
-    finish_restart(out, resolved.box_id, target, answer)?;
+        .context("RestartBox RPC failed");
+    let restarted = matches!(
+        answer,
+        Ok(minimald_rpc::Errorable::Ok(
+            minimald_rpc::RestartBoxResponse::Restarted { .. }
+        ))
+    );
+    // A stopped box that did not start again is retired again, as its
+    // stop retired it.
+    if stopped_host_ip_box && !restarted {
+        retire_stopped_box_with_vm_host(control_sock, resolved.box_id).await;
+    }
+    finish_restart(out, resolved.box_id, target, answer?)?;
     Ok(resolved)
 }
 

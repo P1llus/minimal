@@ -368,7 +368,6 @@ impl Dial for CredentialProxy {
 mod tests {
     use super::*;
     use crate::net::door::testing::{FakeHost, box_id};
-    use crate::net::relay::CREDENTIAL_PROXY;
     use minimald_rpc::StreamRefusal;
     use proptest::prelude::*;
     use tokio::net::TcpListener;
@@ -471,6 +470,18 @@ mod tests {
             (
                 "{\"stream\":\"refused\",\"reason\":\"unknown_box\"}\n",
                 StreamRefusal::UnknownBox,
+                Some("unknown_box"),
+            ),
+            (
+                "{\"stream\":\"refused\",\"reason\":\"busy\"}\n",
+                StreamRefusal::Busy,
+                Some("too_many_streams"),
+            ),
+            // Nothing listens on the host: the box's connection fails as
+            // it would there, and no decision is behind it.
+            (
+                "{\"stream\":\"refused\",\"reason\":\"connect_failed\"}\n",
+                StreamRefusal::ConnectFailed,
                 None,
             ),
         ] {
@@ -487,7 +498,7 @@ mod tests {
                 matches!(&refused, Refused::Door(got) if *got == refusal),
                 "{refused}"
             );
-            assert_eq!((CREDENTIAL_PROXY.reason)(&refused), reason);
+            assert_eq!(refused.reason(), reason);
         }
     }
 
@@ -678,7 +689,7 @@ mod tests {
         assert!(asked.is_empty());
         // The refusal was reported where it was decided, so the endpoint
         // adds no event of its own.
-        assert_eq!((CREDENTIAL_PROXY.reason)(&Refused::Denied), None);
+        assert_eq!(Refused::Denied.reason(), None);
     }
 
     #[tokio::test]
