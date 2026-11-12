@@ -453,6 +453,10 @@ enum BoxMessage {
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
     GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
+    /// A command for the box was refused because the box does not run. In a
+    /// VM the client admitted the box on the VM host before it asked, so
+    /// the VM host is told again that the box does not run.
+    RefusedNotRunning,
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `BoxActor::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -613,9 +617,11 @@ pub struct BoxActor {
     /// The box's cgroup, while it has one: every process that runs in or
     /// for the box starts in it.
     cgroup: Option<sandbox::cgroup::BoxCgroup>,
-    /// Set when the box's cgroup and its entry in the policy engine went,
-    /// until [`Self::report_end_to_vm_host`] has looked at it.
-    engine_entry_removed: bool,
+    /// The sequence number of the moment the box had no entry in the
+    /// policy engine, until [`Self::report_end_to_vm_host`] has looked at
+    /// it: taken when the entry is removed, and when a command is refused
+    /// because the box does not run.
+    entry_removed: Option<u64>,
 
     /// The ports this box published at runtime with its own `min net expose`
     /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
@@ -847,7 +853,7 @@ impl BoxActor {
             daemon_ctx,
             net_switch,
             cgroup: None,
-            engine_entry_removed: false,
+            entry_removed: None,
             deny_all_opt_out,
             tracker: OpTracker::new_root(),
             inner,
@@ -2227,27 +2233,26 @@ impl BoxActor {
         }
     }
 
-    /// Tells the VM host that the box has ended, when the box lost its
-    /// entry in the policy engine since the last call and has none now. The
-    /// loop calls this between two messages. A restart takes the entry out
-    /// and puts one in within one message, so the box keeps what the VM
-    /// host holds for it.
+    /// Tells the VM host that the box does not run, when the box was
+    /// without an entry in the policy engine since the last call and has
+    /// none now. The loop calls this between two messages. A restart takes
+    /// the entry out and puts one in within one message, so nothing is told
+    /// and the box keeps what the VM host holds for it. The word carries
+    /// the sequence number of the moment the entry went, so one that is
+    /// told late does not undo a newer one. Nothing is told on a node that
+    /// has no VM host.
     fn report_end_to_vm_host(&mut self) {
-        if !std::mem::take(&mut self.engine_entry_removed) || self.cgroup.is_some() {
+        let Some(seq) = self.entry_removed.take() else {
+            return;
+        };
+        if self.cgroup.is_some() {
             return;
         }
-        let (switch, box_id) = (Arc::clone(&self.net_switch), *self.record.id());
-        // On a task of its own: the report waits for the switch's lock and
-        // for the VM host, and the box's end waits for neither.
-        crate::traced::spawn_detached(
-            tracing::info_span!(parent: None, "net.end_box", %box_id),
-            async move {
-                switch_control_of(&switch, Some(box_id))
-                    .await
-                    .report_box_end()
-                    .await;
-            },
-        );
+        if let Some(reports) = crate::net::run_reports::current() {
+            // Sent on a task of its own: the box's end does not wait for
+            // the VM host.
+            drop(reports.tell(*self.record.id(), seq, false));
+        }
     }
 
     /// Ends the box when its entrypoint returned on its own (BOX-038): sets
@@ -2784,6 +2789,13 @@ impl BoxActor {
             }
             BoxMessage::GetNetSwitch(r) => {
                 let _ = r.send(Arc::clone(&self.net_switch));
+            }
+            BoxMessage::RefusedNotRunning => {
+                // Decided here, in the loop that installs the entry: a
+                // resume that runs beside the refusal is told after it.
+                if self.cgroup.is_none() {
+                    self.entry_removed = Some(crate::net::run_reports::next_seq());
+                }
             }
             #[cfg(test)]
             BoxMessage::PeekComposition(r) => {

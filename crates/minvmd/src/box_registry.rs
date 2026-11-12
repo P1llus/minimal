@@ -756,6 +756,12 @@ struct Creation {
     /// loads dormant.
     #[serde(skip)]
     standing: bool,
+    /// Whether the guest's word that the box ended took the row away
+    /// ([`BoxRegistry::set_aside_row`]). Only such a row comes back at the
+    /// guest's word that the box runs again. Not persisted: after a restart
+    /// a row comes back at its creator's word alone.
+    #[serde(skip)]
+    set_aside: bool,
 }
 
 impl Creation {
@@ -777,6 +783,7 @@ impl Creation {
             dynamic_allowed_range: spec.dynamic_allowed_range,
             task_addresses,
             standing: true,
+            set_aside: false,
         }
     }
 
@@ -1580,6 +1587,13 @@ pub enum ResumeError {
         /// The name the resume presented.
         name: String,
     },
+    /// The guest said something newer about the box while its row was on
+    /// its way back at the guest's word that it runs.
+    #[error("the guest's word that box {name:?} runs is no longer its newest")]
+    NoLongerWanted {
+        /// The creation's own name.
+        name: String,
+    },
     /// The creation under the name was handed another pair than the one
     /// presented: not the resuming client's box.
     #[error(
@@ -1644,6 +1658,16 @@ pub enum Resumable {
         /// The creation's own name.
         name: String,
     },
+}
+
+/// A row the guest's word set aside ([`BoxRegistry::row_set_aside`]): the
+/// name and the addresses its creation keeps for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAsideRow {
+    /// The creation's own name.
+    pub name: String,
+    pub switch_address: Ipv4Addr,
+    pub loopback_address: Ipv4Addr,
 }
 
 /// The row that stands for `creation`, when one does: the row at its
@@ -2720,8 +2744,12 @@ pub struct BoxRegistry {
     /// same name.
     held_names: Arc<RwLock<BTreeMap<String, Option<boxes::SessionId>>>>,
     /// The resident `host_ip` boxes, by session
-    /// ([`Self::admit_host_ip_box`]), shared by every clone.
+    /// ([`Self::admit_host_ip_box`]), and the ones the guest's word set
+    /// aside, shared by every clone.
     host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
+    /// The sequence of the newest run report taken for each box
+    /// ([`Self::take_run_report`]), shared by every clone.
+    run_reports: Arc<Mutex<BTreeMap<BoxId, u64>>>,
     /// The ids minted for `host_ip` boxes ([`Self::register_host_ip_box`],
     /// BEP-082), shared by every clone. A `host_ip` box has no row in the
     /// address table, so this map is the record of its id, each with the
@@ -3217,6 +3245,7 @@ impl Clone for BoxRegistry {
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
             host_ip_boxes: Arc::clone(&self.host_ip_boxes),
+            run_reports: Arc::clone(&self.run_reports),
             host_ip_ids: Arc::clone(&self.host_ip_ids),
             unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
             table_pings: Arc::clone(&self.table_pings),
@@ -3254,6 +3283,7 @@ impl BoxRegistry {
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
             host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
+            run_reports: Arc::new(Mutex::new(BTreeMap::new())),
             host_ip_ids: Arc::new(Mutex::new(HostIpIds::default())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
@@ -5145,6 +5175,7 @@ impl BoxRegistry {
         );
         let standing = Creation {
             standing: true,
+            set_aside: false,
             ..creation
         };
         let record = self.try_register_since(registration, Some(generation), Some(standing))?;
@@ -5438,6 +5469,96 @@ impl BoxRegistry {
             .expect("the row lock is never held across a panic, so it cannot be poisoned")
             .get(&record.switch_addr.octets())
             .is_some_and(|held| Arc::ptr_eq(held, record))
+    }
+
+    /// Takes the guest's run report of box `id` with the sequence `seq`,
+    /// and says whether it is one to act on: no report of the box with a
+    /// higher sequence was taken before. A report that arrives late, behind
+    /// a newer one, is not acted on. A repeat of the newest one is, because
+    /// what a report does is done once however often it is asked.
+    ///
+    /// Past [`RUN_REPORT_CAP`] boxes, the sequences of boxes this registry
+    /// holds nothing for are dropped, so a guest that reports made-up ids
+    /// cannot grow the map.
+    pub fn take_run_report(&self, id: BoxId, seq: u64) -> bool {
+        let mut newest = self
+            .run_reports
+            .lock()
+            .expect("the run reports' lock is held only across map operations");
+        if newest.get(&id).is_some_and(|taken| *taken > seq) {
+            return false;
+        }
+        newest.insert(id, seq);
+        if newest.len() > RUN_REPORT_CAP {
+            newest.retain(|kept, _| *kept == id || self.holds_for(*kept));
+        }
+        true
+    }
+
+    /// Whether the run report of box `id` with the sequence `seq` is still
+    /// the newest one taken for the box.
+    #[must_use]
+    pub fn newest_run_report_is(&self, id: BoxId, seq: u64) -> bool {
+        self.run_reports
+            .lock()
+            .expect("the run reports' lock is held only across map operations")
+            .get(&id)
+            == Some(&seq)
+    }
+
+    /// Whether this registry holds anything a run report of box `id` could
+    /// change: a row, a kept creation, or a `host_ip` box, resident or set
+    /// aside.
+    fn holds_for(&self, id: BoxId) -> bool {
+        let session = boxes::SessionId::from_bytes(id);
+        let host_ip = {
+            let resident = self
+                .host_ip_boxes
+                .read()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            resident.boxes.contains_key(&session) || resident.set_aside.contains_key(&session)
+        };
+        host_ip
+            || self.row_by_box_id(id).is_some()
+            || self.creations().all().any(|creation| creation.id() == id)
+    }
+
+    /// Sets the row of box `id` aside at the guest's word that the box does
+    /// not run: withdraws it ([`Self::withdraw`]) and marks its creation, so
+    /// the guest's word that the box runs again brings the row back
+    /// ([`Self::row_set_aside`]). Returns the row, when one stood.
+    pub fn set_aside_row(&self, id: BoxId) -> Option<Arc<BoxRecord>> {
+        let row = self.row_by_box_id(id)?;
+        let removed = self.withdraw(row.switch_addr())?;
+        let mut creations = self.creations();
+        let Creations {
+            by_name,
+            superseded,
+        } = &mut *creations;
+        if let Some(creation) = by_name
+            .values_mut()
+            .chain(superseded.iter_mut())
+            .find(|creation| creation.id() == id && !creation.standing)
+        {
+            creation.set_aside = true;
+        }
+        Some(removed)
+    }
+
+    /// The row the guest's word set aside for box `id`, as its creation
+    /// keeps it: what a resume of the box presents. `None` when the box has
+    /// no creation, its row stands, or its row went another way: by a
+    /// restart of this daemon, after which only its creator brings it back.
+    #[must_use]
+    pub fn row_set_aside(&self, id: BoxId) -> Option<SetAsideRow> {
+        self.creations()
+            .all()
+            .find(|creation| creation.id() == id && !creation.standing && creation.set_aside)
+            .map(|creation| SetAsideRow {
+                name: creation.name.clone(),
+                switch_address: creation.switch_address,
+                loopback_address: creation.loopback_address,
+            })
     }
 
     /// Marks the namespace published at `switch_addr` stopped: its row
@@ -5814,17 +5935,40 @@ impl BoxRegistry {
     ///
     /// The admit is the host-side client's, over the host's control socket,
     /// never anything the guest says. The box stays resident until the guest
-    /// reports its end ([`Self::end_host_ip_box`]), a client retires it
-    /// ([`Self::retire_host_ip_box`]), or the VM ends. Returns `true`.
+    /// says it does not run ([`Self::set_aside_host_ip_box`]), a client
+    /// retires it ([`Self::retire_host_ip_box`]), or the VM ends. Returns
+    /// `true`.
     pub fn admit_host_ip_box(
         &self,
         session_id: boxes::SessionId,
         credentialed_upstream: bool,
     ) -> bool {
+        self.make_resident(session_id, Some(credentialed_upstream));
+        true
+    }
+
+    /// Makes a `host_ip` box resident again at the guest's word that it
+    /// runs, as its client admitted it. Only a box that
+    /// [`Self::set_aside_host_ip_box`] set aside comes back: a box no client
+    /// admitted, or one a client retired since, stays out. Returns whether
+    /// it came back.
+    pub fn restore_host_ip_box(&self, id: BoxId) -> bool {
+        self.make_resident(boxes::SessionId::from_bytes(id), None)
+    }
+
+    /// Puts a `host_ip` box into the resident set: as a client admits it
+    /// with `admitted`, or, with `None`, as it was admitted before the
+    /// guest's word set it aside. Returns whether it is resident now.
+    fn make_resident(&self, session_id: boxes::SessionId, admitted: Option<bool>) -> bool {
         let mut resident = self
             .host_ip_boxes
             .write()
             .expect("the resident host_ip boxes' lock is never held across a panic");
+        let set_aside = resident.set_aside.remove(&session_id);
+        // What a client admits stands, whatever the guest said before.
+        let Some(credentialed_upstream) = admitted.or(set_aside) else {
+            return false;
+        };
         // A minted id admitted with a credentialed upstream is revoked at
         // its box's destroy, a destroy after a restart too. The resident
         // set's lock is taken before the ids' lock, as on the register path.
@@ -5865,6 +6009,7 @@ impl BoxRegistry {
                 resident_host_ip_boxes = count,
                 credentialed_upstream,
                 mirrored_address = %mirrored,
+                restored = admitted.is_none(),
                 "a host_ip box is resident"
             );
         }
@@ -5883,27 +6028,49 @@ impl BoxRegistry {
             .copied()
     }
 
-    /// Ends a resident `host_ip` box at the guest's word: the box stopped in
-    /// the VM. Returns whether it was resident.
-    pub fn end_host_ip_box(&self, id: BoxId) -> bool {
-        self.retire_host_ip_box(
-            boxes::SessionId::from_bytes(id),
-            minimald_rpc::HostIpBoxEnd::Stopped,
-        )
+    /// Sets a resident `host_ip` box aside at the guest's word that it does
+    /// not run. The box loses what residency gives, and this registry keeps
+    /// what its client admitted it with, for the guest's word that it runs
+    /// again ([`Self::restore_host_ip_box`]). Returns whether it was
+    /// resident.
+    pub fn set_aside_host_ip_box(&self, id: BoxId) -> bool {
+        self.end_residency(boxes::SessionId::from_bytes(id), None)
+    }
+
+    /// Whether the guest's word set this `host_ip` box aside.
+    #[must_use]
+    pub fn host_ip_box_is_set_aside(&self, id: BoxId) -> bool {
+        self.host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic")
+            .set_aside
+            .contains_key(&boxes::SessionId::from_bytes(id))
     }
 
     /// Ends the residency [`Self::admit_host_ip_box`] made for a session:
-    /// its box stopped or was destroyed, as `end` says. A session the set
-    /// does not hold is the goal
-    /// state already holding. Only a destroy revokes: a destroyed box that
-    /// declared a credentialed upstream under an id this registry minted
-    /// has its id revoked at the Box Egress Proxy (BEP-043). A stopped box
-    /// keeps its id, because a restart brings it back. Returns whether the
-    /// box was resident.
+    /// its box stopped or was destroyed, as `end` says. This registry
+    /// forgets the box, also one the guest's word had set aside, so no word
+    /// of the guest brings it back. A session the set does not hold is the
+    /// goal state already holding. Only a destroy revokes: a destroyed box
+    /// that declared a credentialed upstream under an id this registry
+    /// minted has its id revoked at the Box Egress Proxy (BEP-043). A
+    /// stopped box keeps its id, because a restart brings it back. Returns
+    /// whether the box was resident.
     pub fn retire_host_ip_box(
         &self,
         session_id: boxes::SessionId,
         end: minimald_rpc::HostIpBoxEnd,
+    ) -> bool {
+        self.end_residency(session_id, Some(end))
+    }
+
+    /// Takes a `host_ip` box out of the resident set: for good when a
+    /// client retired it with `retired`, set aside when the guest said it
+    /// does not run. Returns whether it was resident.
+    fn end_residency(
+        &self,
+        session_id: boxes::SessionId,
+        retired: Option<minimald_rpc::HostIpBoxEnd>,
     ) -> bool {
         let mut resident = self
             .host_ip_boxes
@@ -5911,7 +6078,17 @@ impl BoxRegistry {
             .expect("the resident host_ip boxes' lock is never held across a panic");
         let removed_box = resident.boxes.remove(&session_id);
         let removed = removed_box.is_some();
-        let credentialed = removed_box.unwrap_or(false);
+        let credentialed = match retired {
+            // A retire forgets a box that was set aside too.
+            Some(_) => removed_box.or(resident.set_aside.remove(&session_id)),
+            None => {
+                if let Some(credentialed) = removed_box {
+                    resident.set_aside.insert(session_id, credentialed);
+                }
+                removed_box
+            }
+        }
+        .unwrap_or(false);
         let count = resident.boxes.len();
         if removed {
             // Under the resident set's lock, so the mirror's flag follows
@@ -5932,12 +6109,12 @@ impl BoxRegistry {
         // A stop ends the residency, so a later destroy of the stopped box
         // finds none. The id set keeps whether the box was credentialed,
         // for that destroy to revoke, across a restart too.
-        let (credentialed, ids_changed) = match end {
-            minimald_rpc::HostIpBoxEnd::Stopped => {
+        let (credentialed, ids_changed) = match retired {
+            Some(minimald_rpc::HostIpBoxEnd::Stopped) | None => {
                 let changed = credentialed && minted && ids.credentialed.insert(id);
                 (false, changed)
             }
-            minimald_rpc::HostIpBoxEnd::Destroyed => {
+            Some(minimald_rpc::HostIpBoxEnd::Destroyed) => {
                 let was = ids.credentialed.remove(&id);
                 (was || credentialed, was)
             }
@@ -5964,11 +6141,19 @@ impl BoxRegistry {
             );
         }
         if removed {
-            tracing::info!(
-                session = %session_id,
-                resident_host_ip_boxes = count,
-                "a host_ip box is no longer resident"
-            );
+            if retired.is_some() {
+                tracing::info!(
+                    session = %session_id,
+                    resident_host_ip_boxes = count,
+                    "a host_ip box is no longer resident"
+                );
+            } else {
+                tracing::info!(
+                    session = %session_id,
+                    resident_host_ip_boxes = count,
+                    "a host_ip box is set aside: the guest does not run it"
+                );
+            }
             // The last host-address box ended: no box shares the node's
             // namespace any more, so nothing the mirror binds has a
             // listener behind it (NET-138's box end). The mirror checks
@@ -6998,13 +7183,21 @@ struct HostIpName {
     since: Instant,
 }
 
-/// The resident `host_ip` boxes: the ones a host client admitted and that
-/// have not ended. The value says whether the box was admitted with a
-/// credentialed upstream.
+/// The `host_ip` boxes a host client admitted and has not retired. The
+/// value says whether the box was admitted with a credentialed upstream.
 #[derive(Debug, Default)]
 struct HostIpBoxes {
+    /// The resident ones.
     boxes: BTreeMap<boxes::SessionId, bool>,
+    /// The ones the guest said it does not run
+    /// ([`BoxRegistry::set_aside_host_ip_box`]). Each is resident again
+    /// when the guest says it runs, or when a client admits it.
+    set_aside: BTreeMap<boxes::SessionId, bool>,
 }
+
+/// How many boxes [`BoxRegistry::take_run_report`] keeps a sequence for
+/// before it drops those of boxes this host holds nothing for.
+const RUN_REPORT_CAP: usize = 4096;
 
 /// The run of published loopback addresses a box may take inside `slice`:
 /// the slice clamped to the reserved local range's interior. The range's
@@ -11087,9 +11280,9 @@ mod tests {
         assert_eq!(registry.resident_host_ip_box(grant), Some(true));
         assert_eq!(registry.resident_host_ip_boxes().len(), 2);
 
-        // The guest's word ends one. A second end finds nothing.
-        assert!(registry.end_host_ip_box(grant));
-        assert!(!registry.end_host_ip_box(grant));
+        // The guest's word sets one aside. A second one finds nothing.
+        assert!(registry.set_aside_host_ip_box(grant));
+        assert!(!registry.set_aside_host_ip_box(grant));
         assert_eq!(registry.resident_host_ip_box(grant), None);
         assert!(registry.holds_host_ip_boxes());
         // A host client retires the other.
@@ -11098,6 +11291,76 @@ mod tests {
             minimald_rpc::HostIpBoxEnd::Destroyed
         ));
         assert!(!registry.holds_host_ip_boxes());
+
+        // The one set aside comes back once, as it was admitted.
+        assert!(registry.restore_host_ip_box(grant));
+        assert!(!registry.restore_host_ip_box(grant));
+        assert_eq!(registry.resident_host_ip_box(grant), Some(true));
+        // A retire forgets a box that is set aside, and the one a client
+        // retired never comes back.
+        assert!(registry.set_aside_host_ip_box(grant));
+        assert!(!registry.retire_host_ip_box(
+            boxes::SessionId::from_bytes(grant),
+            minimald_rpc::HostIpBoxEnd::Stopped
+        ));
+        assert!(!registry.restore_host_ip_box(grant));
+        assert!(!registry.restore_host_ip_box(plain));
+        assert!(!registry.holds_host_ip_boxes());
+    }
+
+    /// A row comes back at the guest's word only when the guest's word set
+    /// it aside. After a restart of this daemon every row is gone, and
+    /// only its creator brings one back.
+    #[test]
+    fn a_row_set_aside_is_not_one_a_restart_left_dormant() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(REGISTRY_FILE);
+        let registry = BoxRegistry::new(SUBNET).persisting_to(file.clone());
+        let web = registry.register_client_box(client_spec("web")).unwrap();
+        let id = web.box_id();
+        assert_eq!(registry.row_set_aside(id), None, "the row stands");
+        assert!(registry.set_aside_row(id).is_some());
+        assert_eq!(
+            registry.row_set_aside(id),
+            Some(SetAsideRow {
+                name: "web".to_string(),
+                switch_address: web.switch_addr(),
+                loopback_address: web.loopback_addr(),
+            })
+        );
+        assert!(registry.set_aside_row(id).is_none(), "nothing stands");
+
+        let restarted = BoxRegistry::new(SUBNET).persisting_to(file);
+        assert_eq!(restarted.dormant_creation_rows().len(), 1);
+        assert_eq!(restarted.row_set_aside(id), None);
+    }
+
+    /// A report is acted on unless a newer one of the same box was taken,
+    /// and the sequences of boxes the registry holds nothing for do not
+    /// pile up.
+    #[test]
+    fn run_reports_are_ordered_per_box_and_bounded() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (a, b) = ([1; 16], [2; 16]);
+        assert!(registry.take_run_report(a, 5));
+        assert!(registry.take_run_report(a, 5), "a repeat is acted on");
+        assert!(!registry.take_run_report(a, 4));
+        assert!(registry.take_run_report(b, 4), "each box has its own order");
+        assert!(registry.newest_run_report_is(a, 5));
+        assert!(!registry.newest_run_report_is(a, 4));
+
+        // A box the registry holds something for keeps its sequence past
+        // any number of reports about ids it never heard of.
+        let held = registry.register_host_ip_box("held").unwrap();
+        registry.admit_host_ip_box(boxes::SessionId::from_bytes(held), false);
+        assert!(registry.take_run_report(held, 9));
+        for n in 0..=RUN_REPORT_CAP {
+            let mut made_up = [3; 16];
+            made_up[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            assert!(registry.take_run_report(made_up, 1));
+        }
+        assert!(registry.run_reports.lock().unwrap().len() < RUN_REPORT_CAP / 2);
+        assert!(!registry.take_run_report(held, 8));
     }
 
     /// Boxes come and go for as long as the daemon lives, and neither the

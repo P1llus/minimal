@@ -40,6 +40,7 @@ pub(crate) mod listens;
 pub(crate) mod nl;
 pub(crate) mod relay;
 pub(crate) mod resolver;
+pub(crate) mod run_reports;
 pub(crate) mod spec;
 pub(crate) mod steer;
 

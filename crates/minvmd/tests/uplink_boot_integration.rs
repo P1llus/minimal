@@ -657,17 +657,18 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
         pinged.trim()
     );
 
-    // The guest reports the box ended: its forwards are unbound.
-    let ended = vm.guest(&GuestDoorRequest::EndBox(minimald_rpc::EndBoxRequest {
+    // The guest says the box does not run: its forwards are unbound.
+    let ended = vm.guest(&GuestDoorRequest::BoxRun(minimald_rpc::BoxRunReport {
         box_id: web.box_id,
+        seq: 1,
+        runs: false,
     }));
     assert_eq!(
         ended,
-        GuestDoorReply::BoxEnded {
-            ended: true,
+        GuestDoorReply::BoxRunTaken {
             box_id: web.box_id,
-            forwards_unbound: 2,
-            still_bound: 0,
+            seq: 1,
+            effect: minimald_rpc::BoxRunEffect::SetAside,
         }
     );
     assert!(

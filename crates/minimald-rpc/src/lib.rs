@@ -1320,17 +1320,43 @@ pub struct UnpublishPortRequest {
     pub proto: IpProto,
 }
 
-/// Tells the VM host that a box's network is gone. The host unbinds the
-/// box's forwards and stops serving streams for it. Its creator can ask for
-/// the box's row back when the box starts again.
+/// Tells the VM host whether the guest runs a box. A box runs from the
+/// moment it has an entry in the guest's policy engine until the entry is
+/// removed.
+///
+/// On a report that the box does not run, the host sets aside what clients
+/// admitted for the box: the residency of a box that shares the node's
+/// address, the row and the forwards of a box with its own. On a report
+/// that it runs, the host puts back what such a report set aside. A report
+/// gains nothing a client did not admit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EndBoxRequest {
+pub struct BoxRunReport {
     #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
+    /// Orders the reports of one box. The host acts on a report only when
+    /// its `seq` is above that of every report it took for the box, so a
+    /// report that arrives late changes nothing.
+    pub seq: u64,
+    pub runs: bool,
 }
 
-/// Asks whether the VM host holds a row for the box.
+/// What the VM host did with a [`BoxRunReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxRunEffect {
+    /// The host took a newer report of the box before this one.
+    Stale,
+    /// The host holds for the box what it held before.
+    Unchanged,
+    /// What clients admitted for the box is set aside.
+    SetAside,
+    /// What a report had set aside is back.
+    Restored,
+}
+
+/// Asks whether the VM host holds a row for the box, standing or set aside
+/// by a [`BoxRunReport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoxStandingRequest {
@@ -1441,8 +1467,8 @@ pub enum GuestDoorRequest {
     PublishPort(PublishPortRequest),
     /// End a forward published at run time.
     UnpublishPort(UnpublishPortRequest),
-    /// A box's network is gone.
-    EndBox(EndBoxRequest),
+    /// Whether the guest runs a box.
+    BoxRun(BoxRunReport),
     /// Does the host hold a row for the box?
     BoxStanding(BoxStandingRequest),
     /// The id of the box the guest daemon is about to create.
@@ -1480,15 +1506,12 @@ pub enum GuestDoorReply {
         listener: std::net::SocketAddrV4,
         closed: u32,
     },
-    /// The answer to an [`EndBoxRequest`]. `ended` is false when the host
-    /// held no row for the box. `still_bound` counts forwards the host is
-    /// still retrying to unbind.
-    BoxEnded {
-        ended: bool,
+    /// The answer to a [`BoxRunReport`].
+    BoxRunTaken {
         #[serde(with = "boxes::box_id_hex")]
         box_id: BoxId,
-        forwards_unbound: u32,
-        still_bound: u32,
+        seq: u64,
+        effect: BoxRunEffect,
     },
     /// The answer to a [`BoxStandingRequest`].
     BoxStanding {

@@ -330,9 +330,11 @@ impl Publisher {
         let Some(row) = self.inner.boxes.row_by_box_id(id) else {
             // A box that shares the node's address has no row. It is known
             // by the id minted for it, when it has a credentialed upstream,
-            // or as a resident, which is how the stream door knows it.
+            // or as a resident, which is how the stream door knows it, or
+            // as one the guest's word set aside.
             let shares_the_node = self.inner.boxes.holds_host_ip_id(id)
-                || self.inner.boxes.resident_host_ip_box(id).is_some();
+                || self.inner.boxes.resident_host_ip_box(id).is_some()
+                || self.inner.boxes.host_ip_box_is_set_aside(id);
             return Decision::Refuse(if shares_the_node {
                 PublishRefusal::HostIpBox
             } else {
@@ -587,14 +589,15 @@ impl Publisher {
         outcome
     }
 
-    /// Ends a box at the guest's word: unbinds its forwards and withdraws
-    /// its row. The creation stays, so its creator can ask for the row back.
-    pub(crate) fn end_box(&self, box_id: BoxId) -> Ended {
+    /// Sets a box aside at the guest's word that it does not run. A box
+    /// with a row has its forwards unbound and its row withdrawn, and its
+    /// creation stays marked for the guest's word that it runs again. A
+    /// `host_ip` box, which has no row, leaves the resident set the same
+    /// way.
+    pub(crate) fn set_aside(&self, box_id: BoxId) -> Ended {
         let boxes = &self.inner.boxes;
         let Some(row) = boxes.row_by_box_id(box_id) else {
-            // A host_ip box has no row. Ending it takes it out of the
-            // resident set.
-            let ended = boxes.end_host_ip_box(box_id);
+            let ended = boxes.set_aside_host_ip_box(box_id);
             return Ended {
                 ended,
                 ..Ended::default()
@@ -606,13 +609,13 @@ impl Publisher {
         };
         // The worker sees the withdrawal next. It retries what is still
         // bound and holds the box's addresses until it is done.
-        boxes.withdraw(row.switch_addr());
+        boxes.set_aside_row(box_id);
         tracing::info!(
             box = %row.name(),
             box_id = %BoxIdText(&box_id),
             forwards_unbound,
             still_bound,
-            "the guest ended the box; its row is withdrawn"
+            "the guest does not run the box; its row is set aside"
         );
         self.audit(&AuditLine {
             ts: unix_now_secs(),
@@ -1436,7 +1439,7 @@ mod tests {
             Some(format!("{}:80", holder.switch_addr()))
         );
 
-        let ended = bed.publisher.end_box(holder.box_id());
+        let ended = bed.publisher.set_aside(holder.box_id());
         assert_eq!(
             ended,
             Ended {
@@ -1472,7 +1475,7 @@ mod tests {
             .unwrap();
         bed.publish(request(&row, 8081, 81, PublishOrigin::Declared))
             .unwrap();
-        // The creator's withdrawal does not go through `end_box`.
+        // The creator's withdrawal does not go through `set_aside`.
         bed.boxes.withdraw(row.switch_addr());
         until("the worker unbinds the forwards", || {
             bed.fake.forwards().is_empty()
@@ -1497,7 +1500,7 @@ mod tests {
         bed.publish(request(&row, 8080, 80, PublishOrigin::Declared))
             .unwrap();
         bed.fake.fail_next(2);
-        let ended = bed.publisher.end_box(row.box_id());
+        let ended = bed.publisher.set_aside(row.box_id());
         assert_eq!(ended.still_bound, 1);
         assert!(
             bed.boxes
@@ -1518,13 +1521,13 @@ mod tests {
     fn ending_a_box_twice_or_an_unknown_one_ends_nothing() {
         let bed = bed();
         let row = bed.register(&spec("web"), OWN);
-        assert!(bed.publisher.end_box(row.box_id()).ended);
-        assert_eq!(bed.publisher.end_box(row.box_id()), Ended::default());
+        assert!(bed.publisher.set_aside(row.box_id()).ended);
+        assert_eq!(bed.publisher.set_aside(row.box_id()), Ended::default());
         let host_ip = bed.boxes.register_host_ip_box("shared").unwrap();
         bed.boxes
             .admit_host_ip_box(minimald_rpc::BoxId::from_bytes(host_ip), false);
         assert!(bed.boxes.holds_host_ip_boxes());
-        assert!(bed.publisher.end_box(host_ip).ended);
+        assert!(bed.publisher.set_aside(host_ip).ended);
         assert!(!bed.boxes.holds_host_ip_boxes());
     }
 
@@ -1663,7 +1666,7 @@ mod tests {
             panic!("the default stance refuses");
         };
         publisher.audit_refusal(&refused, &refusal);
-        publisher.end_box(row.box_id());
+        publisher.set_aside(row.box_id());
 
         let lines: Vec<serde_json::Value> = std::fs::read_to_string(&audit)
             .unwrap()

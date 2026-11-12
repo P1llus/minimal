@@ -639,6 +639,28 @@ impl BoxActor {
             "made the box's cgroup"
         );
         self.cgroup = Some(cgroup.clone());
+        // In a VM, the VM host puts back what it holds for the box before
+        // anything of the box runs: its residency, or its row, which the
+        // launch's forwards need. The word is numbered after the end of the
+        // box's last run, so that end, told late, undoes nothing.
+        if let Some(reports) = crate::net::run_reports::current() {
+            let told = reports.tell(record.id, crate::net::run_reports::next_seq(), true);
+            if !told
+                .answered_within(crate::net::run_reports::RUN_ANSWER_LIMIT)
+                .await
+            {
+                tracing::warn!(
+                    box_id = %record.id,
+                    "the VM host did not answer that the box runs; the box is not started"
+                );
+                self.destroy_cgroup().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "The VM host did not answer when it was told that the box starts, so the \
+                     box was not started. Try again.",
+                ));
+            }
+        }
         Ok(Some(cgroup))
     }
 
@@ -676,7 +698,7 @@ impl BoxActor {
             );
         }
         crate::net::engine::Engine::current().uninstall(*self.record.id());
-        self.engine_entry_removed = true;
+        self.entry_removed = Some(crate::net::run_reports::next_seq());
     }
 
     /// The processes a stop of this box signals: its cgroup's, or its

@@ -234,11 +234,9 @@ impl Guest {
             .unwrap_or_else(|e| format!("(no run.log at {}: {e})", path.display()))
     }
 
-    /// What the supervisor logged about the residency of the `host_ip`
-    /// box `session`, in order: `true` for a record that it is resident,
-    /// `false` for one that it no longer is.
-    fn residency_records(&self, session: boxes::SessionId) -> Vec<bool> {
-        let session = session.to_string();
+    /// The lines of the supervisor's log that name the box `id`, in order.
+    fn log_lines_about(&self, id: boxes::BoxId) -> Vec<String> {
+        let id = id.to_string();
         let mut logs: Vec<PathBuf> = Vec::new();
         let mut dirs = vec![self.state.path().to_path_buf()];
         while let Some(dir) = dirs.pop() {
@@ -256,18 +254,43 @@ impl Guest {
             }
         }
         logs.sort();
-        let mut records = Vec::new();
-        for log in logs {
-            let text = std::fs::read_to_string(&log).unwrap_or_default();
-            for line in text.lines().filter(|line| line.contains(&session)) {
+        logs.iter()
+            .flat_map(|log| {
+                let text = std::fs::read_to_string(log).unwrap_or_default();
+                text.lines()
+                    .filter(|line| line.contains(&id))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// How often the supervisor logged `text` about the box `id`.
+    fn logged(&self, text: &str, id: boxes::BoxId) -> usize {
+        self.log_lines_about(id)
+            .iter()
+            .filter(|line| line.contains(text))
+            .count()
+    }
+
+    /// What the supervisor logged about the residency of the `host_ip`
+    /// box `session`, in order: `true` for a record that it is resident,
+    /// `false` for one that it is set aside or no longer resident.
+    fn residency_records(&self, session: boxes::SessionId) -> Vec<bool> {
+        self.log_lines_about(session)
+            .iter()
+            .filter_map(|line| {
                 if line.contains("a host_ip box is resident") {
-                    records.push(true);
-                } else if line.contains("a host_ip box is no longer resident") {
-                    records.push(false);
+                    Some(true)
+                } else if line.contains("a host_ip box is set aside")
+                    || line.contains("a host_ip box is no longer resident")
+                {
+                    Some(false)
+                } else {
+                    None
                 }
-            }
-        }
-        records
+            })
+            .collect()
     }
 
     /// The `box_id` of every `minted the box id for an in-VM create`
@@ -813,22 +836,218 @@ async fn within_ten_seconds(what: &str, mut met: impl FnMut() -> bool) {
     }
 }
 
-/// The VM host drops what it holds for a box when the guest ends the box,
-/// with no client telling it: the residency of a box that shares the node's
-/// address, and the row of a box with its own. A restart is not an end, so
-/// the box keeps both through one.
+/// A box that runs until it is stopped, so the guest restarts it. Its
+/// stored spec names the network and the policy the request does, as a
+/// client's does: a restart starts the box from the spec.
+fn restartable(
+    name: &str,
+    network: boxes::NetworkMode,
+    policy: boxes::BoxPolicy,
+) -> minimald_rpc::CreateSessionRequest {
+    let mut spec = mfile::spec::BoxSpec::for_session(
+        None,
+        mfile::spec::SpecFlags {
+            network,
+            policy: policy.clone(),
+            ..mfile::spec::SpecFlags::default()
+        },
+    );
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    let mut req = minimald_rpc::CreateSessionRequest::new(
+        name.to_string(),
+        paths::HostAbsPath::try_new("/tmp").unwrap(),
+        network,
+        Default::default(),
+    );
+    req.config.policy = policy;
+    req.spec = Some(serde_json_lenient::to_value(&spec).unwrap());
+    req
+}
+
+/// The host port the `own_ip` box of these tests declares, and the port in
+/// the box it leads to.
+const DECLARED: boxes::PortMapping = boxes::PortMapping {
+    external_port: 28471,
+    internal_port: 8080,
+    proto: boxes::IpProto::Tcp,
+};
+
+/// What these tests run in a box and ask of the VM host around it.
+struct Boxes<'a> {
+    guest: &'a Guest,
+    control: PathBuf,
+}
+
+impl Boxes<'_> {
+    /// One request of a client on the host's control socket.
+    fn client(
+        &self,
+        request: &minimald_rpc::BoxControlRequest,
+    ) -> Result<minimald_rpc::BoxControlReply, String> {
+        let reply = control_line(
+            &self.control,
+            &serde_json_lenient::to_string(request).unwrap(),
+        );
+        serde_json_lenient::from_str(&reply).map_err(|e| format!("{e}: {reply}"))
+    }
+
+    /// Creates a `host_ip` box that the guest restarts, admits it as its
+    /// creator does, and runs a command in it.
+    async fn shares(&self, name: &str) -> (russh::client::Handle<ClientHandler>, boxes::BoxId) {
+        let (handle, id) = open_session(
+            &self.guest.sock_path,
+            &restartable(
+                name,
+                boxes::NetworkMode::HostNet,
+                boxes::BoxPolicy::default(),
+            ),
+            Some(SHELL_PROJECT),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        self.admit(id);
+        self.runs(&handle, id).await;
+        (handle, id)
+    }
+
+    /// A client's admit of a `host_ip` box.
+    fn admit(&self, id: boxes::BoxId) {
+        let admitted = self.client(&minimald_rpc::BoxControlRequest::AdmitHostIpBox(
+            minimald_rpc::HostIpBoxRequest {
+                session_id: id,
+                credentialed_upstream: false,
+            },
+        ));
+        assert!(
+            matches!(
+                admitted,
+                Ok(minimald_rpc::BoxControlReply::HostIpBox { resident: true, .. })
+            ),
+            "{admitted:?}"
+        );
+    }
+
+    /// Registers a box with its own address and one declared port as its
+    /// creator does, creates it for the guest to restart, and runs a
+    /// command in it.
+    async fn own(
+        &self,
+        name: &str,
+    ) -> (
+        russh::client::Handle<ClientHandler>,
+        minimald_rpc::RegisteredBox,
+    ) {
+        let register =
+            minimald_rpc::BoxControlRequest::Register(minimald_rpc::RegisterBoxRequest {
+                name: name.to_string(),
+                ingress_ports: vec![DECLARED],
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+                hold: false,
+                task_slots: 0,
+                host_ip: false,
+            });
+        let row = match self.client(&register) {
+            Ok(minimald_rpc::BoxControlReply::Registered(row)) => row,
+            other => panic!("the registration was answered {other:?}"),
+        };
+        let policy = boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![DECLARED],
+                ..boxes::IngressPolicy::default()
+            }),
+            ..boxes::BoxPolicy::default()
+        };
+        let mut req = restartable(name, boxes::NetworkMode::OwnIp, policy);
+        req.config.box_addresses = Some(boxes::BoxAddresses {
+            switch_address: row.switch_address,
+            loopback_address: row.loopback_address,
+        });
+        let (handle, id) = open_session(&self.guest.sock_path, &req, Some(SHELL_PROJECT))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(id, row.box_id, "the box has the id its host minted");
+        self.runs(&handle, id).await;
+        (handle, row)
+    }
+
+    /// Whether a row stands for the box registered as `name`.
+    fn has_row(&self, name: &str) -> bool {
+        let read = minimald_rpc::BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+            name: name.to_string(),
+        });
+        match self.client(&read) {
+            Ok(minimald_rpc::BoxControlReply::Row(_)) => true,
+            Ok(minimald_rpc::BoxControlReply::NoRow { .. }) => false,
+            other => panic!("the row read was answered {other:?}"),
+        }
+    }
+
+    /// Panics unless a row stands for the box and the host listens at its
+    /// declared port. The panic carries what the supervisor logged about
+    /// the box.
+    fn assert_row_and_forward(&self, name: &str, row: &minimald_rpc::RegisteredBox, why: &str) {
+        let (has_row, forwards) = (self.has_row(name), Self::forwards(row));
+        assert!(
+            has_row && forwards,
+            "{why}: row {has_row}, forward {forwards}\n{}",
+            self.guest.log_lines_about(row.box_id).join("\n")
+        );
+    }
+
+    /// Whether the host listens at the box's declared port.
+    fn forwards(row: &minimald_rpc::RegisteredBox) -> bool {
+        let listener = std::net::SocketAddr::from((row.loopback_address, DECLARED.external_port));
+        std::net::TcpStream::connect_timeout(&listener, Duration::from_secs(2)).is_ok()
+    }
+
+    /// A command runs in the box.
+    async fn runs(&self, handle: &russh::client::Handle<ClientHandler>, id: boxes::BoxId) {
+        let command = minimald_rpc::exec::ExecRequest::Argv(vec!["true".to_string()]).encode();
+        let ran = exec_in_session(handle, id, &command).await;
+        assert_eq!(ran, Ok((String::new(), Some(0))), "a command runs in {id}");
+    }
+
+    /// The guest stops the box. No client tells the VM host.
+    async fn stop(&self, handle: &russh::client::Handle<ClientHandler>, id: boxes::BoxId) {
+        let stop = minimald_rpc::StopBoxRequest { id, force: true };
+        let stopped = call::<minimald_rpc::StopBox>(handle, &stop).await;
+        assert!(
+            matches!(stopped, Ok(minimald_rpc::Errorable::Ok(_))),
+            "{stopped:?}"
+        );
+    }
+
+    /// The guest restarts the box. Returns whether it was running.
+    async fn restart(
+        &self,
+        handle: &russh::client::Handle<ClientHandler>,
+        id: boxes::BoxId,
+    ) -> bool {
+        let restarted =
+            call::<minimald_rpc::RestartBox>(handle, &minimald_rpc::RestartBoxRequest { id }).await;
+        match restarted {
+            Ok(minimald_rpc::Errorable::Ok(minimald_rpc::RestartBoxResponse::Restarted {
+                was_running,
+            })) => was_running,
+            other => panic!("the restart was answered {other:?}"),
+        }
+    }
+}
+
+/// The VM host sets aside what it holds for a box while the guest does not
+/// run the box, with no client telling it, and puts it back when the guest
+/// runs the box again: the residency of a box that shares the node's
+/// address, and the row of a box with its own. A restart of a running box
+/// is not an end, so the box keeps both through one.
 ///
 /// The boxes need a shell, which the guest fetches. So the test runs only
 /// with `MINVMD_E2E_INTERNET=1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1 and MINVMD_E2E_INTERNET=1; needs KVM, gvproxy and the internet"]
-async fn the_vm_host_drops_a_box_the_guest_ended_and_keeps_one_it_restarted() {
-    use minimald_rpc::{
-        BoxControlReply, BoxControlRequest, Errorable, ReadRowRequest, RegisterBoxRequest,
-        RestartBox, RestartBoxRequest, RestartBoxResponse, StopBox, StopBoxRequest,
-    };
-
+async fn the_vm_host_sets_a_box_aside_while_the_guest_does_not_run_it() {
     if !e2e_enabled() {
         return;
     }
@@ -842,150 +1061,255 @@ async fn the_vm_host_drops_a_box_the_guest_ended_and_keeps_one_it_restarted() {
         .path()
         .join("minimal/providers/local-minvmd0/control.sock");
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let ask = |request: &BoxControlRequest| -> Result<BoxControlReply, String> {
-        let reply = control_line(&control, &serde_json_lenient::to_string(request).unwrap());
-        serde_json_lenient::from_str(&reply).map_err(|e| format!("{e}: {reply}"))
+    let boxes = Boxes {
+        guest: &guest,
+        control,
     };
-    // Only a box that runs until it is stopped restarts.
-    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
-    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
-    let spec = serde_json_lenient::to_value(&spec).unwrap();
-    let request = |name: &str, network| {
-        let mut req = minimald_rpc::CreateSessionRequest::new(
-            name.to_string(),
-            paths::HostAbsPath::try_new("/tmp").unwrap(),
-            network,
-            Default::default(),
-        );
-        req.spec = Some(spec.clone());
-        req
-    };
-    let runs = minimald_rpc::exec::ExecRequest::Argv(vec!["true".to_string()]).encode();
 
-    // A box that shares the node's address. Its creator admits it.
-    let (handle, shares) = open_session(
-        &guest.sock_path,
-        &request("shares", boxes::NetworkMode::HostNet),
-        Some(SHELL_PROJECT),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("shares: {e}"));
-    let admit = BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
-        session_id: shares,
-        credentialed_upstream: false,
-    });
-    let admitted = ask(&admit);
-    assert!(
-        matches!(
-            admitted,
-            Ok(BoxControlReply::HostIpBox { resident: true, .. })
-        ),
-        "{admitted:?}"
-    );
-    let ran = exec_in_session(&handle, shares, &runs).await;
-    assert_eq!(ran, Ok((String::new(), Some(0))), "shares runs a command");
-
-    let restarted = call::<RestartBox>(&handle, &RestartBoxRequest { id: shares }).await;
-    assert_eq!(
-        restarted,
-        Ok(Errorable::Ok(RestartBoxResponse::Restarted {
-            was_running: true
-        })),
-    );
+    // A box that shares the node's address.
+    let (handle, shares) = boxes.shares("shares").await;
+    assert!(boxes.restart(&handle, shares).await, "shares was running");
     // An admit of a box that is resident writes no record. Were the box
-    // retired by the restart, this one would write a second.
-    let admitted = ask(&admit);
-    assert!(
-        matches!(
-            admitted,
-            Ok(BoxControlReply::HostIpBox { resident: true, .. })
-        ),
-        "{admitted:?}"
-    );
-    let ran = exec_in_session(&handle, shares, &runs).await;
-    assert_eq!(
-        ran,
-        Ok((String::new(), Some(0))),
-        "shares runs after its restart"
-    );
+    // set aside by the restart, this one would write a second.
+    boxes.admit(shares);
+    boxes.runs(&handle, shares).await;
+    assert_eq!(guest.residency_records(shares), [true]);
 
-    // The guest stops the box. No client retires it.
-    let stop = StopBoxRequest {
-        id: shares,
-        force: true,
-    };
-    let stopped = call::<StopBox>(&handle, &stop).await;
-    assert!(matches!(stopped, Ok(Errorable::Ok(_))), "{stopped:?}");
+    boxes.stop(&handle, shares).await;
     within_ten_seconds(
         "the VM host still holds the stopped box as resident",
-        || guest.residency_records(shares).last() == Some(&false),
+        || guest.residency_records(shares) == [true, false],
     )
     .await;
+    // The guest starts it again, and no client admits it again.
+    assert!(!boxes.restart(&handle, shares).await, "shares was stopped");
+    boxes.runs(&handle, shares).await;
     assert_eq!(
         guest.residency_records(shares),
-        [true, false],
-        "resident from the admit to the stop, through the restart"
+        [true, false, true],
+        "resident while the guest runs it"
     );
 
-    // A box with its own address. Its creator registers its row.
-    let register = BoxControlRequest::Register(RegisterBoxRequest {
-        name: "own".to_string(),
-        ingress_ports: Vec::new(),
-        credentialed_upstream: None,
-        dynamic_ingress: None,
-        dynamic_allowed_range: None,
-        hold: false,
-        task_slots: 0,
-        host_ip: false,
-    });
-    let row = match ask(&register) {
-        Ok(BoxControlReply::Registered(row)) => row,
-        other => panic!("the registration was answered {other:?}"),
-    };
-    let mut req = request("own", boxes::NetworkMode::OwnIp);
-    req.config.box_addresses = Some(boxes::BoxAddresses {
-        switch_address: row.switch_address,
-        loopback_address: row.loopback_address,
-    });
-    let (handle, own) = open_session(&guest.sock_path, &req, Some(SHELL_PROJECT))
-        .await
-        .unwrap_or_else(|e| panic!("own: {e}"));
-    assert_eq!(own, row.box_id, "the box has the id its host minted");
-    let read = BoxControlRequest::ReadRow(ReadRowRequest {
-        name: "own".to_string(),
-    });
-    let ran = exec_in_session(&handle, own, &runs).await;
-    assert_eq!(ran, Ok((String::new(), Some(0))), "own runs a command");
+    // Stopped and started again at once, as `min box stop` and then `min
+    // box restart` do it: the guest stops the box, the client retires it
+    // and admits it, the guest starts it.
+    for round in 1..=30 {
+        boxes.stop(&handle, shares).await;
+        let retired = boxes.client(&minimald_rpc::BoxControlRequest::RetireHostIpBox(
+            minimald_rpc::RetireHostIpBoxRequest {
+                session_id: shares,
+                end: minimald_rpc::HostIpBoxEnd::Stopped,
+            },
+        ));
+        assert!(retired.is_ok(), "{retired:?}");
+        boxes.admit(shares);
+        assert!(!boxes.restart(&handle, shares).await, "shares was stopped");
+        within_ten_seconds(
+            &format!("round {round}: the restarted box is not resident"),
+            || guest.residency_records(shares).last() == Some(&true),
+        )
+        .await;
+    }
+    boxes.runs(&handle, shares).await;
+    assert_eq!(guest.residency_records(shares).last(), Some(&true));
 
-    let restarted = call::<RestartBox>(&handle, &RestartBoxRequest { id: own }).await;
-    assert_eq!(
-        restarted,
-        Ok(Errorable::Ok(RestartBoxResponse::Restarted {
-            was_running: true
-        })),
+    // A box with its own address.
+    let (handle, own) = boxes.own("own").await;
+    boxes.assert_row_and_forward(
+        "own",
+        &own,
+        "the row and the forward stand while the box runs",
     );
-    let ran = exec_in_session(&handle, own, &runs).await;
-    assert_eq!(
-        ran,
-        Ok((String::new(), Some(0))),
-        "own runs after its restart"
-    );
-    let standing = ask(&read);
-    assert!(
-        matches!(standing, Ok(BoxControlReply::Row(_))),
-        "{standing:?}"
+    assert!(boxes.restart(&handle, own.box_id).await, "own was running");
+    boxes.runs(&handle, own.box_id).await;
+    boxes.assert_row_and_forward(
+        "own",
+        &own,
+        "the row and the forward stand through the restart",
     );
 
-    let stop = StopBoxRequest {
-        id: own,
-        force: true,
-    };
-    let stopped = call::<StopBox>(&handle, &stop).await;
-    assert!(matches!(stopped, Ok(Errorable::Ok(_))), "{stopped:?}");
+    boxes.stop(&handle, own.box_id).await;
     within_ten_seconds("the VM host still holds the stopped box's row", || {
-        matches!(ask(&read), Ok(BoxControlReply::NoRow { .. }))
+        !boxes.has_row("own")
     })
     .await;
+    assert!(!Boxes::forwards(&own), "the stopped box's port is closed");
+    // The guest starts it again, and its creator does not ask its row back.
+    assert!(!boxes.restart(&handle, own.box_id).await, "own was stopped");
+    boxes.runs(&handle, own.box_id).await;
+    boxes.assert_row_and_forward(
+        "own",
+        &own,
+        "the row and the forward are back while the guest runs the box",
+    );
+}
+
+/// The guest's word that a box ended can reach the VM host late: after a
+/// client admitted the box for its next run, or after that run began. The
+/// box has what the VM host holds for it once it runs, in either order.
+///
+/// The supervisor holds the guest's word back while a file exists
+/// (`MINVMD_HOLD_END_REPORTS`), so the test decides when it arrives.
+///
+/// The boxes need a shell, which the guest fetches. So the test runs only
+/// with `MINVMD_E2E_INTERNET=1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1 and MINVMD_E2E_INTERNET=1; needs KVM, gvproxy and the internet"]
+async fn a_box_s_end_that_the_vm_host_hears_late_does_not_cost_its_next_run() {
+    use minimald_rpc::{BoxControlReply, BoxControlRequest};
+
+    if !e2e_enabled() {
+        return;
+    }
+    if std::env::var_os("MINVMD_E2E_INTERNET").is_none() {
+        eprintln!("skipping: MINVMD_E2E_INTERNET is not set");
+        return;
+    }
+    let gates = short_state_dir();
+    let gate = gates.path().join("hold-end-reports");
+    let guest = Guest::boot_with(&[("MINVMD_HOLD_END_REPORTS", gate.to_str().unwrap())]);
+    let control = guest
+        .state
+        .path()
+        .join("minimal/providers/local-minvmd0/control.sock");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let boxes = Boxes {
+        guest: &guest,
+        control,
+    };
+    const HELD: &str = "held the guest's word that a box does not run";
+    const PASSED_OVER: &str = "passed over the guest's word on a box";
+    // What `min box stop` and then `min box restart` tell the VM host about
+    // a `host_ip` box, before the restart reaches the guest.
+    let stop_then_admit = |id| {
+        let retired = boxes.client(&BoxControlRequest::RetireHostIpBox(
+            minimald_rpc::RetireHostIpBoxRequest {
+                session_id: id,
+                end: minimald_rpc::HostIpBoxEnd::Stopped,
+            },
+        ));
+        assert!(
+            matches!(
+                retired,
+                Ok(BoxControlReply::HostIpBox {
+                    resident: false,
+                    ..
+                })
+            ),
+            "{retired:?}"
+        );
+        boxes.admit(id);
+    };
+
+    // A box that shares the node's address.
+    let (handle, shares) = boxes.shares("shares").await;
+    assert_eq!(guest.residency_records(shares), [true]);
+
+    // The end arrives after the client's admit and before the next run.
+    std::fs::write(&gate, b"").unwrap();
+    boxes.stop(&handle, shares).await;
+    within_ten_seconds("the guest's word did not reach the VM host", || {
+        guest.logged(HELD, shares) == 1
+    })
+    .await;
+    stop_then_admit(shares);
+    assert_eq!(guest.residency_records(shares), [true, false, true]);
+    std::fs::remove_file(&gate).unwrap();
+    within_ten_seconds("the late word did not set the box aside", || {
+        guest.residency_records(shares) == [true, false, true, false]
+    })
+    .await;
+    assert!(!boxes.restart(&handle, shares).await, "shares was stopped");
+    boxes.runs(&handle, shares).await;
+    assert_eq!(
+        guest.residency_records(shares),
+        [true, false, true, false, true],
+        "resident once it runs"
+    );
+
+    // The end arrives after the next run began. The guest gives up on the
+    // held word after ten seconds and tells the newer one.
+    std::fs::write(&gate, b"").unwrap();
+    boxes.stop(&handle, shares).await;
+    within_ten_seconds("the guest's word did not reach the VM host", || {
+        guest.logged(HELD, shares) == 2
+    })
+    .await;
+    stop_then_admit(shares);
+    assert!(!boxes.restart(&handle, shares).await, "shares was stopped");
+    std::fs::remove_file(&gate).unwrap();
+    within_ten_seconds("the VM host did not pass over the late word", || {
+        guest.logged(PASSED_OVER, shares) == 1
+    })
+    .await;
+    boxes.runs(&handle, shares).await;
+    assert_eq!(
+        guest.residency_records(shares),
+        [true, false, true, false, true, false, true],
+        "the late word changed nothing"
+    );
+
+    // A box with its own address. Its creator asks its row back before the
+    // next run, which finds the row standing while the end is held.
+    let (handle, own) = boxes.own("own").await;
+    let resume = BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+        name: "own".to_string(),
+        switch_address: own.switch_address,
+        loopback_address: own.loopback_address,
+        box_id: Some(own.box_id),
+    });
+    let asks_its_row_back = || {
+        let resumed = boxes.client(&resume);
+        assert!(
+            matches!(resumed, Ok(BoxControlReply::Registered(_))),
+            "{resumed:?}"
+        );
+    };
+
+    // The end arrives after the creator's resume and before the next run.
+    std::fs::write(&gate, b"").unwrap();
+    boxes.stop(&handle, own.box_id).await;
+    within_ten_seconds("the guest's word did not reach the VM host", || {
+        guest.logged(HELD, own.box_id) == 1
+    })
+    .await;
+    asks_its_row_back();
+    assert!(boxes.has_row("own"));
+    std::fs::remove_file(&gate).unwrap();
+    within_ten_seconds("the late word did not set the row aside", || {
+        !boxes.has_row("own")
+    })
+    .await;
+    assert!(!Boxes::forwards(&own));
+    assert!(!boxes.restart(&handle, own.box_id).await, "own was stopped");
+    boxes.runs(&handle, own.box_id).await;
+    boxes.assert_row_and_forward(
+        "own",
+        &own,
+        "the row and the forward stand once the box runs",
+    );
+
+    // The end arrives after the next run began and bound its forward.
+    std::fs::write(&gate, b"").unwrap();
+    boxes.stop(&handle, own.box_id).await;
+    within_ten_seconds("the guest's word did not reach the VM host", || {
+        guest.logged(HELD, own.box_id) == 2
+    })
+    .await;
+    asks_its_row_back();
+    assert!(!boxes.restart(&handle, own.box_id).await, "own was stopped");
+    std::fs::remove_file(&gate).unwrap();
+    within_ten_seconds("the VM host did not pass over the late word", || {
+        guest.logged(PASSED_OVER, own.box_id) == 1
+    })
+    .await;
+    boxes.runs(&handle, own.box_id).await;
+    boxes.assert_row_and_forward(
+        "own",
+        &own,
+        "the late word took down nothing of the new run",
+    );
 }
 
 /// Open a russh client over the bridge UDS, authenticate, create a session,

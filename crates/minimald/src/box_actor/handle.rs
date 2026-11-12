@@ -755,6 +755,13 @@ impl BoxHandle {
         }
     }
 
+    /// Says that a command for the box was refused because the box does
+    /// not run ([`BoxMessage::RefusedNotRunning`]). An actor that is gone
+    /// has nothing to tell.
+    pub(crate) async fn refused_not_running(&self) {
+        let _ = self.0.send(BoxMessage::RefusedNotRunning).await;
+    }
+
     /// Registers a forward relay with the session it forwards for, so the
     /// session aborts it at teardown.
     ///

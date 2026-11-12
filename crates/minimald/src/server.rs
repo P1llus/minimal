@@ -463,6 +463,8 @@ impl ServerState {
         // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
         // (owned by `minvmd`). DM2 (native Linux): spawn + own gvproxy locally.
         let transport = if config.in_microvm {
+            // The VM host hears of every box this daemon runs and ends.
+            crate::net::run_reports::start(crate::net::door::of_this_guest());
             crate::net::SwitchTransport::VmHost
         } else {
             crate::net::SwitchTransport::LocalSpawn

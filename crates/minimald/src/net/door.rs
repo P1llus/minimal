@@ -14,7 +14,7 @@ use std::time::Duration;
 use boxes::BoxId;
 use futures::future::BoxFuture;
 use minimald_rpc::{
-    BoxStandingRequest, EndBoxRequest, ForwardState, GuestDoorReply, GuestDoorRequest,
+    BoxRunEffect, BoxRunReport, BoxStandingRequest, ForwardState, GuestDoorReply, GuestDoorRequest,
     ListenNotice, MintBoxIdRequest, PublishOrigin, PublishPortRequest, PublishRefusal, StreamOpen,
     StreamRefusal, StreamReply, UnpublishPortRequest, VM_HOST_GUEST_DOOR_PORT, VM_HOST_STREAM_PORT,
 };
@@ -30,10 +30,6 @@ const REPLY_MAX: usize = 4096;
 
 /// The longest reply line of the stream door.
 const STREAM_REPLY_MAX: usize = 256;
-
-/// The waits between two tries to tell the VM host that a box has ended.
-const END_BOX_FIRST_WAIT: Duration = Duration::from_millis(200);
-const END_BOX_LONGEST_WAIT: Duration = Duration::from_secs(5);
 
 /// A way to open a connection to a port of the VM host daemon.
 pub(crate) trait Connect: Send + Sync + 'static {
@@ -104,16 +100,6 @@ pub struct Forwarded {
     pub listener: SocketAddrV4,
     /// Whether the listener is bound, or waits for another box to end.
     pub state: ForwardState,
-}
-
-/// What the VM host did when it was told that a box has ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BoxEnded {
-    /// False when the host held no row for the box.
-    pub ended: bool,
-    pub forwards_unbound: u32,
-    /// Forwards the host has not unbound yet and keeps trying to.
-    pub still_bound: u32,
 }
 
 /// The guest door of the VM host daemon.
@@ -221,35 +207,17 @@ impl<C: Connect> GuestDoor<C> {
         }
     }
 
-    /// Tells the VM host that a box has ended, and keeps trying until the
-    /// host has answered. The host drops what it holds for the box on this
-    /// message only, so giving up would leave its forwards bound.
-    pub(crate) async fn end_box(&self, box_id: BoxId) -> BoxEnded {
-        let request = GuestDoorRequest::EndBox(EndBoxRequest { box_id });
-        let mut wait = END_BOX_FIRST_WAIT;
-        loop {
-            match self.ask(&request, Some(ANSWER_LIMIT)).await {
-                Ok(GuestDoorReply::BoxEnded {
-                    ended,
-                    box_id: answered,
-                    forwards_unbound,
-                    still_bound,
-                }) if answered == box_id => {
-                    return BoxEnded {
-                        ended,
-                        forwards_unbound,
-                        still_bound,
-                    };
-                }
-                Ok(other) => {
-                    tracing::warn!(%box_id, reply = ?other, "the VM host answered the end of a box with another reply");
-                }
-                Err(error) => {
-                    tracing::warn!(%box_id, %error, "could not tell the VM host that a box has ended");
-                }
-            }
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(END_BOX_LONGEST_WAIT);
+    /// Tells the VM host whether this daemon runs a box, once. Returns what
+    /// the host did with the word.
+    pub(crate) async fn report_run(&self, report: BoxRunReport) -> Result<BoxRunEffect, DoorError> {
+        let request = GuestDoorRequest::BoxRun(report);
+        match self.ask(&request, Some(ANSWER_LIMIT)).await? {
+            GuestDoorReply::BoxRunTaken {
+                box_id,
+                seq,
+                effect,
+            } if box_id == report.box_id && seq == report.seq => Ok(effect),
+            other => Err(unexpected(&other)),
         }
     }
 
@@ -291,7 +259,7 @@ impl<C: Connect> GuestDoor<C> {
 pub trait HostDoor: Send + Sync + std::fmt::Debug {
     fn publish(&self, request: PublishPortRequest) -> BoxFuture<'_, Result<Forwarded, DoorError>>;
     fn unpublish(&self, request: UnpublishPortRequest) -> BoxFuture<'_, Result<u32, DoorError>>;
-    fn end_box(&self, box_id: BoxId) -> BoxFuture<'_, BoxEnded>;
+    fn report_run(&self, report: BoxRunReport) -> BoxFuture<'_, Result<BoxRunEffect, DoorError>>;
     fn box_standing(&self, box_id: BoxId) -> BoxFuture<'_, Result<bool, DoorError>>;
     fn mint_box_id(&self, request: MintBoxIdRequest) -> BoxFuture<'_, Result<BoxId, DoorError>>;
     fn listen_notice(&self, notice: ListenNotice) -> BoxFuture<'_, Result<(), DoorError>>;
@@ -306,8 +274,8 @@ impl<C: Connect + std::fmt::Debug> HostDoor for GuestDoor<C> {
         Box::pin(Self::unpublish(self, request))
     }
 
-    fn end_box(&self, box_id: BoxId) -> BoxFuture<'_, BoxEnded> {
-        Box::pin(Self::end_box(self, box_id))
+    fn report_run(&self, report: BoxRunReport) -> BoxFuture<'_, Result<BoxRunEffect, DoorError>> {
+        Box::pin(Self::report_run(self, report))
     }
 
     fn box_standing(&self, box_id: BoxId) -> BoxFuture<'_, Result<bool, DoorError>> {
@@ -619,39 +587,37 @@ mod tests {
         assert_eq!(closed, 3);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn the_end_of_a_box_is_told_until_the_host_answers() {
-        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::clone(&tries);
-        // The first try gets no answer, the second an error, the third the
-        // reply.
+    #[tokio::test]
+    async fn a_run_report_returns_what_the_host_did_with_it() {
+        let report = BoxRunReport {
+            box_id: box_id(7),
+            seq: 12,
+            runs: false,
+        };
         let host = FakeHost::answering(move |asked| {
-            let GuestDoorRequest::EndBox(asked) = asked else {
-                panic!("{asked:?}")
-            };
-            match seen.fetch_add(1, Ordering::SeqCst) {
-                0 => None,
-                1 => Some(GuestDoorReply::Error {
-                    error: "busy".into(),
-                }),
-                _ => Some(GuestDoorReply::BoxEnded {
-                    ended: true,
-                    box_id: asked.box_id,
-                    forwards_unbound: 2,
-                    still_bound: 1,
-                }),
-            }
+            assert_eq!(asked, GuestDoorRequest::BoxRun(report));
+            Some(GuestDoorReply::BoxRunTaken {
+                box_id: report.box_id,
+                seq: report.seq,
+                effect: BoxRunEffect::SetAside,
+            })
         });
-        let ended = GuestDoor::new(host).end_box(box_id(7)).await;
-        assert_eq!(
-            ended,
-            BoxEnded {
-                ended: true,
-                forwards_unbound: 2,
-                still_bound: 1
-            }
+        let effect = GuestDoor::new(host).report_run(report).await;
+        assert!(matches!(effect, Ok(BoxRunEffect::SetAside)), "{effect:?}");
+
+        // An answer about another report is no answer to this one.
+        let host = FakeHost::answering(move |_| {
+            Some(GuestDoorReply::BoxRunTaken {
+                box_id: report.box_id,
+                seq: report.seq - 1,
+                effect: BoxRunEffect::Stale,
+            })
+        });
+        let effect = GuestDoor::new(host).report_run(report).await;
+        assert!(
+            matches!(effect, Err(DoorError::Unreachable(_))),
+            "{effect:?}"
         );
-        assert_eq!(tries.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]

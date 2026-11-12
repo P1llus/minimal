@@ -2072,7 +2072,11 @@ fn guest_door_requests_round_trip() {
             external: 8080,
             proto: IpProto::Tcp,
         }),
-        GuestDoorRequest::EndBox(EndBoxRequest { box_id }),
+        GuestDoorRequest::BoxRun(BoxRunReport {
+            box_id,
+            seq: 7,
+            runs: false,
+        }),
         GuestDoorRequest::BoxStanding(BoxStandingRequest { box_id }),
         GuestDoorRequest::ListenNotice(ListenNotice {
             port: 3000,
@@ -2114,11 +2118,10 @@ fn guest_door_replies_round_trip() {
             listener,
             closed: 2,
         },
-        GuestDoorReply::BoxEnded {
-            ended: true,
+        GuestDoorReply::BoxRunTaken {
             box_id,
-            forwards_unbound: 3,
-            still_bound: 0,
+            seq: 7,
+            effect: BoxRunEffect::SetAside,
         },
         GuestDoorReply::BoxStanding {
             box_id,

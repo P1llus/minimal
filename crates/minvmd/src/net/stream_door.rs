@@ -1101,7 +1101,7 @@ mod tests {
         );
 
         // Once the guest reports the box ended, its streams are refused.
-        bed.boxes.end_host_ip_box(id);
+        bed.boxes.set_aside_host_ip_box(id);
         let (_guest, reply) = Guest::open(&bed.door, &proxy(id));
         assert_eq!(reply, refused(StreamRefusal::UnknownBox));
     }
@@ -1202,7 +1202,7 @@ mod tests {
             closed(&mut of_web, WAIT),
             "the row is gone and its stream is still open"
         );
-        boxes.end_host_ip_box(shared);
+        boxes.set_aside_host_ip_box(shared);
         assert!(
             closed(&mut of_shared, WAIT),
             "the box ended and its stream is still open"

@@ -300,6 +300,7 @@ pub(crate) async fn handle_exec(
             let message = not_running_message(&label, record.status);
             session.channel_success(id)?;
             spawn(async move {
+                session_handle.refused_not_running().await;
                 answer_exec(channel, b"", message.as_bytes(), NOT_RUNNING_STATUS).await;
             });
             return Ok(());

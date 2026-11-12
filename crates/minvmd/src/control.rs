@@ -627,9 +627,9 @@ fn serve_connection(
             return Ok(());
         }
         return match serde_json_lenient::from_str::<GuestDoorRequest>(&line) {
-            Ok(request) => {
-                serve_guest_door(stream, boxes, audit_path, order, publisher, request, &line)
-            }
+            Ok(request) => serve_guest_door(
+                stream, boxes, answerer, audit_path, order, publisher, request, &line,
+            ),
             Err(error) => {
                 let error = error.to_string();
                 tracing::debug!(error = %error, "guest door request did not parse");
@@ -1128,6 +1128,20 @@ fn resume_reply(
     order: &Arc<ApplyOrder>,
     request: minimald_rpc::ResumeBoxRequest,
 ) -> BoxControlReply {
+    resume_row(boxes, answerer, order, request, || true)
+}
+
+/// [`resume_reply`] for a row that is reinstated only while `wanted` holds
+/// in the turn that reinstates it. The guest's word that a box runs brings
+/// its row back this way ([`box_run_reply`]), and a newer word of the guest
+/// that lands while the answerer is asked ends the wish.
+fn resume_row(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: minimald_rpc::ResumeBoxRequest,
+    wanted: impl FnOnce() -> bool,
+) -> BoxControlReply {
     let refused = |error: crate::box_registry::ResumeError| {
         tracing::info!(box = %request.name, error = %error, "box row resume refused");
         BoxControlReply::Error {
@@ -1171,14 +1185,19 @@ fn resume_reply(
         }
     };
     order.apply(move || {
-        match boxes.resume_client_box(
-            &name,
-            request.switch_address,
-            request.loopback_address,
-            request.box_id.map(minimald_rpc::BoxId::to_bytes),
-            allocated,
-            claim.generation(),
-        ) {
+        let resumed = if wanted() {
+            boxes.resume_client_box(
+                &name,
+                request.switch_address,
+                request.loopback_address,
+                request.box_id.map(minimald_rpc::BoxId::to_bytes),
+                allocated,
+                claim.generation(),
+            )
+        } else {
+            Err(crate::box_registry::ResumeError::NoLongerWanted { name: name.clone() })
+        };
+        match resumed {
             Ok(record) => BoxControlReply::Registered(RegisteredBox {
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
@@ -2565,9 +2584,14 @@ static QUEUE_FULL_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 const QUEUE_FULL_WARN_EVERY: Duration = Duration::from_secs(10);
 
 /// Serves one guest door request.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the door's shared state, passed through as serve_connection holds it"
+)]
 fn serve_guest_door(
     mut stream: UnixStream,
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
     audit_path: &Path,
     order: &Arc<ApplyOrder>,
     publisher: &Option<Publisher>,
@@ -2617,13 +2641,15 @@ fn serve_guest_door(
         GuestDoorRequest::UnpublishPort(unpublish) => {
             order.apply(|| unpublish_reply(publisher.as_ref(), &unpublish))
         }
-        GuestDoorRequest::EndBox(end) => {
-            order.apply(|| end_box_reply(boxes, publisher.as_ref(), &end))
+        GuestDoorRequest::BoxRun(report) => {
+            run_report_gate::pass(&report);
+            box_run_reply(boxes, answerer, order, publisher.as_ref(), &report)
         }
         // A read of the host's own table. The answer is for the box id the
         // request names and nothing else.
         GuestDoorRequest::BoxStanding(request) => {
-            let row = boxes.row_by_box_id(request.box_id.to_bytes());
+            let id = request.box_id.to_bytes();
+            let row = boxes.row_by_box_id(id);
             // The daemon asks before it starts the box, so from here the
             // box may run at its addresses.
             if let Some(row) = &row {
@@ -2631,7 +2657,9 @@ fn serve_guest_door(
             }
             GuestDoorReply::BoxStanding {
                 box_id: request.box_id,
-                standing: row.is_some(),
+                // A row the guest's own word set aside comes back when the
+                // guest says the box runs, so the box may start.
+                standing: row.is_some() || boxes.row_set_aside(id).is_some(),
             }
         }
     };
@@ -2713,32 +2741,152 @@ fn unpublish_reply(
     }
 }
 
-/// Serve the guest's word that a box ended. With no publisher there are no
-/// forwards, and the row is withdrawn all the same.
-fn end_box_reply(
+/// Serves the guest's word on whether it runs a box.
+///
+/// The word that it does not run sets aside what clients admitted for the
+/// box: a `host_ip` box leaves the resident set, and a box with a row has
+/// its forwards unbound and its row withdrawn. The word that it runs puts
+/// back what such a word set aside, and nothing else: a box no client
+/// admitted, and one a client retired or withdrew since, gain nothing.
+///
+/// A report is acted on only when no newer report of the box was taken
+/// before it, so one that arrives late changes nothing. The check and what
+/// follows from it are one turn of the door.
+fn box_run_reply(
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
     publisher: Option<&Publisher>,
-    request: &minimald_rpc::EndBoxRequest,
+    report: &minimald_rpc::BoxRunReport,
 ) -> GuestDoorReply {
-    let id = request.box_id.to_bytes();
-    let ended = match publisher {
-        Some(publisher) => publisher.end_box(id),
-        None => {
-            let ended = match boxes.row_by_box_id(id) {
-                Some(row) => boxes.withdraw(row.switch_addr()).is_some(),
-                None => boxes.end_host_ip_box(id),
-            };
-            crate::net::publish::Ended {
-                ended,
-                ..Default::default()
-            }
+    use minimald_rpc::BoxRunEffect;
+
+    let id = report.box_id.to_bytes();
+    // `None`: a row is to be reinstated, which asks the answerer for the
+    // row's address and so cannot be done inside the turn.
+    let in_turn = order.apply(|| {
+        if !boxes.take_run_report(id, report.seq) {
+            return Some(BoxRunEffect::Stale);
         }
+        if !report.runs {
+            let set_aside = match publisher {
+                Some(publisher) => publisher.set_aside(id).ended,
+                // With no publisher there are no forwards to unbind.
+                None => boxes.set_aside_row(id).is_some() || boxes.set_aside_host_ip_box(id),
+            };
+            return Some(if set_aside {
+                BoxRunEffect::SetAside
+            } else {
+                BoxRunEffect::Unchanged
+            });
+        }
+        if boxes.restore_host_ip_box(id) {
+            return Some(BoxRunEffect::Restored);
+        }
+        boxes
+            .row_set_aside(id)
+            .is_none()
+            .then_some(BoxRunEffect::Unchanged)
+    });
+    let effect = in_turn.unwrap_or_else(|| {
+        if restore_row(boxes, answerer, order, report) {
+            BoxRunEffect::Restored
+        } else {
+            BoxRunEffect::Unchanged
+        }
+    });
+    if effect == BoxRunEffect::Stale {
+        tracing::info!(
+            box_id = %report.box_id,
+            seq = report.seq,
+            runs = report.runs,
+            "passed over the guest's word on a box: it arrived behind a newer one"
+        );
+    } else {
+        tracing::debug!(
+            box_id = %report.box_id,
+            seq = report.seq,
+            runs = report.runs,
+            ?effect,
+            "took the guest's word on whether it runs the box"
+        );
+    }
+    GuestDoorReply::BoxRunTaken {
+        box_id: report.box_id,
+        seq: report.seq,
+        effect,
+    }
+}
+
+/// Reinstates the row that the guest's word set aside for the box of
+/// `report`, from the creation this host keeps, as the row's creator would
+/// resume it. Nothing is reinstated when a newer word of the guest landed
+/// meanwhile. Returns whether the row stands.
+fn restore_row(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    report: &minimald_rpc::BoxRunReport,
+) -> bool {
+    let id = report.box_id.to_bytes();
+    let Some(row) = boxes.row_set_aside(id) else {
+        return boxes.row_by_box_id(id).is_some();
     };
-    GuestDoorReply::BoxEnded {
-        ended: ended.ended,
-        box_id: request.box_id,
-        forwards_unbound: ended.forwards_unbound,
-        still_bound: ended.still_bound,
+    let resume = minimald_rpc::ResumeBoxRequest {
+        name: row.name,
+        switch_address: row.switch_address,
+        loopback_address: row.loopback_address,
+        box_id: Some(report.box_id),
+    };
+    let reply = resume_row(boxes, answerer, order, resume, || {
+        boxes.newest_run_report_is(id, report.seq)
+    });
+    let restored = matches!(reply, BoxControlReply::Registered(_));
+    if restored {
+        // The guest runs the box, so the box is at its addresses.
+        if let Some(row) = boxes.row_by_box_id(id) {
+            row.mark_used();
+        }
+        tracing::info!(
+            box_id = %report.box_id,
+            "the guest runs the box again; the row its end set aside is back"
+        );
+    }
+    restored
+}
+
+/// A gate for the guest's run reports, for the VM harness: while the file
+/// that `MINVMD_HOLD_END_REPORTS` names exists, a report that a box does
+/// not run waits here before it is taken. A test holds a report back with
+/// it and lets it arrive when the test wants it to.
+mod run_report_gate {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    static GATE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    pub(super) fn pass(report: &minimald_rpc::BoxRunReport) {
+        let gate = GATE.get_or_init(|| std::env::var_os("MINVMD_HOLD_END_REPORTS").map(Into::into));
+        let Some(gate) = gate else {
+            return;
+        };
+        if report.runs || !gate.exists() {
+            return;
+        }
+        tracing::info!(
+            box_id = %report.box_id,
+            seq = report.seq,
+            "held the guest's word that a box does not run"
+        );
+        while gate.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        tracing::info!(
+            box_id = %report.box_id,
+            seq = report.seq,
+            "let the held word through"
+        );
     }
 }
 
@@ -6592,6 +6740,7 @@ mod tests {
         host: PathBuf,
         guest: PathBuf,
         fake: crate::net::gvproxy_api::testing::FakeSwitch,
+        boxes: BoxRegistry,
     }
 
     impl PublishHost {
@@ -6614,14 +6763,20 @@ mod tests {
                 boxes.clone(),
                 Some(audit_log_path(&host)),
             );
-            let guest =
-                spawn_guest_door_with(&host, boxes, answerer, proxy_publish, Some(publisher))
-                    .expect("the guest door binds");
+            let guest = spawn_guest_door_with(
+                &host,
+                boxes.clone(),
+                answerer,
+                proxy_publish,
+                Some(publisher),
+            )
+            .expect("the guest door binds");
             Self {
                 _dir: dir,
                 host,
                 guest,
                 fake,
+                boxes,
             }
         }
 
@@ -6691,6 +6846,35 @@ mod tests {
                 GuestDoorReply::BoxStanding { standing, .. } => standing,
                 other => panic!("a standing read answers standing, got {other:?}"),
             }
+        }
+
+        /// The guest's word on whether it runs the box, and what the host
+        /// did with it.
+        fn run_report(
+            &self,
+            box_id: minimald_rpc::BoxId,
+            seq: u64,
+            runs: bool,
+        ) -> minimald_rpc::BoxRunEffect {
+            let report = minimald_rpc::BoxRunReport { box_id, seq, runs };
+            match self.guest(&GuestDoorRequest::BoxRun(report)) {
+                GuestDoorReply::BoxRunTaken {
+                    box_id: answered,
+                    seq: answered_seq,
+                    effect,
+                } if answered == box_id && answered_seq == seq => effect,
+                other => panic!("a run report is answered as taken, got {other:?}"),
+            }
+        }
+
+        /// Whether a row stands for the box.
+        fn has_row(&self, box_id: minimald_rpc::BoxId) -> bool {
+            self.boxes.row_by_box_id(box_id.to_bytes()).is_some()
+        }
+
+        /// One request of a client on the host door.
+        fn client(&self, request: &BoxControlRequest) -> BoxControlReply {
+            control(&self.host, request).expect("the host door answers")
         }
     }
 
@@ -6797,11 +6981,9 @@ mod tests {
         assert_eq!(host.fake.forwards().len(), 3);
     }
 
-    /// Unpublish ends a run-time forward and never a declared one, and the
-    /// guest's word that the box ended unbinds what is left and withdraws
-    /// the row, which its creator then asks back.
+    /// Unpublish ends a run-time forward and never a declared one.
     #[test]
-    fn the_guest_door_unpublishes_and_ends_a_box() {
+    fn the_guest_door_unpublishes_a_run_time_forward_only() {
         use minimald_rpc::{PublishOrigin, PublishRefusal};
         let host = PublishHost::start();
         let web = host.register("web", &[tcp_mapping(8080, 80)], Some((3000, 3999)));
@@ -6824,50 +7006,198 @@ mod tests {
         assert_eq!(refusal_of(unpublish(3000)), PublishRefusal::NotPublished);
         assert_eq!(refusal_of(unpublish(8080)), PublishRefusal::DeclaredPort);
         assert_eq!(host.fake.forwards().len(), 1);
+    }
 
-        let end = GuestDoorRequest::EndBox(minimald_rpc::EndBoxRequest { box_id: web.box_id });
+    /// The guest's word that a box with a row does not run sets the row and
+    /// its forwards aside, and its word that the box runs again brings the
+    /// row back as its creator registered it.
+    #[test]
+    fn the_guests_word_sets_a_row_aside_and_brings_it_back() {
+        use minimald_rpc::{BoxRunEffect, PublishOrigin, PublishRefusal};
+        let host = PublishHost::start();
+        let web = host.register("web", &[tcp_mapping(8080, 80)], Some((3000, 3999)));
+        host.publish(&web, 8080, 80, PublishOrigin::Declared);
+        host.publish(&web, 3000, 3000, PublishOrigin::Expose);
+        // The word that a running box runs changes nothing.
         assert_eq!(
-            host.guest(&end),
-            GuestDoorReply::BoxEnded {
-                ended: true,
-                box_id: web.box_id,
-                forwards_unbound: 1,
-                still_bound: 0,
-            }
+            host.run_report(web.box_id, 4, true),
+            BoxRunEffect::Unchanged
+        );
+        assert_eq!(host.fake.forwards().len(), 2);
+
+        assert_eq!(
+            host.run_report(web.box_id, 5, false),
+            BoxRunEffect::SetAside
         );
         assert!(host.fake.forwards().is_empty());
-        assert!(!host.standing(web.box_id));
-        // A second end, and a publish for the ended box, find no row.
-        assert!(matches!(
-            host.guest(&end),
-            GuestDoorReply::BoxEnded { ended: false, .. }
-        ));
+        assert!(!host.has_row(web.box_id));
         assert_eq!(
             refusal_of(host.publish(&web, 8080, 80, PublishOrigin::Declared)),
             PublishRefusal::UnknownBox
         );
-
-        // The creator's resume, on the host door, brings the row back, and
-        // the box's ports can be published again.
-        let resumed = control(
-            &host.host,
-            &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
-                name: "web".to_string(),
-                switch_address: web.switch_address,
-                loopback_address: web.loopback_address,
-                box_id: Some(web.box_id),
-            }),
-        )
-        .expect("the resume is answered");
-        assert!(
-            !matches!(resumed, BoxControlReply::Error { .. }),
-            "{resumed:?}"
-        );
+        // The box may start: its row comes back when the guest says it runs.
         assert!(host.standing(web.box_id));
+        // The same word again finds nothing left to set aside.
+        assert_eq!(
+            host.run_report(web.box_id, 5, false),
+            BoxRunEffect::Unchanged
+        );
+
+        assert_eq!(host.run_report(web.box_id, 6, true), BoxRunEffect::Restored);
+        let row = host
+            .boxes
+            .row_by_box_id(web.box_id.to_bytes())
+            .expect("the row is back");
+        assert_eq!(
+            (row.switch_addr(), row.loopback_addr()),
+            (web.switch_address, web.loopback_address)
+        );
+        // The launch that follows binds the box's declared port again, and
+        // only what its creator declared.
         assert!(matches!(
             host.publish(&web, 8080, 80, PublishOrigin::Declared),
             GuestDoorReply::Published { .. }
         ));
+        assert_eq!(
+            refusal_of(host.publish(&web, 8081, 80, PublishOrigin::Declared)),
+            PublishRefusal::NotDeclared
+        );
+        assert_eq!(host.fake.forwards().len(), 1);
+    }
+
+    /// A run report that arrives behind a newer one of the same box changes
+    /// nothing: the end of a run, told late, does not take down what the
+    /// next run set up, and the start of a run, told late, does not bring
+    /// back a box that has ended since.
+    #[test]
+    fn a_run_report_that_arrives_late_changes_nothing() {
+        use minimald_rpc::{BoxRunEffect, PublishOrigin};
+        let host = PublishHost::start();
+        let web = host.register("web", &[tcp_mapping(8080, 80)], None);
+        let shares = minimald_rpc::BoxId::mint();
+        host.client(&BoxControlRequest::AdmitHostIpBox(
+            minimald_rpc::HostIpBoxRequest {
+                session_id: shares,
+                credentialed_upstream: false,
+            },
+        ));
+
+        // The next run's word arrives first, and its forward is bound.
+        assert_eq!(
+            host.run_report(web.box_id, 6, true),
+            BoxRunEffect::Unchanged
+        );
+        assert_eq!(host.run_report(shares, 6, true), BoxRunEffect::Unchanged);
+        host.publish(&web, 8080, 80, PublishOrigin::Declared);
+        // The end of the run before it arrives late.
+        assert_eq!(host.run_report(web.box_id, 5, false), BoxRunEffect::Stale);
+        assert_eq!(host.run_report(shares, 5, false), BoxRunEffect::Stale);
+        assert!(host.has_row(web.box_id));
+        assert_eq!(host.fake.forwards().len(), 1);
+        assert_eq!(
+            host.boxes.resident_host_ip_box(shares.to_bytes()),
+            Some(false)
+        );
+
+        // Both boxes end, and the word that they ran arrives after it.
+        assert_eq!(
+            host.run_report(web.box_id, 8, false),
+            BoxRunEffect::SetAside
+        );
+        assert_eq!(host.run_report(shares, 8, false), BoxRunEffect::SetAside);
+        assert_eq!(host.run_report(web.box_id, 7, true), BoxRunEffect::Stale);
+        assert_eq!(host.run_report(shares, 7, true), BoxRunEffect::Stale);
+        assert!(!host.has_row(web.box_id));
+        assert_eq!(host.boxes.resident_host_ip_box(shares.to_bytes()), None);
+    }
+
+    /// A `host_ip` box that the guest's word set aside is resident again,
+    /// as its client admitted it, when the guest says it runs or a client
+    /// admits it.
+    #[test]
+    fn the_guests_word_sets_a_host_ip_box_aside_and_brings_it_back() {
+        use minimald_rpc::BoxRunEffect;
+        let host = PublishHost::start();
+        let shares = minimald_rpc::BoxId::mint();
+        let id = shares.to_bytes();
+        let admit = BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
+            session_id: shares,
+            credentialed_upstream: true,
+        });
+        host.client(&admit);
+        assert_eq!(host.boxes.resident_host_ip_box(id), Some(true));
+
+        assert_eq!(host.run_report(shares, 5, false), BoxRunEffect::SetAside);
+        assert_eq!(host.boxes.resident_host_ip_box(id), None);
+        assert!(host.boxes.host_ip_box_is_set_aside(id));
+        assert!(!host.boxes.holds_host_ip_boxes());
+        assert_eq!(host.run_report(shares, 5, false), BoxRunEffect::Unchanged);
+
+        // With what its client admitted it with, and nothing more.
+        assert_eq!(host.run_report(shares, 6, true), BoxRunEffect::Restored);
+        assert_eq!(host.boxes.resident_host_ip_box(id), Some(true));
+        assert!(!host.boxes.host_ip_box_is_set_aside(id));
+
+        // A client's admit stands whatever the guest said last.
+        assert_eq!(host.run_report(shares, 7, false), BoxRunEffect::SetAside);
+        host.client(&admit);
+        assert_eq!(host.boxes.resident_host_ip_box(id), Some(true));
+        assert!(!host.boxes.host_ip_box_is_set_aside(id));
+    }
+
+    /// What a client retired or withdrew is forgotten, and no word of the
+    /// guest brings it back. A box no client admitted gains nothing either.
+    #[test]
+    fn the_guests_word_brings_back_nothing_a_client_did_not_leave_admitted() {
+        use minimald_rpc::BoxRunEffect;
+        let host = PublishHost::start();
+
+        // A `host_ip` box its client retired after the guest ended it.
+        let shares = minimald_rpc::BoxId::mint();
+        host.client(&BoxControlRequest::AdmitHostIpBox(
+            minimald_rpc::HostIpBoxRequest {
+                session_id: shares,
+                credentialed_upstream: false,
+            },
+        ));
+        assert_eq!(host.run_report(shares, 5, false), BoxRunEffect::SetAside);
+        host.client(&BoxControlRequest::RetireHostIpBox(
+            minimald_rpc::RetireHostIpBoxRequest {
+                session_id: shares,
+                end: minimald_rpc::HostIpBoxEnd::Stopped,
+            },
+        ));
+        assert!(!host.boxes.host_ip_box_is_set_aside(shares.to_bytes()));
+        assert_eq!(host.run_report(shares, 6, true), BoxRunEffect::Unchanged);
+        assert_eq!(host.boxes.resident_host_ip_box(shares.to_bytes()), None);
+
+        // A box with a row its creator withdrew after the guest ended it.
+        let web = host.register("web", &[tcp_mapping(8080, 80)], None);
+        assert_eq!(
+            host.run_report(web.box_id, 5, false),
+            BoxRunEffect::SetAside
+        );
+        host.client(&BoxControlRequest::Withdraw(WithdrawBoxRequest {
+            name: "web".to_string(),
+            switch_address: web.switch_address,
+            loopback_address: web.loopback_address,
+            box_id: Some(web.box_id),
+        }));
+        assert_eq!(
+            host.run_report(web.box_id, 6, true),
+            BoxRunEffect::Unchanged
+        );
+        assert!(!host.has_row(web.box_id));
+        assert!(!host.standing(web.box_id));
+
+        // Ids no client ever named.
+        let stranger = minimald_rpc::BoxId::mint();
+        assert_eq!(host.run_report(stranger, 1, true), BoxRunEffect::Unchanged);
+        assert_eq!(host.run_report(stranger, 2, false), BoxRunEffect::Unchanged);
+        assert_eq!(host.run_report(stranger, 3, true), BoxRunEffect::Unchanged);
+        assert_eq!(host.boxes.resident_host_ip_box(stranger.to_bytes()), None);
+        assert!(!host.has_row(stranger));
+        assert!(!host.standing(stranger));
     }
 
     /// Each door serves its own verbs: the in-VM daemon cannot register or
