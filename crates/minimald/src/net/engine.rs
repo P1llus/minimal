@@ -1437,8 +1437,9 @@ impl Engine {
     }
 
     /// Says once per box that the rules of the names of one address did
-    /// not fit one list. The list refuses what its missing rules would
-    /// have judged, so the user needs to know why a name stopped working.
+    /// not fit one list. The list refuses every flow the rules left out
+    /// would have judged, so the user needs to know why a name stopped
+    /// working.
     fn report_set_overflow(&self, of: &Arc<Installed>, overflow: &boxbpf::SetOverflow) {
         let names = overflow.names.join(", ");
         tracing::warn!(
@@ -1448,7 +1449,7 @@ impl Engine {
             rules = overflow.overflow.rules,
             limit = netpol::abi::RULES_MAX,
             "the names of one address have more rules between them than one list holds; \
-             the rules that did not fit refuse what they would have judged"
+             flows that the rules left out would have judged are refused"
         );
         self.observe(
             Arc::clone(of),
