@@ -30,7 +30,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +41,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 use super::policy::Direction;
+use super::resolver::ZoneAnswer;
 
 /// The port the host-side egress/DNS proxy listens on (TC3): the documented
 /// default the recipes that export `HTTP(S)_PROXY` assume. A daemon started
@@ -106,6 +107,71 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
 /// The reason of the event for a request to a box that has no address on
 /// the asking box's network.
 const NO_ADDRESS_FOR_CALLER: &str = "no_address_for_caller";
+
+/// A box's request that its own connection to the target would not get.
+#[derive(Debug, PartialEq, Eq)]
+struct Refused {
+    /// Where the box's connection would have gone, when it has an address
+    /// for the target.
+    remote: Option<IpAddr>,
+    /// The reason of the event.
+    reason: String,
+    /// Position of the deciding rule in the box's compiled policy.
+    rule: Option<u16>,
+    /// What the box reads in the response.
+    told: &'static str,
+}
+
+/// Judges a box's request as the box's own connection to the target.
+///
+/// `told` is what the box's resolver answers for the target's name, and
+/// the connection is judged at that address. `dials` is where this node
+/// connects for the request, which is a socket of the node's namespace
+/// and says nothing about what a box in a namespace of its own may reach.
+/// A box that shares the node's namespace would dial that same socket,
+/// so where its resolver has no address for the target it is judged
+/// there. With nothing to dial there is nothing to judge, and the caller
+/// refuses the port.
+fn judge_own_connection(
+    told: ZoneAnswer,
+    own_namespace: bool,
+    dials: Option<SocketAddr>,
+    port: u16,
+    judge: impl FnOnce(&netpol::Flow) -> netpol::Decision,
+) -> Result<(), Refused> {
+    let remote = match told {
+        ZoneAnswer::Address(told) => IpAddr::V4(told),
+        ZoneAnswer::NoData | ZoneAnswer::NoSuchName if own_namespace => {
+            return Err(Refused {
+                remote: None,
+                reason: NO_ADDRESS_FOR_CALLER.to_owned(),
+                rule: None,
+                told: "the caller's network has no address for this box",
+            });
+        }
+        ZoneAnswer::NoData | ZoneAnswer::NoSuchName => match dials {
+            Some(dials) => dials.ip(),
+            None => return Ok(()),
+        },
+    };
+    let flow = netpol::Flow {
+        direction: netpol::Direction::Egress,
+        protocol: netpol::Protocol::Tcp,
+        remote,
+        port,
+        local: None,
+    };
+    let decision = judge(&flow);
+    if decision.verdict == netpol::FlowVerdict::Deny {
+        return Err(Refused {
+            remote: Some(remote),
+            reason: crate::events::snake(&decision.reason),
+            rule: decision.rule,
+            told: "the caller's egress policy denies this target",
+        });
+    }
+    Ok(())
+}
 
 /// The rule the `network policy violation` line names for a request to a
 /// port the box has not published.
@@ -527,55 +593,33 @@ where
     let port = port.unwrap_or(DEFAULT_UPSTREAM_PORT);
 
     // A box at its own endpoint is judged as its own connection to the
-    // target would be: at the address its resolver tells it for the name,
-    // by its compiled policy. The address this daemon dials below is the
-    // host's end of the target's port, which says nothing about what the
-    // asking box may reach. A box with its own address counts every
-    // loopback address as its own. The name stands for a pin, so a peer
-    // the box lists by name is admitted.
+    // target would be, by its compiled policy. The name stands for a pin,
+    // so a peer the box lists by name is admitted.
     if let Asker::Box(asker) = &asker {
-        let refuse = |remote: Option<std::net::IpAddr>, reason: String, rule| {
+        let told = asker.engine.zone_answer(&asker.of, host);
+        let judged = judge_own_connection(
+            told,
+            asker.of.own_namespace(),
+            route.upstream(port),
+            port,
+            |flow| asker.engine.evaluate(&asker.of, flow, Some(host)),
+        );
+        if let Err(refused) = judged {
             asker.engine.observe(
                 Arc::clone(&asker.of),
                 crate::events::NetRefusal {
                     source: crate::events::Source::HostnameProxy,
                     direction: netpol::Direction::Egress,
                     protocol: Some(netpol::Protocol::Tcp),
-                    remote,
+                    remote: refused.remote,
                     port: Some(port),
                     name: Some(host.to_owned()),
-                    reason,
-                    rule,
+                    reason: refused.reason,
+                    rule: crate::events::RuleRef::of(&asker.of.compiled(), refused.rule),
                     pid: None,
                 },
             );
-        };
-        let crate::net::resolver::ZoneAnswer::Address(reached_at) =
-            asker.engine.zone_answer(&asker.of, host)
-        else {
-            // The target has no address where the asking box is: a box
-            // that shares the host's address, asked for from the virtual
-            // network.
-            refuse(None, NO_ADDRESS_FOR_CALLER.to_owned(), None);
-            let reason = "the caller's network has no address for this box";
-            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
-        };
-        let flow = netpol::Flow {
-            direction: netpol::Direction::Egress,
-            protocol: netpol::Protocol::Tcp,
-            remote: std::net::IpAddr::V4(reached_at),
-            port,
-            local: None,
-        };
-        let decision = asker.engine.evaluate(&asker.of, &flow, Some(host));
-        if decision.verdict == netpol::FlowVerdict::Deny {
-            refuse(
-                Some(flow.remote),
-                crate::events::snake(&decision.reason),
-                crate::events::RuleRef::of(&asker.of.compiled(), decision.rule),
-            );
-            let reason = "the caller's egress policy denies this target";
-            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
+            return write_refusal_status(&mut client, "403 Forbidden", refused.told).await;
         }
     }
 
@@ -1697,6 +1741,117 @@ mod tests {
 
     use crate::net::dns::DEFAULT_HOST_ID;
     use crate::test_harness::CaptureWriter;
+
+    /// The compiled policy of a box on a guest node, with the names
+    /// `listed` in its egress, or no egress section.
+    fn guest_box(mode: boxes::NetworkMode, listed: Option<&[&str]>) -> netpol::Compiled {
+        use crate::net::engine::Engine;
+        let section = listed.map(|listed| boxes::EgressPolicy {
+            allow_subnets: None,
+            allow_dns_hosts: Some(listed.iter().map(|&name| name.to_owned()).collect()),
+            allow_protocols: None,
+            deny_subnets: None,
+        });
+        let policy = BoxPolicy::new(section, None);
+        let own = boxes::egress::box_policy(policy.egress.as_ref(), mode, false).expect("policy");
+        let node = crate::net::spec::Node::guest(switch::DEFAULT_SUBNET);
+        let block = Some(crate::net::endpoints::Block::sample());
+        Engine::spec_of(&node, mode, &policy, own, block)
+            .compile()
+            .expect("compiles")
+    }
+
+    /// The request of a box with `policy` for port 8080 of `peer`, a box
+    /// that shares the node's address. On the virtual network the zone
+    /// has no address for it, and the node dials it at its own loopback.
+    fn asks_for_sharing_peer(
+        policy: &netpol::Compiled,
+        own_namespace: bool,
+        peer: &str,
+    ) -> Result<(), Refused> {
+        let dials = SocketAddr::from((Ipv4Addr::LOCALHOST, 8080));
+        judge_own_connection(
+            ZoneAnswer::NoData,
+            own_namespace,
+            Some(dials),
+            8080,
+            |flow| policy.evaluate(flow, |_| policy.set_for_name(peer).into_iter().collect()),
+        )
+    }
+
+    #[test]
+    fn a_box_sharing_a_guest_s_address_reaches_a_sharing_peer_by_default() {
+        let open = guest_box(boxes::NetworkMode::HostNet, None);
+        assert_eq!(
+            asks_for_sharing_peer(&open, false, "peer.min.internal"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_closed_box_sharing_a_guest_s_address_reaches_only_a_sharing_peer_it_lists() {
+        let mode = boxes::NetworkMode::HostNet;
+        let other = guest_box(mode, Some(&["example.com"]));
+        let refused = asks_for_sharing_peer(&other, false, "peer.min.internal")
+            .expect_err("the box does not list the peer");
+        // Judged where the node dials, by the box's own default.
+        assert_eq!(refused.remote, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(refused.reason, "default");
+        assert_eq!(
+            refused.told,
+            "the caller's egress policy denies this target"
+        );
+
+        let lists = guest_box(mode, Some(&["peer.min.internal"]));
+        assert_eq!(
+            asks_for_sharing_peer(&lists, false, "peer.min.internal"),
+            Ok(())
+        );
+    }
+
+    /// A box in a namespace of its own counts every loopback address as
+    /// itself, so the address the node dials must never judge its request.
+    #[test]
+    fn a_box_with_its_own_address_has_no_way_to_a_sharing_peer() {
+        let mode = boxes::NetworkMode::OwnIp;
+        for listed in [None, Some(&["peer.min.internal"][..])] {
+            let policy = guest_box(mode, listed);
+            let refused = asks_for_sharing_peer(&policy, true, "peer.min.internal")
+                .expect_err("no address for the peer");
+            assert_eq!(
+                (refused.remote, refused.reason.as_str(), refused.rule),
+                (None, NO_ADDRESS_FOR_CALLER, None),
+                "{listed:?}"
+            );
+        }
+    }
+
+    /// The address the box is told wins over the one the node dials, and a
+    /// port with nothing to dial is left to the caller's own refusal.
+    #[test]
+    fn a_box_is_judged_at_the_address_it_is_told_before_the_one_the_node_dials() {
+        let lease = Ipv4Addr::new(100, 64, 0, 9);
+        let dials = SocketAddr::from((Ipv4Addr::LOCALHOST, 8080));
+        let judged_at = |told, dials| {
+            let mut seen = None;
+            let outcome = judge_own_connection(told, false, dials, 8080, |flow| {
+                seen = Some(flow.remote);
+                netpol::Decision {
+                    verdict: netpol::FlowVerdict::Allow,
+                    rule: None,
+                    reason: netpol::Reason::Default,
+                }
+            });
+            assert_eq!(outcome, Ok(()));
+            seen
+        };
+        assert_eq!(
+            judged_at(ZoneAnswer::Address(lease), Some(dials)),
+            Some(IpAddr::V4(lease))
+        );
+        assert_eq!(judged_at(ZoneAnswer::NoData, Some(dials)), Some(dials.ip()));
+        assert_eq!(judged_at(ZoneAnswer::NoData, None), None);
+    }
 
     /// Proof artifact 1 (registry/proxy routing contract): a `HostNet` PTask's
     /// `Host:` header routes through the proxy to its registered target; after

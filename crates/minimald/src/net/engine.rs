@@ -218,6 +218,12 @@ impl Installed {
         self.session
     }
 
+    /// Whether the box's processes have a network namespace of their own.
+    /// Without one they share the node's and dial from it as the node does.
+    pub(crate) const fn own_namespace(&self) -> bool {
+        self.own_namespace
+    }
+
     /// Whether the box reaches a peer at the peer's address on the virtual
     /// network. A box that shares a native node's address reaches it at
     /// the node's loopback, where the peer's ports are published.
@@ -982,7 +988,7 @@ impl Engine {
         }
     }
 
-    fn spec_of(
+    pub(super) fn spec_of(
         node: &Node,
         mode: NetworkMode,
         policy: &BoxPolicy,
