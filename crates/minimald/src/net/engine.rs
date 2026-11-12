@@ -18,7 +18,7 @@ use std::{
 };
 
 use boxbpf::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
-use boxes::{BoxPolicy, NetworkMode, SessionId, core::bep::Steering};
+use boxes::{BoxPolicy, NetworkMode, SessionId, core::bep::Steering, egress::SpecError};
 use netpol::{
     Compiled, Protocol, Verdict,
     base::{NodeKind, PortOf, Services},
@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use super::{
     endpoints::{self, Allocator, Block, Service, Sockets, Wants},
-    spec::{self, Node, SpecError},
+    spec::{self, Node},
 };
 use crate::events::{self, Limiter, Log, Observation};
 
@@ -90,8 +90,12 @@ impl std::fmt::Display for Absent {
 pub(crate) enum Unenforceable {
     /// The node has no network to give the box.
     NoNetwork(&'static str),
-    /// A setting nothing applies yet.
-    Setting(&'static str),
+    /// The box has a secret for an authority that its own egress rules
+    /// do not let it connect to.
+    Steered {
+        host: String,
+        port: u16,
+    },
     /// The box sends connections to the credential proxy, and this node
     /// has no way to one.
     NoCredentialProxy,
@@ -109,10 +113,11 @@ impl std::fmt::Display for Unenforceable {
                 "it asks for a network, and this VM has none: {why}. A box with \
                  `--network none` starts."
             ),
-            Self::Setting(setting) => write!(
+            Self::Steered { host, port } => write!(
                 f,
-                "its network policy sets `{setting}`, which this version of Minimal cannot \
-                 apply. Remove the setting."
+                "it has a secret for {host}:{port}, and its own egress rules do not let it \
+                 connect there. A secret opens no destination. Add {host} to \
+                 `egress.allow_dns_hosts`."
             ),
             Self::NoCredentialProxy => f.write_str(
                 "it declares a credentialed upstream, and this node has no credential proxy \
@@ -245,6 +250,21 @@ impl Installed {
                 .v6
                 .is_some_and(|e| *e.ip() == ip && e.port() == at.port()),
         }
+    }
+
+    /// The names whose connections to `port` the engine redirects to the
+    /// box's credential proxy endpoint.
+    pub(crate) fn steered_at(&self, port: u16) -> Vec<netpol::NamePattern> {
+        let entry = self.entry.lock().expect("box entry lock");
+        entry
+            .live
+            .spec()
+            .deployment
+            .steered
+            .iter()
+            .filter(|authority| authority.port == port)
+            .map(|authority| authority.name.clone())
+            .collect()
     }
 
     /// The count of the streams the box holds through its endpoints.
@@ -879,21 +899,6 @@ impl Engine {
                 .is_some_and(|upstream| upstream.bep.resolved_steering() != Steering::Off)
     }
 
-    /// The first setting of `policy` that nothing applies to a box with a
-    /// network.
-    fn unapplied_setting(mode: NetworkMode, policy: &BoxPolicy) -> Option<&'static str> {
-        let redirects = policy
-            .credentialed_upstream
-            .as_ref()
-            .is_some_and(|upstream| {
-                matches!(
-                    upstream.bep.resolved_steering(),
-                    Steering::Dns | Steering::Both
-                )
-            });
-        (mode != NetworkMode::NoNet && redirects).then_some("network.bep.steering = \"dns\"")
-    }
-
     /// Whether a box in `mode` with `policy` can run here with every rule
     /// of the policy applied.
     pub(crate) fn can_enforce(
@@ -912,11 +917,20 @@ impl Engine {
         if self.node == NodeKind::Native && Self::credential_proxy(mode, policy) {
             return Err(Unenforceable::NoCredentialProxy);
         }
-        if let Some(setting) = Self::unapplied_setting(mode, policy) {
-            return Err(Unenforceable::Setting(setting));
-        }
-        let own = spec::box_policy(policy.egress.as_ref(), mode, deny_all_opt_out)
+        let own = boxes::egress::box_policy(policy.egress.as_ref(), mode, deny_all_opt_out)
             .map_err(Unenforceable::Spec)?;
+        // A secret opens no destination: the box's own rules must let it
+        // connect to each authority it has one for.
+        if Self::credential_proxy(mode, policy)
+            && let Some(refused) = spec::credentialed(policy).into_iter().find(|authority| {
+                !own.admits_tcp_by_name(mode.into(), authority.name.domain(), authority.port)
+            })
+        {
+            return Err(Unenforceable::Steered {
+                host: refused.name.domain().to_owned(),
+                port: refused.port,
+            });
+        }
         match &self.state {
             State::Attached(attached) => {
                 let node = attached.node.read().expect("engine lock").clone();
@@ -957,10 +971,13 @@ impl Engine {
     /// The endpoints of a box in `mode` that declares `policy`, which
     /// reads as `own` for the engine.
     fn wants(node: &Node, mode: NetworkMode, policy: &BoxPolicy, own: &netpol::BoxPolicy) -> Wants {
+        let credential_proxy = Self::credential_proxy(mode, policy);
         Wants {
-            resolver: spec::needs_resolver(node, mode, own),
+            // A redirect follows a pin, and only the box's resolver pins.
+            resolver: spec::needs_resolver(node, mode, own)
+                || (credential_proxy && !spec::redirected(policy).is_empty()),
             hostname_proxy: mode != NetworkMode::NoNet,
-            credential_proxy: Self::credential_proxy(mode, policy),
+            credential_proxy,
             host_relay: mode != NetworkMode::NoNet,
         }
     }
@@ -991,8 +1008,12 @@ impl Engine {
             endpoints::port_range()
         };
         let ranges = spec::endpoint_ranges(&endpoints::addresses(), ports);
+        let mut deployment = spec::deployment(node, mode, services, ranges);
+        if wants.credential_proxy {
+            deployment.steered = spec::redirected(policy);
+        }
         Spec {
-            deployment: spec::deployment(node, mode, services, ranges),
+            deployment,
             policy: own,
             options: spec::OPTIONS,
         }
@@ -1013,7 +1034,7 @@ impl Engine {
         let Some(attached) = self.attached_state() else {
             return Ok(None);
         };
-        let own = spec::box_policy(
+        let own = boxes::egress::box_policy(
             facts.policy.egress.as_ref(),
             facts.mode,
             facts.deny_all_opt_out,
@@ -1257,7 +1278,7 @@ impl Engine {
         of: &Installed,
         facts: &BoxFacts,
     ) -> Result<(), InstallError> {
-        let own = spec::box_policy(
+        let own = boxes::egress::box_policy(
             facts.policy.egress.as_ref(),
             facts.mode,
             facts.deny_all_opt_out,
@@ -1628,6 +1649,27 @@ impl Engine {
         compiled.evaluate(flow, |_| pinned.clone())
     }
 
+    /// Judges a flow that a steering rule redirected by the rest of the
+    /// box's rules: whether the flow may exist at all, wherever it goes.
+    pub(crate) fn evaluate_unsteered(
+        &self,
+        of: &Installed,
+        flow: &netpol::Flow,
+    ) -> netpol::Decision {
+        let pinned = self.attached_state().map_or_else(Vec::new, |attached| {
+            attached
+                .handles
+                .lock()
+                .expect("engine lock")
+                .pinned_sets(of.id, flow.remote)
+        });
+        of.compiled().evaluate_skipping(
+            flow,
+            |_| pinned.clone(),
+            |rule| rule.origin == netpol::Origin::Steering,
+        )
+    }
+
     /// Makes the box's entry match `facts`, when a launch finds the entry
     /// a different launch wrote.
     pub(crate) fn reconfigure(&self, of: &Installed, facts: &BoxFacts) -> Result<(), InstallError> {
@@ -1926,6 +1968,175 @@ mod tests {
         assert_ne!(
             spec.deployment.services.credential_proxy,
             spec.deployment.services.hostname_proxy
+        );
+    }
+
+    /// A box with a GitHub grant, the upstream of a store rule, and the
+    /// names `listed` in its egress.
+    fn granted(steering: Steering, listed: &[&str]) -> BoxPolicy {
+        use boxes::core::bep::{GrantSource, SecretGrant};
+        let mut policy = egress(|e| e.allow_dns_hosts = list(listed));
+        let mut upstream = steered(steering).credentialed_upstream.expect("declared");
+        upstream.secrets.insert(
+            "GH_TOKEN".into(),
+            SecretGrant {
+                source: GrantSource::Broker,
+                scopes: vec!["github:user-token".into()],
+                mode: None,
+            },
+        );
+        upstream.store_upstreams = vec!["api.store.test:8443".into()];
+        policy.credentialed_upstream = Some(upstream);
+        policy
+    }
+
+    const GRANTED: [&str; 5] = [
+        "github.com",
+        "api.github.com",
+        "uploads.github.com",
+        "codeload.github.com",
+        "api.store.test",
+    ];
+
+    /// A secret opens no destination: the box's own rules must let it
+    /// connect to every authority it has a secret for, in both forms of
+    /// steering.
+    #[test]
+    fn a_box_whose_rules_refuse_an_authority_of_its_secrets_does_not_start() {
+        let guest = Engine {
+            state: State::Absent(Absent::NotStarted),
+            node: NodeKind::Guest,
+        };
+        for steering in [Steering::Dns, Steering::ProxyEnv, Steering::Both] {
+            for mode in [NetworkMode::HostNet, NetworkMode::OwnIp] {
+                let refusal = guest
+                    .can_enforce(mode, &granted(steering, &GRANTED[1..]), false)
+                    .expect_err("github.com is not listed");
+                assert_eq!(
+                    refusal,
+                    Unenforceable::Steered {
+                        host: "github.com".into(),
+                        port: 443
+                    }
+                );
+                assert!(
+                    refusal
+                        .to_string()
+                        .contains("Add github.com to `egress.allow_dns_hosts`"),
+                    "{refusal}"
+                );
+                assert_eq!(
+                    guest.can_enforce(mode, &granted(steering, &GRANTED[..4]), false),
+                    Err(Unenforceable::Steered {
+                        host: "api.store.test".into(),
+                        port: 8443
+                    })
+                );
+                // With every authority listed the box only lacks an engine.
+                assert!(matches!(
+                    guest.can_enforce(mode, &granted(steering, &GRANTED), false),
+                    Err(Unenforceable::NoEngine(_))
+                ));
+            }
+        }
+        // With steering off the box sends nothing to the proxy.
+        assert!(matches!(
+            guest.can_enforce(NetworkMode::HostNet, &granted(Steering::Off, &[]), false),
+            Err(Unenforceable::NoEngine(_))
+        ));
+    }
+
+    /// A steered name's address is redirected to the box's endpoint at the
+    /// authority's port, and the rest of the box's rules still judge the
+    /// connection that was redirected.
+    #[test]
+    fn a_steered_authority_is_redirected_and_still_judged_by_the_box_s_rules() {
+        let guest = Node::guest(switch::DEFAULT_SUBNET);
+        let compiled = |steering, listed: &[&str], deny: Option<&str>| {
+            let mut policy = granted(steering, listed);
+            if let Some(section) = policy.egress.as_mut() {
+                section.deny_subnets = deny.map(|prefix| vec![prefix.to_owned()]);
+            }
+            let own =
+                boxes::egress::box_policy(policy.egress.as_ref(), NetworkMode::HostNet, false)
+                    .expect("policy");
+            let spec = Engine::spec_of(
+                &guest,
+                NetworkMode::HostNet,
+                &policy,
+                own.clone(),
+                Some(Block::sample()),
+            );
+            let wants = Engine::wants(&guest, NetworkMode::HostNet, &policy, &own);
+            (spec.compile().expect("compiles"), wants)
+        };
+        let address: IpAddr = "140.82.112.3".parse().expect("address");
+        let flow = |port| netpol::Flow {
+            direction: netpol::Direction::Egress,
+            protocol: Protocol::Tcp,
+            remote: address,
+            port,
+            local: None,
+        };
+        let proxy = Block::sample()
+            .endpoint(Service::CredentialProxy)
+            .v4
+            .map(SocketAddr::V4)
+            .expect("endpoint");
+        let unsteered = |rule: &netpol::Rule| rule.origin == netpol::Origin::Steering;
+
+        let (redirecting, wants) = compiled(Steering::Dns, &GRANTED, None);
+        assert!(wants.resolver && wants.credential_proxy);
+        let github = redirecting.set_for_name("github.com").expect("a set");
+        let pinned = |_| vec![github];
+        assert_eq!(
+            redirecting.evaluate(&flow(443), pinned).verdict,
+            netpol::FlowVerdict::Redirect(proxy)
+        );
+        assert_eq!(
+            redirecting
+                .evaluate_skipping(&flow(443), pinned, unsteered)
+                .verdict,
+            netpol::FlowVerdict::Allow
+        );
+        // Another port of the name goes out as the box's rules say.
+        assert_eq!(
+            redirecting.evaluate(&flow(22), pinned).verdict,
+            netpol::FlowVerdict::Allow
+        );
+        // The store rule's upstream is steered at its own port.
+        let store = redirecting.set_for_name("api.store.test").expect("a set");
+        assert_eq!(
+            redirecting.evaluate(&flow(8443), |_| vec![store]).verdict,
+            netpol::FlowVerdict::Redirect(proxy)
+        );
+        assert_eq!(
+            redirecting.evaluate(&flow(443), |_| vec![store]).verdict,
+            netpol::FlowVerdict::Allow
+        );
+
+        // A rule of the box that denies the address: the redirect still
+        // comes first in the kernel, and the rest of the list refuses.
+        let (denied, _) = compiled(Steering::Dns, &GRANTED, Some("140.82.112.0/20"));
+        let github = denied.set_for_name("github.com").expect("a set");
+        assert_eq!(
+            denied.evaluate(&flow(443), |_| vec![github]).verdict,
+            netpol::FlowVerdict::Redirect(proxy)
+        );
+        assert_eq!(
+            denied
+                .evaluate_skipping(&flow(443), |_| vec![github], unsteered)
+                .verdict,
+            netpol::FlowVerdict::Deny
+        );
+
+        // A box that reaches the proxy only through its environment has
+        // no redirect.
+        let (explicit, _) = compiled(Steering::ProxyEnv, &GRANTED, None);
+        let github = explicit.set_for_name("github.com").expect("a set");
+        assert_eq!(
+            explicit.evaluate(&flow(443), |_| vec![github]).verdict,
+            netpol::FlowVerdict::Allow
         );
     }
 

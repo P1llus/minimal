@@ -1266,6 +1266,50 @@ fn a_box_that_cannot_start_is_refused_or_leaves_nothing() {
     assert_eq!(daemon.exec("open", "echo still").trim(), "still");
 }
 
+/// The credential proxy runs on the host of a VM. A native node has no
+/// way to one, so it creates no box that would send connections there.
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_native_node_creates_no_box_that_needs_the_credential_proxy() {
+    if !gated("a_native_node_creates_no_box_that_needs_the_credential_proxy") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    for (name, flags) in [
+        ("shares", &["--network", "host_ip"][..]),
+        (
+            "own",
+            &["--network", "own_ip", "--allow-dns-hosts", "example.com"],
+        ),
+    ] {
+        let mut flags = flags.to_vec();
+        flags.push("--credentialed-upstream");
+        let activation = daemon.activate(name, &flags);
+        assert!(
+            activation.contains("this node has no credential proxy"),
+            "{activation}"
+        );
+        assert!(!daemon.lists(name), "{activation}");
+    }
+    assert!(daemon.box_cgroups().is_empty());
+
+    // With steering off the box sends nothing to a proxy, and runs.
+    let project = daemon.project.join("minimal.toml");
+    let mut file = std::fs::read_to_string(&project).expect("project file");
+    file.push_str("\n[session.network.bep]\nsteering = \"off\"\n");
+    std::fs::write(&project, file).expect("project file");
+    let activation = daemon.activate("off", &["--network", "host_ip", "--credentialed-upstream"]);
+    assert_eq!(
+        daemon.exec("off", "echo runs").trim(),
+        "runs",
+        "{activation}"
+    );
+    let env = daemon.exec("off", "env");
+    assert!(!env.contains("HTTPS_PROXY"), "{env}");
+}
+
 /// A box asks the hostname proxy for another box. The proxy judges the
 /// request where the asking box would dial: at the address its resolver
 /// tells it for the name, by the box's own rules.

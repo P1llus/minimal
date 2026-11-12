@@ -32,7 +32,7 @@ use super::engine::{Engine, Installed, Peers};
 use crate::events::{NetRefusal, Source};
 
 /// How long a host service may take to accept.
-const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How often the exposure table is read again while a stream that depends
 /// on it is open.
@@ -92,7 +92,7 @@ pub(crate) static HOST_RELAY: Kind = Kind {
             Some("host_port_not_exposed")
         }
         Refused::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
-        Refused::Unreachable(_) | Refused::Door(_) => None,
+        Refused::Denied | Refused::Unreachable(_) | Refused::Door(_) => None,
     },
 };
 
@@ -108,7 +108,7 @@ pub(crate) static CREDENTIAL_PROXY: Kind = Kind {
         // request with a secret fails.
         Refused::Door(StreamRefusal::ProxyDown) => Some("credential_proxy_down"),
         Refused::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
-        Refused::NotExposed | Refused::Unreachable(_) | Refused::Door(_) => None,
+        Refused::NotExposed | Refused::Denied | Refused::Unreachable(_) | Refused::Door(_) => None,
     },
 };
 
@@ -184,6 +184,9 @@ impl Drop for Slot {
 pub(crate) enum Refused {
     /// The host exposures table does not open the port.
     NotExposed,
+    /// A rule of the box refuses the flow. Whoever found that reported it
+    /// with the rule.
+    Denied,
     /// Nothing accepted the connection.
     Unreachable(io::Error),
     /// The VM host decided against the stream.
@@ -194,6 +197,7 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotExposed => f.write_str("the host exposures table does not open the port"),
+            Self::Denied => f.write_str("the box's own rules refuse the flow"),
             Self::Unreachable(error) => write!(f, "nothing accepted the connection: {error}"),
             Self::Door(reason) => write!(f, "the VM host refused the stream: {reason:?}"),
         }

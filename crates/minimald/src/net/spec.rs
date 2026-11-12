@@ -5,11 +5,13 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use boxes::NetworkMode;
-pub(crate) use boxes::egress::{SpecError, box_policy};
+use boxes::{
+    BoxPolicy, NetworkMode,
+    core::bep::{SecretGrant, Steering},
+};
 use netpol::{
-    PortRange, Prefix, Verdict,
-    base::{Deployment, EndpointRange, NodeKind, Services, VirtualNetwork},
+    NamePattern, PortRange, Prefix, Verdict,
+    base::{Deployment, EndpointRange, NodeKind, Services, Steered, VirtualNetwork},
     compile::Options,
 };
 
@@ -64,6 +66,60 @@ impl Node {
     /// box of the node.
     pub(crate) fn host_alias(&self) -> Option<IpAddr> {
         self.switch.map(|subnet| IpAddr::V4(subnet.host_alias()))
+    }
+}
+
+/// The authorities the box's secrets are for: the GitHub hosts when it has
+/// a GitHub grant, and the upstreams of the store rules its creation
+/// accepted. Empty for a box whose steering is `off`.
+pub(crate) fn credentialed(policy: &BoxPolicy) -> Vec<Steered> {
+    let Some(upstream) = policy
+        .credentialed_upstream
+        .as_ref()
+        .filter(|upstream| upstream.bep.resolved_steering() != Steering::Off)
+    else {
+        return Vec::new();
+    };
+    let github = bep::module::GITHUB
+        .hosts
+        .iter()
+        .filter(|_| upstream.secrets.values().any(SecretGrant::is_github))
+        .map(|authority| (authority.host.to_owned(), authority.port));
+    let mut out = Vec::new();
+    for (host, port) in github.chain(upstream.store_upstream_authorities()) {
+        match host.parse::<NamePattern>() {
+            Ok(name) if !name.is_wildcard() => {
+                let authority = Steered { name, port };
+                if !out.contains(&authority) {
+                    out.push(authority);
+                }
+            }
+            // The client checks an upstream before it accepts the rule.
+            // One that is no host name is steered nowhere.
+            _ => tracing::warn!(%host, "a store upstream of the box is no host name"),
+        }
+    }
+    out
+}
+
+/// The authorities whose connections the engine redirects to the box's
+/// credential proxy endpoint: all of [`credentialed`] when the box's
+/// steering redirects, and none when the box reaches the proxy only
+/// through its environment.
+pub(crate) fn redirected(policy: &BoxPolicy) -> Vec<Steered> {
+    let redirects = policy
+        .credentialed_upstream
+        .as_ref()
+        .is_some_and(|upstream| {
+            matches!(
+                upstream.bep.resolved_steering(),
+                Steering::Dns | Steering::Both
+            )
+        });
+    if redirects {
+        credentialed(policy)
+    } else {
+        Vec::new()
     }
 }
 
@@ -135,7 +191,7 @@ pub(crate) fn endpoint_ranges(addrs: &[IpAddr], ports: PortRange) -> Vec<Endpoin
 
 #[cfg(test)]
 mod tests {
-    use boxes::EgressPolicy;
+    use boxes::{EgressPolicy, egress::box_policy};
     use netpol::{
         Action, Direction, Flow, FlowVerdict, Origin, Protocol, base::Mode, compile::Spec,
     };
@@ -155,6 +211,96 @@ mod tests {
 
     fn list(entries: &[&str]) -> Option<Vec<String>> {
         Some(entries.iter().map(|e| (*e).to_owned()).collect())
+    }
+
+    #[test]
+    fn steered_authorities_come_from_the_github_grant_and_the_store_upstreams() {
+        use boxes::core::bep::{BepSettings, GrantSource, SecretGrant};
+        let declared = |steering, edit: fn(&mut boxes::CredentialedUpstream)| {
+            let mut upstream = boxes::CredentialedUpstream {
+                bep: BepSettings {
+                    steering: Some(steering),
+                    ..BepSettings::default()
+                },
+                ..Default::default()
+            };
+            edit(&mut upstream);
+            BoxPolicy {
+                credentialed_upstream: Some(upstream),
+                ..BoxPolicy::default()
+            }
+        };
+        let authorities = |policy: &BoxPolicy| -> Vec<String> {
+            credentialed(policy)
+                .iter()
+                .map(|a| format!("{}:{}", a.name.domain(), a.port))
+                .collect()
+        };
+
+        // A declaration alone names no authority.
+        assert!(credentialed(&declared(Steering::Dns, |_| {})).is_empty());
+        assert!(credentialed(&BoxPolicy::default()).is_empty());
+
+        let github = declared(Steering::Dns, |u| {
+            u.secrets.insert(
+                "GH_TOKEN".into(),
+                SecretGrant {
+                    source: GrantSource::Broker,
+                    scopes: vec!["github:user-token".into()],
+                    mode: None,
+                },
+            );
+        });
+        assert_eq!(
+            authorities(&github),
+            [
+                "github.com:443",
+                "api.github.com:443",
+                "uploads.github.com:443",
+                "codeload.github.com:443"
+            ]
+        );
+        assert_eq!(redirected(&github), credentialed(&github));
+
+        // A secret from the client's environment goes through no proxy.
+        let client_env = declared(Steering::Dns, |u| {
+            u.secrets.insert(
+                "NPM_TOKEN".into(),
+                SecretGrant {
+                    source: GrantSource::ClientEnv,
+                    scopes: Vec::new(),
+                    mode: None,
+                },
+            );
+        });
+        assert!(credentialed(&client_env).is_empty());
+
+        // Store upstreams keep their port, once each. One that is no host
+        // name is steered nowhere.
+        let stored = declared(Steering::Both, |u| {
+            u.store_upstreams = vec![
+                "API.Store.test".into(),
+                "api.store.test:443".into(),
+                "mcp.store.test:8443".into(),
+                "*.store.test".into(),
+                "not a name".into(),
+            ];
+        });
+        assert_eq!(
+            authorities(&stored),
+            ["api.store.test:443", "mcp.store.test:8443"]
+        );
+
+        // Only a box whose steering redirects has redirect rules.
+        let explicit = declared(Steering::ProxyEnv, |u| {
+            u.store_upstreams = vec!["api.store.test".into()];
+        });
+        assert_eq!(authorities(&explicit), ["api.store.test:443"]);
+        assert!(redirected(&explicit).is_empty());
+        let off = declared(Steering::Off, |u| {
+            u.store_upstreams = vec!["api.store.test".into()];
+        });
+        assert!(credentialed(&off).is_empty());
     }
 
     #[test]

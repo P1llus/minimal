@@ -3570,7 +3570,7 @@ async fn own_ip_default_deny_all() {
     // What that section is to the engine: a policy that denies what it
     // does not list, and lists nothing.
     let policy =
-        crate::net::spec::box_policy(effective.egress.as_ref(), boxes::NetworkMode::OwnIp, false)
+        boxes::egress::box_policy(effective.egress.as_ref(), boxes::NetworkMode::OwnIp, false)
             .expect("the deny-all section is a policy");
     assert_eq!(
         policy.egress_default(netpol::Verdict::Allow),
