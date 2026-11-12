@@ -1285,8 +1285,10 @@ fn the_hostname_proxy_judges_a_box_s_request_where_the_box_would_dial() {
     // listens on the host at a port, the host's service included.
     daemon.activate("shares", &["--network", "host_ip"]);
     assert_eq!(daemon.exec("shares", "echo runs").trim(), "runs");
-    // A box with its own address and a published port.
-    daemon.activate("web", &["--network", "own_ip", "--ingress", "18080:8080"]);
+    // A box with its own address and a published port. Another test's
+    // daemon publishes 18080 at the same loopback address.
+    let activation = daemon.activate("web", &["--network", "own_ip", "--ingress", "18190:8080"]);
+    assert!(daemon.lists("web"), "{activation}");
     let _serving = daemon.run_in(
         "web",
         &[
@@ -1297,7 +1299,7 @@ fn the_hostname_proxy_judges_a_box_s_request_where_the_box_would_dial() {
             "--base-path=/tmp",
         ],
     );
-    let published = SocketAddr::new(IpAddr::V4(daemon.published_address("web")), 18080);
+    let published = SocketAddr::new(IpAddr::V4(daemon.published_address("web")), 18190);
     wait_for("the published port", Duration::from_secs(20), || {
         stays_open(published)
     });
@@ -1344,10 +1346,10 @@ fn the_hostname_proxy_judges_a_box_s_request_where_the_box_would_dial() {
     for asker in ["narrow", "wide"] {
         // A peer the box does not list is closed to it, also when its
         // rules allow every address: the peer's address is protected.
-        let answer = connect(asker, "web.min.internal:18080");
+        let answer = connect(asker, "web.min.internal:18190");
         assert!(answer.contains("403"), "{asker} -> web: {answer}");
     }
-    let answer = connect("friend", "web.min.internal:18080");
+    let answer = connect("friend", "web.min.internal:18190");
     assert!(answer.contains("200"), "friend -> web: {answer}");
 
     wait_for(
