@@ -689,6 +689,13 @@ impl Engine {
         ENGINE.get().unwrap_or(&NOT_STARTED)
     }
 
+    /// Whether this process looked for an engine, as a daemon does when it
+    /// starts. A process that did not is no node that runs boxes: a test
+    /// that drives the daemon's code in its own process.
+    pub(crate) const fn started(&self) -> bool {
+        !matches!(self.state, State::Absent(Absent::NotStarted))
+    }
+
     const fn attached_state(&self) -> Option<&Attached> {
         match &self.state {
             State::Attached(attached) => Some(attached),

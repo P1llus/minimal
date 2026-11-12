@@ -476,7 +476,7 @@ async fn serve_create_session(
             // on a daemon without it, and one that asks for an address
             // of its own on a daemon with no virtual network.
             #[cfg(target_os = "linux")]
-            {
+            if crate::net::engine::Engine::current().started() {
                 let refused = match crate::net::engine::Engine::current().can_enforce(
                     req.config.network,
                     &req.config.policy,

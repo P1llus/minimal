@@ -1312,8 +1312,9 @@ mod tests {
         assert!(switch.leases().is_empty(), "nothing was drawn");
     }
 
-    /// A native switch keeps self-allocation (NET-102): its draw reaches the
-    /// reserve, and fails only where spawning the (missing) gvproxy does.
+    /// A native switch draws its own addresses. With no gvproxy to start,
+    /// the attach fails at the spawn, after the draw reached the reserve,
+    /// and gives the address back.
     #[tokio::test]
     async fn local_spawn_switch_still_self_allocates() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1327,12 +1328,19 @@ mod tests {
             !matches!(err, NetError::SelfAllocationRetired),
             "a native switch is never refused the draw: {err}"
         );
+        assert!(matches!(err, NetError::Spawn { .. }), "{err}");
         let (reserve_first, _) = self_allocation_run(switch.subnet());
-        assert_eq!(
-            switch.leases().first().map(|lease| lease.ip),
-            Some(Ipv4Addr::from(reserve_first)),
-            "the draw reached the reserve"
+        let config = std::fs::read_to_string(dir.path().join("gvproxy/gvproxy.yaml"))
+            .expect("the config the failed attach wrote");
+        assert!(
+            config.contains(&format!("\"{}\"", Ipv4Addr::from(reserve_first))),
+            "the draw reached the reserve: {config}"
         );
+        assert!(
+            switch.leases().is_empty(),
+            "a failed attach holds no address"
+        );
+        assert_eq!(switch.attached(), 0);
     }
 
     /// A task run attaches at a task address registered with its box
