@@ -471,6 +471,32 @@ async fn serve_create_session(
                     error: refused.to_string(),
                 });
             }
+            // A box this node cannot run is refused here too, before
+            // anything is made for it: one whose policy needs the engine
+            // on a daemon without it, and one that asks for an address
+            // of its own on a daemon with no virtual network.
+            #[cfg(target_os = "linux")]
+            if crate::net::engine::Engine::current().started() {
+                let refused = match crate::net::engine::Engine::current().can_enforce(
+                    req.config.network,
+                    &req.config.policy,
+                    s.deny_all_opt_out().await,
+                ) {
+                    Err(refusal) => Some(refusal.to_string()),
+                    Ok(()) if req.config.network == minimald_rpc::NetworkMode::OwnIp => {
+                        s.no_virtual_network().await
+                    }
+                    Ok(()) => None,
+                };
+                if let Some(error) = refused {
+                    tracing::info!(
+                        network_mode = %req.config.network.word(),
+                        refusal = %error,
+                        "create refused: this node cannot run the box"
+                    );
+                    return Ok(Errorable::Err { error });
+                }
+            }
             req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
             // The session remembers its creator, so an attach from another

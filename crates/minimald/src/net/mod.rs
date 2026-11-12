@@ -453,6 +453,25 @@ impl IpAllocator {
     }
 }
 
+/// Why `binary` cannot be run as gvproxy, when it cannot. Asked when a box
+/// with an address of its own is created, so the box is refused there and
+/// not at its first start.
+pub(crate) fn gvproxy_missing(binary: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let why = match std::fs::metadata(binary) {
+        Ok(file) if file.is_file() && file.permissions().mode() & 0o111 != 0 => return None,
+        Ok(_) => "is not a program".to_owned(),
+        Err(error) => format!("cannot be read ({error})"),
+    };
+    Some(format!(
+        "the box was not created: it asks for an address of its own, and this daemon has no \
+         gvproxy to run the virtual network with: {} {why}. Install gvproxy there, or start \
+         the daemon with `--gvproxy-bin`.",
+        binary.display()
+    ))
+}
+
 ///
 /// The switch is reference-counted against the set of attached `OwnIp` PTasks:
 /// it is spawned lazily on the first attach and torn down after the last
@@ -606,6 +625,29 @@ impl SwitchClient {
         self.state_dir.join("gvproxy.pid")
     }
 
+    fn token_path(&self) -> PathBuf {
+        self.state_dir.join(::switch::api_token::FILE)
+    }
+
+    /// The arguments gvproxy is started with. The token file closes its
+    /// API at the gateway address to the boxes ([`::switch::api_token`]).
+    fn argv(&self) -> Vec<std::ffi::OsString> {
+        vec![
+            "-config".into(),
+            self.config_path().into(),
+            "-listen".into(),
+            format!("unix://{}", self.control_socket().display()).into(),
+            "-pid-file".into(),
+            self.pid_path().into(),
+            // gvproxy's own default forward targets an address that is not
+            // on this subnet.
+            "-ssh-port".into(),
+            "-1".into(),
+            ::switch::api_token::FLAG.into(),
+            self.token_path().into(),
+        ]
+    }
+
     /// Allocates an address for a new PTask, (re)writes the config, ensures
     /// gvproxy is running, and bumps the attach count.
     ///
@@ -626,14 +668,7 @@ impl SwitchClient {
             return Err(NetError::SelfAllocationRetired);
         }
         let lease = self.allocator.allocate()?;
-        // DM2 spawns + configures gvproxy locally; DM1/3/4 (VmHost) leaves
-        // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
-        // only track the attach count.
-        if matches!(self.transport, SwitchTransport::LocalSpawn) {
-            self.write_config().await?;
-            self.ensure_running().await?;
-        }
-        self.attached += 1;
+        self.start_for(lease).await?;
         tracing::info!(
             ip = %lease.ip,
             mac = %lease.mac,
@@ -642,6 +677,25 @@ impl SwitchClient {
             "attached OwnIp PTask to gvproxy switch"
         );
         Ok(lease)
+    }
+
+    /// Counts `lease` as attached, with gvproxy running for it where this
+    /// daemon runs gvproxy itself. A VM host runs its own. When gvproxy
+    /// does not start, the lease is given back: an attach that failed
+    /// holds no address.
+    async fn start_for(&mut self, lease: PtaskLease) -> Result<(), NetError> {
+        if matches!(self.transport, SwitchTransport::LocalSpawn) {
+            let started = match self.write_config().await {
+                Ok(()) => self.ensure_running().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = started {
+                self.allocator.release(lease);
+                return Err(error);
+            }
+        }
+        self.attached += 1;
+        Ok(())
     }
 
     /// Attaches a PTask at the switch address the VM host handed its box,
@@ -663,14 +717,7 @@ impl SwitchClient {
     /// failures as [`Self::attach`] does.
     pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<PtaskLease, NetError> {
         let lease = self.allocator.hand(handed)?;
-        // DM2 spawns + configures gvproxy locally; DM1/3/4 (VmHost) leaves
-        // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
-        // only track the attach count — same shape as [`Self::attach`].
-        if matches!(self.transport, SwitchTransport::LocalSpawn) {
-            self.write_config().await?;
-            self.ensure_running().await?;
-        }
-        self.attached += 1;
+        self.start_for(lease).await?;
         tracing::info!(
             ip = %lease.ip,
             mac = %lease.mac,
@@ -797,18 +844,15 @@ impl SwitchClient {
             Err(e) => return Err(NetError::Io(e)),
         }
 
+        // A new token for each start. A blocking write of one small file.
+        ::switch::api_token::write(&self.token_path()).map_err(|source| NetError::WriteConfig {
+            path: self.token_path(),
+            source,
+        })?;
         let mut cmd = Command::new(&self.binary);
         crate::box_cgroups::place_helper(cmd.as_std_mut());
-        cmd.arg("-config")
-            .arg(self.config_path())
-            .arg("-listen")
-            .arg(format!("unix://{}", sock.display()))
-            .arg("-pid-file")
-            .arg(self.pid_path())
-            // Disable the default 127.0.0.1:2222 -> 192.168.127.2:22 forward,
-            // which targets an address that does not exist on our subnet.
-            .arg("-ssh-port")
-            .arg("-1")
+        cmd.args(self.argv())
+            .env_remove(::switch::api_token::ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -906,6 +950,7 @@ impl SwitchClient {
             }
         }
         let _ = tokio::fs::remove_file(self.control_socket()).await;
+        let _ = tokio::fs::remove_file(self.token_path()).await;
         Ok(())
     }
 }
@@ -1261,8 +1306,9 @@ mod tests {
         assert!(switch.leases().is_empty(), "nothing was drawn");
     }
 
-    /// A native switch keeps self-allocation (NET-102): its draw reaches the
-    /// reserve, and fails only where spawning the (missing) gvproxy does.
+    /// A native switch draws its own addresses. With no gvproxy to start,
+    /// the attach fails at the spawn, after the draw reached the reserve,
+    /// and gives the address back.
     #[tokio::test]
     async fn local_spawn_switch_still_self_allocates() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1276,12 +1322,19 @@ mod tests {
             !matches!(err, NetError::SelfAllocationRetired),
             "a native switch is never refused the draw: {err}"
         );
+        assert!(matches!(err, NetError::Spawn { .. }), "{err}");
         let (reserve_first, _) = self_allocation_run(switch.subnet());
-        assert_eq!(
-            switch.leases().first().map(|lease| lease.ip),
-            Some(Ipv4Addr::from(reserve_first)),
-            "the draw reached the reserve"
+        let config = std::fs::read_to_string(dir.path().join("gvproxy/gvproxy.yaml"))
+            .expect("the config the failed attach wrote");
+        assert!(
+            config.contains(&format!("\"{}\"", Ipv4Addr::from(reserve_first))),
+            "the draw reached the reserve: {config}"
         );
+        assert!(
+            switch.leases().is_empty(),
+            "a failed attach holds no address"
+        );
+        assert_eq!(switch.attached(), 0);
     }
 
     /// A task run attaches at a task address registered with its box

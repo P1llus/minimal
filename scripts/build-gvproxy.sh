@@ -3,10 +3,13 @@
 # commit pinned in vendor/gvproxy/gvproxy.lock plus every patch in
 # vendor/gvproxy/patches/, with the Go toolchain the lock pins.
 #
-# Why a source build: the upstream release's unexpose closes a forward's
-# listener and leaves the connections it accepted open, so a withdrawn port
-# keeps serving the connections already through it. The carried patch closes
-# them. See docs/specs/03-spec-networking/architecture.md (gvproxy-source-build).
+# Why a source build, one reason per carried patch:
+#   0001  the upstream unexpose closes a forward's listener and leaves the
+#         connections it accepted open, so a withdrawn port keeps serving them.
+#   0002  upstream translates the host address of the subnet to 127.0.0.1
+#         unless the configuration names another NAT entry, and dials a
+#         destination of 0.0.0.0 as this host. Either lets anything on the
+#         virtual network reach the host's loopback.
 #
 # Reproducible on purpose: CGO_ENABLED=0, -mod=vendor, -trimpath,
 # -buildvcs=false and fixed ldflags, so every host builds the same bytes for an

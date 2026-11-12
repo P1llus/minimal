@@ -33,7 +33,7 @@
 //! the registrations, their withdrawals, and both read-only verbs; the
 //! second door — [`GUEST_CONTROL_SOCK_FILE`] — is the in-VM daemon's,
 //! bridged to the guest over vsock at
-//! [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`], and it takes the guest door's
+//! [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`], and it takes the guest door's
 //! verbs alone ([`minimald_rpc::GuestDoorRequest`]): publishing and
 //! unpublishing a port for a box, a box's end, and what the guest daemon
 //! asks about a box. The verb decides
@@ -114,16 +114,16 @@ pub const CONTROL_SOCK_FILE: &str = "control.sock";
 /// The guest door's file name, beside the control socket in the same host
 /// dir: the door the in-VM daemon's requests
 /// ([`minimald_rpc::GuestDoorRequest`]) arrive on, bridged to the guest over
-/// vsock at [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`].
+/// vsock at [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`].
 pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
 
-/// The env the supervisor hands the VMM child the guest report door's path
+/// The env the supervisor hands the VMM child the guest door's path
 /// under (T94): the child is the process that owns the libkrun context, so
 /// only it can register the door's vsock port — and it registers the port
 /// exactly when the env names a door the supervisor bound, which is how the
 /// door is bound only once the bridge is up. The name lives here, beside
 /// the door it names, because the child only reads it.
-pub const GUEST_REPORT_SOCK_ENV: &str = "MINVMD_GUEST_REPORT_SOCK";
+pub const GUEST_DOOR_SOCK_ENV: &str = "MINVMD_GUEST_DOOR_SOCK";
 
 /// The audit log the daemon appends its host-side copy of each recorded
 /// admission to, relative to the host dir the sockets live in — the
@@ -155,10 +155,10 @@ enum ControlDoor {
     /// the gate.
     Host,
     /// The guest daemon's door behind the vsock bridge at
-    /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`]
+    /// [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`]
     /// ([`minimald_rpc::GuestDoorRequest`]). What a request does is decided
     /// by the box's registration, never by the peer.
-    GuestReports,
+    Guest,
 }
 
 impl ControlDoor {
@@ -166,7 +166,7 @@ impl ControlDoor {
     fn name(self) -> &'static str {
         match self {
             Self::Host => "host control",
-            Self::GuestReports => "guest reports",
+            Self::Guest => "guest",
         }
     }
 
@@ -174,7 +174,7 @@ impl ControlDoor {
     fn cap_warned(self) -> &'static Mutex<Option<std::time::Instant>> {
         match self {
             Self::Host => &HOST_CONTROL_CAP_WARNED,
-            Self::GuestReports => &GUEST_REPORTS_CAP_WARNED,
+            Self::Guest => &GUEST_DOOR_CAP_WARNED,
         }
     }
 }
@@ -348,7 +348,7 @@ pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
 /// bound here: the supervisor binds it as the vsock bridge's other half
 /// ([`spawn_guest_reports_door`]), so the door exists exactly when a
 /// running VM is handed it at
-/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (7352). A guest verb that
+/// [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`] (7352). A guest verb that
 /// reaches the host's socket does not parse there.
 ///
 /// The bind happens on the calling thread so its failure surfaces to the
@@ -395,7 +395,7 @@ pub fn spawn(
 /// `control_sock_path` and serves it on its own thread, with a publisher
 /// that reaches gvproxy's forwarder API at `switch_sock`. Returns the door's
 /// path, which the VMM child maps the guest's vsock port
-/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] to.
+/// [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`] to.
 ///
 /// What a publish binds is decided by the box's registration, never by the
 /// peer.
@@ -447,9 +447,8 @@ pub(crate) fn spawn_guest_door(
     // stop path finds it (NET-085).
     tracing::info!(
         sock = %sock_path.display(),
-        vsock_port = minimald_rpc::VM_HOST_BOX_REPORT_PORT,
-        "bound the guest report door; the in-VM daemon's port reports reach the \
-         host-held grant over the vsock bridge"
+        vsock_port = minimald_rpc::VM_HOST_GUEST_DOOR_PORT,
+        "bound the guest door; the in-VM daemon's requests arrive over the vsock bridge"
     );
     std::thread::Builder::new()
         .name("minvmd-guest-control".to_string())
@@ -459,7 +458,7 @@ pub(crate) fn spawn_guest_door(
                 boxes,
                 answerer,
                 proxy_publish,
-                ControlDoor::GuestReports,
+                ControlDoor::Guest,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
                 &publisher,
@@ -482,7 +481,7 @@ pub(crate) fn spawn_guest_door(
 /// is spawned, so a peer that opens connections in a loop cannot grow
 /// threads without limit. A slot is freed when its connection's thread
 /// ends. Each door has its own gauge and its own [`ApplyOrder`]: a guest
-/// flooding its report door fills the guest door's slots, never the host's.
+/// flooding its door fills the guest door's slots, never the host's.
 ///
 /// The connections are served concurrently, but each door's mutations
 /// apply one at a time, in the order their requests were read and
@@ -598,7 +597,7 @@ fn serve_connection(
     // host door keeps its check, and the door, not the peer, decides which
     // verbs a connection can ask for.
     let checked = match door {
-        ControlDoor::GuestReports => check_guest_peer_uid(uid),
+        ControlDoor::Guest => check_guest_peer_uid(uid),
         ControlDoor::Host => check_peer_uid(uid),
     };
     if !root_peer && let Err(error) = checked {
@@ -622,7 +621,7 @@ fn serve_connection(
     }
     // Each door parses only its own verbs, so a verb of the other door is
     // a line that does not parse here.
-    if door == ControlDoor::GuestReports {
+    if door == ControlDoor::Guest {
         if root_peer {
             tracing::warn!(peer_uid = uid, "refused a guest door request from root");
             return Ok(());
@@ -907,7 +906,7 @@ fn oversized_listen_notice(line: &str) -> Option<GuestDoorReply> {
 /// The guest infrastructure ports this VM host provisioned for the guest's
 /// own services, read from this daemon's own configuration and never from
 /// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
-/// bridge, the boot marker, the timekeep bridge, the report door and the
+/// bridge, the boot marker, the timekeep bridge, the guest door and the
 /// telemetry port), the zone answerer's port, and the node row's admitted
 /// ports, which hold the hostname proxy's port the host assigned before boot.
 pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
@@ -915,7 +914,7 @@ pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collection
         crate::sock::VSOCK_BRIDGE_PORT,
         crate::cmd::VSOCK_MARKER_PORT,
         crate::timekeep::VSOCK_TIMEKEEP_PORT,
-        minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+        minimald_rpc::VM_HOST_GUEST_DOOR_PORT,
         crate::guest_telemetry::VSOCK_TELEMETRY_PORT,
     ];
     let mut ports: std::collections::BTreeSet<u16> = vsock
@@ -2291,8 +2290,8 @@ static LEASE_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 /// guest flooding its door never silences the host door's line.
 static HOST_CONTROL_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// When the guest report door's last connection-cap warn line was written.
-static GUEST_REPORTS_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// When the guest door's last connection-cap warn line was written.
+static GUEST_DOOR_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 /// Whether a rate-limited warn line is due, stamping it when it is.
 fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
@@ -2310,7 +2309,7 @@ fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
 /// Refuse a connection past its kind's cap, before any thread is spawned:
 /// an error reply naming the cap, and a warn line rate-limited by `warned`.
 /// The line names the `door` the connection arrived on, so a guest flooding
-/// its report door reads apart from the host's own clients.
+/// its door reads apart from the host's own clients.
 fn refuse_past_cap(
     stream: &mut UnixStream,
     kind: &str,
@@ -2607,7 +2606,7 @@ fn serve_guest_door(
                     None => refuse_past_cap(
                         &mut stream,
                         "guest ask",
-                        ControlDoor::GuestReports.name(),
+                        ControlDoor::Guest.name(),
                         gauges.guest_ask_cap(),
                         &ASK_CAP_WARNED,
                     ),
@@ -3374,7 +3373,7 @@ mod tests {
         Ok((sock_path, handle, boxes, answerer, proxy_publish))
     }
 
-    /// Serves [`ControlDoor::GuestReports`] on the guest door beside
+    /// Serves [`ControlDoor::Guest`] on the guest door beside
     /// `sock_path`, through the same production bind the supervisor calls
     /// behind the vsock bridge — posture, audit path, drain and all — so the
     /// per-door verb enforcement runs the runtime's own door.
@@ -6470,7 +6469,7 @@ mod tests {
             for port in [
                 rpc_port,
                 proxy_port,
-                minimald_rpc::VM_HOST_BOX_REPORT_PORT as u16,
+                minimald_rpc::VM_HOST_GUEST_DOOR_PORT as u16,
             ] {
                 let line =
                     format!(r#"{{"verb":"listen_notice","port":{port},"state":"listening"}}"#);

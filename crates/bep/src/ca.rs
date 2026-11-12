@@ -55,12 +55,10 @@ use crate::module::Module;
 /// confirmation on <https://github.com/gominimal/minimal/issues/2441>, the
 /// tracking issue. Each entry covers the endpoints in its comment.
 ///
-/// The built-in baseline of an un-enrolled host
-/// (`NodePlaneBaseline::built_in` in `crates/minvmd/src/net/baseline.rs`)
-/// is addresses, not names. The root excludes every IP address, so no
-/// entry here is needed for those addresses. This set does not cover a
-/// configured cache (`MINIMAL_REMOTE_CACHE_URL`), registry or baseline
-/// endpoint outside its domains, a gap that waits on
+/// The root excludes every IP address, so no entry here is needed for an
+/// endpoint that is reached by address. This set does not cover a
+/// configured cache (`MINIMAL_REMOTE_CACHE_URL`) or registry outside its
+/// domains, a gap that waits on
 /// <https://github.com/gominimal/minimal/issues/2441>.
 ///
 /// The `minimal.dev` entry covers the hosted tenant issuers only. A

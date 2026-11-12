@@ -6,7 +6,7 @@
 //! control socket and hands its path to the VMM child in
 //! [`GUEST_TELEMETRY_SOCK_ENV`]; the child registers it for
 //! [`VSOCK_TELEMETRY_PORT`] (guest to host), the same way the READY marker
-//! and the guest report door are wired. Each connection libkrun bridges in
+//! and the guest door are wired. Each connection libkrun bridges in
 //! is the guest's pid-1 daemon: the port exists only for this VM, the
 //! socket is owner-only, and inside the guest no box can open an `AF_VSOCK`
 //! socket. That last claim is `sandbox`'s, not this crate's: no
@@ -56,7 +56,7 @@ use serde_json::{Map, Value};
 
 /// The vsock port the guest daemon connects out to (CID 2) with its
 /// telemetry: beside the READY marker's 7350, the host time updates' 7351
-/// and the report door's 7352.
+/// and the guest door's 7352.
 pub const VSOCK_TELEMETRY_PORT: u32 = 7353;
 
 /// The host socket the door is bound at, beside the control socket.

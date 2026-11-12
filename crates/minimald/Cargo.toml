@@ -87,6 +87,8 @@ stdlib.workspace = true
 version.workspace = true
 
 [dev-dependencies]
+# The guest of hand-built frames the gvproxy tests attach to the switch.
+switch = { workspace = true, features = ["pump", "fake-guest"] }
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
 # lets the wedged-host probe's deadline elapse in virtual time.
 tokio = { workspace = true, features = ["test-util"] }

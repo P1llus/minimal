@@ -30,7 +30,7 @@ pub const MAX_FRAME: usize = 65_535;
 
 /// The request that turns a connection to gvproxy's `-listen` socket into a
 /// frame stream. gvproxy writes no response.
-const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n";
+pub(crate) const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n";
 
 /// A length a [`Prefixed`] peer cannot mean. Past it the stream is out of
 /// step and the pump stops instead of discarding gigabytes.

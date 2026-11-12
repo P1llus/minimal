@@ -16,7 +16,7 @@ use futures::future::BoxFuture;
 use minimald_rpc::{
     BoxStandingRequest, EndBoxRequest, ForwardState, GuestDoorReply, GuestDoorRequest,
     ListenNotice, MintBoxIdRequest, PublishOrigin, PublishPortRequest, PublishRefusal, StreamOpen,
-    StreamRefusal, StreamReply, UnpublishPortRequest, VM_HOST_BOX_REPORT_PORT, VM_HOST_STREAM_PORT,
+    StreamRefusal, StreamReply, UnpublishPortRequest, VM_HOST_GUEST_DOOR_PORT, VM_HOST_STREAM_PORT,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -150,7 +150,7 @@ impl<C: Connect> GuestDoor<C> {
         limit: Option<Duration>,
     ) -> Result<GuestDoorReply, DoorError> {
         let exchange = async {
-            let mut stream = self.host.connect(VM_HOST_BOX_REPORT_PORT).await?;
+            let mut stream = self.host.connect(VM_HOST_GUEST_DOOR_PORT).await?;
             let mut line = serde_json_lenient::to_vec(request).map_err(io::Error::other)?;
             line.push(b'\n');
             stream.write_all(&line).await?;
@@ -436,7 +436,7 @@ pub(crate) mod testing {
             Self::new(move |port, mut stream| {
                 let answer = Arc::clone(&answer);
                 async move {
-                    assert_eq!(port, VM_HOST_BOX_REPORT_PORT);
+                    assert_eq!(port, VM_HOST_GUEST_DOOR_PORT);
                     let line = read_line(&mut stream, 4096).await.expect("a request line");
                     let request =
                         serde_json_lenient::from_slice(&line).expect("a guest door request");

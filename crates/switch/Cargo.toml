@@ -12,6 +12,9 @@ license.workspace = true
 # daemons turn it on; a build that only needs the address plan does not pull
 # in tokio.
 pump = ["dep:tokio", "dep:libc"]
+# A guest of hand-built frames on gvproxy's switch socket (`fake_guest`), for
+# the tests of both daemons.
+fake-guest = ["pump"]
 
 [dependencies]
 # The pump's sockets and timers.
@@ -21,7 +24,7 @@ libc = { workspace = true, optional = true }
 [dev-dependencies]
 # The crate's own tests turn the pump on. A dev-dependency shapes only this
 # crate's test targets, never another crate's build.
-switch = { path = ".", features = ["pump"] }
+switch = { path = ".", features = ["pump", "fake-guest"] }
 tempfile.workspace = true
 
 [lints]
