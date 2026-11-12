@@ -66,11 +66,36 @@ const HALF_CLOSED_IDLE: Duration = Duration::from_millis(400);
 /// How often a silent direction checks whether the other one has ended.
 const IDLE_TICK: Duration = Duration::from_millis(200);
 
-/// The streams the door carries at once.
-const MAX_STREAMS: usize = minimald_rpc::MAX_HOST_PORT_STREAMS;
+/// The connections the door holds that it has neither let through nor
+/// refused yet. A box is known only once the header is read, so this bound
+/// is for the whole guest.
+const MAX_UNDECIDED: usize = 512;
 
 /// The credential proxy streams one box holds at once.
 const MAX_PROXY_STREAMS_PER_BOX: usize = minimald_rpc::MAX_CREDENTIAL_PROXY_STREAMS;
+
+/// The host port streams one box holds at once, as on a native node.
+#[cfg(not(test))]
+const MAX_HOST_PORT_STREAMS_PER_BOX: usize = minimald_rpc::MAX_HOST_PORT_STREAMS;
+#[cfg(test)]
+const MAX_HOST_PORT_STREAMS_PER_BOX: usize = 8;
+
+/// What a stream is for, as the door counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Proxy,
+    HostPort,
+}
+
+impl Kind {
+    /// The streams of this kind one box holds at once.
+    const fn most(self) -> usize {
+        match self {
+            Self::Proxy => MAX_PROXY_STREAMS_PER_BOX,
+            Self::HostPort => MAX_HOST_PORT_STREAMS_PER_BOX,
+        }
+    }
+}
 
 /// How the door reaches the credential proxy.
 #[derive(Clone)]
@@ -120,36 +145,37 @@ impl StreamDoor {
 
 struct Door {
     config: Config,
-    streams: AtomicUsize,
-    proxy_streams: std::sync::Mutex<std::collections::HashMap<BoxId, usize>>,
+    undecided: AtomicUsize,
+    /// The streams each box holds, by kind.
+    held: std::sync::Mutex<std::collections::HashMap<(BoxId, Kind), usize>>,
 }
 
-/// One slot of the door's stream count, given back on drop.
-struct Slot<'a>(&'a AtomicUsize);
+/// One place among the undecided connections, given back on drop.
+struct Undecided<'a>(&'a AtomicUsize);
 
-impl Drop for Slot<'_> {
+impl Drop for Undecided<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/// One of a box's credential proxy streams, given back on drop.
-struct ProxySlot<'a> {
+/// One of a box's streams of one kind, given back on drop.
+struct BoxSlot<'a> {
     door: &'a Door,
-    id: BoxId,
+    of: (BoxId, Kind),
 }
 
-impl Drop for ProxySlot<'_> {
+impl Drop for BoxSlot<'_> {
     fn drop(&mut self) {
         let mut held = self
             .door
-            .proxy_streams
+            .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = held.get_mut(&self.id) {
+        if let Some(count) = held.get_mut(&self.of) {
             *count -= 1;
             if *count == 0 {
-                held.remove(&self.id);
+                held.remove(&self.of);
             }
         }
     }
@@ -170,8 +196,8 @@ pub(crate) fn spawn(sock_path: PathBuf, config: Config) -> io::Result<StreamDoor
     listener.set_nonblocking(true)?;
     let door = Arc::new(Door {
         config,
-        streams: AtomicUsize::new(0),
-        proxy_streams: std::sync::Mutex::default(),
+        undecided: AtomicUsize::new(0),
+        held: std::sync::Mutex::default(),
     });
     let span = crate::telemetry::vm_task("net.stream_door");
     std::thread::Builder::new()
@@ -222,8 +248,8 @@ pub(crate) fn spawn(sock_path: PathBuf, config: Config) -> io::Result<StreamDoor
 
 /// Where a stream was let through to.
 enum Target<'a> {
-    Proxy(UnixStream, ProxySlot<'a>, Standing),
-    Host(TcpStream),
+    Proxy(UnixStream, BoxSlot<'a>, Standing),
+    Host(TcpStream, BoxSlot<'a>),
 }
 
 /// The registration a stream was admitted on.
@@ -247,15 +273,14 @@ impl Door {
             return;
         }
         let mut guest = BufReader::with_capacity(STREAM_OPEN_MAX, stream);
-        let outcome = match self.streams.fetch_add(1, Ordering::AcqRel) {
-            held if held >= MAX_STREAMS => {
-                self.streams.fetch_sub(1, Ordering::AcqRel);
+        let undecided = match self.undecided.fetch_add(1, Ordering::AcqRel) {
+            held if held >= MAX_UNDECIDED => {
+                self.undecided.fetch_sub(1, Ordering::AcqRel);
                 refuse(&mut guest, StreamRefusal::Busy).await;
                 return;
             }
-            _ => Slot(&self.streams),
+            _ => Undecided(&self.undecided),
         };
-        let _slot = outcome;
         let open = match tokio::time::timeout(HEADER_TIMEOUT, read_header(&mut guest)).await {
             Ok(Some(open)) => open,
             Ok(None) | Err(_) => {
@@ -277,6 +302,8 @@ impl Door {
                 return;
             }
         };
+        // From here the stream counts against its box alone.
+        drop(undecided);
         if write_reply(&mut guest, StreamReply::Open).await.is_err() {
             return;
         }
@@ -296,7 +323,7 @@ impl Door {
                     }
                 }
             }
-            Target::Host(host) => {
+            Target::Host(host, _slot) => {
                 let StreamPurpose::HostPort { port } = open.purpose else {
                     return;
                 };
@@ -404,7 +431,7 @@ impl Door {
                     .as_ref()
                     .filter(|proxy| proxy.listening.is_listening())
                     .ok_or(StreamRefusal::ProxyDown)?;
-                let slot = self.proxy_slot(id).ok_or(StreamRefusal::Busy)?;
+                let slot = self.slot(id, Kind::Proxy).ok_or(StreamRefusal::Busy)?;
                 let delivery = bep::listener::Delivery { box_id: id, entry };
                 let stream = deliver(proxy, &delivery)
                     .await
@@ -415,27 +442,31 @@ impl Door {
                 if !self.exposed(port) {
                     return Err(StreamRefusal::PortNotExposed);
                 }
+                let slot = self.slot(id, Kind::HostPort).ok_or(StreamRefusal::Busy)?;
                 // Always the host's own loopback. The header names a port
                 // and nothing else.
                 match dial_loopback(port).await {
-                    Ok(stream) => Ok(Target::Host(stream)),
+                    Ok(stream) => Ok(Target::Host(stream, slot)),
                     Err(_) => Err(StreamRefusal::ConnectFailed),
                 }
             }
         }
     }
 
-    fn proxy_slot(&self, id: BoxId) -> Option<ProxySlot<'_>> {
+    /// A place for one more stream of `kind` of the box, when it holds
+    /// fewer than the kind allows.
+    fn slot(&self, id: BoxId, kind: Kind) -> Option<BoxSlot<'_>> {
+        let of = (id, kind);
         let mut held = self
-            .proxy_streams
+            .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = held.entry(id).or_insert(0);
-        if *count >= MAX_PROXY_STREAMS_PER_BOX {
+        let count = held.entry(of).or_insert(0);
+        if *count >= kind.most() {
             return None;
         }
         *count += 1;
-        Some(ProxySlot { door: self, id })
+        Some(BoxSlot { door: self, of })
     }
 }
 
@@ -1210,6 +1241,49 @@ mod tests {
         let deadline = std::time::Instant::now() + WAIT;
         loop {
             let (_guest, reply) = Guest::open(&door, &proxy(web.box_id()));
+            if reply == StreamReply::Open {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the place never came back"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// One box at its bound leaves the other boxes their streams, and its
+    /// streams of one kind do not count against the other kind.
+    #[test]
+    fn a_box_holds_a_bounded_number_of_host_port_streams() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+        let bed = bed(HostExposures::fixed(vec![HostExposure::tcp(port)]));
+        let web = bed.boxes.register_client_box(spec("web", true)).unwrap();
+        let other = bed.boxes.register_client_box(spec("other", false)).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..MAX_HOST_PORT_STREAMS_PER_BOX {
+            let (guest, reply) = Guest::open(&bed.door, &host_port(web.box_id(), port));
+            assert_eq!(reply, StreamReply::Open);
+            held.push(guest);
+        }
+        let (_guest, reply) = Guest::open(&bed.door, &host_port(web.box_id(), port));
+        assert_eq!(reply, refused(StreamRefusal::Busy));
+        let (_other, reply) = Guest::open(&bed.door, &host_port(other.box_id(), port));
+        assert_eq!(reply, StreamReply::Open);
+        let (_proxied, reply) = Guest::open(&bed.door, &proxy(web.box_id()));
+        assert_eq!(reply, StreamReply::Open);
+        // A stream that ends gives its place back.
+        held.pop();
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let (_guest, reply) = Guest::open(&bed.door, &host_port(web.box_id(), port));
             if reply == StreamReply::Open {
                 break;
             }
