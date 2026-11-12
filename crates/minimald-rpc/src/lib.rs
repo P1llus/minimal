@@ -1470,7 +1470,7 @@ impl std::fmt::Display for PublishRefusal {
 }
 
 /// One request line on the guest door (vsock port
-/// [`VM_HOST_BOX_REPORT_PORT`]): what the in-VM daemon may ask of the VM
+/// [`VM_HOST_GUEST_DOOR_PORT`]): what the in-VM daemon may ask of the VM
 /// host. The host door's verbs are [`BoxControlRequest`]'s and are never
 /// served here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1621,7 +1621,7 @@ pub const MAX_HOST_PORT_STREAMS: usize = 512;
 /// `VMADDR_CID_HOST` on it, and the VM host daemon answers each request
 /// line. Defined here because both ends depend on this crate. Not 7351:
 /// the timekeep bridge owns that number, in the opposite direction.
-pub const VM_HOST_BOX_REPORT_PORT: u32 = 7352;
+pub const VM_HOST_GUEST_DOOR_PORT: u32 = 7352;
 
 /// The one request line the control socket takes: which verb the client
 /// wants, tagged in the line itself.

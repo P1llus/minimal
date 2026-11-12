@@ -755,13 +755,13 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // allocated switch and loopback addresses from, and asks for the
     // answerer's state — the read that never goes through the in-VM
     // daemon, because a guest relaying a host fact is forgeable from
-    // inside the escape boundary — and the guest report door's bridge pair
+    // inside the escape boundary — and the guest door's bridge pair
     // beside it (T94, NET-138). Both are bound before the guest boots, so a
     // session activated against this VM can only ever be handed an address
     // this table holds. A bind failure of either is fatal (#1790): with no
     // control socket no own-address box can register, so the supervisor
     // exits naming the socket instead.
-    let (_control, guest_report_door) = bind_box_doors(
+    let (_control, guest_door) = bind_box_doors(
         &control_sock,
         &boxes,
         &answerer_status,
@@ -1056,7 +1056,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     };
     // The child owns the libkrun context, so it maps the guest doors' vsock
     // ports to the sockets this supervisor bound.
-    let (name, path) = &guest_report_door;
+    let (name, path) = &guest_door;
     cmd.env(name, path);
     cmd.env(
         crate::net::stream_door::STREAM_DOOR_SOCK_ENV,
@@ -2622,7 +2622,7 @@ fn publish_node_proxy(
 /// Bind the host's two box doors beside each other before the guest boots
 /// (T66, T94, NET-138): the box-registration control socket at
 /// `control_sock_path`, whose accept loop's handle the caller holds for the
-/// daemon's life, and the guest report door beside it, answered as the env
+/// daemon's life, and the guest door beside it, answered as the env
 /// pair the VMM child registers the door's vsock port from. Either bind
 /// failing is the supervisor's startup error, naming the socket and the
 /// cause (#1790).
@@ -2658,22 +2658,21 @@ fn bind_box_doors(
             control_sock_path.display()
         )
     })?;
-    let guest_report_door =
-        guest_report_door_env(control_sock_path, boxes, answerer, proxy_publish, publisher)
-            .with_context(|| {
-                format!(
-                    "binding the guest report door at {}",
-                    control_sock_path
-                        .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
-                        .display()
-                )
-            })?;
-    Ok((control, guest_report_door))
+    let guest_door = guest_door_env(control_sock_path, boxes, answerer, proxy_publish, publisher)
+        .with_context(|| {
+        format!(
+            "binding the guest door at {}",
+            control_sock_path
+                .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
+                .display()
+        )
+    })?;
+    Ok((control, guest_door))
 }
 
-/// Bind the guest report door (T94) beside `control_sock_path` and answer
+/// Bind the guest door (T94) beside `control_sock_path` and answer
 /// the env pair the VMM child registers the door's vsock port at
-/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] from — the bridge's two halves
+/// [`minimald_rpc::VM_HOST_GUEST_DOOR_PORT`] from — the bridge's two halves
 /// as one step, so the door is bound only once the bridge is up. A bind
 /// failure answers no env at all, and [`bind_box_doors`] fails the boot on
 /// it: no boot bridges a door it did not bind, and no bound door stands
@@ -2686,7 +2685,7 @@ fn bind_box_doors(
                   target compiles it unreached"
     )
 )]
-fn guest_report_door_env(
+fn guest_door_env(
     control_sock_path: &std::path::Path,
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
@@ -2700,7 +2699,7 @@ fn guest_report_door_env(
         proxy_publish.clone(),
         publisher,
     )?;
-    Ok((crate::control::GUEST_REPORT_SOCK_ENV, door))
+    Ok((crate::control::GUEST_DOOR_SOCK_ENV, door))
 }
 
 /// Reads the guest's boot beacon from the first connection on the marker
@@ -4187,7 +4186,7 @@ mod tests {
         std::fs::create_dir_all(host.join(crate::control::GUEST_CONTROL_SOCK_FILE).join("x"))
             .unwrap();
         let error = bind(&host.join("control.sock")).unwrap_err();
-        assert!(error.contains("binding the guest report door"), "{error}");
+        assert!(error.contains("binding the guest door"), "{error}");
 
         // The stream door, the same way.
         let stream = host.join(crate::net::GUEST_STREAM_SOCK_FILE);

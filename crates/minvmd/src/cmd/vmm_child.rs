@@ -16,9 +16,9 @@
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
 //!    libkrun bridges to the host UNIX socket where the parent listens.
-//!    When the parent also bound the guest report door (T94), its path
-//!    arrives as `MINVMD_GUEST_REPORT_SOCK` and is registered for
-//!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's
+//!    When the parent also bound the guest door (T94), its path
+//!    arrives as `MINVMD_GUEST_DOOR_SOCK` and is registered for
+//!    `VM_HOST_GUEST_DOOR_PORT` the same way, so the in-VM daemon's
 //!    requests reach the VM host daemon. Likewise the
 //!    guest telemetry door (`MINVMD_GUEST_TELEMETRY_SOCK`, registered for
 //!    `VSOCK_TELEMETRY_PORT`), over which the in-VM daemon's telemetry
@@ -135,18 +135,18 @@ fn run_vmm() -> Result<()> {
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
 
-    // The guest report door's vsock port (T94, NET-138): the parent binds
+    // The guest door's vsock port (T94, NET-138): the parent binds
     // the door and hands its path here, and this registration is what
     // bridges the in-VM daemon's requests to it — so it is made only
     // when the parent bound a door, which is what the env names. A
     // supervisor with no door (a bind failure, or a supervisor that binds
     // no box table) hands no env, and the guest's runtime publishes then
     // fail their reports instead of being recorded.
-    if let Some(guest_report_sock) =
-        std::env::var_os(crate::control::GUEST_REPORT_SOCK_ENV).filter(|path| !path.is_empty())
+    if let Some(guest_door_sock) =
+        std::env::var_os(crate::control::GUEST_DOOR_SOCK_ENV).filter(|path| !path.is_empty())
     {
-        ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
-            .context("registering the guest report door's vsock port")?;
+        ctx.add_vsock_port(minimald_rpc::VM_HOST_GUEST_DOOR_PORT, &guest_door_sock)
+            .context("registering the guest door's vsock port")?;
     }
 
     // The stream door's vsock port: the guest daemon opens one connection

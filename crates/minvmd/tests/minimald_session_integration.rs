@@ -15,7 +15,7 @@
 //! on the host.
 //!
 //! Each test boots the VM under its supervisor (`minvmd run --detach`), which
-//! holds the box table and the guest report door. The in-VM daemon takes
+//! holds the box table and the guest door. The in-VM daemon takes
 //! every box id from that door (BOX-002), so a bare `minvmd boot` creates no
 //! session.
 //!
@@ -143,7 +143,7 @@ impl Guest {
     /// (`minvmd run --detach`) and polls `status --json` until Running.
     ///
     /// The supervisor, not a bare `minvmd boot`, because only the
-    /// supervisor holds the box table and binds the guest report door: the
+    /// supervisor holds the box table and binds the guest door: the
     /// VM host daemon that mints every box id (BOX-002). A bare boot has no
     /// door, so the in-VM daemon refuses every create there.
     fn boot() -> Guest {

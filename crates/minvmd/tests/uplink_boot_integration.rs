@@ -553,7 +553,7 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
     .unwrap();
     let replies = shell.run(&format!(
         "for i in {{1..20}}; do printf '%s\\n' '{standing}' | socat -t10 - VSOCK-CONNECT:2:{}; done",
-        minimald_rpc::VM_HOST_BOX_REPORT_PORT
+        minimald_rpc::VM_HOST_GUEST_DOOR_PORT
     ));
     let answered = replies.matches(r#""standing":true"#).count();
     assert_eq!(answered, 20, "{replies}");
