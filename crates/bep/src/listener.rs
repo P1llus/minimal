@@ -65,23 +65,6 @@ pub const PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// names no box.
 pub type BoxId = [u8; 16];
 
-/// The reserved id a delivery from the `host_ip` cohort address carries.
-/// The cohort's boxes share the address,
-/// so the delivery names none of them (BEP-084). The proxy reads this id as
-/// [`crate::redeem::Attribution::HostIpCohort`], and the sealed value a
-/// request carries names the box the request is checked for.
-pub const COHORT_BOX_ID: BoxId = [0xff; 16];
-
-/// [`COHORT_BOX_ID`] in its text form, [`box_id_text`]: the subject of a
-/// cohort delivery's records that name no box.
-pub const COHORT_BOX_ID_TEXT: &str = "ffffffffffffffffffffffffffffffff";
-
-/// Whether `box_id`, in its text form, is the reserved cohort id.
-#[must_use]
-pub fn is_cohort_box_id(box_id: &str) -> bool {
-    box_id == COHORT_BOX_ID_TEXT
-}
-
 /// The box id in its one text form: 32 lowercase hex digits, the form every
 /// audit record's `subject` and `min box audit` use.
 #[must_use]
@@ -190,13 +173,6 @@ impl Delivery {
             }
         }
         head
-    }
-
-    /// Whether the delivery is from the `host_ip` cohort address: its box
-    /// id is [`COHORT_BOX_ID`], and it names no box (BEP-084).
-    #[must_use]
-    pub fn is_cohort(&self) -> bool {
-        self.box_id == COHORT_BOX_ID
     }
 
     /// The box id as text, [`box_id_text`].

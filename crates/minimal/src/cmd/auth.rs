@@ -3104,7 +3104,7 @@ mod tests {
     // refused.
     #[tokio::test]
     async fn sign_in_after_logout_revives_no_earlier_reference() {
-        use bep::boxes::{Boxes, Stance};
+        use bep::boxes::Boxes;
         use bep::forward::{Redeemer as _, Verdict};
         use bep::handle::{Claims, ClientKeys};
         use bep::module::GITHUB;
@@ -3132,7 +3132,7 @@ mod tests {
             .collect();
         let boxes = Arc::new(Boxes::new());
         for b in ["b1", "b2", "b3"] {
-            boxes.register(b, hosts.clone(), Stance::OwnIp);
+            boxes.register(b, hosts.clone());
         }
         let redeemer = bep::redeemer::BoxRedeemer::new(
             key,

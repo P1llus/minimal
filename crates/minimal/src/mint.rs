@@ -39,10 +39,10 @@
 //! proxy's key store. The Box Host a value binds is the fingerprint of the
 //! proxy's sealing key, which is the name `bep serve` redeems under.
 //!
-//! The same control socket then registers the box with its declared egress
-//! and its address stance, so the proxy admits the box's requests to those
-//! authorities. Last, it records one `mint` record per member in the
-//! proxy's audit log, the log the proxy's decisions go to (BEP-067).
+//! The same control socket then registers the box with its declared
+//! egress, so the proxy admits the box's requests to those authorities.
+//! Last, it records one `mint` record per member in the proxy's audit log,
+//! the log the proxy's decisions go to (BEP-067).
 
 use std::fmt;
 use std::io::{self, BufRead as _, BufReader, Write as _};
@@ -52,7 +52,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bep::boxes::Stance;
 use bep::control::{Reply, Request};
 use bep::handle::{self, Claims, StoreRule};
 use bep::module::{GITHUB, Module};
@@ -1136,24 +1135,17 @@ impl ControlClient {
         Ok(())
     }
 
-    /// Registers the box `box_id` with its declared egress and its address
-    /// stance.
+    /// Registers the box `box_id` with its declared egress.
     ///
     /// # Errors
     ///
     /// [`MintError::Control`] when the connection fails, and
     /// [`MintError::Refused`] when the proxy refuses the registration.
-    pub fn register_box(
-        &mut self,
-        box_id: &str,
-        egress: &[String],
-        stance: Stance,
-    ) -> Result<(), MintError> {
+    pub fn register_box(&mut self, box_id: &str, egress: &[String]) -> Result<(), MintError> {
         self.ask(
             &Request::RegisterBox {
                 box_id: box_id.to_owned(),
                 egress: egress.to_vec(),
-                stance,
             },
             "the box",
         )?;
@@ -1262,8 +1254,6 @@ pub struct GrantBox {
     pub grants: Vec<String>,
     /// The authorities the box's declared egress admits.
     pub egress: Vec<String>,
-    /// The box's address stance.
-    pub stance: Stance,
 }
 
 /// Mints and seals a sign-in reference for each of `grant_box`'s grants
@@ -1362,7 +1352,7 @@ pub fn mint_and_register(
         });
     }
 
-    if let Err(error) = control.register_box(&box_id, &grant_box.egress, grant_box.stance) {
+    if let Err(error) = control.register_box(&box_id, &grant_box.egress) {
         // BEP-003: a reply that fails, a read timeout for one, can follow a
         // box the proxy stored. That connection can still carry the late
         // reply, so the forget goes over a new one.
@@ -2070,7 +2060,6 @@ mod tests {
             box_id: box_id.into(),
             grants: vec!["GH_TOKEN".into()],
             egress: vec!["github.com".into(), "api.github.com".into()],
-            stance: Stance::OwnIp,
         }
     }
 

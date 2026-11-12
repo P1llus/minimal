@@ -1,5 +1,4 @@
-//! The boxes this proxy serves: each box's declared egress and its address
-//! stance (BEP-020, BEP-022).
+//! The boxes this proxy serves, each with its declared egress.
 //!
 //! The box's creator registers the box over the control socket
 //! ([`crate::control`]) when it creates the box, and forgets it when it
@@ -11,28 +10,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use serde::{Deserialize, Serialize};
-
 use crate::redeem::{Attribution, Authority};
-
-/// How a box's traffic reaches the proxy: from an address of its own, or
-/// from the address this host's `host_ip` boxes share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stance {
-    /// The box sends from an address of its own.
-    OwnIp,
-    /// The box sends from the address this host's `host_ip` boxes share.
-    HostIp,
-}
 
 /// One registered box.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxEgress {
     /// The authorities the box's declared egress admits.
     pub egress: Vec<Authority<String>>,
-    /// The box's address stance.
-    pub stance: Stance,
 }
 
 /// The registered boxes, by box id. Shared between the control socket and
@@ -52,19 +36,18 @@ impl Boxes {
         Self::default()
     }
 
-    /// Registers `box_id` with its declared egress and its stance. A second
-    /// registration of the same id replaces the first.
-    pub fn register(&self, box_id: &str, egress: Vec<Authority<String>>, stance: Stance) {
+    /// Registers `box_id` with its declared egress. A second registration
+    /// of the same id replaces the first.
+    pub fn register(&self, box_id: &str, egress: Vec<Authority<String>>) {
         tracing::debug!(
             box_id,
             authorities = egress.len(),
-            ?stance,
             "registered a box's declared egress"
         );
         self.boxes
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(box_id.to_owned(), BoxEgress { egress, stance });
+            .insert(box_id.to_owned(), BoxEgress { egress });
     }
 
     /// Forgets `box_id`. Returns whether it was registered.
@@ -96,29 +79,13 @@ impl Boxes {
         self.get(box_id).map(|b| b.egress).unwrap_or_default()
     }
 
-    /// The box a connection from `box_id` is attributed to (BEP-020).
+    /// Whether a delivery for `box_id` names a live box.
     #[must_use]
     pub fn attribution(&self, box_id: &str) -> Attribution<String> {
-        match self.get(box_id).map(|b| b.stance) {
+        match self.get(box_id) {
             None => Attribution::NoLiveBox,
-            Some(Stance::OwnIp) => Attribution::OwnIp(box_id.to_owned()),
-            Some(Stance::HostIp) => Attribution::HostIpCohort,
+            Some(_) => Attribution::LiveBox(box_id.to_owned()),
         }
-    }
-
-    /// The ids of the registered `host_ip` boxes, in a stable order.
-    #[must_use]
-    pub fn cohort(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .boxes
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(_, b)| b.stance == Stance::HostIp)
-            .map(|(id, _)| id.clone())
-            .collect();
-        ids.sort();
-        ids
     }
 }
 
@@ -152,7 +119,6 @@ mod tests {
             &line(&Request::RegisterBox {
                 box_id: BOX.into(),
                 egress: vec!["api.github.com".into(), "GitHub.com:8443".into()],
-                stance: Stance::OwnIp,
             }),
             &keys,
             &boxes,
@@ -165,7 +131,8 @@ mod tests {
                 authority("github.com", 8443)
             ]
         );
-        assert_eq!(boxes.attribution(BOX), Attribution::OwnIp(BOX.into()));
+        assert_eq!(boxes.attribution(BOX), Attribution::LiveBox(BOX.into()));
+        assert_eq!(boxes.attribution(OTHER), Attribution::NoLiveBox);
         assert!(boxes.egress(OTHER).is_empty());
 
         // A new registration decides the next read.
@@ -173,7 +140,6 @@ mod tests {
             &line(&Request::RegisterBox {
                 box_id: BOX.into(),
                 egress: vec!["codeload.github.com".into()],
-                stance: Stance::HostIp,
             }),
             &keys,
             &boxes,
@@ -183,15 +149,12 @@ mod tests {
             boxes.egress(BOX),
             vec![authority("codeload.github.com", 443)]
         );
-        assert_eq!(boxes.attribution(BOX), Attribution::HostIpCohort);
-        assert_eq!(boxes.cohort(), vec![BOX.to_owned()]);
 
         // An authority that does not parse refuses the whole registration.
         let reply = control::handle_line(
             &line(&Request::RegisterBox {
                 box_id: BOX.into(),
                 egress: vec!["github.com:notaport".into()],
-                stance: Stance::OwnIp,
             }),
             &keys,
             &boxes,
@@ -207,7 +170,6 @@ mod tests {
             &line(&Request::RegisterBox {
                 box_id: "0190F0E0-A1B2-C3D4-E5F6-0718293A4B5D".into(),
                 egress: vec!["github.com".into()],
-                stance: Stance::OwnIp,
             }),
             &keys,
             &boxes,
@@ -226,7 +188,6 @@ mod tests {
                 &line(&Request::RegisterBox {
                     box_id: bad.into(),
                     egress: vec!["github.com".into()],
-                    stance: Stance::OwnIp,
                 }),
                 &keys,
                 &boxes,
@@ -240,7 +201,7 @@ mod tests {
     fn forgotten_box_is_refused_no_live_box() {
         let keys = RwLock::new(ClientKeys::new());
         let boxes = Boxes::new();
-        boxes.register(BOX, vec![authority("github.com", 443)], Stance::OwnIp);
+        boxes.register(BOX, vec![authority("github.com", 443)]);
         // An id that is not 32 hex digits is refused, and forgets nothing.
         let reply = control::handle_line(
             &line(&Request::ForgetBox {
@@ -262,7 +223,6 @@ mod tests {
         assert!(reply.ok, "{reply:?}");
         assert_eq!(boxes.attribution(BOX), Attribution::NoLiveBox);
         assert!(boxes.egress(BOX).is_empty());
-        assert!(boxes.cohort().is_empty());
         // Forgetting a box that is not registered is not an error.
         let reply = control::handle_line(
             &line(&Request::ForgetBox { box_id: BOX.into() }),

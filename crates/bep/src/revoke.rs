@@ -267,9 +267,8 @@ mod tests {
             host: "api.github.com".to_owned(),
             port: 443,
         };
-        let register = format!(
-            r#"{{"op":"register_box","box_id":"{web}","egress":["api.github.com"],"stance":"own_ip"}}"#
-        );
+        let register =
+            format!(r#"{{"op":"register_box","box_id":"{web}","egress":["api.github.com"]}}"#);
         assert!(records.handle(&register).ok);
         let jws = handle::sign(
             &client,

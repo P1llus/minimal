@@ -518,8 +518,7 @@ pub enum ProxyAbsence {
         /// The proxy's log file.
         log: Option<std::path::PathBuf>,
     },
-    /// The host gives the box no box id or no address stance, so no proxy
-    /// serves it.
+    /// The host gives the box no box id, so no proxy serves it.
     NotServed,
 }
 

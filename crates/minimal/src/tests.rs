@@ -5641,7 +5641,7 @@ mod mint_tests {
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use bep::boxes::{BoxRegistry, Stance};
+    use bep::boxes::BoxRegistry;
     use bep::control::{Control, Registry};
     use bep::module::GITHUB;
     use bep::publish::{Identity, PublishedKey};
@@ -5697,7 +5697,7 @@ mod mint_tests {
         keychain
     }
 
-    fn grant_box(stance: Stance) -> GrantBox {
+    fn grant_box() -> GrantBox {
         GrantBox {
             box_id: BOX_ID.into(),
             grants: vec!["GH_TOKEN".into()],
@@ -5707,7 +5707,6 @@ mod mint_tests {
                 "uploads.github.com".into(),
                 "codeload.github.com".into(),
             ],
-            stance,
         }
     }
 
@@ -5879,7 +5878,7 @@ mod mint_tests {
             std::path::Path::new("identity.json"),
             &mut control,
             &key,
-            &grant_box(Stance::OwnIp),
+            &grant_box(),
             NOW,
         )
         .unwrap();
@@ -5953,7 +5952,7 @@ mod mint_tests {
             std::path::Path::new("identity.json"),
             &mut control,
             &ClientKey::generate().unwrap(),
-            &grant_box(Stance::OwnIp),
+            &grant_box(),
             NOW,
         )
         .unwrap_err();
@@ -5961,8 +5960,8 @@ mod mint_tests {
         assert!(served.boxes.get(BOX_HEX).is_none());
     }
 
-    // BEP-003: the proxy holds the box's declared egress and its stance
-    // after the mint. With no sign-in held, nothing is registered.
+    // The proxy holds the box's declared egress after the mint. With no
+    // sign-in held, nothing is registered.
     #[test]
     fn grant_box_registers_its_declared_egress_with_the_proxy() {
         let (_, identity) = proxy();
@@ -5975,7 +5974,7 @@ mod mint_tests {
             std::path::Path::new("identity.json"),
             &mut control,
             &ClientKey::generate().unwrap(),
-            &grant_box(Stance::HostIp),
+            &grant_box(),
             NOW,
         )
         .unwrap();
@@ -5994,7 +5993,6 @@ mod mint_tests {
                 ("codeload.github.com".to_owned(), 443),
             ]
         );
-        assert_eq!(held.stance, Stance::HostIp);
 
         // With no sign-in held the creation fails with the defined error's
         // text, and the proxy gets no registration.
@@ -6007,7 +6005,7 @@ mod mint_tests {
             &ClientKey::generate().unwrap(),
             &GrantBox {
                 box_id: other.into(),
-                ..grant_box(Stance::OwnIp)
+                ..grant_box()
             },
             NOW,
         )
@@ -6028,7 +6026,7 @@ mod mint_tests {
             &GrantBox {
                 box_id: other.into(),
                 egress: vec![".".into()],
-                ..grant_box(Stance::OwnIp)
+                ..grant_box()
             },
             NOW,
         )
@@ -6060,7 +6058,7 @@ mod mint_tests {
                 &ClientKey::generate().unwrap(),
                 &GrantBox {
                     box_id: box_id.into(),
-                    ..grant_box(Stance::OwnIp)
+                    ..grant_box()
                 },
                 NOW,
             )
@@ -6132,7 +6130,7 @@ mod mint_tests {
         let mut client = ControlClient::connect(&path).unwrap();
         let two_grants = GrantBox {
             grants: vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
-            ..grant_box(Stance::OwnIp)
+            ..grant_box()
         };
         let minted = mint_and_register(
             &keychain,
@@ -6271,7 +6269,7 @@ mod mint_tests {
             std::path::Path::new("identity.json"),
             &mut control,
             &ClientKey::generate().unwrap(),
-            &grant_box(Stance::OwnIp),
+            &grant_box(),
             NOW,
         )
         .unwrap_err();
@@ -6367,7 +6365,7 @@ mod mint_tests {
             std::path::Path::new("identity.json"),
             &mut control,
             &ClientKey::generate().unwrap(),
-            &grant_box(Stance::OwnIp),
+            &grant_box(),
             NOW,
         )
         .unwrap_err();
@@ -6595,34 +6593,25 @@ mod mint_tests {
         );
     }
 
-    // Gatehouse §6.2: a grant box with no box id or no stance is refused
-    // with `gatehouse_unenrolled_node`, and does not start with a grant that
+    // A grant box with no box id is refused with
+    // `gatehouse_unenrolled_node`, and does not start with a grant that
     // resolves to nothing.
     #[test]
-    fn a_grant_box_with_no_box_id_or_stance_is_refused_as_an_unenrolled_node() {
+    fn a_grant_box_with_no_box_id_is_refused_as_an_unenrolled_node() {
         let grants = vec!["GH_TOKEN".to_owned()];
-        let refused =
-            crate::cmd::grant_box_facts(&grants, None, boxes::NetworkMode::OwnIp).unwrap_err();
+        let refused = crate::cmd::grant_box_id(&grants, None).unwrap_err();
         assert_eq!(
             refused.refusals[0].code(),
             Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
         );
         assert_eq!(refused.exit_code(), 5);
-        let refused =
-            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::NoNet)
-                .unwrap_err();
-        assert_eq!(refused.exit_code(), 5);
 
         assert_eq!(
-            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::HostNet)
-                .unwrap(),
-            Some((BOX_ID.to_owned(), Stance::HostIp))
+            crate::cmd::grant_box_id(&grants, Some(BOX_ID.into())).unwrap(),
+            Some(BOX_ID.to_owned())
         );
-        // A box with no GitHub grant needs neither.
-        assert_eq!(
-            crate::cmd::grant_box_facts(&[], None, boxes::NetworkMode::NoNet).unwrap(),
-            None
-        );
+        // A box with no GitHub grant needs no id.
+        assert_eq!(crate::cmd::grant_box_id(&[], None).unwrap(), None);
     }
 }
 

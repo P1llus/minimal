@@ -1959,7 +1959,6 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use bep::audit::Decision;
-    use bep::boxes::Stance;
     use bep::control::{Reply, Request};
     use bep::forward::Verdict;
     use bep::handle::{self, Claims, Inject};
@@ -2580,7 +2579,6 @@ mod tests {
             &Request::RegisterBox {
                 box_id: BOX.into(),
                 egress: vec!["api.github.com".into()],
-                stance: Stance::OwnIp,
             },
         )
         .await;
@@ -2739,7 +2737,6 @@ mod tests {
             &Request::RegisterBox {
                 box_id: BOX.into(),
                 egress: vec!["api.openai.com".into()],
-                stance: Stance::OwnIp,
             },
         )
         .await;

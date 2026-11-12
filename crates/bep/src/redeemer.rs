@@ -5,9 +5,8 @@
 //!
 //! 1. reads the sending box's attribution and declared egress from the box
 //!    registry ([`crate::boxes`]),
-//! 2. opens the value under this host's proxy key, bound to the box that
-//!    the attribution names, or to the `host_ip` cohort box that the value
-//!    names, in one open ([`Unsealed::from_open`]),
+//! 2. opens the value under this host's proxy key, bound to the box the
+//!    delivery names ([`Unsealed::from_open`]),
 //! 3. reads the member's handle and verifies it under the registered client
 //!    keys ([`handle::read_opened`]),
 //! 4. gives the facts and the revocations it holds to [`redeem::decide`],
@@ -36,11 +35,8 @@ use crate::forward::{
 };
 use crate::handle::{self, Handle, Rules, StoreRule};
 use crate::keys::HeldKey;
-use crate::listener;
 use crate::module::Module;
-use crate::redeem::{
-    self, Attribution, Authority, Decision, Redemption, RequestAuthority, Unsealed,
-};
+use crate::redeem::{self, Authority, Decision, Redemption, RequestAuthority, Unsealed};
 use crate::seal::{self, Binding, MemberKind, OpenError, Opened};
 use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, TokenEndpoint};
 
@@ -48,11 +44,6 @@ use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, Token
 /// resolves to no live sign-in: the item is gone, names another sign-in, or
 /// its token expired and was not renewed.
 pub const SIGN_IN_REQUIRED: &str = "github_sign_in_required";
-
-/// The audit marker of a request on a `host_ip` cohort delivery whose
-/// sealed value names no live `host_ip` box of this host: an `own_ip` box,
-/// a box that ended, or a box of another host (BEP-084).
-pub const COHORT_MISATTRIBUTED: &str = "cohort_misattributed";
 
 /// The box ids that the revocations in force name.
 pub type Revocations = Arc<RwLock<Vec<String>>>;
@@ -115,15 +106,6 @@ struct Facts {
     /// The handle's `jti` for the audit record, or empty when the value did
     /// not open or the handle does not parse.
     jti: String,
-    /// True for a cohort delivery whose value names no live `host_ip` box
-    /// of this host. The request is refused [`COHORT_MISATTRIBUTED`]
-    /// (BEP-084).
-    misattributed: bool,
-    /// The box the audit record names: the flow's own box, or for a cohort
-    /// delivery the live `host_ip` box the value names, else the cohort id.
-    /// It is read from the same cohort snapshot as `misattributed`
-    /// (BEP-084).
-    subject: String,
 }
 
 impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
@@ -205,49 +187,6 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         )
     }
 
-    /// The cohort box to bind the one open of `sealed` to.
-    ///
-    /// The value's protected header names its box in `sub`. The header is
-    /// not yet authenticated here, but the open authenticates it: an open
-    /// bound to a box that the value does not carry fails as
-    /// [`Unsealed::OtherBox`]. When `sub` names no cohort box, or the header
-    /// does not parse, the target is the first cohort box. That open
-    /// classifies the value as every cohort open does: other box, or the
-    /// error that precedes the box check. `None` means the cohort is empty.
-    fn cohort_target(cohort: &[String], sealed: &str) -> Option<String> {
-        let carried = Self::carried_box(sealed);
-        carried
-            .filter(|id| cohort.contains(id))
-            .or_else(|| cohort.first().cloned())
-    }
-
-    /// The box a request on a `host_ip` cohort delivery is for: the box
-    /// the value's `sub` names, when that is a live `host_ip` box of this
-    /// host (BEP-084). `None` for a value that names an `own_ip` box, a box
-    /// that ended, a box of another host, or no box. The `sub` is not yet
-    /// authenticated here. The open bound to the box authenticates it.
-    fn cohort_member(&self, sealed: &str) -> Option<String> {
-        Self::carried_box(sealed).filter(|id| self.boxes.cohort().contains(id))
-    }
-
-    /// The `sub` member of the protected header of `sealed`, read with no
-    /// key and no check. Only [`Self::cohort_target`] and
-    /// [`Self::cohort_member`] read it.
-    fn carried_box(sealed: &str) -> Option<String> {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        #[derive(serde::Deserialize)]
-        struct Sub {
-            sub: String,
-        }
-        if sealed.len() > seal::MAX_SEALED_LEN {
-            return None;
-        }
-        let header = URL_SAFE_NO_PAD.decode(sealed.split('.').next()?).ok()?;
-        serde_json::from_slice::<Sub>(&header).ok().map(|h| h.sub)
-    }
-
     /// The decryption fact for one open. An open error that no check of
     /// [`redeem::decide`] names is refused as undecryptable: the proxy
     /// cannot read the value.
@@ -285,62 +224,11 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         sealed: &str,
         now: u64,
     ) -> Facts {
-        // BEP-084: a cohort delivery names no box. The request is
-        // attributed to the cohort, and its egress re-check and audit
-        // subject are the box the value names, which must be a live
-        // `host_ip` box of this host.
-        let cohort_delivery = listener::is_cohort_box_id(box_id);
-        let member = if cohort_delivery {
-            self.cohort_member(sealed)
-        } else {
-            None
-        };
-        let misattributed = cohort_delivery && member.is_none();
-        let attribution = if cohort_delivery {
-            Attribution::HostIpCohort
-        } else {
-            self.boxes.attribution(box_id)
-        };
-        let subject = member.as_deref().unwrap_or(box_id).to_owned();
-        let egress = self.boxes.egress(&subject);
-        tracing::debug!(
-            attribution = if matches!(attribution, Attribution::HostIpCohort) {
-                "cohort"
-            } else {
-                "box"
-            },
-            subject = subject.as_str(),
-            misattributed,
-            "attributed a sealed value"
-        );
-        let (unsealed, opened, named_box_in_cohort) = match &attribution {
-            _ if misattributed => (Unsealed::OtherBox, None, false),
-            Attribution::HostIpCohort if cohort_delivery => {
-                let member = member.as_deref().unwrap_or_default();
-                let (unsealed, opened) = Self::unsealed(self.open(member, sealed, now));
-                let named = unsealed != Unsealed::OtherBox;
-                (unsealed, opened, named)
-            }
-            Attribution::OwnIp(sender) => {
-                let (unsealed, opened) = Self::unsealed(self.open(sender, sealed, now));
-                (unsealed, opened, false)
-            }
-            // The cohort's shared address names no single box. The open is
-            // bound once, to the cohort box the value's header names, so a
-            // request costs one key agreement whatever the cohort's size.
-            Attribution::HostIpCohort => match Self::cohort_target(&self.boxes.cohort(), sealed) {
-                None => (Unsealed::OtherBox, None, false),
-                Some(member) => {
-                    let (unsealed, opened) = Self::unsealed(self.open(&member, sealed, now));
-                    let named = unsealed != Unsealed::OtherBox;
-                    (unsealed, opened, named)
-                }
-            },
-            Attribution::NoLiveBox => {
-                let (unsealed, opened) = Self::unsealed(self.open(box_id, sealed, now));
-                (unsealed, opened, false)
-            }
-        };
+        let attribution = self.boxes.attribution(box_id);
+        let egress = self.boxes.egress(box_id);
+        // The open is bound to the box the delivery names, so a value
+        // sealed to any other box comes back as `OtherBox`.
+        let (unsealed, opened) = Self::unsealed(self.open(box_id, sealed, now));
         let current_set: Vec<Authority<String>> = self
             .module
             .hosts
@@ -412,9 +300,8 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 .revocations
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            // The value's own box id, which differs from the source's for a
-            // cohort member. A value that did not open names no box, and
-            // `decide` refuses it before it reads this set.
+            // A value that did not open names no box, and `decide` refuses
+            // it before it reads this set.
             match &unsealed {
                 Unsealed::Opened { box_id: named, .. } => crate::revoke::in_force_for(&set, named)
                     .into_iter()
@@ -427,7 +314,6 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             redemption: Redemption {
                 unsealed,
                 attribution,
-                named_box_in_cohort,
                 now,
                 revoked,
                 authority: authority.clone(),
@@ -440,33 +326,22 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             identifier,
             kind,
             jti,
-            misattributed,
-            subject,
         }
     }
 
     /// The verdict on a sign-in member, from its `facts` at clock reading
     /// `now`.
     fn sign_in_verdict(&self, box_id: &str, facts: Facts, now: u64) -> Verdict {
-        if facts.misattributed {
-            tracing::debug!(box_id, "sealed value refused: it names no live host_ip box");
-            return Verdict::Refuse(COHORT_MISATTRIBUTED);
-        }
         let verdict = match redeem::decide(&facts.redemption) {
             Decision::Refuse(check) => Verdict::Refuse(check.marker()),
-            decision @ Decision::Admit { .. } => {
+            Decision::Admit { .. } => {
                 let identifier = facts.identifier.unwrap_or_default();
                 match self.credential(&identifier, now) {
-                    // The admission's marker reaches the audit record, so a
-                    // cohort admission is recorded `cohort_attributed`
-                    // (BEP-028).
                     Some((credential, renewed)) => Verdict::Admit {
                         credential,
                         identifier,
                         mapping: Mapping::ModuleUnmapped,
                         renewed,
-                        marker: decision.marker(),
-                        cohort_attributed: decision.cohort_attributed(),
                     },
                     None => Verdict::Refuse(SIGN_IN_REQUIRED),
                 }
@@ -482,7 +357,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     fn store_decision(box_id: &str, facts: Facts) -> Redeemed {
         let decided = match redeem::decide(&facts.redemption) {
             Decision::Refuse(check) => Redeemed::Verdict(Verdict::Refuse(check.marker())),
-            decision @ Decision::Admit { .. } => {
+            Decision::Admit { .. } => {
                 let reference = facts
                     .identifier
                     .as_deref()
@@ -493,8 +368,6 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                         id: id.to_owned(),
                         inject,
                         mapping: Mapping::ModuleUnmapped,
-                        marker: decision.marker(),
-                        cohort_attributed: decision.cohort_attributed(),
                     }),
                     // A checked store handle names both, so this is not
                     // reached. It refuses rather than inject nothing.
@@ -615,26 +488,8 @@ where
     K: HeldKey + Send + Sync,
     C: Keychain + Send + Sync,
 {
-    /// The declared egress of `box_id`. For a cohort delivery, which names
-    /// no box, this is the union of the live `host_ip` boxes' egress: the
-    /// reach of the shared address. A request that carries a sealed value
-    /// is checked again against the egress of the box the value names
-    /// (BEP-084). A request with no sealed value is checked against the
-    /// union alone. That is the shared address's network reach (BEP-083),
-    /// so the proxy admits nothing the cohort cannot reach directly.
     fn egress(&self, box_id: &str) -> Vec<Authority<String>> {
-        if !listener::is_cohort_box_id(box_id) {
-            return self.boxes.egress(box_id);
-        }
-        let mut union: Vec<Authority<String>> = Vec::new();
-        for member in self.boxes.cohort() {
-            for authority in self.boxes.egress(&member) {
-                if !union.contains(&authority) {
-                    union.push(authority);
-                }
-            }
-        }
-        union
+        self.boxes.egress(box_id)
     }
 
     fn redeem(
@@ -676,49 +531,21 @@ where
         sealed: &str,
         header: &str,
     ) -> (Redeemed, String) {
-        let (redeemed, jti, _subject) =
-            self.redeem_attributed(box_id, authority, request, sealed, header);
-        (redeemed, jti)
-    }
-
-    /// Decides one request as [`Self::redeem_reference`] does. The subject
-    /// comes from the same [`Self::facts`] as the verdict, so one cohort
-    /// read decides both: a cohort delivery's record names the live
-    /// `host_ip` box the value names, or the cohort id when it names none
-    /// (BEP-084).
-    fn redeem_attributed(
-        &self,
-        box_id: &str,
-        authority: &Authority<String>,
-        request: &RequestAuthority<String>,
-        sealed: &str,
-        header: &str,
-    ) -> (Redeemed, String, String) {
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
         let jti = facts.jti.clone();
-        let subject = facts.subject.clone();
-        if facts.misattributed {
-            return (
-                Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
-                jti,
-                subject,
-            );
-        }
         if facts.kind == Some(MemberKind::Store) {
-            return (Self::store_decision(box_id, facts), jti, subject);
+            return (Self::store_decision(box_id, facts), jti);
         }
         if !header.eq_ignore_ascii_case("authorization") {
             return (
                 Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED)),
                 String::new(),
-                subject,
             );
         }
         (
             Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
             jti,
-            subject,
         )
     }
 }
@@ -741,14 +568,14 @@ mod tests {
 
     use super::*;
     use crate::audit::{Decision as Record, Outcome};
-    use crate::boxes::{Boxes, Stance};
+    use crate::boxes::Boxes;
     use crate::forward::{Flow, HalfEnd, Validated, forward_requests};
     use crate::handle::{Claims, ClientKeys, Inject};
     use crate::keys::memory::{MemoryKey, MemoryStore};
     use crate::keys::{KeyStore, Role};
     use crate::module::GITHUB;
     use crate::proxy::AuditWriter;
-    use crate::redeem::Check;
+    use crate::redeem::{Attribution, Check};
     use crate::seal::{Breadth, Context, Member, MemberKind, MemberList, Mode};
     use crate::signin::{Flow as SignInFlow, Material, MemoryKeychain, Metadata};
 
@@ -785,13 +612,8 @@ mod tests {
     }
 
     fn new_world() -> World {
-        new_world_with(|key| key)
-    }
-
-    /// A world whose sealing key is `wrap` of a fresh memory key.
-    fn new_world_with<K: HeldKey>(wrap: impl FnOnce(MemoryKey) -> K) -> World<K> {
         let store = MemoryStore::default();
-        let key = wrap(store.generate(Role::Sealing).unwrap());
+        let key = store.generate(Role::Sealing).unwrap();
         let keychain = MemoryKeychain::default();
         seed(&keychain, NOW + 3600, NOW + 7200);
         world_over(key, keychain, |redeemer| redeemer)
@@ -852,23 +674,11 @@ mod tests {
 
     /// A value sealed for `box_id` on this node, with a sign-in member.
     fn sealed_for<K, C>(world: &World<K, C>, box_id: &str, expiry: u64, version: u32) -> String {
-        sealed_on(world, NODE, box_id, expiry, version)
-    }
-
-    /// A value sealed for `box_id` on Box Host `node`, with a sign-in
-    /// member.
-    fn sealed_on<K, C>(
-        world: &World<K, C>,
-        node: &str,
-        box_id: &str,
-        expiry: u64,
-        version: u32,
-    ) -> String {
         let jws = handle::sign(
             &world.client,
             &Claims {
                 sub: box_id.into(),
-                node_id: node.into(),
+                node_id: NODE.into(),
                 store: GITHUB.id.into(),
                 id: INSTANCE.into(),
                 upstream: GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect(),
@@ -882,7 +692,7 @@ mod tests {
             &world.sealing,
             &Context {
                 box_id: box_id.into(),
-                host: node.into(),
+                host: NODE.into(),
                 module: GITHUB.id.into(),
                 host_set_version: version,
                 mode: Mode::User,
@@ -945,7 +755,7 @@ mod tests {
     #[test]
     fn sealed_member_is_redeemed_within_declared_egress() {
         let world = new_world();
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world.boxes.register("b1", vec![api()]);
         let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
 
         let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
@@ -996,13 +806,14 @@ mod tests {
         assert!(upstream.is_empty());
     }
 
-    // BEP-020: a value sealed for one `own_ip` box, sent from another, is
-    // refused before anything goes upstream. A forgotten box is no live box.
+    // A value sealed for one box, presented on the delivery of another box
+    // registered the same way, is refused before anything goes upstream. A
+    // forgotten box is no live box.
     #[test]
     fn cross_box_value_is_refused_cross_box() {
         let world = new_world();
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
-        world.boxes.register("b2", vec![api()], Stance::OwnIp);
+        world.boxes.register("b1", vec![api()]);
+        world.boxes.register("b2", vec![api()]);
         let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
 
         let (upstream, end, records) = send(&world, "b2", &api(), "api.github.com", &sealed);
@@ -1010,10 +821,14 @@ mod tests {
         assert!(upstream.is_empty());
         assert_eq!(records[0].outcome, Outcome::Refuse);
         assert_eq!(records[0].marker.as_deref(), Some("cross_box"));
+        assert_eq!(
+            records[0].box_id, "b2",
+            "the record names the delivery's box"
+        );
 
         // A value sealed to another host's key does not open here.
         let other = new_world();
-        other.boxes.register("b1", vec![api()], Stance::OwnIp);
+        other.boxes.register("b1", vec![api()]);
         let (upstream, end, _) = send(&other, "b1", &api(), "api.github.com", &sealed);
         assert_eq!(refused(&end), Some(Check::Undecryptable.marker()));
         assert!(upstream.is_empty());
@@ -1033,6 +848,45 @@ mod tests {
             world.redeemer.redeem("b1", &api(), &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    // A delivery for a box id that is not registered names no live box,
+    // whichever box the value is sealed to.
+    #[test]
+    fn value_on_a_delivery_for_an_unregistered_box_is_refused_no_live_box() {
+        let world = new_world();
+        world.boxes.register("b1", vec![api()]);
+        let request = RequestAuthority {
+            host: Some(api()),
+            target: None,
+        };
+        for named in ["b1", "b9"] {
+            let sealed = sealed_for(&world, named, NOW + 600, GITHUB.host_set_version);
+            let verdict = world.redeemer.redeem("b9", &api(), &request, &sealed);
+            assert!(
+                matches!(verdict, Verdict::Refuse("no_live_box")),
+                "sealed to {named}: {verdict:?}"
+            );
+        }
+    }
+
+    // A value presented on the delivery of the box it names is admitted. The
+    // audit record names that box and carries no marker.
+    #[test]
+    fn value_on_its_own_box_delivery_is_admitted_with_no_marker() {
+        let world = new_world();
+        world.boxes.register("b1", vec![api()]);
+        world.boxes.register("b2", vec![api()]);
+        for id in ["b1", "b2"] {
+            let sealed = sealed_for(&world, id, NOW + 600, GITHUB.host_set_version);
+            let (upstream, end, records) = send(&world, id, &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{id}: {end:?}");
+            assert!(upstream.contains(&format!("Bearer {TOKEN}")), "{id}");
+            assert_eq!(records.len(), 1, "{id}");
+            assert_eq!(records[0].outcome, Outcome::Admit, "{id}");
+            assert_eq!(records[0].box_id, id);
+            assert_eq!(records[0].marker, None, "{id}");
+        }
     }
 
     /// A value sealed for `box_id` on this node, with one store-handle
@@ -1086,7 +940,7 @@ mod tests {
     #[test]
     fn a_store_handle_audit_record_carries_its_jti() {
         let world = new_world();
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world.boxes.register("b1", vec![api()]);
 
         let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
         let (_, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
@@ -1110,194 +964,10 @@ mod tests {
 
         // A value sealed to another host's key does not open here.
         let other = new_world();
-        other.boxes.register("b1", vec![api()], Stance::OwnIp);
+        other.boxes.register("b1", vec![api()]);
         let (_, end, records) = send(&other, "b1", &api(), "api.github.com", &sealed);
         assert_eq!(refused(&end), Some(Check::Undecryptable.marker()));
         assert_eq!(records[0].jti, "");
-    }
-
-    /// A sealing key that counts its key agreements.
-    struct Counting {
-        inner: MemoryKey,
-        agreements: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl HeldKey for Counting {
-        fn role(&self) -> Role {
-            self.inner.role()
-        }
-        fn public(&self) -> seal::ProxyPublicKey {
-            self.inner.public()
-        }
-        fn exportable(&self) -> bool {
-            self.inner.exportable()
-        }
-        fn agree(
-            &self,
-            peer: &seal::ProxyPublicKey,
-        ) -> Result<Zeroizing<Vec<u8>>, crate::keys::KeyError> {
-            self.agreements
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.agree(peer)
-        }
-        fn probe(&self) -> Result<(), crate::keys::KeyError> {
-            self.inner.probe()
-        }
-    }
-
-    #[test]
-    fn host_ip_cohort_value_is_opened_once() {
-        let agreements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&agreements);
-        let world = new_world_with(move |inner| Counting {
-            inner,
-            agreements: counter,
-        });
-        for id in ["c0", "c1", "c2", "c3", "c4"] {
-            world.boxes.register(id, github(), Stance::HostIp);
-        }
-        let request = RequestAuthority {
-            host: Some(api()),
-            target: None,
-        };
-        let count = || agreements.swap(0, std::sync::atomic::Ordering::SeqCst);
-
-        // The last cohort box in order: the old loop paid five agreements.
-        let sealed = sealed_for(&world, "c4", NOW + 600, GITHUB.host_set_version);
-        let verdict = world.redeemer.redeem("c0", &api(), &request, &sealed);
-        assert!(matches!(verdict, Verdict::Admit { .. }));
-        assert_eq!(count(), 1);
-
-        // A value for a box outside the cohort pays one agreement too.
-        let sealed = sealed_for(&world, "other", NOW + 600, GITHUB.host_set_version);
-        let verdict = world.redeemer.redeem("c0", &api(), &request, &sealed);
-        assert!(matches!(verdict, Verdict::Refuse(m) if m == Check::CrossBox.marker()));
-        assert_eq!(count(), 1);
-    }
-
-    // BEP-028: a `host_ip` sender that presents a value naming another live
-    // `host_ip` box is admitted, and its audit record is marked
-    // `cohort_attributed`. An admission from the named box itself carries
-    // no marker.
-    #[test]
-    fn host_ip_redemption_is_cohort_attributed_in_the_audit_record() {
-        let world = new_world();
-        world.boxes.register("c1", github(), Stance::HostIp);
-        world.boxes.register("c2", github(), Stance::HostIp);
-        let sealed = sealed_for(&world, "c2", NOW + 600, GITHUB.host_set_version);
-        let (upstream, end, records) = send(&world, "c1", &api(), "api.github.com", &sealed);
-        assert_eq!(refused(&end), None, "{end:?}");
-        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].outcome, Outcome::Admit);
-        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
-
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
-        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
-        let (_, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
-        assert_eq!(refused(&end), None, "{end:?}");
-        assert_eq!(records[0].outcome, Outcome::Admit);
-        assert_eq!(records[0].marker, None);
-    }
-
-    // BEP-084: a request on a cohort delivery, which names no box, is
-    // checked against the egress of the live `host_ip` box its value
-    // names, and its audit record names that box as its subject.
-    #[test]
-    fn cohort_redemption_uses_named_box_egress_and_subject() {
-        assert_eq!(
-            listener::box_id_text(&listener::COHORT_BOX_ID),
-            listener::COHORT_BOX_ID_TEXT,
-            "the cohort id has one text form"
-        );
-        let cohort = listener::COHORT_BOX_ID_TEXT;
-        let world = new_world();
-        let github_com = Authority {
-            host: "github.com".to_owned(),
-            port: 443,
-        };
-        world.boxes.register("c1", vec![api()], Stance::HostIp);
-        world
-            .boxes
-            .register("c2", vec![github_com.clone()], Stance::HostIp);
-
-        // c1's egress admits the API: admitted for c1, in c1's records.
-        let sealed = sealed_for(&world, "c1", NOW + 600, GITHUB.host_set_version);
-        let (upstream, end, records) = send(&world, cohort, &api(), "api.github.com", &sealed);
-        assert_eq!(refused(&end), None, "{end:?}");
-        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].outcome, Outcome::Admit);
-        assert_eq!(records[0].box_id, "c1", "the subject is the named box");
-        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
-
-        // c2's egress does not admit the API, though c1's does: refused by
-        // c2's egress, in c2's records.
-        let sealed = sealed_for(&world, "c2", NOW + 600, GITHUB.host_set_version);
-        let (upstream, end, records) = send(&world, cohort, &api(), "api.github.com", &sealed);
-        assert_eq!(
-            refused(&end),
-            Some(Check::OutsideDeclaredEgress.marker()),
-            "{end:?}"
-        );
-        assert!(upstream.is_empty());
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].outcome, Outcome::Refuse);
-        assert_eq!(records[0].box_id, "c2", "the subject is the named box");
-
-        // c2's own egress admits github.com: admitted for c2.
-        let (upstream, end, records) = send(&world, cohort, &github_com, "github.com", &sealed);
-        assert_eq!(refused(&end), None, "{end:?}");
-        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
-        assert_eq!(records[0].box_id, "c2");
-        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
-    }
-
-    // BEP-084: a cohort delivery's value that names an `own_ip` box, a box
-    // that ended, or a box of another host is refused
-    // `cohort_misattributed`, and nothing reaches the upstream.
-    #[test]
-    fn cohort_value_naming_no_live_host_ip_box_is_refused() {
-        let cohort = listener::COHORT_BOX_ID_TEXT;
-        let world = new_world();
-        world.boxes.register("c1", github(), Stance::HostIp);
-        world.boxes.register("b1", github(), Stance::OwnIp);
-        world.boxes.register("ended", github(), Stance::HostIp);
-        let own_ip = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
-        let ended = sealed_for(&world, "ended", NOW + 600, GITHUB.host_set_version);
-        assert!(world.boxes.forget("ended"));
-        let elsewhere = sealed_on(
-            &world,
-            "node-2",
-            "elsewhere",
-            NOW + 600,
-            GITHUB.host_set_version,
-        );
-        for (case, sealed) in [
-            ("own_ip box", own_ip),
-            ("ended box", ended),
-            ("another host's box", elsewhere),
-        ] {
-            let (upstream, end, records) = send(&world, cohort, &api(), "api.github.com", &sealed);
-            assert_eq!(refused(&end), Some(COHORT_MISATTRIBUTED), "{case}: {end:?}");
-            assert!(upstream.is_empty(), "{case}: nothing reaches the upstream");
-            assert_eq!(records.len(), 1, "{case}");
-            assert_eq!(records[0].outcome, Outcome::Refuse, "{case}");
-            assert_eq!(
-                records[0].marker.as_deref(),
-                Some(COHORT_MISATTRIBUTED),
-                "{case}"
-            );
-            assert_eq!(
-                records[0].box_id, cohort,
-                "{case}: the subject is the cohort"
-            );
-        }
-
-        // The same value from the `own_ip` box itself is admitted.
-        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
-        let (_, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
-        assert_eq!(refused(&end), None, "{end:?}");
     }
 
     /// One scenario for the property test.
@@ -1305,7 +975,7 @@ mod tests {
     struct Scenario {
         sender: usize,
         named: usize,
-        stances: [Option<Stance>; 3],
+        registered: [bool; 3],
         egress_api: [bool; 3],
         authority: usize,
         host_matches: bool,
@@ -1316,14 +986,9 @@ mod tests {
     }
 
     fn scenario() -> impl Strategy<Value = Scenario> {
-        let stance = prop_oneof![
-            Just(None),
-            Just(Some(Stance::OwnIp)),
-            Just(Some(Stance::HostIp))
-        ];
         (
             (0usize..3, 0usize..3),
-            [stance.clone(), stance.clone(), stance],
+            any::<[bool; 3]>(),
             any::<[bool; 3]>(),
             0usize..3,
             // Each failure is drawn rarely, so admits are common too.
@@ -1338,14 +1003,14 @@ mod tests {
             .prop_map(
                 |(
                     (sender, named),
-                    stances,
+                    registered,
                     egress_api,
                     authority,
                     (host_matches, expired, revoked, old_version, foreign_key),
                 )| Scenario {
                     sender,
                     named,
-                    stances,
+                    registered,
                     egress_api,
                     authority,
                     host_matches,
@@ -1378,10 +1043,10 @@ mod tests {
     fn expected(s: &Scenario) -> Option<&'static str> {
         let authority = authority_of(s.authority);
         let egress_of = |i: usize| -> Vec<Authority<String>> {
-            match s.stances[i] {
-                None => Vec::new(),
-                Some(_) if s.egress_api[i] => vec![api(), authority_of(1)],
-                Some(_) => vec![authority_of(1)],
+            match (s.registered[i], s.egress_api[i]) {
+                (false, _) => Vec::new(),
+                (true, true) => vec![api(), authority_of(1)],
+                (true, false) => vec![authority_of(1)],
             }
         };
         let request = RequestAuthority {
@@ -1401,19 +1066,14 @@ mod tests {
         }) {
             return Some(check.marker());
         }
-        let attribution = match s.stances[s.sender] {
-            None => Attribution::NoLiveBox,
-            Some(Stance::OwnIp) => Attribution::OwnIp(IDS[s.sender].to_owned()),
-            Some(Stance::HostIp) => Attribution::HostIpCohort,
-        };
-        let in_cohort = s.stances[s.named] == Some(Stance::HostIp);
-        let opens_for_sender = match s.stances[s.sender] {
-            None | Some(Stance::OwnIp) => s.named == s.sender,
-            Some(Stance::HostIp) => in_cohort,
+        let attribution = if s.registered[s.sender] {
+            Attribution::LiveBox(IDS[s.sender].to_owned())
+        } else {
+            Attribution::NoLiveBox
         };
         let unsealed = if s.foreign_key {
             Unsealed::Undecryptable
-        } else if !opens_for_sender {
+        } else if s.named != s.sender {
             Unsealed::OtherBox
         } else if s.expired {
             Unsealed::Expired
@@ -1430,10 +1090,7 @@ mod tests {
         let current = github();
         let decision = redeem::decide(&Redemption {
             unsealed,
-            attribution: attribution.clone(),
-            named_box_in_cohort: matches!(attribution, Attribution::HostIpCohort)
-                && in_cohort
-                && opens_for_sender,
+            attribution,
             now: NOW,
             revoked: if s.revoked {
                 vec![IDS[s.named].to_owned()]
@@ -1473,14 +1130,14 @@ mod tests {
         #[test]
         fn prop_serve_redeems_iff_decide_admits(s in scenario()) {
             let world = new_world();
-            for (i, stance) in s.stances.iter().enumerate() {
-                if let Some(stance) = stance {
+            for (i, registered) in s.registered.iter().enumerate() {
+                if *registered {
                     let egress = if s.egress_api[i] {
                         vec![api(), authority_of(1)]
                     } else {
                         vec![authority_of(1)]
                     };
-                    world.boxes.register(IDS[i], egress, *stance);
+                    world.boxes.register(IDS[i], egress);
                 }
             }
             if s.revoked {
@@ -1572,7 +1229,7 @@ mod tests {
         let world = world_over(key, keychain, |redeemer| {
             redeemer.with_token_endpoint(endpoint)
         });
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world.boxes.register("b1", vec![api()]);
         world
     }
 
@@ -1787,7 +1444,7 @@ mod tests {
                     now.load(std::sync::atomic::Ordering::SeqCst)
                 }))
         });
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world.boxes.register("b1", vec![api()]);
         let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
 
         let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
@@ -1948,7 +1605,7 @@ mod tests {
                     now.load(std::sync::atomic::Ordering::SeqCst)
                 }))
         });
-        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world.boxes.register("b1", vec![api()]);
         let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
 
         for _ in 0..3 {
@@ -2090,7 +1747,7 @@ mod tests {
         let world = world_over(key, keychain, |redeemer| {
             redeemer.with_rules(Arc::new(vec![openai_rule()]))
         });
-        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        world.boxes.register("b1", vec![openai()]);
         let program = std::path::PathBuf::from("/opt/minimal/bin/bep");
         let store = Arc::new(MemorySecretStore::default());
         store
@@ -2119,7 +1776,7 @@ mod tests {
 
         // The same value from another box is refused, and nothing goes
         // upstream (BEP-020).
-        world.boxes.register("b2", vec![openai()], Stance::OwnIp);
+        world.boxes.register("b2", vec![openai()]);
         let (upstream, end, _) = send_to_store(&world, "b2", Arc::clone(&reader), &bearer_header);
         assert_eq!(refused(&end), Some(Check::CrossBox.marker()));
         assert!(upstream.is_empty());
@@ -2151,7 +1808,7 @@ mod tests {
         let keychain = MemoryKeychain::default();
         let key = MemoryStore::default().generate(Role::Sealing).unwrap();
         let bare = world_over(key, keychain, |redeemer| redeemer);
-        bare.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        bare.boxes.register("b1", vec![openai()]);
         let sealed = store_sealed_for(&bare, "b1");
         let (upstream, end, _) = send_to_store(
             &bare,
@@ -2174,7 +1831,7 @@ mod tests {
         let world = world_over(key, keychain, |redeemer| {
             redeemer.with_rules(Arc::new(vec![openai_rule()]))
         });
-        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        world.boxes.register("b1", vec![openai()]);
         let sealed = store_sealed_for(&world, "b1");
         let (upstream, end, records) = send_to_store(
             &world,

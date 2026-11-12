@@ -1954,17 +1954,6 @@ fn sign_in_held(keychain: &dyn bep::signin::Keychain) -> Result<bool, anyhow::Er
         .map_err(|error| crate::mint::MintError::SignIn(error).into())
 }
 
-/// The proxy's name for the box's address stance. A box with no network
-/// has none, and the activation refuses it a grant (BEP-009). The enum is
-/// non-exhaustive, and a mode added later has no stance until it says one.
-fn proxy_stance(network: boxes::NetworkMode) -> Option<bep::boxes::Stance> {
-    match network {
-        boxes::NetworkMode::OwnIp => Some(bep::boxes::Stance::OwnIp),
-        boxes::NetworkMode::HostNet => Some(bep::boxes::Stance::HostIp),
-        _ => None,
-    }
-}
-
 /// Whether a node-local Box Egress Proxy serves boxes on this host: the
 /// proxy published its identity at `identity`, and its control socket is
 /// at `control`. A missing home directory gives neither path.
@@ -2049,40 +2038,55 @@ pub(crate) fn check_github_grants(
     Ok(grants)
 }
 
-/// The facts a GitHub grant box is registered with the proxy under: its
-/// box id and its address stance. A native host and a daemon that predates
-/// box ids give no id, and no proxy serves those boxes. A grant there is
-/// refused with `gatehouse_unenrolled_node`, and never resolves to nothing.
+/// The box id a GitHub grant box is registered with the proxy under. A
+/// host that registers no box gives no id, and no proxy serves its boxes.
+/// A grant there is refused with `gatehouse_unenrolled_node`, and never
+/// resolves to nothing.
 #[cfg(test)]
-pub(crate) fn grant_box_facts(
+pub(crate) fn grant_box_id(
     grants: &[String],
     box_id: Option<String>,
-    network: boxes::NetworkMode,
-) -> Result<Option<(String, bep::boxes::Stance)>, boxes::core::bep::ActivationRefused> {
-    proxy_box_facts(grants, &[], box_id, network)
+) -> Result<Option<String>, boxes::core::bep::ActivationRefused> {
+    proxy_box_id(grants, &[], box_id)
 }
 
-/// `grant_box_facts` for a box with the GitHub grants `github_grants` and
-/// the store references `stores`. A refusal names every one of them, and
+/// `grant_box_id` for a box with the GitHub grants `github_grants` and the
+/// store references `stores`. A refusal names every one of them, and
 /// names them as secrets, not as GitHub grants, when any is a store
 /// reference.
-fn proxy_box_facts(
+fn proxy_box_id(
     github_grants: &[String],
     stores: &[crate::mint::StoreGrant],
     box_id: Option<String>,
-    network: boxes::NetworkMode,
-) -> Result<Option<(String, bep::boxes::Stance)>, boxes::core::bep::ActivationRefused> {
+) -> Result<Option<String>, boxes::core::bep::ActivationRefused> {
     let grants = proxy_grant_names(github_grants, stores);
     if grants.is_empty() {
         return Ok(None);
     }
-    match (box_id, proxy_stance(network)) {
-        (Some(box_id), Some(stance)) => Ok(Some((box_id, stance))),
-        _ => Err(boxes::core::bep::unenrolled_node(
+    box_id.map(Some).ok_or_else(|| {
+        boxes::core::bep::unenrolled_node(
             grants,
             !stores.is_empty(),
             boxes::core::bep::ProxyAbsence::NotServed,
-        )),
+        )
+    })
+}
+
+/// Where the node-local proxy publishes its identity and takes control
+/// requests.
+struct ProxyPaths {
+    identity: std::path::PathBuf,
+    control: std::path::PathBuf,
+}
+
+impl ProxyPaths {
+    /// The proxy's paths under the home directory, or `None` with no home
+    /// directory.
+    fn in_home() -> Option<Self> {
+        Some(Self {
+            identity: crate::mint::identity_path()?,
+            control: crate::mint::control_path()?,
+        })
     }
 }
 
@@ -2246,13 +2250,12 @@ fn hand_minted(
 }
 
 /// Mints each GitHub grant's sign-in reference for the box `box_id`, and
-/// registers the box's declared egress and stance with the Box Egress
-/// Proxy (BEP-005). Then it mints a store handle for each of `stores`, and
-/// seals each one as a `store` member (BEP-032). A box with store
-/// references only registers with no sign-in. Does nothing for a box with
-/// neither, and
-/// refuses a grant box with no id or no stance, or one whose proxy
-/// publishes no root certificate. It blocks on the control socket, so the
+/// registers the box's declared egress with the Box Egress Proxy at
+/// `proxy`. Then it mints a store handle for each of `stores`, and seals
+/// each one as a `store` member. A box with store references only
+/// registers with no sign-in. Does nothing for a box with neither, and
+/// refuses a grant box with no id, or one whose proxy publishes no root
+/// certificate. It blocks on the control socket, so the
 /// activation runs it on a blocking thread. The registration it gives
 /// forgets the box at the proxy when it is dropped before the creation
 /// finishes.
@@ -2262,13 +2265,13 @@ fn mint_grants(
     config_dir: Option<&std::path::Path>,
     box_id: Option<String>,
     egress: Vec<String>,
-    network: boxes::NetworkMode,
+    proxy: Option<ProxyPaths>,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
         ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
         StoreOnlyMintError, local_client_key, mint_and_register, mint_store_members,
     };
-    let Some((box_id, stance)) = proxy_box_facts(&grants, stores, box_id, network)? else {
+    let Some(box_id) = proxy_box_id(&grants, stores, box_id)? else {
         return Ok(MintedGrants {
             minted: Vec::new(),
             root_certificate: None,
@@ -2290,8 +2293,10 @@ fn mint_grants(
             error.into()
         }
     };
-    let (Some(identity_path), Some(control_path)) =
-        (crate::mint::identity_path(), crate::mint::control_path())
+    let Some(ProxyPaths {
+        identity: identity_path,
+        control: control_path,
+    }) = proxy
     else {
         bail!(
             "Cannot start the box: it declares {declares}, and no home directory was found, \
@@ -2324,9 +2329,9 @@ fn mint_grants(
     let now = since.as_secs();
     let mut minted = if grants.is_empty() {
         // A box with store references only needs no sign-in: it registers
-        // its egress and stance here, as the GitHub mint does.
+        // its egress here, as the GitHub mint does.
         let box_hex = crate::mint::box_id_hex(&box_id).map_err(mint_error)?;
-        if let Err(error) = control.register_box(&box_hex, &egress, stance) {
+        if let Err(error) = control.register_box(&box_hex, &egress) {
             if !matches!(error, MintError::NotRunning { .. }) {
                 drop(ProxyRegistration::new(control_path.clone(), &box_id).map_err(mint_error)?);
             }
@@ -2338,7 +2343,6 @@ fn mint_grants(
             box_id: box_id.clone(),
             grants,
             egress,
-            stance,
         };
         mint_and_register(
             &bep::signin::HostKeychain,
@@ -2439,10 +2443,15 @@ fn proxy_egress(
 /// sealed value on the request for the box's launches to place (BEP-005,
 /// BEP-007, BEP-032), with the proxy's root certificate (BEP-072). Does
 /// nothing for a box with neither. `config_dir` is the `min --config-dir`
-/// override, which the store mint checks `bep serve` agrees with. No box
+/// override, which the store mint checks `bep serve` agrees with. `proxy`
+/// is where the proxy that serves the box is. No box
 /// exists yet, so a failure only withdraws the row the box's registration
 /// bought (T66). `box_name` is the name that row was registered under. A
 /// box with no `--name` has none on the request (BOX-163).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct fact of the mint or of the row a failure withdraws"
+)]
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
     box_name: Option<&str>,
@@ -2450,6 +2459,7 @@ async fn mint_into_request(
     github_grants: &[String],
     store_grants: &[crate::mint::StoreGrant],
     config_dir: Option<std::path::PathBuf>,
+    proxy: Option<ProxyPaths>,
     control_sock: Option<std::path::PathBuf>,
 ) -> Result<Option<crate::mint::ProxyRegistration>, anyhow::Error> {
     let grants = github_grants.to_vec();
@@ -2472,7 +2482,7 @@ async fn mint_into_request(
             config_dir.as_deref(),
             box_id,
             egress,
-            network,
+            proxy,
         )
     })
     .await
@@ -3496,17 +3506,16 @@ pub(crate) async fn activate_box(
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
-    // Gatehouse §6.2: a GitHub grant box with no box id or no stance has no
-    // proxy to serve its grant. It is refused before the create, and the
-    // row the registration bought is withdrawn (T66).
+    // A grant box with no box id has no proxy to serve its grant. It is
+    // refused before the create, and the row the registration bought is
+    // withdrawn.
     let registered_id = registered
         .as_ref()
         .and_then(|registration| registration.box_id);
-    if let Err(refused) = proxy_box_facts(
+    if let Err(refused) = proxy_box_id(
         &github_grants,
         &store_grants,
         registered_id.map(|box_id| box_id.to_string()),
-        request.config.network,
     ) {
         withdraw_box_row(
             control_sock.clone(),
@@ -3535,6 +3544,7 @@ pub(crate) async fn activate_box(
             &github_grants,
             &store_grants,
             global.config_dir.clone(),
+            ProxyPaths::in_home(),
             control_sock.clone(),
         ))
         .await?;
@@ -4840,8 +4850,8 @@ mod tests {
     /// T66, BOX-163: an activation with no `--name` registers its row under
     /// the entry's name, and the request carries no name. When the grant
     /// mint fails, the row that registration bought is withdrawn under the
-    /// registered name. The mint fails here before it reads the home
-    /// directory: the request's network mode gives the proxy no stance.
+    /// registered name. The mint fails here because the proxy paths name a
+    /// directory where no proxy published an identity.
     #[tokio::test]
     async fn unnamed_activation_withdraws_its_row_when_the_grant_mint_fails() {
         use minimal_client::box_registration::register_box_for_activation;
@@ -4886,7 +4896,7 @@ mod tests {
         let mut request = minimald_rpc::CreateSessionRequest::new(
             "web",
             paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
-            boxes::NetworkMode::NoNet,
+            boxes::NetworkMode::OwnIp,
             boxes::BoxPolicy::default(),
         );
         // No `--name`: the request names no box (BOX-163).
@@ -4900,6 +4910,10 @@ mod tests {
             &["GH_TOKEN".to_owned()],
             &[],
             None,
+            Some(ProxyPaths {
+                identity: dir.path().join("bep/identity.json"),
+                control: dir.path().join("bep/control.sock"),
+            }),
             Some(sock_path.clone()),
         )
         .await;
@@ -5117,8 +5131,8 @@ mod tests {
     /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
     /// registers for a box id, with no address and no row in the host's
     /// address table. With that id the proxy serves it, so the grant check
-    /// gives its id and its `host_ip` stance, not the refusal that says no
-    /// proxy serves boxes on this machine. A `host_ip` box that declares no
+    /// gives its id, not the refusal that says no proxy serves boxes on
+    /// this machine. A `host_ip` box that declares no
     /// credentialed upstream registers nothing.
     #[tokio::test]
     async fn host_ip_grant_box_on_vm_host_is_not_refused_as_unserved() {
@@ -5161,17 +5175,12 @@ mod tests {
             "the registration put no row in the address table"
         );
 
-        let facts = proxy_box_facts(
-            &["GH_TOKEN".to_owned()],
-            &[],
-            Some(id.to_string()),
-            boxes::NetworkMode::HostNet,
-        )
-        .expect("a host_ip grant box with an id is served");
+        let served = proxy_box_id(&["GH_TOKEN".to_owned()], &[], Some(id.to_string()))
+            .expect("a host_ip grant box with an id is served");
         assert_eq!(
-            facts,
-            Some((id.to_string(), bep::boxes::Stance::HostIp)),
-            "the grant is served under the minted id and the host_ip stance"
+            served,
+            Some(id.to_string()),
+            "the grant is served under the minted id"
         );
 
         // A host_ip box that declares no upstream needs no id.
@@ -5188,13 +5197,8 @@ mod tests {
             .is_none()
         );
         // With no id, the refusal still prints: no proxy serves the box.
-        let refused = proxy_box_facts(
-            &["GH_TOKEN".to_owned()],
-            &[],
-            None,
-            boxes::NetworkMode::HostNet,
-        )
-        .expect_err("no box id, so no proxy serves the box");
+        let refused = proxy_box_id(&["GH_TOKEN".to_owned()], &[], None)
+            .expect_err("no box id, so no proxy serves the box");
         assert!(
             refused
                 .to_string()
@@ -5513,7 +5517,7 @@ mod tests {
         use std::sync::Arc;
 
         use base64::Engine as _;
-        use bep::boxes::{BoxRegistry, Stance};
+        use bep::boxes::BoxRegistry;
         use bep::control::{Control, Registry};
         use bep::publish::{Identity, PublishedKey};
         use bep::seal::{Binding, MemberKind, ProxyKey, ProxyPublicKey};
@@ -5593,7 +5597,7 @@ mod tests {
         let key = crate::mint::ClientKey::generate().unwrap();
         let mut client = crate::mint::ControlClient::connect(&path).unwrap();
         client
-            .register_box(BOX_HEX, &["api.openai.com".into()], Stance::OwnIp)
+            .register_box(BOX_HEX, &["api.openai.com".into()])
             .unwrap();
         let minted = crate::mint::mint_store_members(
             &identity,
@@ -6157,7 +6161,7 @@ mod tests {
         )
         .expect("the rule accepts both references");
         let stores = store_grants(&secrets, &accepted).expect("each rule has a form");
-        let refused = proxy_box_facts(&[], &stores, None, boxes::NetworkMode::OwnIp)
+        let refused = proxy_box_id(&[], &stores, None)
             .expect_err("no box id, so no proxy serves the box")
             .to_string();
         assert!(
@@ -6167,7 +6171,7 @@ mod tests {
             "{refused}"
         );
         assert!(!refused.contains("GitHub"), "{refused}");
-        let refused = proxy_box_facts(&["GH_TOKEN".into()], &[], None, boxes::NetworkMode::OwnIp)
+        let refused = proxy_box_id(&["GH_TOKEN".into()], &[], None)
             .expect_err("no box id, so no proxy serves the box")
             .to_string();
         assert!(

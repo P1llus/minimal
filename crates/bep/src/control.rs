@@ -16,12 +16,11 @@
 //! < {"ok":true,"kid":"<RFC 7638 thumbprint>"}
 //! ```
 //!
-//! The box's creator registers each box with its declared egress and its
-//! address stance when it creates the box, and forgets the box when it
-//! destroys it:
+//! The box's creator registers each box with its declared egress when it
+//! creates the box, and forgets the box when it destroys it:
 //!
 //! ```text
-//! > {"op":"register_box","box_id":"<id>","egress":["github.com","api.github.com:443"],"stance":"own_ip"}
+//! > {"op":"register_box","box_id":"<id>","egress":["github.com","api.github.com:443"]}
 //! < {"ok":true}
 //! > {"op":"forget_box","box_id":"<id>"}
 //! < {"ok":true}
@@ -165,7 +164,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::audit::{Decision, Kind, Mapping, Outcome};
-use crate::boxes::{BoxRegistry, Boxes, Stance};
+use crate::boxes::{BoxRegistry, Boxes};
 use crate::ca::{Ca, CaError, CaKey};
 use crate::handle::{self, ClientKeys, parse_authority};
 use crate::listener::bind_owner_only;
@@ -194,16 +193,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         box_id: Option<String>,
     },
-    /// Register a box with its declared egress and its address stance. A
-    /// second registration of the same box replaces the first.
+    /// Register a box with its declared egress. A second registration of
+    /// the same box replaces the first.
     RegisterBox {
         /// The box id.
         box_id: String,
         /// The authorities the box's declared egress admits, each `host` or
         /// `host:port`.
         egress: Vec<String>,
-        /// The box's address stance.
-        stance: Stance,
     },
     /// Forget a box, at its destroy.
     ForgetBox {
@@ -1334,11 +1331,7 @@ fn handle_request(
                 Err(error) => Reply::refused(error),
             }
         }
-        Request::RegisterBox {
-            box_id,
-            egress,
-            stance,
-        } => {
+        Request::RegisterBox { box_id, egress } => {
             let Some(box_id) = normalise_box_id(&box_id) else {
                 return Reply::refused("the box id is not 32 hex digits");
             };
@@ -1349,7 +1342,7 @@ fn handle_request(
             else {
                 return Reply::refused("an egress authority is not `host` or `host:port`");
             };
-            boxes.register(&box_id, egress, stance);
+            boxes.register(&box_id, egress);
             Reply::done()
         }
         Request::ForgetBox { box_id } => {

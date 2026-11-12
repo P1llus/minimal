@@ -2,9 +2,9 @@
 //!
 //! The proxy decides whether to redeem a sealed value in one pure function,
 //! [`decide`], over owned values. The TLS and socket shell does the I/O. It
-//! opens the value with [`crate::seal::open`], resolves the connection's
-//! source address to a box, and looks up the box the value names. It then
-//! gives the facts to [`decide`] as a [`Redemption`]. [`decide`] reads no
+//! looks up the box the delivery names in the registry, and opens the value
+//! with [`crate::seal::open`], bound to that box. It then gives the facts to
+//! [`decide`] as a [`Redemption`]. [`decide`] reads no
 //! clock, no socket and no key, so a property test and a Kani harness can
 //! cover every input.
 //!
@@ -18,12 +18,11 @@
 //!
 //! 1. The value decrypts under this host's proxy key (BEP-019).
 //! 2. The member carries a `mode` and a recognised `breadth` (BEP-058).
-//! 3. The connection's source is the box the value names (BEP-020). A source
-//!    in the `host_ip` cohort passes only when the named box is a live
-//!    `host_ip` box of this host. The admission then says
-//!    [`Attributed::Cohort`], and the audit records it `cohort_attributed`.
-//!    A value that [`crate::seal::open`] refuses as bound to another box id
-//!    is [`Unsealed::OtherBox`], and this check refuses it too.
+//! 3. The delivery names a live box, and that box is the one the value
+//!    names. A delivery for a box that is not registered is refused as
+//!    `no_live_box`. A value sealed to any other box is refused as
+//!    `cross_box`. That includes a value [`crate::seal::open`] refuses as
+//!    bound to another box id, which is [`Unsealed::OtherBox`].
 //! 4. The sending box's declared egress admits the connection authority
 //!    (BEP-022).
 //! 5. The clock is before the value's expiry (BEP-024). A value that
@@ -112,24 +111,13 @@ impl Unsealed<String> {
     /// breadth gives [`Unsealed::Unbounded`], so [`decide`] refuses it as
     /// [`Check::UnboundedMember`]. A value bound to another box id gives
     /// [`Unsealed::OtherBox`], so [`decide`] refuses it as
-    /// [`Check::CrossBox`], or as [`Check::NoLiveBox`] when the source
-    /// resolves to no live box. A value past its expiry gives
+    /// [`Check::CrossBox`], or as [`Check::NoLiveBox`] when the delivery
+    /// names no live box. A value past its expiry gives
     /// [`Unsealed::Expired`], so [`decide`] refuses it as [`Check::Expired`]
     /// once the attribution and the declared egress pass.
     ///
-    /// The shell binds the open to the box id that the source resolves to.
-    /// For an [`Attribution::OwnIp`] source, that is the sending box, so a
-    /// value from another `own_ip` box comes back as
-    /// [`Unsealed::OtherBox`].
-    ///
-    /// An [`Attribution::HostIpCohort`] source resolves to no single box.
-    /// [`crate::seal`] has no call that reads the value's box id before the
-    /// open. So the shell binds the open to each live box of the cohort in
-    /// turn, and keeps the first result that is not [`Unsealed::OtherBox`].
-    /// That box is in the cohort, so the shell sets
-    /// [`Redemption::named_box_in_cohort`]. When every live box of the
-    /// cohort gives [`Unsealed::OtherBox`], the shell gives that, and
-    /// [`decide`] refuses it as [`Check::CrossBox`].
+    /// The shell binds the open to the box id the delivery names, so a
+    /// value sealed to any other box comes back as [`Unsealed::OtherBox`].
     ///
     /// # Errors
     ///
@@ -169,18 +157,13 @@ pub struct Bounds {
     pub breadth: Option<Breadth>,
 }
 
-/// The box the connection's source address resolves to.
+/// Whether the box a delivery names is live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Attribution<B> {
-    /// The source resolves to no live box.
+    /// The delivery names a box that is not registered.
     NoLiveBox,
-    /// The source is the own address of this live `own_ip` box.
-    OwnIp(B),
-    /// The source is the shared address of this host's live `host_ip`
-    /// boxes. It does not say which one. On an un-enrolled node, until
-    /// NET-132 and NET-133 are built, every VM-hosted box and the host shell
-    /// send from this address (see [`Redemption::named_box_in_cohort`]).
-    HostIpCohort,
+    /// The delivery names this registered box.
+    LiveBox(B),
 }
 
 /// One authority: a hostname, interned as an `H`, and a port.
@@ -202,24 +185,8 @@ pub struct Authority<H> {
 pub struct Redemption<B, H, I = Inject> {
     /// The decryption fact, with the named box and the member's bounds.
     pub unsealed: Unsealed<B>,
-    /// The box the connection's source resolves to.
+    /// The box the delivery names, when it is live.
     pub attribution: Attribution<B>,
-    /// Whether the box the value names is a live box of this host behind
-    /// the cohort's shared address.
-    ///
-    /// On an enrolled node, the shell sets this field only when the named
-    /// box is a live `host_ip` box of this host. Cross-box redemption
-    /// between `own_ip` boxes is then always refused.
-    ///
-    /// An un-enrolled node has an interim, until the per-box attachment
-    /// facts (NET-132, NET-133) are built. Every VM-hosted box, `own_ip`
-    /// included, and the host shell send from one shared attachment. The
-    /// shell gives such a source as [`Attribution::HostIpCohort`]. It sets
-    /// this field when the named box is any live VM-hosted box of this
-    /// host. The admission is then audited `cohort_attributed`. The
-    /// cross-box and host-shell refusals do not hold in that interim. The
-    /// spec records this as a residual risk (T28, Gatehouse §6.10).
-    pub named_box_in_cohort: bool,
     /// The clock reading for this request, in seconds since the Unix epoch.
     pub now: u64,
     /// The box ids that the revocations in force name. The shell selects
@@ -273,28 +240,6 @@ pub struct Plain<H> {
     pub egress: Vec<Authority<H>>,
 }
 
-/// How an admitted request was attributed to the box the value names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Attributed {
-    /// The source is the named box's own address.
-    OwnBox,
-    /// The source is the `host_ip` cohort, and the named box is in it. The
-    /// audit records this `cohort_attributed`.
-    Cohort,
-}
-
-impl Attributed {
-    /// The audit record's marker for this attribution, or `None` when the
-    /// source is the named box's own address (BEP-028).
-    #[must_use]
-    pub fn marker(self) -> Option<&'static str> {
-        match self {
-            Self::OwnBox => None,
-            Self::Cohort => Some("cohort_attributed"),
-        }
-    }
-}
-
 /// The check that refused a redemption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Check {
@@ -302,10 +247,9 @@ pub enum Check {
     Undecryptable,
     /// The member carries no `mode` or no recognised `breadth` (BEP-058).
     UnboundedMember,
-    /// The source address resolves to no live box (BEP-020).
+    /// The delivery names no live box.
     NoLiveBox,
-    /// The source is a box other than the one the value names, or the
-    /// `host_ip` cohort when the named box is not in it (BEP-020).
+    /// The delivery names a box other than the one the value names.
     CrossBox,
     /// The clock is at or after the value's expiry (BEP-024).
     Expired,
@@ -361,8 +305,6 @@ impl fmt::Display for Check {
 pub enum Decision {
     /// Every check passed.
     Admit {
-        /// How the source was attributed to the named box.
-        attributed: Attributed,
         /// The member's mode, for the audit.
         mode: Mode,
         /// The member's breadth.
@@ -370,34 +312,6 @@ pub enum Decision {
     },
     /// The first check that failed.
     Refuse(Check),
-}
-
-impl Decision {
-    /// The audit record's marker for this decision: the failed check's
-    /// marker for a refusal, and the attribution's marker for an admission.
-    /// An admission from the named box's own address carries no marker.
-    #[must_use]
-    pub fn marker(self) -> Option<&'static str> {
-        match self {
-            Self::Admit { attributed, .. } => attributed.marker(),
-            Self::Refuse(check) => Some(check.marker()),
-        }
-    }
-
-    /// Whether this decision admits a `host_ip` sender for another live
-    /// `host_ip` box of this host (BEP-028). This is the cohort flag for the
-    /// connection span: the forwarder records it as `cohort_attributed` on
-    /// the `box_connection` span.
-    #[must_use]
-    pub fn cohort_attributed(self) -> bool {
-        matches!(
-            self,
-            Self::Admit {
-                attributed: Attributed::Cohort,
-                ..
-            }
-        )
-    }
 }
 
 /// Decides one redemption. Pure: the result depends only on `redemption`.
@@ -415,22 +329,19 @@ pub fn decide<B: PartialEq, H: PartialEq, I: PartialEq>(
         Unsealed::OtherBox => {
             return Decision::Refuse(match redemption.attribution {
                 Attribution::NoLiveBox => Check::NoLiveBox,
-                Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::CrossBox,
+                Attribution::LiveBox(_) => Check::CrossBox,
             });
         }
-        // BEP-024: open refused the value as past its expiry. The open was
-        // bound to the box the source resolves to, so only the source or the
-        // declared egress (BEP-022) can fail first.
+        // Open refused the value as past its expiry. The open was bound to
+        // the box the delivery names, so only a box that is not live or the
+        // declared egress can fail first.
         Unsealed::Expired => {
             return Decision::Refuse(match redemption.attribution {
                 Attribution::NoLiveBox => Check::NoLiveBox,
-                Attribution::HostIpCohort if !redemption.named_box_in_cohort => Check::CrossBox,
-                Attribution::OwnIp(_) | Attribution::HostIpCohort
-                    if !redemption.egress.contains(&redemption.authority) =>
-                {
+                Attribution::LiveBox(_) if !redemption.egress.contains(&redemption.authority) => {
                     Check::OutsideDeclaredEgress
                 }
-                Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::Expired,
+                Attribution::LiveBox(_) => Check::Expired,
             });
         }
         Unsealed::Opened {
@@ -443,15 +354,12 @@ pub fn decide<B: PartialEq, H: PartialEq, I: PartialEq>(
     let (Some(mode), Some(breadth)) = (bounds.mode, bounds.breadth) else {
         return Decision::Refuse(Check::UnboundedMember);
     };
-    // BEP-020: the source must be the named box, or the cohort it is in.
-    let attributed = match &redemption.attribution {
+    // The delivery must name a live box, and the value must name that box.
+    match &redemption.attribution {
         Attribution::NoLiveBox => return Decision::Refuse(Check::NoLiveBox),
-        Attribution::OwnIp(sender) if sender == box_id => Attributed::OwnBox,
-        Attribution::HostIpCohort if redemption.named_box_in_cohort => Attributed::Cohort,
-        Attribution::OwnIp(_) | Attribution::HostIpCohort => {
-            return Decision::Refuse(Check::CrossBox);
-        }
-    };
+        Attribution::LiveBox(delivered) if delivered == box_id => {}
+        Attribution::LiveBox(_) => return Decision::Refuse(Check::CrossBox),
+    }
     // BEP-022: the box reaches only what its declared egress admits.
     let authority = &redemption.authority;
     if !redemption.egress.contains(authority) {
@@ -488,11 +396,7 @@ pub fn decide<B: PartialEq, H: PartialEq, I: PartialEq>(
         return Decision::Refuse(Check::HostMismatch);
     }
     // BEP-025: every check passed.
-    Decision::Admit {
-        attributed,
-        mode,
-        breadth,
-    }
+    Decision::Admit { mode, breadth }
 }
 
 /// Decides one request that carries no sealed value. Pure: the result
@@ -546,7 +450,6 @@ mod tests {
         Redemption {
             unsealed: Unsealed::Undecryptable,
             attribution: Attribution::NoLiveBox,
-            named_box_in_cohort: false,
             now: 1_500,
             revoked: Vec::new(),
             authority: API,
@@ -612,8 +515,8 @@ mod tests {
         target: None,
     };
 
-    /// An opened value for `named`, sent from `named`, that passes the
-    /// source and bounds checks.
+    /// An opened value for `named`, on a delivery for `named`, that passes
+    /// the attribution and bounds checks.
     fn own(named: u8) -> Redemption<u8, u8, u8> {
         Redemption {
             unsealed: Unsealed::Opened {
@@ -621,7 +524,7 @@ mod tests {
                 bounds: BOUNDED,
                 expiry: 2_000,
             },
-            attribution: Attribution::OwnIp(named),
+            attribution: Attribution::LiveBox(named),
             ..rest()
         }
     }
@@ -693,12 +596,9 @@ mod tests {
     fn any_redemption() -> impl Strategy<Value = Redemption<u8, u8, u8>> {
         (
             any_unsealed(),
-            (0u8..3, 0u8..3).prop_map(|(source, sender)| match source {
-                0 => Attribution::NoLiveBox,
-                1 => Attribution::OwnIp(sender),
-                _ => Attribution::HostIpCohort,
+            prop::option::of(0u8..3).prop_map(|delivered| {
+                delivered.map_or(Attribution::NoLiveBox, Attribution::LiveBox)
             }),
-            any::<bool>(),
             0u64..4_000,
             prop::collection::vec(0u8..3, 0..=2),
             any_authority(),
@@ -714,7 +614,6 @@ mod tests {
                 |(
                     unsealed,
                     attribution,
-                    named_box_in_cohort,
                     now,
                     revoked,
                     authority,
@@ -724,7 +623,6 @@ mod tests {
                 )| Redemption {
                     unsealed,
                     attribution,
-                    named_box_in_cohort,
                     now,
                     revoked,
                     authority,
@@ -781,11 +679,8 @@ mod tests {
         };
         let attributed = match &r.attribution {
             Attribution::NoLiveBox => false,
-            Attribution::OwnIp(sender) => {
-                opened && Some(*sender) == box_id || matches!(r.unsealed, Unsealed::Expired)
-            }
-            Attribution::HostIpCohort => {
-                r.named_box_in_cohort && !matches!(r.unsealed, Unsealed::OtherBox)
+            Attribution::LiveBox(delivered) => {
+                opened && Some(*delivered) == box_id || matches!(r.unsealed, Unsealed::Expired)
             }
         };
         let credentialed = r.current_set.iter().any(|c| c.host == a.host);
@@ -833,7 +728,6 @@ mod tests {
     }
 
     const ADMITTED: Decision = Decision::Admit {
-        attributed: Attributed::OwnBox,
         mode: Mode::User,
         breadth: Breadth::Full,
     };
@@ -901,8 +795,7 @@ mod tests {
                 .expect("a decryption fact");
             let decision = decide(&Redemption {
                 unsealed,
-                attribution: Attribution::OwnIp(box_id.clone()),
-                named_box_in_cohort: false,
+                attribution: Attribution::LiveBox(box_id.clone()),
                 ..rest()
             });
             if same_key {
@@ -917,52 +810,34 @@ mod tests {
             prop_assert_eq!(
                 decide(&Redemption {
                     unsealed: own,
-                    attribution: Attribution::OwnIp(box_id),
-                    named_box_in_cohort: false,
+                    attribution: Attribution::LiveBox(box_id),
                     ..rest()
                 }),
                 Decision::Admit {
-                    attributed: Attributed::OwnBox,
                     mode: mode_of(user),
                     breadth: Breadth::Full,
                 }
             );
         }
 
-        /// BEP-020: a value redeems only from the box it names, or from the
-        /// `host_ip` cohort when the named box is in it.
+        /// A value redeems only on a delivery for the box it names, and
+        /// only while that box is live.
         #[test]
         fn prop_cross_box_sealed_value_is_refused(
             named in any::<u8>(),
-            sender in any::<u8>(),
-            source in 0u8..3,
-            in_cohort in any::<bool>(),
+            delivered in prop::option::of(any::<u8>()),
         ) {
-            let attribution = match source {
-                0 => Attribution::NoLiveBox,
-                1 => Attribution::OwnIp(sender),
-                _ => Attribution::HostIpCohort,
-            };
             let decision = decide(&Redemption {
                 unsealed: Unsealed::Opened { box_id: named, bounds: BOUNDED, expiry: 2_000 },
-                attribution: attribution.clone(),
-                named_box_in_cohort: in_cohort,
+                attribution: delivered.map_or(Attribution::NoLiveBox, Attribution::LiveBox),
                 ..rest()
             });
-            let expected = match attribution {
-                Attribution::NoLiveBox => Err(Check::NoLiveBox),
-                Attribution::OwnIp(s) if s == named => Ok(Attributed::OwnBox),
-                Attribution::HostIpCohort if in_cohort => Ok(Attributed::Cohort),
-                _ => Err(Check::CrossBox),
+            let expected = match delivered {
+                None => Decision::Refuse(Check::NoLiveBox),
+                Some(delivered) if delivered == named => ADMITTED,
+                Some(_) => Decision::Refuse(Check::CrossBox),
             };
-            match expected {
-                Ok(attributed) => prop_assert_eq!(decision, Decision::Admit {
-                    attributed,
-                    mode: Mode::User,
-                    breadth: Breadth::Full,
-                }),
-                Err(check) => prop_assert_eq!(decision, Decision::Refuse(check)),
-            }
+            prop_assert_eq!(decision, expected);
         }
 
         /// BEP-058: a member redeems only with a mode and a recognised
@@ -976,16 +851,13 @@ mod tests {
             let bounds = Bounds { mode, breadth: breadth.then_some(Breadth::Full) };
             let decision = decide(&Redemption {
                 unsealed: Unsealed::Opened { box_id: named, bounds, expiry: 2_000 },
-                attribution: Attribution::OwnIp(named),
-                named_box_in_cohort: false,
+                attribution: Attribution::LiveBox(named),
                 ..rest()
             });
             match (bounds.mode, bounds.breadth) {
-                (Some(mode), Some(breadth)) => prop_assert_eq!(decision, Decision::Admit {
-                    attributed: Attributed::OwnBox,
-                    mode,
-                    breadth,
-                }),
+                (Some(mode), Some(breadth)) => {
+                    prop_assert_eq!(decision, Decision::Admit { mode, breadth });
+                }
                 _ => prop_assert_eq!(decision, Decision::Refuse(Check::UnboundedMember)),
             }
         }
@@ -1178,10 +1050,10 @@ mod tests {
             reaching.current_set.push(a);
             admits_iff_every_check_passes(&reaching)?;
 
-            // And sent from the box the value names, so an opened value
+            // And delivered for the box the value names, so an opened value
             // reaches the expiry, revocation and bounds checks.
             if let Unsealed::Opened { box_id, .. } = reaching.unsealed {
-                reaching.attribution = Attribution::OwnIp(box_id);
+                reaching.attribution = Attribution::LiveBox(box_id);
                 admits_iff_every_check_passes(&reaching)?;
             }
         }
@@ -1246,15 +1118,9 @@ mod tests {
                 let Unsealed::Opened { bounds, .. } = r.unsealed else {
                     panic!("every check passed for a value that did not open");
                 };
-                let attributed = if matches!(r.attribution, Attribution::OwnIp(_)) {
-                    Attributed::OwnBox
-                } else {
-                    Attributed::Cohort
-                };
                 prop_assert_eq!(
                     decision,
                     Decision::Admit {
-                        attributed,
                         mode: bounds.mode.expect("a mode"),
                         breadth: bounds.breadth.expect("a breadth"),
                     }
@@ -1283,7 +1149,7 @@ mod tests {
         assert_eq!(late, Unsealed::Expired);
         let decision = decide(&Redemption {
             unsealed: late,
-            attribution: Attribution::OwnIp("box-a".to_owned()),
+            attribution: Attribution::LiveBox("box-a".to_owned()),
             ..rest()
         });
         assert_eq!(decision, Decision::Refuse(Check::Expired));
@@ -1299,22 +1165,17 @@ mod tests {
 
     /// BEP-058: `seal::open` refuses a member with a missing or unknown
     /// breadth as `UnknownBreadth`, after it decrypts. The shell maps that to
-    /// `Unbounded`, and the refusal names `unbounded_member`, from every
-    /// source.
+    /// `Unbounded`, and the refusal names `unbounded_member`, whether or not
+    /// the delivery names a live box.
     #[test]
     fn from_open_unknown_breadth_is_refused_as_unbounded_member() {
         let unsealed =
             Unsealed::from_open(Err(OpenError::UnknownBreadth)).expect("a decryption fact");
         assert_eq!(unsealed, Unsealed::Unbounded);
-        for attribution in [
-            Attribution::NoLiveBox,
-            Attribution::OwnIp("a".to_owned()),
-            Attribution::HostIpCohort,
-        ] {
+        for attribution in [Attribution::NoLiveBox, Attribution::LiveBox("a".to_owned())] {
             let decision = decide(&Redemption {
                 unsealed: unsealed.clone(),
                 attribution,
-                named_box_in_cohort: true,
                 ..rest()
             });
             assert_eq!(decision, Decision::Refuse(Check::UnboundedMember));
@@ -1325,7 +1186,7 @@ mod tests {
         }
     }
 
-    /// BEP-020: `seal::open` refuses a value from another `own_ip` box as
+    /// `seal::open` refuses a value sealed to another box as
     /// `ContextMismatch(BoxId)`, after it decrypts. The shell maps that to
     /// `OtherBox`, and the refusal names `cross_box`.
     #[test]
@@ -1345,129 +1206,16 @@ mod tests {
         assert_eq!(unsealed, Unsealed::OtherBox);
         for (attribution, check) in [
             (Attribution::NoLiveBox, Check::NoLiveBox),
-            (Attribution::OwnIp("box-b".to_owned()), Check::CrossBox),
-            (Attribution::HostIpCohort, Check::CrossBox),
+            (Attribution::LiveBox("box-b".to_owned()), Check::CrossBox),
         ] {
             let decision = decide(&Redemption {
                 unsealed: unsealed.clone(),
                 attribution,
-                named_box_in_cohort: true,
                 ..rest()
             });
             assert_eq!(decision, Decision::Refuse(check));
         }
         assert_eq!(Check::CrossBox.marker(), "cross_box");
-    }
-
-    /// BEP-020, BEP-028: a cohort source names no single box, so the shell
-    /// binds the open to each live cohort box in turn. The value opens for
-    /// the box it names, and the decision admits it as `Cohort`. Bound to
-    /// another cohort box, it is `OtherBox`, refused as `cross_box`.
-    #[test]
-    fn cohort_open_bound_to_named_box_is_admitted_as_cohort() {
-        let Some(key) = key([9; 32]) else {
-            panic!("a valid key");
-        };
-        let sealed = sealed_to(&key, "box-a", "host-a", Mode::User);
-        let bind = |box_id: &str| Binding {
-            box_id: box_id.into(),
-            host: "host-a".into(),
-            module: "github".into(),
-            now: 1_500,
-        };
-        let mut admitted = None;
-        for live in ["box-b", "box-a"] {
-            let unsealed =
-                Unsealed::from_open(open(&key, &sealed, &bind(live))).expect("a decryption fact");
-            if unsealed == Unsealed::OtherBox {
-                let decision = decide(&Redemption {
-                    unsealed,
-                    attribution: Attribution::HostIpCohort,
-                    named_box_in_cohort: true,
-                    ..rest()
-                });
-                assert_eq!(decision, Decision::Refuse(Check::CrossBox));
-                continue;
-            }
-            admitted = Some(decide(&Redemption {
-                unsealed,
-                attribution: Attribution::HostIpCohort,
-                named_box_in_cohort: true,
-                ..rest()
-            }));
-            break;
-        }
-        assert_eq!(
-            admitted,
-            Some(Decision::Admit {
-                attributed: Attributed::Cohort,
-                mode: Mode::User,
-                breadth: Breadth::Full,
-            })
-        );
-    }
-
-    /// BEP-028: a `host_ip` sender that presents a value naming another
-    /// live `host_ip` box of this host is admitted once the remaining checks
-    /// pass. The admission is attributed to the cohort, and its audit marker
-    /// is `cohort_attributed`. The same value from the `own_ip` address of
-    /// another box, or with the named box outside the cohort, is refused as
-    /// `cross_box`.
-    #[test]
-    fn host_ip_redemption_is_cohort_attributed() {
-        const NAMED: u8 = 7;
-        let cohort = Redemption {
-            attribution: Attribution::HostIpCohort,
-            named_box_in_cohort: true,
-            ..own(NAMED)
-        };
-        let decision = decide(&cohort);
-        assert_eq!(
-            decision,
-            Decision::Admit {
-                attributed: Attributed::Cohort,
-                mode: Mode::User,
-                breadth: Breadth::Full,
-            }
-        );
-        assert_eq!(decision.marker(), Some("cohort_attributed"));
-        assert!(decision.cohort_attributed());
-
-        // The named box's own address is no cohort redemption.
-        let own_box = decide(&own(NAMED));
-        assert_eq!(own_box.marker(), None);
-        assert!(!own_box.cohort_attributed());
-
-        // The `own_ip` address of another box is not the named box.
-        let other_box = decide(&Redemption {
-            attribution: Attribution::OwnIp(NAMED + 1),
-            ..own(NAMED)
-        });
-        assert_eq!(other_box, Decision::Refuse(Check::CrossBox));
-        assert_eq!(other_box.marker(), Some("cross_box"));
-        assert!(!other_box.cohort_attributed());
-
-        // The named box is not a live `host_ip` box of this host.
-        let outside = decide(&Redemption {
-            named_box_in_cohort: false,
-            ..cohort.clone()
-        });
-        assert_eq!(outside, Decision::Refuse(Check::CrossBox));
-        assert_eq!(outside.marker(), Some("cross_box"));
-        assert!(!outside.cohort_attributed());
-
-        // The remaining checks still bind a cohort sender.
-        let expired = decide(&Redemption {
-            now: 2_000,
-            ..cohort.clone()
-        });
-        assert_eq!(expired, Decision::Refuse(Check::Expired));
-        let revoked = decide(&Redemption {
-            revoked: vec![NAMED],
-            ..cohort
-        });
-        assert_eq!(revoked, Decision::Refuse(Check::Revoked));
-        assert!(!revoked.cohort_attributed());
     }
 
     /// An unsupported header is not a value sealed to another key, so the
@@ -1606,8 +1354,7 @@ mod tests {
         };
         let redemption = Redemption {
             unsealed: Unsealed::from_open(Ok(opened.clone())).expect("opened"),
-            attribution: Attribution::OwnIp("b1".to_owned()),
-            named_box_in_cohort: false,
+            attribution: Attribution::LiveBox("b1".to_owned()),
             now: 1_500,
             revoked: Vec::new(),
             authority: api.clone(),
@@ -1764,10 +1511,10 @@ mod kani_proofs {
     }
 
     fn any_attribution() -> Attribution<u8> {
-        match kani::any::<u8>() % 3 {
-            0 => Attribution::NoLiveBox,
-            1 => Attribution::OwnIp(kani::any()),
-            _ => Attribution::HostIpCohort,
+        if kani::any() {
+            Attribution::LiveBox(kani::any())
+        } else {
+            Attribution::NoLiveBox
         }
     }
 
@@ -1795,7 +1542,6 @@ mod kani_proofs {
         Redemption {
             unsealed: any_unsealed(),
             attribution: any_attribution(),
-            named_box_in_cohort: kani::any(),
             now: kani::any(),
             revoked: any_revoked(),
             authority: any_authority(),
@@ -1821,8 +1567,8 @@ mod kani_proofs {
         }
     }
 
-    /// BEP-020: an admission comes only from the named `own_ip` box, or
-    /// from the `host_ip` cohort when the named box is in it.
+    /// An admission comes only on a delivery for the live box the value
+    /// names.
     #[kani::proof]
     #[kani::unwind(6)]
     fn kani_redeem_refuses_misattributed() {
@@ -1841,9 +1587,8 @@ mod kani_proofs {
                 panic!("admitted an undecryptable value");
             };
             match r.attribution {
-                Attribution::NoLiveBox => panic!("admitted from no live box"),
-                Attribution::OwnIp(sender) => assert_eq!(sender, box_id),
-                Attribution::HostIpCohort => assert!(r.named_box_in_cohort),
+                Attribution::NoLiveBox => panic!("admitted for no live box"),
+                Attribution::LiveBox(delivered) => assert_eq!(delivered, box_id),
             }
         }
     }
@@ -2028,8 +1773,7 @@ mod kani_proofs {
             } => {
                 let attributed = match r.attribution {
                     Attribution::NoLiveBox => false,
-                    Attribution::OwnIp(sender) => sender == box_id,
-                    Attribution::HostIpCohort => r.named_box_in_cohort,
+                    Attribution::LiveBox(delivered) => delivered == box_id,
                 };
                 bounds.mode.is_some()
                     && bounds.breadth.is_some()

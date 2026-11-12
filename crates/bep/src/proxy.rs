@@ -385,8 +385,7 @@ impl fmt::Debug for Proxy {
 
 /// The `box_connection` span of one box connection. It carries the box id,
 /// the entry form (`connect` or `direct_tls`), the authority the box asked
-/// for, the upstream's validation outcome, the
-/// last substitution decision, whether an admission was cohort-attributed,
+/// for, the upstream's validation outcome, the last substitution decision
 /// and the outcome. When a store reference is redeemed it also carries the
 /// `store` and the `identifier`, with the names the audit record uses
 /// (BEP-028, Gatehouse 6.10). It never carries a credential or a stored
@@ -400,7 +399,6 @@ pub(crate) fn connection_span(box_id: &str, delivered: &dyn std::fmt::Display) -
         authority = tracing::field::Empty,
         upstream_tls = tracing::field::Empty,
         substitution = tracing::field::Empty,
-        cohort_attributed = tracing::field::Empty,
         store = tracing::field::Empty,
         identifier = tracing::field::Empty,
         outcome = tracing::field::Empty,
@@ -1970,8 +1968,6 @@ pub(crate) mod tests {
                 identifier: "github:member".to_owned(),
                 mapping: Mapping::ModuleUnmapped,
                 renewed: false,
-                marker: None,
-                cohort_attributed: false,
             }
         }
     }
