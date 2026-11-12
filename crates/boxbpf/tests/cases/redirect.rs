@@ -357,3 +357,54 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
     h.handles.publish(&mut live, port).expect("publish");
     assert_eq!(open_flow.step(), "err 1");
 }
+
+/// A pin admits new connections to its address while it lives. A TCP
+/// connection made in that time goes on after the pin has run out, both
+/// ways, and the next connection to the same address is refused.
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn an_open_tcp_connection_outlives_the_pin_that_admitted_it() {
+    let Some(mut h) =
+        Harness::start("cases::redirect::an_open_tcp_connection_outlives_the_pin_that_admitted_it")
+    else {
+        return;
+    };
+    let echo = servers::greeting_echo().to_string();
+    let policy = BoxPolicy {
+        names: vec!["allowed.test".parse().expect("name")],
+        ..BoxPolicy::default()
+    };
+    let live = h.install("c", host_ip(), policy);
+    let id = live.id();
+    let target = IpAddr::V4(h.v4(5, 8));
+    let target_s = target.to_string();
+    let connect = |h: &Harness| h.probe("c", &["tcp", &target_s, &echo, "300"]);
+    assert_eq!(connect(&h), refused(), "not pinned yet");
+
+    // Long enough for a probe to start under a loaded test run.
+    let lives = Duration::from_secs(3);
+    h.handles
+        .pin(id, target, "allowed.test", lives)
+        .expect("pin");
+    let mut open = h.hold_probe("c", &["hold-tcp", &target_s, &echo]);
+    assert!(
+        open.ready.starts_with("ok ") && open.ready.ends_with("data=hello"),
+        "connected while the pin lived: {}",
+        open.ready
+    );
+    assert_eq!(open.step(), "ok data=again");
+
+    let end = std::time::Instant::now() + lives + Duration::from_secs(5);
+    while !h.handles.pinned_sets(id, target).is_empty() {
+        assert!(std::time::Instant::now() < end, "the pin never ran out");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(connect(&h), refused(), "a new connection needs a live pin");
+    for _ in 0..3 {
+        assert_eq!(open.step(), "ok data=again", "the open connection goes on");
+    }
+    // The same once the expired pin is deleted from the map.
+    assert_eq!(h.handles.sweep_pins().expect("sweep"), 1);
+    assert_eq!(open.step(), "ok data=again");
+    assert_eq!(connect(&h), refused());
+}

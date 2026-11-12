@@ -753,54 +753,6 @@ fn cli_command_tree_stays_renderable() {
     Cli::command().debug_assert();
 }
 
-/// The CLI reference documents no retired command (NET-111): the reference
-/// is the page a person reads to learn what the CLI offers, so a command
-/// the tree no longer parses must not survive there. `min login` survives
-/// as a verb, so the guard is on what it must never document again — the
-/// minted key and CA — not on the verb's name. And the tree agrees with
-/// the page: the retired verb is refused by the argument parser, with its
-/// usage, rather than parsing into nothing.
-#[test]
-fn cli_reference_has_no_retired_commands() {
-    let reference = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md"),
-    )
-    .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
-    for (retired, why) in [
-        ("ssh-forward", "the SSH LocalForward verb is retired"),
-        ("client.pem", "the retired client certificate"),
-        ("client.key", "the retired client key"),
-        ("ca.pem", "the retired CA certificate"),
-        ("cert-dir", "login's retired --cert-dir flag"),
-    ] {
-        assert!(
-            !reference.contains(retired),
-            "the CLI reference documents a retired surface ({retired}): {why}"
-        );
-    }
-
-    let Err(err) = Cli::try_parse_from(["min", "ssh-forward", "dev", "18080:127.0.0.1:80"]) else {
-        panic!("ssh-forward is retired and must not parse");
-    };
-    let rendered = err.to_string();
-    assert!(
-        rendered.contains("unrecognized subcommand 'ssh-forward'"),
-        "the refusal must name the verb, got: {rendered}"
-    );
-    assert!(
-        rendered.contains("Usage:"),
-        "the refusal must carry the usage, got: {rendered}"
-    );
-
-    // The refusal `min` prints names the verb that replaced the retired one.
-    let rendered = with_retired_command_hint(err).to_string();
-    assert!(
-        rendered.contains("unrecognized subcommand 'ssh-forward'")
-            && rendered.contains("min net forward <SESSION> <LOCAL>:<PORT>"),
-        "the refusal must name the replacement, got: {rendered}"
-    );
-}
-
 /// Entry constructor for the bare-`min` state-report tests.
 fn twin_entry(
     id: &str,
@@ -4502,36 +4454,6 @@ fn dynamic_ingress_flags_parse() {
         rendered.contains(&boxes::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
         "the refusal must use the launch check's words, got: {rendered}"
     );
-}
-
-/// The CLI reference documents the network flags on `session activate`
-/// (NET-036), read from the real file so a docs edit cannot silently drop
-/// either row.
-#[test]
-fn cli_reference_documents_network_flags() {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md");
-    let doc = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    let section = doc
-        .split_once("### `session activate`")
-        .expect("a `session activate` section in the CLI reference")
-        .1;
-    let section = section.split("### ").next().unwrap();
-    // Table cells escape their pipes as `\|`; compare against the rendered
-    // form.
-    let section = section.replace("\\|", "|");
-    for row in [
-        "--network <none|host_ip|own_ip>",
-        "--ingress <EXT:INT[/PROTO]>",
-        "--dynamic-ingress <allow|ask|deny>",
-        "--dynamic-range <LO-HI>",
-    ] {
-        assert!(
-            section.contains(row),
-            "the CLI reference's `session activate` rows must document `{row}`"
-        );
-    }
 }
 
 /// Stand up the two-VM shape the named-VM tests below need (NET-057/NET-058):

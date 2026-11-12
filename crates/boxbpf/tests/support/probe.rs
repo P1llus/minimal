@@ -452,7 +452,8 @@ fn endpoint_tcp(at: SocketAddr) {
     }
 }
 
-/// A connection that stays open until the probe is dropped.
+/// A connection that stays open until the probe is dropped. Each step
+/// sends a line on it and reports what comes back.
 fn hold_tcp(to: SocketAddr) {
     match TcpStream::connect_timeout(&to, Duration::from_secs(2)) {
         Ok(mut stream) => {
@@ -464,7 +465,16 @@ fn hold_tcp(to: SocketAddr) {
                 stream.peer_addr().expect("peer"),
                 data.trim()
             ));
-            while wait_step() {}
+            // A silent peer must not hold the test.
+            let _bounded = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            while wait_step() {
+                let answer = stream.write_all(b"again\n").and_then(|()| {
+                    let n = stream.read(&mut buf)?;
+                    let data = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
+                    Ok(format!("data={}", data.trim()))
+                });
+                say(&report(answer));
+            }
         }
         Err(e) => say(&format!("ready {}", errno(&e))),
     }

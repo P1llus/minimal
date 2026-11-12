@@ -2439,7 +2439,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # design §5.3's DNS-pinned admission, which admits an *address* for the
   # window its name resolved in — and admits it however the application
   # learned it, `curl --resolve` included, because the pin table is keyed by
-  # address alone (crates/minimald/src/net/dns_gate.rs). An earlier round
+  # address alone (the engine's pin map). An earlier round
   # probed a host-resolved address of example.com itself on the belief that
   # "the box's own resolution" and the host's never agree; the macOS lane is
   # where they do — both ride the same upstream — so the pinned address was
@@ -19100,9 +19100,9 @@ PY
 
   # ---- the ask: an in-range port of an allow box --------------------------
   # The reply is the box's own word that the publish stood: the address its
-  # forward bound, spelled host:port, with no caveat — the publish admitted
-  # the port at the box's relay gate (NET-044). A native host has no host
-  # gate in the ask's way, so any refusal here is a failure.
+  # forward bound, spelled host:port, with no caveat — the publish opened
+  # the port in the box's ingress rules (NET-044). On a native host nothing
+  # else decides the ask, so any refusal here is a failure.
   mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_port" \
     >"$WORK/mnx-expose.out" 2>"$WORK/mnx-expose.err"
   mnx_expose_rc=$?
@@ -20598,7 +20598,7 @@ proof_expose_from_inside_box() {
     done
     echo "host probe: GET http://$eib_addr:$eib_port/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none})"
     if [ -z "$eib_reached" ]; then
-      echo "::error::the host probe at $eib_addr:$eib_port did not reach the allow box's in-box server on a VM lane (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not admitted at the guest relay gate (NET-044)"
+      echo "::error::the host probe at $eib_addr:$eib_port did not reach the allow box's in-box server on a VM lane (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not open in the box's ingress rules (NET-044)"
       cat "$WORK/eib-vm-host.err" 2>/dev/null || true
       fail
     fi
@@ -21157,7 +21157,7 @@ PY
   done
   echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none})"
   if [ -z "$eib_reached" ]; then
-    echo "::error::the host probe at $eib_rec_addr did not reach the allow box's in-box server (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not admitted at the box's relay gate (NET-044)"
+    echo "::error::the host probe at $eib_rec_addr did not reach the allow box's in-box server (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not open in the box's ingress rules (NET-044)"
     cat "$WORK/eib-host.err" 2>/dev/null || true
     eib_restore_log
     fail
@@ -21552,9 +21552,9 @@ proof_proxy_refuses_like_direct() {
 
   # One DIRECT attempt from a box: curl's exit code and its stderr ARE the
   # refusal a direct connection gets — a refused connection is curl 7 (the
-  # OS on a port nothing listens on, or a target's ingress gate answering a
-  # SYN to a port the box never declared with a reset, NET-014), a SYN an
-  # egress gate silently dropped is a connect timeout, curl 28.
+  # OS on a port nothing listens on, or the box's own rules refusing the
+  # connect at once), and a SYN dropped on the way to an unpublished port
+  # of another box is a connect timeout, curl 28.
   par_direct() { # $1 box, $2 url, $3 max-time
     mnl session exec "$1" "curl -sS --max-time $3 -o /dev/null '$2'" \
       2>"$WORK/par-direct.err"

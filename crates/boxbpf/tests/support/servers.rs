@@ -26,6 +26,30 @@ pub fn banner() -> u16 {
     port
 }
 
+/// A TCP listener on every address of the host that greets with `hello`
+/// and then sends back what it reads, for as long as the client stays.
+/// Returns its port.
+pub fn greeting_echo() -> u16 {
+    let listener = TcpListener::bind("[::]:0").expect("bind an echo listener");
+    let port = listener.local_addr().expect("local address").port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                let mut next: &[u8] = b"hello\n";
+                // Either end may have gone away.
+                while stream.write_all(next).is_ok() {
+                    match stream.read(&mut buf) {
+                        Ok(n) if n > 0 => next = buf.get(..n).unwrap_or_default(),
+                        _ => break,
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 /// A UDP socket at `at` that answers every datagram. Returns its port.
 pub fn udp_echo(at: IpAddr) -> u16 {
     let sock = UdpSocket::bind(SocketAddr::new(at, 0)).expect("bind a UDP echo socket");
