@@ -7576,9 +7576,17 @@ proof_native_resolution_without_proxy_env() {
       echo "resolution check SKIPPED — this host's lookups never reach systemd-resolved, so they cannot carry the zone"
     else
       # NET-009: any process on the host, through the host's NATIVE resolver,
-      # with every proxy variable stripped from its environment.
-      native_resolved="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
-        -u ALL_PROXY -u all_proxy getent hosts "$NATIVE_NAME.min.internal" 2>/dev/null || true)"
+      # with every proxy variable stripped from its environment. The setup
+      # script returns when the box-name service holds the port, and the
+      # daemon publishes its names to the service a moment later, so the
+      # lookup is asked again for a few seconds.
+      native_resolved=""
+      for _ in $(seq 1 20); do
+        native_resolved="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+          -u ALL_PROXY -u all_proxy getent hosts "$NATIVE_NAME.min.internal" 2>/dev/null || true)"
+        [ -n "$native_resolved" ] && break
+        sleep 0.5
+      done
       if [ -z "$native_resolved" ]; then
         echo "::error::$NATIVE_NAME.min.internal did not resolve on the host with no proxy settings"
         # The two causes this could be, each answered by its own read below —
