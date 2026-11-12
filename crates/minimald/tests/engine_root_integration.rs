@@ -1360,6 +1360,78 @@ fn the_hostname_proxy_judges_a_box_s_request_where_the_box_would_dial() {
     );
 }
 
+/// A box holds a bounded number of streams to exposed host ports, the
+/// stream past the bound is refused with an event, and the streams end
+/// when the box does.
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_box_s_streams_to_the_host_are_bounded_and_end_with_the_box() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const MOST: usize = 512;
+
+    if !gated("a_box_s_streams_to_the_host_are_bounded_and_end_with_the_box") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+
+    // A host service that greets each connection and then waits for it
+    // to end.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let (accepted, ended) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (counted, finished) = (Arc::clone(&accepted), Arc::clone(&ended));
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                let _sent = stream.write_all(b"hello\n");
+                let mut rest = Vec::new();
+                let _end = stream.read_to_end(&mut rest);
+                finished.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+    });
+    daemon.expose_host_port(port);
+
+    daemon.activate("many", &["--network", "host_ip"]);
+    // Opens connections and keeps each that was greeted. A connection past
+    // the bound is accepted by the box's endpoint and reset at once.
+    let asked = MOST + 8;
+    let script = format!(
+        "ulimit -n 4096; kept=0; for i in $(seq 1 {asked}); do \
+         exec {{fd}}<>/dev/tcp/host.min.internal/{port} || continue; \
+         if read -t 5 -u $fd line && [ \"$line\" = hello ]; then kept=$((kept + 1)); \
+         else exec {{fd}}>&-; fi; done; echo $kept > /tmp/kept; sleep 600"
+    );
+    let holder = daemon.run_in("many", &["bash", "-c", &script]);
+    let mut kept = String::new();
+    wait_for("the box's connections", Duration::from_secs(120), || {
+        kept = daemon.exec("many", "cat /tmp/kept 2>/dev/null; true");
+        !kept.trim().is_empty()
+    });
+    assert_eq!(kept.trim(), MOST.to_string(), "streams the box holds");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        MOST,
+        "streams the host got"
+    );
+    let events = daemon.min(&["box", "events", "many"]);
+    assert!(events.contains("too_many_streams"), "{events}");
+
+    // The box is removed: its endpoints go, and its streams with them.
+    daemon.min(&["box", "rm", "--force", "many"]);
+    wait_for(
+        "the host's ends of the streams",
+        Duration::from_secs(20),
+        || ended.load(Ordering::SeqCst) == MOST,
+    );
+    drop(holder);
+}
+
 /// What a guest with no manners gets from the daemon's gvproxy: frames
 /// written straight to the switch, for the host alias and for the
 /// addresses that mean this host.

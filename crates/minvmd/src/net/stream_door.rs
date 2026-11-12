@@ -67,7 +67,7 @@ const HALF_CLOSED_IDLE: Duration = Duration::from_millis(400);
 const IDLE_TICK: Duration = Duration::from_millis(200);
 
 /// The streams the door carries at once.
-const MAX_STREAMS: usize = 512;
+const MAX_STREAMS: usize = minimald_rpc::MAX_HOST_PORT_STREAMS;
 
 /// The credential proxy streams one box holds at once.
 const MAX_PROXY_STREAMS_PER_BOX: usize = 16;

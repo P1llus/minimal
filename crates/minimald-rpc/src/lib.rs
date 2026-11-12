@@ -1612,6 +1612,11 @@ pub enum StreamRefusal {
     Busy,
 }
 
+/// The streams one node holds to exposed ports of the host at once. The VM
+/// host's stream door stops there for a whole VM, and a native node's relay
+/// for each box.
+pub const MAX_HOST_PORT_STREAMS: usize = 512;
+
 /// The vsock port of the guest door: the in-VM daemon dials
 /// `VMADDR_CID_HOST` on it, and the VM host daemon answers each request
 /// line. Defined here because both ends depend on this crate. Not 7351:

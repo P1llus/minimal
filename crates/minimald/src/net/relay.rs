@@ -6,6 +6,12 @@
 //! flow record which box sent it and where it was headed, and has a
 //! [`Dial`] open the other end. The dialler decides at that moment whether
 //! the stream may exist.
+//!
+//! Each kind of stream endpoint is described by a [`Kind`]: which service
+//! it is, how many streams a box may hold through it, and what its
+//! refusals are called in the box's events. A box's streams of a kind are
+//! counted for the box ([`Held`]), across every endpoint of that kind it
+//! has. A stream ends with the endpoint that accepted it.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -60,6 +66,103 @@ pub(crate) struct Dialled {
     pub(crate) revoked: Option<BoxFuture<'static, ()>>,
 }
 
+/// One kind of stream endpoint.
+#[derive(Debug)]
+pub(crate) struct Kind {
+    pub(crate) service: Service,
+    /// What the kind's refusals are reported as coming from.
+    pub(crate) source: Source,
+    /// The streams one box holds through endpoints of this kind at once.
+    pub(crate) most: usize,
+    /// The refusal as an event names it, when a rule of the user's is
+    /// behind it. A service that is not running is no rule.
+    pub(crate) reason: fn(&Refused) -> Option<&'static str>,
+}
+
+/// The reason of the event for a stream past [`Kind::most`].
+pub(crate) const TOO_MANY_STREAMS: &str = "too_many_streams";
+
+/// The endpoint a box's connections to the host alias arrive at.
+pub(crate) static HOST_RELAY: Kind = Kind {
+    service: Service::HostRelay,
+    source: Source::HostRelay,
+    most: minimald_rpc::MAX_HOST_PORT_STREAMS,
+    reason: |refused| match refused {
+        Refused::NotExposed | Refused::Door(StreamRefusal::PortNotExposed) => {
+            Some("host_port_not_exposed")
+        }
+        Refused::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
+        Refused::Unreachable(_) | Refused::Door(_) => None,
+    },
+};
+
+/// The streams one box holds, for each kind of endpoint.
+#[derive(Debug, Default)]
+pub(crate) struct Held(std::sync::Mutex<Vec<(Service, usize)>>);
+
+impl Held {
+    /// Counts one more stream of `kind`, unless the box holds as many as
+    /// it may. The count goes down again when the slot is dropped.
+    fn take(self: &Arc<Self>, kind: &Kind) -> Option<Slot> {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = match held
+            .iter()
+            .position(|(service, _)| *service == kind.service)
+        {
+            Some(at) => at,
+            None => {
+                held.push((kind.service, 0));
+                held.len() - 1
+            }
+        };
+        let count = &mut held[at].1;
+        if *count >= kind.most {
+            return None;
+        }
+        *count += 1;
+        Some(Slot {
+            held: Arc::clone(self),
+            service: kind.service,
+        })
+    }
+
+    /// The streams the box holds through endpoints of `service`.
+    #[cfg(test)]
+    fn count(&self, service: Service) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(held, _)| *held == service)
+            .map_or(0, |(_, count)| *count)
+    }
+}
+
+/// One stream's place in its box's count.
+struct Slot {
+    held: Arc<Held>,
+    service: Service,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut held = self
+            .held
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, count)) = held
+            .iter_mut()
+            .find(|(service, _)| *service == self.service)
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
 /// Why no stream was opened.
 #[derive(Debug)]
 pub(crate) enum Refused {
@@ -69,20 +172,6 @@ pub(crate) enum Refused {
     Unreachable(io::Error),
     /// The VM host decided against the stream.
     Door(StreamRefusal),
-}
-
-impl Refused {
-    /// The refusal as an event names it, when a rule of the user's is
-    /// behind it. A service that is not running is no rule.
-    fn reason(&self) -> Option<&'static str> {
-        match self {
-            Self::NotExposed | Self::Door(StreamRefusal::PortNotExposed) => {
-                Some("host_port_not_exposed")
-            }
-            Self::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
-            Self::Unreachable(_) | Self::Door(_) => None,
-        }
-    }
 }
 
 impl std::fmt::Display for Refused {
@@ -289,27 +378,28 @@ where
 }
 
 /// Serves one stream endpoint of a box until the listener fails or the
-/// task is aborted.
+/// task is aborted. Its streams end with it.
 pub(crate) async fn serve(
     listener: TcpListener,
     engine: &'static Engine,
     of: Arc<Installed>,
     peers: Peers,
-    service: Service,
+    kind: &'static Kind,
     dial: Arc<dyn Dial>,
 ) {
     let from = of.session();
+    let held = of.streams();
     let attributed = Arc::clone(&of);
     let attribute = move |peer: SocketAddr| {
         peers
-            .of_box(&attributed, service, peer, netpol::Protocol::Tcp)
+            .of_box(&attributed, kind.service, peer, netpol::Protocol::Tcp)
             .map(|flow| flow.destination)
     };
     let report = move |original: SocketAddr, reason: &'static str| {
         engine.observe(
             Arc::clone(&of),
             NetRefusal {
-                source: Source::HostRelay,
+                source: kind.source,
                 direction: netpol::Direction::Egress,
                 protocol: Some(netpol::Protocol::Tcp),
                 remote: Some(original.ip()),
@@ -321,7 +411,16 @@ pub(crate) async fn serve(
             },
         );
     };
-    relay(listener, from, attribute, dial, Arc::new(report)).await;
+    relay(
+        listener,
+        from,
+        attribute,
+        kind,
+        held,
+        dial,
+        Arc::new(report),
+    )
+    .await;
 }
 
 type Report = dyn Fn(SocketAddr, &'static str) + Send + Sync;
@@ -329,15 +428,26 @@ type Report = dyn Fn(SocketAddr, &'static str) + Send + Sync;
 /// Accepts connections and carries each one the engine names as the box's.
 /// `attribute` gives where a peer's connection was headed, or `None` for a
 /// peer that is no socket of the box.
+///
+/// The streams are tasks of this endpoint. When it is dropped they are
+/// dropped with it, and each resets both of its ends.
 async fn relay(
     listener: TcpListener,
     from: BoxId,
     attribute: impl Fn(SocketAddr) -> Option<SocketAddr>,
+    kind: &'static Kind,
+    held: Arc<Held>,
     dial: Arc<dyn Dial>,
     report: Arc<Report>,
 ) {
+    let mut streams = tokio::task::JoinSet::new();
     loop {
-        let (client, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            // Forgets the streams that ended.
+            Some(_) = streams.join_next() => continue,
+        };
+        let (client, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => continue,
             Err(error)
@@ -358,14 +468,28 @@ async fn relay(
         let Some(original) = attribute(peer) else {
             continue;
         };
-        crate::traced::spawn(carry(
-            client,
+        let Some(slot) = held.take(kind) else {
+            tracing::debug!(
+                box_id = %from,
+                %original,
+                most = kind.most,
+                "a relayed connection was refused: the box holds as many streams as it may"
+            );
+            report(original, TOO_MANY_STREAMS);
+            reset(client);
+            continue;
+        };
+        let carried = carry(
+            Ends::of(client),
             peer,
             from,
             original,
+            kind,
+            slot,
             Arc::clone(&dial),
             Arc::clone(&report),
-        ));
+        );
+        streams.spawn(tracing::Instrument::in_current_span(carried));
     }
 }
 
@@ -373,28 +497,66 @@ fn reset(client: TcpStream) {
     let _ = client.set_zero_linger();
 }
 
-/// Carries one connection of the box until either end closes it or the
-/// dialler takes its permission back.
+/// The two ends of a carried stream. Dropped while it still holds them,
+/// it resets both: a stream that broke on one side breaks on the other,
+/// and an orderly close would tell its reader that all the data arrived.
+struct Ends {
+    client: Option<TcpStream>,
+    far: Option<Box<dyn Stream>>,
+}
+
+impl Ends {
+    const fn of(client: TcpStream) -> Self {
+        Self {
+            client: Some(client),
+            far: None,
+        }
+    }
+
+    /// Closes both ends in order: everything was carried.
+    fn close(mut self) {
+        self.client = None;
+        self.far = None;
+    }
+}
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        if let Some(far) = self.far.take() {
+            far.reset();
+        }
+        if let Some(client) = self.client.take() {
+            reset(client);
+        }
+    }
+}
+
+/// Carries one connection of the box until either end closes it, the
+/// dialler takes its permission back, or the endpoint that accepted it is
+/// removed. `slot` is its place in the box's count.
+#[expect(clippy::too_many_arguments, reason = "one call site, which names each")]
 async fn carry(
-    mut client: TcpStream,
+    mut ends: Ends,
     peer: SocketAddr,
     from: BoxId,
     original: SocketAddr,
+    kind: &'static Kind,
+    slot: Slot,
     dial: Arc<dyn Dial>,
     report: Arc<Report>,
 ) {
-    let Dialled {
-        mut stream,
-        revoked,
-    } = match dial.dial(from, original, peer.port()).await {
-        Ok(dialled) => dialled,
+    let _slot = slot;
+    let revoked = match dial.dial(from, original, peer.port()).await {
+        Ok(Dialled { stream, revoked }) => {
+            ends.far = Some(stream);
+            revoked
+        }
         Err(refused) => {
             tracing::debug!(box_id = %from, %original, %refused, "a relayed connection was refused");
-            if let Some(reason) = refused.reason() {
+            if let Some(reason) = (kind.reason)(&refused) {
                 report(original, reason);
             }
             // The box sees what a closed port answers.
-            reset(client);
             return;
         }
     };
@@ -404,16 +566,18 @@ async fn carry(
             None => std::future::pending().await,
         }
     };
+    let (Some(client), Some(far)) = (ends.client.as_mut(), ends.far.as_mut()) else {
+        return;
+    };
     let ended = tokio::select! {
-        copied = tokio::io::copy_bidirectional(&mut client, &mut stream) => copied.map(drop),
+        copied = tokio::io::copy_bidirectional(client, far) => copied.map(drop),
         () = revoked => Err(io::Error::other("the stream's permission ended")),
     };
-    if let Err(error) = ended {
-        tracing::debug!(box_id = %from, %original, %error, "a relayed connection was cut");
-        // A stream that broke on one side breaks on the other. An orderly
-        // close would tell the box that all the data arrived.
-        stream.reset();
-        reset(client);
+    match ended {
+        Ok(()) => ends.close(),
+        Err(error) => {
+            tracing::debug!(box_id = %from, %original, %error, "a relayed connection was cut");
+        }
     }
 }
 
@@ -436,6 +600,7 @@ mod tests {
         at: SocketAddr,
         reports: Reports,
         outsider: Arc<std::sync::atomic::AtomicBool>,
+        held: Arc<Held>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -445,16 +610,19 @@ mod tests {
         }
     }
 
-    async fn bench(dial: Arc<dyn Dial>, original: SocketAddr) -> Bench {
+    async fn bench_of(kind: &'static Kind, dial: Arc<dyn Dial>, original: SocketAddr) -> Bench {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = listener.local_addr().unwrap();
         let reports = Reports::default();
         let outsider = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (seen, is_outsider) = (Arc::clone(&reports), Arc::clone(&outsider));
+        let held = Arc::new(Held::default());
         let task = crate::traced::spawn(relay(
             listener,
             box_id(1),
             move |_| (!is_outsider.load(std::sync::atomic::Ordering::SeqCst)).then_some(original),
+            kind,
+            Arc::clone(&held),
             dial,
             Arc::new(move |original, reason| seen.lock().unwrap().push((original, reason))),
         ));
@@ -462,8 +630,121 @@ mod tests {
             at,
             reports,
             outsider,
+            held,
             task,
         }
+    }
+
+    async fn bench(dial: Arc<dyn Dial>, original: SocketAddr) -> Bench {
+        bench_of(&HOST_RELAY, dial, original).await
+    }
+
+    /// The host relay's kind with room for two streams a box.
+    static TWO_STREAMS: Kind = Kind {
+        service: Service::HostRelay,
+        source: Source::HostRelay,
+        most: 2,
+        reason: HOST_RELAY.reason,
+    };
+
+    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_box_holds_no_more_streams_than_its_endpoint_kind_allows() {
+        let (port, _service) = service(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let table = exposures(
+            dir.path(),
+            &format!("[host-exposures]\ndb = {{ port = {port} }}\n"),
+        );
+        let bench = bench_of(&TWO_STREAMS, NativeHostPorts::new(table), alias(port)).await;
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(bench.at).await.unwrap();
+            let mut hello = [0u8; 5];
+            client.read_exact(&mut hello).await.unwrap();
+            open.push(client);
+        }
+        assert_eq!(bench.held.count(Service::HostRelay), 2);
+
+        // The third is reset, and reported with the reason.
+        let third = TcpStream::connect(bench.at).await.unwrap();
+        let (read, reset) = read_to_end(third).await;
+        assert!(read.is_empty());
+        assert!(reset, "the box must not read an orderly close");
+        assert_eq!(
+            *bench.reports.lock().unwrap(),
+            [(alias(port), TOO_MANY_STREAMS)]
+        );
+
+        // A stream that ends gives its place to the next one.
+        drop(open.pop());
+        until("the closed stream's place", || {
+            bench.held.count(Service::HostRelay) == 1
+        })
+        .await;
+        let mut next = TcpStream::connect(bench.at).await.unwrap();
+        let mut hello = [0u8; 5];
+        next.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_box_s_streams_end_with_the_endpoint_that_accepted_them() {
+        // A service that reports how each of its connections ended.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ended, mut endings) = tokio::sync::mpsc::unbounded_channel();
+        let _service = crate::traced::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let ended = ended.clone();
+                crate::traced::spawn(async move {
+                    stream.write_all(b"hello").await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ = ended.send(stream.read_to_end(&mut rest).await.map(drop));
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let table = exposures(
+            dir.path(),
+            &format!("[host-exposures]\ndb = {{ port = {port} }}\n"),
+        );
+        let bench = bench(NativeHostPorts::new(table), alias(port)).await;
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let mut client = TcpStream::connect(bench.at).await.unwrap();
+            let mut hello = [0u8; 5];
+            client.read_exact(&mut hello).await.unwrap();
+            clients.push(client);
+        }
+        assert_eq!(bench.held.count(Service::HostRelay), 3);
+
+        // The box's endpoints are removed: the engine aborts the task.
+        bench.task.abort();
+        for client in clients {
+            let (read, reset) = read_to_end(client).await;
+            assert!(read.is_empty());
+            assert!(reset, "the box's end is reset");
+        }
+        for _ in 0..3 {
+            let ending = tokio::time::timeout(Duration::from_secs(5), endings.recv())
+                .await
+                .expect("the host's end ends")
+                .expect("an ending");
+            assert_eq!(
+                ending.expect_err("a reset").kind(),
+                io::ErrorKind::ConnectionReset
+            );
+        }
+        assert_eq!(bench.held.count(Service::HostRelay), 0);
     }
 
     /// How a connection ended for the box: what it read, and whether the

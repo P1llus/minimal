@@ -179,6 +179,8 @@ pub(crate) struct Installed {
     serving: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Notified when a socket of the box starts or stops listening.
     listen_wake: Arc<tokio::sync::Notify>,
+    /// The streams the box holds through its stream endpoints.
+    streams: Arc<super::relay::Held>,
 }
 
 struct Entry {
@@ -213,6 +215,11 @@ impl Installed {
     /// The address that stands for the host's loopback for this box.
     pub(crate) const fn host_alias(&self) -> Option<Ipv4Addr> {
         self.host_alias
+    }
+
+    /// The count of the streams the box holds through its endpoints.
+    pub(crate) fn streams(&self) -> Arc<super::relay::Held> {
+        Arc::clone(&self.streams)
     }
 
     /// A snapshot of the box's compiled policy.
@@ -1009,6 +1016,7 @@ impl Engine {
             log,
             serving: Mutex::default(),
             listen_wake: Arc::default(),
+            streams: Arc::default(),
         });
         attached
             .boxes
@@ -1141,7 +1149,7 @@ impl Engine {
                             self,
                             Arc::clone(of),
                             peers,
-                            Service::HostRelay,
+                            &super::relay::HOST_RELAY,
                             Arc::clone(&serving.host_relay),
                         ))
                         .abort_handle(),
