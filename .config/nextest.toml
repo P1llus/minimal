@@ -47,6 +47,11 @@ leak-timeout = "5s"
 # downloads real packages over the network; the per-tool timeout is capped at
 # 60s, but the whole test including boot and compose can run past the default
 # vm profile's 6-minute kill. Give this one test a longer leash.
+# Four boxes, each with a shell the guest fetches first.
+[[profile.vm.overrides]]
+filter = 'test(a_box_s_connections_reach_the_credential_proxy_under_its_own_id)'
+slow-timeout = { period = "180s", terminate-after = 5 }
+
 [[profile.vm.overrides]]
 filter = 'test(hostname_allowlist_toolchain_completes)'
 slow-timeout = { period = "180s", terminate-after = 4 }

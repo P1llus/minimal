@@ -108,8 +108,14 @@ impl Drop for Guest {
 /// [`SUBPROC_TIMEOUT`]: a subprocess that overruns it is a wedged daemon,
 /// killed so the test fails instead of hanging CI.
 fn minvmd(state: &Path, args: &[&str]) -> Output {
+    minvmd_with(state, args, &[])
+}
+
+/// [`minvmd`] with `env` added to the subcommand's environment.
+fn minvmd_with(state: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut child = Command::new(minvmd_bin())
         .args(args)
+        .envs(env.iter().copied())
         // HOME too, so no `dirs` fallback reaches the real state dir.
         .env("HOME", state)
         .env("XDG_STATE_HOME", state)
@@ -147,6 +153,11 @@ impl Guest {
     /// VM host daemon that mints every box id (BOX-002). A bare boot has no
     /// door, so the in-VM daemon refuses every create there.
     fn boot() -> Guest {
+        Self::boot_with(&[])
+    }
+
+    /// [`Self::boot`] with `env` in the supervisor's environment.
+    fn boot_with(env: &[(&str, &str)]) -> Guest {
         let state = short_state_dir();
         let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let guest = Guest {
@@ -155,9 +166,10 @@ impl Guest {
         };
         // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
         // the caller); the rootfs stays generic.
-        let run = minvmd(
+        let run = minvmd_with(
             guest.state.path(),
             &["run", "--detach", "--timeout", DETACH_TIMEOUT_SECS],
+            env,
         );
         assert!(
             run.status.success(),
@@ -438,6 +450,275 @@ async fn vm_host_mints_box_id_before_in_vm_create() {
     }
 }
 
+/// A project whose box has a shell, from the package index the daemon's
+/// own tests pin.
+const SHELL_PROJECT: &str = "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n\
+     branch = \"main\"\nlocked_commit = \"1419729941fd3b67cec371b4064daafff0e69c7a\"\n\n\
+     [defaults]\nstate_key = \"dev\"\n\n[session]\npackages = [\"base\"]\n";
+
+/// The hosts of a GitHub grant, and a host of the same addresses that no
+/// grant names.
+const GITHUB_HOSTS: [&str; 4] = [
+    "github.com",
+    "api.github.com",
+    "uploads.github.com",
+    "codeload.github.com",
+];
+const SHARES_ADDRESSES: &str = "gist.github.com";
+/// The upstream of a store rule.
+const STORE_HOST: &str = "example.com";
+
+/// A TLS ClientHello that asks for `name`, as the escapes bash's `printf`
+/// writes it from.
+fn client_hello_for_printf(name: &str) -> String {
+    let sized = |width: usize, data: &[u8]| {
+        let mut out = data.len().to_be_bytes()[8 - width..].to_vec();
+        out.extend_from_slice(data);
+        out
+    };
+    let mut entry = vec![0];
+    entry.extend(sized(2, name.as_bytes()));
+    let mut extensions = vec![0, 0];
+    extensions.extend(sized(2, &sized(2, &entry)));
+    // Versions, groups, signature algorithms and a key share, which a
+    // server needs before it answers.
+    extensions.extend_from_slice(&[0, 43, 0, 3, 2, 3, 4]);
+    extensions.extend_from_slice(&[0, 10, 0, 4, 0, 2, 0, 29]);
+    extensions.extend_from_slice(&[0, 13, 0, 8, 0, 6, 4, 3, 8, 4, 4, 1]);
+    extensions.extend_from_slice(&[0, 51, 0, 38, 0, 36, 0, 29, 0, 32]);
+    extensions.extend_from_slice(&[9; 32]);
+    let mut body = vec![3, 3];
+    body.extend_from_slice(&[7; 32]);
+    body.extend(sized(1, &[5; 32]));
+    body.extend(sized(2, &[0x13, 0x01, 0x13, 0x02]));
+    body.extend(sized(1, &[0]));
+    body.extend(sized(2, &extensions));
+    let mut message = vec![1];
+    message.extend(sized(3, &body));
+    let mut record = vec![22, 3, 1];
+    record.extend(sized(2, &message));
+    record.iter().map(|byte| format!("\\x{byte:02x}")).collect()
+}
+
+/// A script that connects to `host` at 443, asks for the server `name`,
+/// and prints what comes back: the line the credential proxy's stand-in
+/// answers with, or the first three bytes of a TLS server's answer as
+/// numbers.
+fn tls_probe(host: &str, name: &str) -> String {
+    format!(
+        "exec 3<>/dev/tcp/{host}/443 || exit 1\n\
+         printf '{hello}' >&3\n\
+         LC_ALL=C IFS= read -r -t 20 -N 1 first <&3 || {{ echo nothing; exit 0; }}\n\
+         if [ \"$first\" = b ]; then IFS= read -r -t 20 rest <&3; echo \"b$rest\"; exit 0; fi\n\
+         printf '%d' \"'$first\"\n\
+         for i in 1 2; do LC_ALL=C IFS= read -r -t 20 -N 1 c <&3 || break; printf ' %d' \"'$c\"; done\n\
+         echo\n",
+        hello = client_hello_for_printf(name),
+    )
+}
+
+/// The first three bytes of a TLS server's answer: a handshake record.
+const TLS_ANSWER: &str = "22 3 3";
+
+/// A script that dials the proxy the box's environment names and asks it
+/// for a tunnel, and prints the first line of the answer.
+const PROXY_PROBE: &str = "p=\"${HTTPS_PROXY#http://}\"\n\
+     [ -n \"$p\" ] || { echo \"no HTTPS_PROXY\"; exit 0; }\n\
+     [ \"$HTTP_PROXY\" = \"$HTTPS_PROXY\" ] || echo \"HTTP_PROXY=$HTTP_PROXY\"\n\
+     exec 3<>\"/dev/tcp/${p%:*}/${p##*:}\" || exit 1\n\
+     printf 'CONNECT github.com:443 HTTP/1.1\\r\\nHost: github.com:443\\r\\n\\r\\n' >&3\n\
+     IFS= read -r -t 20 line <&3; echo \"$p $line\"\n";
+
+/// One JSON line to the supervisor's control socket and the line it
+/// answers.
+fn control_line(sock: &Path, line: &str) -> String {
+    use std::io::{BufRead as _, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(sock)
+        .unwrap_or_else(|e| panic!("connect to {}: {e}", sock.display()));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read timeout");
+    writeln!(stream, "{line}").expect("write the request");
+    let mut reply = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut reply)
+        .expect("read the reply");
+    reply.trim().to_string()
+}
+
+/// A box in a VM sends its connections for the credential proxy to its own
+/// endpoint, and the node carries them to the proxy on the VM's host under
+/// the box's id. The proxy here is the supervisor's stand-in, which answers
+/// each connection with the box id and the entry it was delivered with.
+///
+/// Each box has a GitHub grant and the upstream of a store rule, and lists
+/// their hosts in its egress, as the client's own checks require. The
+/// client registers the box with the VM's host before it creates it, and
+/// this test does the same on the control socket.
+///
+/// The boxes need a shell, which the guest fetches, and they connect to
+/// GitHub. So the test runs only with `MINVMD_E2E_INTERNET=1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1 and MINVMD_E2E_INTERNET=1; needs KVM, gvproxy and the internet"]
+async fn a_box_s_connections_reach_the_credential_proxy_under_its_own_id() {
+    use boxes::core::bep::{BepSettings, GrantSource, SecretGrant, Steering};
+    use minimald_rpc::{BoxControlReply, BoxControlRequest, RegisterBoxRequest};
+
+    if !e2e_enabled() {
+        return;
+    }
+    if std::env::var_os("MINVMD_E2E_INTERNET").is_none() {
+        eprintln!("skipping: MINVMD_E2E_INTERNET is not set");
+        return;
+    }
+    let guest = Guest::boot_with(&[("MINVMD_BEP_STUB", "1")]);
+    let control = guest
+        .state
+        .path()
+        .join("minimal/providers/local-minvmd0/control.sock");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut listed: Vec<String> = GITHUB_HOSTS.iter().map(|h| (*h).to_string()).collect();
+    listed.push(SHARES_ADDRESSES.to_string());
+    listed.push(STORE_HOST.to_string());
+    let cases = [
+        (
+            "redirect-shares",
+            boxes::NetworkMode::HostNet,
+            Steering::Dns,
+        ),
+        ("redirect-own", boxes::NetworkMode::OwnIp, Steering::Dns),
+        (
+            "explicit-shares",
+            boxes::NetworkMode::HostNet,
+            Steering::ProxyEnv,
+        ),
+        (
+            "explicit-own",
+            boxes::NetworkMode::OwnIp,
+            Steering::ProxyEnv,
+        ),
+    ];
+    for (name, network, steering) in cases {
+        let upstream = boxes::CredentialedUpstream {
+            bep: BepSettings {
+                steering: Some(steering),
+                ..BepSettings::default()
+            },
+            secrets: [(
+                "GH_TOKEN".to_string(),
+                SecretGrant {
+                    source: GrantSource::Broker,
+                    scopes: vec!["github:user-token".to_string()],
+                    mode: None,
+                },
+            )]
+            .into(),
+            store_upstreams: vec![STORE_HOST.to_string()],
+        };
+        let host_ip = network == boxes::NetworkMode::HostNet;
+        let register = BoxControlRequest::Register(RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            credentialed_upstream: Some(upstream.clone()),
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: 0,
+            host_ip,
+        });
+        let reply = control_line(&control, &serde_json_lenient::to_string(&register).unwrap());
+        let (registered_id, addresses) = match serde_json_lenient::from_str(&reply) {
+            Ok(BoxControlReply::Registered(row)) if !host_ip => (
+                row.box_id,
+                Some(boxes::BoxAddresses {
+                    switch_address: row.switch_address,
+                    loopback_address: row.loopback_address,
+                }),
+            ),
+            Ok(BoxControlReply::BoxIdMinted { minted_box_id }) if host_ip => (minted_box_id, None),
+            other => panic!("{name}: the registration was answered {other:?} ({reply})"),
+        };
+
+        let mut req = minimald_rpc::CreateSessionRequest::new(
+            name.to_string(),
+            paths::HostAbsPath::try_new("/tmp").unwrap(),
+            network,
+            Default::default(),
+        );
+        req.config.box_addresses = addresses;
+        req.config.policy = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_dns_hosts: Some(listed.clone()),
+                ..boxes::EgressPolicy::default()
+            }),
+            credentialed_upstream: Some(upstream),
+            ..boxes::BoxPolicy::default()
+        };
+        let (handle, id) = open_session(&guest.sock_path, &req, Some(SHELL_PROJECT))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            id, registered_id,
+            "{name}: the box has the id its host minted"
+        );
+        let id_text = id.to_string().replace('-', "");
+        let run = |script: String| {
+            let handle = &handle;
+            async move {
+                let argv = vec!["bash".to_string(), "-c".to_string(), script];
+                let command = minimald_rpc::exec::ExecRequest::Argv(argv).encode();
+                let (stdout, exit) = exec_in_session(handle, id, &command)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                eprintln!("{name}: exit {exit:?}: {}", stdout.trim_end());
+                stdout.trim_end().to_string()
+            }
+        };
+
+        let proxied = run(PROXY_PROBE.to_string()).await;
+        let github = run(tls_probe("github.com", "github.com")).await;
+        let store = run(tls_probe(STORE_HOST, STORE_HOST)).await;
+        let other_name = run(tls_probe("github.com", SHARES_ADDRESSES)).await;
+        let by_its_name = run(tls_probe(SHARES_ADDRESSES, SHARES_ADDRESSES)).await;
+        let quic = run("echo x >/dev/udp/github.com/443".to_string()).await;
+        let ssh = run(
+            "exec 3<>/dev/tcp/github.com/22 && IFS= read -r -t 20 line <&3; echo \"${line:0:4}\""
+                .to_string(),
+        )
+        .await;
+
+        if steering == Steering::Dns {
+            // The engine redirects the connection, and the node hands it
+            // to the proxy with where the box sent it.
+            let redirected = format!("box_id={id_text} entry=redirected destination=");
+            for (what, said) in [("github.com", &github), (STORE_HOST, &store)] {
+                assert!(
+                    said.starts_with(&redirected) && said.ends_with(":443"),
+                    "{name}: {what} answered {said:?}"
+                );
+            }
+            // A name no grant names goes to the address the box sent it
+            // to, at an address of a steered name too.
+            assert_eq!(other_name, TLS_ANSWER, "{name}");
+            assert_eq!(by_its_name, TLS_ANSWER, "{name}");
+            assert!(quic.contains("Operation not permitted"), "{name}: {quic}");
+            assert_eq!(proxied, "no HTTPS_PROXY", "{name}");
+        } else {
+            // The box dials its own endpoint, and nothing is redirected.
+            let (endpoint, answer) = proxied.split_once(' ').unwrap_or_default();
+            assert!(endpoint.starts_with("127.0.80.1:"), "{name}: {proxied}");
+            assert_eq!(answer, format!("box_id={id_text} entry=dialled"), "{name}");
+            for said in [&github, &store, &other_name, &by_its_name] {
+                assert_eq!(said, TLS_ANSWER, "{name}");
+            }
+        }
+        // Another port of a steered name follows the box's own rules.
+        assert_eq!(ssh, "SSH-", "{name}");
+    }
+}
+
 /// Open a russh client over the bridge UDS, authenticate, create a session,
 /// optionally upload a `minimal.toml` into its workspace over SFTP, then exec
 /// `command` in it. Returns `(stdout, exit_status)`.
@@ -446,14 +727,25 @@ async fn run_session_exec(
     mfile: Option<&str>,
     command: &str,
 ) -> Result<(String, Option<u32>), String> {
+    let (handle, session_id) = open_session(sock_path, &e2e_session_request()?, mfile).await?;
+    exec_in_session(&handle, session_id, command).await
+}
+
+/// Open a russh client over the bridge UDS, authenticate, create the
+/// session `req` asks for, optionally upload a `minimal.toml` into its
+/// workspace over SFTP, and make it active.
+async fn open_session(
+    sock_path: &Path,
+    req: &minimald_rpc::CreateSessionRequest,
+    mfile: Option<&str>,
+) -> Result<(russh::client::Handle<ClientHandler>, boxes::SessionId), String> {
     use minimald_rpc::OneshotSshRpc;
-    use russh::ChannelMsg;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let handle = connect_bridge(sock_path).await?;
     // CreateSession: open a channel, request the subsystem, write the JSON
     // request, half-close, read the JSON response.
-    let session_id = create_session(&handle, &e2e_session_request()?).await?;
+    let session_id = create_session(&handle, req).await?;
 
     // Upload the project's `minimal.toml` into the session workspace over
     // SFTP (the subsystem presents the session's working tree at
@@ -583,6 +875,17 @@ async fn run_session_exec(
         resp.ok()
             .ok_or_else(|| "FinalizeSession returned an error".to_string())?;
     }
+    Ok((handle, session_id))
+}
+
+/// Exec `command` in the session over `handle`. Returns
+/// `(stdout, exit_status)`.
+async fn exec_in_session(
+    handle: &russh::client::Handle<ClientHandler>,
+    session_id: boxes::SessionId,
+    command: &str,
+) -> Result<(String, Option<u32>), String> {
+    use russh::ChannelMsg;
 
     // Exec the command in that session.
     let mut channel = handle
