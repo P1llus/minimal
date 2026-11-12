@@ -12,9 +12,10 @@
 //! ```
 //!
 //! The stream door asks for the current table at every stream. The handle
-//! re-reads the file when its stat changes, so an entry added opens its port
-//! and an entry removed closes it, with no restart. The handle stats the
-//! file at most once per [`RECHECK`].
+//! stats the file each time and re-reads it when the stat changed, so a
+//! stream is decided by the table as it is at that moment: an entry added
+//! opens its port and an entry removed closes it, with no restart. A stream
+//! that is open looks again every [`RECHECK`].
 //!
 //! Minimal's own listeners are never exposures. The caller hands the handle
 //! the listeners that hold a port at each decision ([`Holder`]). An entry at
@@ -31,12 +32,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use client_config::host_exposures::{HOST_EXPOSURES_TABLE, HostExposuresFile};
 
-/// The longest time a changed table waits before a stream is decided by
-/// it: the handle stats the file at most once in this interval.
+/// How often an open stream looks at the table again, which bounds how long
+/// it outlives its entry.
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
 /// One host exposure: the TCP port a table entry opens.
@@ -122,7 +123,7 @@ pub struct HostExposures {
 struct Inner {
     /// The `config.toml` the table is read from, `None` for a fixed table.
     file: Option<HostExposuresFile>,
-    /// The least time between two stats of the file.
+    /// The wait between two looks at the table for a stream that is open.
     recheck: Duration,
     state: Mutex<State>,
 }
@@ -131,8 +132,6 @@ struct State {
     /// The table the shared reader gave for the entries, so a read that
     /// gives the same table changes nothing.
     table: Option<Arc<client_config::host_exposures::HostExposures>>,
-    /// When the handle last looked at the file, `None` before the first look.
-    checked: Option<Instant>,
     /// The entries of the current table, each in the accepted form.
     entries: Arc<[Entry]>,
     /// The listeners the last decision held the entries against.
@@ -170,15 +169,15 @@ impl HostExposures {
         }
     }
 
-    /// How often the table can change: the wait between two stats of its
-    /// file. `None` for a table no file backs, which never changes.
+    /// How often an open stream looks at the table again. `None` for a
+    /// table no file backs, which never changes.
     #[must_use]
     pub(crate) fn changes_every(&self) -> Option<Duration> {
         self.inner.file.as_ref().map(|_| self.inner.recheck)
     }
 
     /// The table of the `config.toml` at `path`, re-read when the file
-    /// changes, with at least `recheck` between two stats of it.
+    /// changes. An open stream looks at it again every `recheck`.
     #[must_use]
     pub fn at(path: PathBuf, recheck: Duration) -> Self {
         Self::new(Some(path), recheck, Vec::new())
@@ -206,7 +205,6 @@ impl HostExposures {
                 recheck,
                 state: Mutex::new(State {
                     table: None,
-                    checked: None,
                     entries: entries.into(),
                     held: Vec::new(),
                     open,
@@ -217,8 +215,8 @@ impl HostExposures {
     }
 
     /// The exposures the current table opens while the listeners in `held`
-    /// hold their ports. The handle re-reads the file first when the
-    /// recheck interval passed and the file's stat changed.
+    /// hold their ports. The handle stats the file first and re-reads it
+    /// when the stat changed.
     ///
     /// An entry at a held port is not opened. When the entry is new in a
     /// load, the log says the load refused it. When the entry was open
@@ -273,35 +271,23 @@ impl HostExposures {
         Arc::clone(&state.open)
     }
 
-    /// Asks the shared reader for the table when the recheck interval
-    /// passed, and returns the entries when its table changed. The reader
-    /// runs outside this handle's lock, so a slow disk stalls only the stream
-    /// that found the recheck due, never the other callers.
+    /// Asks the shared reader for the table, which stats the file, and
+    /// returns the entries when the table changed. The reader runs outside
+    /// this handle's lock, so a slow disk stalls only the stream that asks.
     fn reload(&self) -> Option<Arc<[Entry]>> {
         let file = self.inner.file.as_ref()?;
-        let (first, known) = {
-            let mut state = self.lock();
-            let now = Instant::now();
-            let due = state
-                .checked
-                .is_none_or(|checked| now.duration_since(checked) >= self.inner.recheck);
-            if !due {
-                return None;
-            }
-            // Mark the check as taken before the IO, so the callers that
-            // come in the meantime keep the current table and do not stat.
-            let first = state.checked.is_none();
-            state.checked = Some(now);
-            (first, state.table.clone())
-        };
         let table = file.current();
-        if !first
-            && known
+        let first = {
+            let state = self.lock();
+            if state
+                .table
                 .as_ref()
                 .is_some_and(|known| Arc::ptr_eq(known, &table))
-        {
-            return None;
-        }
+            {
+                return None;
+            }
+            state.table.is_none()
+        };
         let entries: Arc<[Entry]> = entries_of(&table).into();
         let mut state = self.lock();
         state.table = Some(table);
@@ -462,5 +448,20 @@ mod tests {
             exposures.current(&[]).is_empty(),
             "a broken file fails closed"
         );
+    }
+
+    /// A stream is decided by the table as it is when the stream opens,
+    /// however long an open stream waits between two looks at it.
+    #[test]
+    fn a_changed_table_decides_the_next_stream_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[host-exposures]\n").unwrap();
+        let exposures = HostExposures::at(path.clone(), Duration::from_secs(3600));
+        assert!(exposures.current(&[]).is_empty());
+        std::fs::write(&path, "[host-exposures]\ndev = { port = 8080 }\n").unwrap();
+        assert_eq!(&*exposures.current(&[]), &[HostExposure::tcp(8080)]);
+        std::fs::write(&path, "[host-exposures]\n").unwrap();
+        assert!(exposures.current(&[]).is_empty());
     }
 }
