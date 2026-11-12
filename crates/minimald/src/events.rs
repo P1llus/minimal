@@ -76,6 +76,10 @@ impl RuleRef {
     }
 }
 
+/// The reason of a refusal that comes from the rules of one address's
+/// names not fitting one list.
+pub(crate) const NAME_RULES_OVERFLOW: &str = "name_rules_overflow";
+
 /// A flow, a bind or a name the box's network policy refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetRefusal {
@@ -135,6 +139,15 @@ impl NetRefusal {
             rule: RuleRef::of(compiled, event.rule),
             pid: (event.pid != 0).then_some(event.pid),
         }
+    }
+
+    /// This refusal as one a merged list of several names' rules made
+    /// because it did not fit: the kernel names the rule whose place the
+    /// list ends in, and that rule refused nothing.
+    pub(crate) fn at_overflow(mut self) -> Self {
+        NAME_RULES_OVERFLOW.clone_into(&mut self.reason);
+        self.rule = None;
+        self
     }
 
     fn key(&self) -> Key {
@@ -427,6 +440,35 @@ mod tests {
             remote: Some("192.0.2.1".parse().expect("address")),
             port: Some(port),
             name: None,
+        }
+    }
+
+    #[test]
+    fn a_refusal_at_the_end_of_a_list_that_did_not_fit_names_no_rule() {
+        let refusal = NetRefusal {
+            source: Source::Kernel(netpol::abi::Hook::Connect4),
+            direction: netpol::Direction::Egress,
+            protocol: Some(netpol::Protocol::Tcp),
+            remote: Some("192.0.2.1".parse().expect("address")),
+            port: Some(443),
+            name: None,
+            reason: "set_rule".to_owned(),
+            // The rule whose place the list ends in: an allow of the box.
+            rule: Some(RuleRef {
+                index: 31,
+                origin: "rules[31]".to_owned(),
+                text: "egress allow tcp 2011 b.test".to_owned(),
+            }),
+            pid: Some(7),
+        };
+        let data = refusal.at_overflow().data(0);
+        assert_eq!(data["reason"], NAME_RULES_OVERFLOW);
+        assert_eq!(data["remote"], "192.0.2.1");
+        for key in ["rule", "rule_origin", "rule_text"] {
+            assert!(
+                !data.contains_key(key),
+                "{key} names a rule that refused nothing"
+            );
         }
     }
 

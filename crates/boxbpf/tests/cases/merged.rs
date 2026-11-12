@@ -327,6 +327,29 @@ fn a_merged_list_that_does_not_fit_refuses_what_its_missing_rules_would_judge() 
         (told.overflow.direction, told.overflow.rules),
         (Direction::Egress, 40)
     );
+    // The list refuses in the place of the first rule left out. A refusal
+    // there is told apart from one that rule made.
+    let cut = told.overflow.cut;
+    assert_eq!(cut, 31);
+    let flow = Flow {
+        direction: Direction::Egress,
+        protocol: Protocol::Tcp,
+        remote: shared,
+        port: late,
+        local: None,
+    };
+    let decided = live
+        .compiled()
+        .evaluate(&flow, |a| h.handles.pinned_sets(id, a));
+    assert_eq!(decided.rule, Some(cut));
+    assert!(
+        h.handles
+            .refused_at_overflow(id, shared, Direction::Egress, cut)
+    );
+    assert!(
+        !h.handles
+            .refused_at_overflow(id, shared, Direction::Egress, cut - 1)
+    );
     // A box is told once.
     h.handles.unpin(id, shared).expect("unpin");
     h.handles.pin(id, shared, "b.test", minute).expect("pin");

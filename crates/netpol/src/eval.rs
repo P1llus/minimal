@@ -564,7 +564,7 @@ mod tests {
         }
         let merged = c.merged(&both);
         assert_eq!(merged.id, crate::pins::merged_id(&both));
-        assert_eq!(merged.overflow, None);
+        assert_eq!(merged.overflow, []);
         assert!(c.sets.iter().all(|set| set.id != merged.id));
     }
 
@@ -595,10 +595,11 @@ mod tests {
         let merged = c.merged(&both);
         assert_eq!(
             merged.overflow,
-            Some(crate::compile::Overflow {
+            [crate::compile::Overflow {
                 direction: Direction::Egress,
-                rules: 40
-            })
+                rules: 40,
+                cut: 32,
+            }]
         );
         let [entry] = merged.entries.as_slice() else {
             panic!("one direction has rules: {merged:?}");

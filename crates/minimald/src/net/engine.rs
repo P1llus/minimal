@@ -770,7 +770,18 @@ impl Engine {
                 }
                 continue;
             };
-            let refusal = events::NetRefusal::from_kernel(&event, &of.compiled());
+            let mut refusal = events::NetRefusal::from_kernel(&event, &of.compiled());
+            if event.reason == netpol::Reason::SetRule
+                && let (Some(rule), Some(remote)) = (event.rule, refusal.remote)
+                && let Some(attached) = self.attached_state()
+                && attached
+                    .handles
+                    .lock()
+                    .expect("engine lock")
+                    .refused_at_overflow(of.id, remote, refusal.direction, rule)
+            {
+                refusal = refusal.at_overflow();
+            }
             self.observe(of, refusal);
         }
     }
@@ -1460,7 +1471,7 @@ impl Engine {
                 remote: Some(overflow.address),
                 port: None,
                 name: Some(names),
-                reason: "name_rules_overflow".to_owned(),
+                reason: events::NAME_RULES_OVERFLOW.to_owned(),
                 rule: None,
                 pid: None,
             },

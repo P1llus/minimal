@@ -105,6 +105,8 @@ struct Merged {
     keys: Vec<abi::SetKey>,
     /// How many pins name it. With the last one it goes.
     addresses: usize,
+    /// Where its lists that did not fit refuse.
+    overflow: Vec<netpol::compile::Overflow>,
 }
 
 type MergedSets = StdHashMap<SetId, Merged>;
@@ -221,9 +223,10 @@ impl Merging<'_> {
                 members: members.to_vec(),
                 keys,
                 addresses: 0,
+                overflow: made.overflow.clone(),
             },
         );
-        Ok(made.overflow)
+        Ok(made.overflow.first().copied())
     }
 }
 
@@ -1147,6 +1150,32 @@ impl Handles {
         Some(Duration::from_nanos(
             next.saturating_sub(sys::boot_time_ns()),
         ))
+    }
+
+    /// Whether a refusal of a flow to `addr` at rule number `rule` came
+    /// from a merged list that did not fit: such a list refuses in the
+    /// place of the first rule left out of it, and that rule refused
+    /// nothing.
+    #[must_use]
+    pub fn refused_at_overflow(
+        &self,
+        id: BoxId,
+        addr: IpAddr,
+        direction: netpol::Direction,
+        rule: u16,
+    ) -> bool {
+        let Some(held) = self.boxes.get(&id.0) else {
+            return false;
+        };
+        held.pins
+            .placed(addr)
+            .filter(|placed| placed.is_merged())
+            .and_then(|placed| held.merged.get(&placed.set()))
+            .is_some_and(|set| {
+                set.overflow
+                    .iter()
+                    .any(|o| o.direction == direction && o.cut == rule)
+            })
     }
 
     /// The first merged list of the box that did not fit one set, once.

@@ -123,8 +123,8 @@ pub struct MergedSet {
     pub id: SetId,
     /// One entry for each direction the members have rules for.
     pub entries: Vec<SetEntry>,
-    /// Set when the members' rules for a direction did not fit one list.
-    pub overflow: Option<Overflow>,
+    /// One for each direction whose rules did not fit one list.
+    pub overflow: Vec<Overflow>,
 }
 
 /// A merged list that did not fit. It holds the rules that did and then
@@ -134,6 +134,9 @@ pub struct Overflow {
     pub direction: Direction,
     /// How many rules the members have for the direction between them.
     pub rules: usize,
+    /// The position of the first rule left out. The list refuses there,
+    /// so a refusal with this rule number is the list's and not the rule's.
+    pub cut: u16,
 }
 
 /// The settings of a box that are not rules.
@@ -529,7 +532,7 @@ impl Compiled {
     pub fn merged(&self, members: &[SetId]) -> MergedSet {
         let id = crate::pins::merged_id(members);
         let mut entries = Vec::new();
-        let mut overflow = None;
+        let mut overflow = Vec::new();
         for direction in Direction::ALL {
             let mut slots: Vec<Slot> = members
                 .iter()
@@ -544,9 +547,10 @@ impl Compiled {
             if let Some(first_left_out) = rules.get(abi::RULES_MAX - 1).copied()
                 && rules.len() > abi::RULES_MAX
             {
-                overflow.get_or_insert(Overflow {
+                overflow.push(Overflow {
                     direction,
                     rules: rules.len(),
+                    cut: first_left_out.prio,
                 });
                 rules.truncate(abi::RULES_MAX - 1);
                 rules.push(Slot {
