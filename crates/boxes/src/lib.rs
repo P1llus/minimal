@@ -315,17 +315,14 @@ impl IngressPolicy {
     }
 }
 
-/// A box's declaration of a credentialed upstream (NET-134): the fact that
-/// the Box Egress Proxy — the node-local listener a box's credentialed
-/// traffic is steered through — is this box's infrastructure, reached
-/// whatever the box's egress rules say.
+/// A box's declaration of a credentialed upstream: its grants and how its
+/// traffic to the hosts they are for reaches the Box Egress Proxy.
 ///
-/// The declaration carries the Box Egress Proxy settings: the
-/// `[network.bep]` table and the `[secrets]` grants ([`core::bep`]). Both
-/// default to empty and are skipped when empty, so a declaration with no settings serializes as `{}`, exactly as
-/// it did before the settings existed, and an old `{}` reads as no settings.
-/// A policy that carries `Some` declaration puts its box on a credentialed
-/// lane; one that carries `None` declares nothing.
+/// The declaration carries the `[network.bep]` table and the `[secrets]`
+/// grants ([`core::bep`]). Both default to empty and are skipped when
+/// empty, so a declaration with no settings serializes as `{}`. A grant
+/// does not widen what the box may reach: its own rules must admit the
+/// hosts the grant is for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // An unknown field is one the proxy document has not bound here — refused
 // like every other field the policy schemas do not know (the same
@@ -363,45 +360,6 @@ impl CredentialedUpstream {
                 _ => authority.as_str(),
             })
     }
-
-    /// Whether a declared lane takes effect in a box of this network mode
-    /// on a host of this kind (BEP-085): for an own-address box on every
-    /// host, for a host-address box only on a VM host, and never for a
-    /// `none` box, which has no network. A declaration that is not in
-    /// effect stays on the record and is still shown, marked as not in
-    /// effect.
-    #[must_use]
-    pub fn in_effect(network: NetworkMode, host: paths::HostKind) -> bool {
-        match network {
-            NetworkMode::OwnIp => true,
-            NetworkMode::HostNet => host == paths::HostKind::Minvmd,
-            NetworkMode::NoNet => false,
-        }
-    }
-
-    /// The policy row that states a declared lane, without indentation:
-    /// the one text `min session policy` and the `min dash` detail pane
-    /// both print, so the two surfaces cannot disagree. A box whose mode
-    /// leaves the lane without effect on its host gets a
-    /// `(not in effect: <mode> box)` mark, the mode named by its CLI word.
-    #[must_use]
-    pub fn policy_row(network: NetworkMode, host: paths::HostKind) -> String {
-        if Self::in_effect(network, host) {
-            Self::POLICY_ROW.to_string()
-        } else {
-            format!(
-                "{} (not in effect: {} box)",
-                Self::POLICY_ROW,
-                network.word()
-            )
-        }
-    }
-
-    /// The lane's row text with no mode mark: what [`Self::policy_row`]
-    /// prints for an own-address box, and what a view prints when it does
-    /// not know the box's mode.
-    pub const POLICY_ROW: &'static str =
-        "credentialed upstream  allowed to reach the Box Egress Proxy";
 }
 
 /// The networking policy for a session: its egress and ingress configuration.
@@ -422,22 +380,15 @@ pub struct BoxPolicy {
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
-    /// The box's declaration of a credentialed upstream (NET-134): `Some`
-    /// marks the Box Egress Proxy's listener as this box's infrastructure —
-    /// the one destination its egress rules never decide — while `None`, the
-    /// absent declaration every policy without one carries, is no lane: the
-    /// proxy's address stays refused under the box-to-host default-deny.
-    /// Skipped when `None`, so a policy that declares nothing serializes
-    /// exactly as it did before this field existed — the shape every stored
-    /// record and every reading client already holds.
+    /// The box's declaration of a credentialed upstream, when it has
+    /// grants. Skipped when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
 impl BoxPolicy {
-    /// Builds a policy from its egress and ingress halves, carrying no
-    /// credentialed-upstream declaration (NET-134): the lane a box asks the
-    /// proxy for is its declaration's own, never a default.
+    /// Builds a policy from its egress and ingress halves, with no
+    /// credentialed upstream.
     #[must_use]
     pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
         Self {
@@ -553,11 +504,7 @@ impl EffectiveEgress {
 // The strictness is also the wire contract with an older `min`: an old client
 // rejects a key it has no field for, so a fact that did not exist when it was
 // built must ride its own reply (`GetSessionRuntimeFacts`, the way live
-// ingress rides `GetLiveIngress`) rather than a new field here. The
-// credentialed-upstream lane (NET-134) breaks that rule deliberately: a
-// policy reply a client cannot read is a visible error, while a lane it
-// cannot see is a security fact this command exists to state, and
-// `min session policy` reads no other reply that carries it.
+// ingress rides `GetLiveIngress`) rather than a new field here.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveBoxPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -565,12 +512,8 @@ pub struct EffectiveBoxPolicy {
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
-    /// The box's credentialed-upstream lane (NET-134), carried verbatim
-    /// from the declaration: `Some` marks the Box Egress Proxy's listener
-    /// as the box's infrastructure — the one destination its egress rules
-    /// never decide — and `None` is no lane. Skipped when `None`, so a
-    /// lane-less box serializes exactly as it did before this field
-    /// existed.
+    /// The box's declaration of a credentialed upstream, as declared.
+    /// Skipped when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
 }
@@ -2207,44 +2150,6 @@ mod tests {
             let serde = serde_json_lenient::to_string(&mode).unwrap();
             assert_ne!(mode.word(), serde.trim_matches('"'), "{mode:?}");
         }
-    }
-
-    /// NET-134, BEP-085: the lane is in effect for an own-address box on
-    /// every host and for a host-address box on a VM host. Its row is
-    /// unmarked there. Every other case still shows the declaration,
-    /// marked with the mode that leaves it without effect.
-    #[test]
-    fn credentialed_upstream_in_effect_by_mode_and_host() {
-        use paths::HostKind::{Minimald, Minvmd};
-        const ROW: &str = "credentialed upstream  allowed to reach the Box Egress Proxy";
-        for host in [Minimald, Minvmd] {
-            assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp, host));
-            assert_eq!(
-                CredentialedUpstream::policy_row(NetworkMode::OwnIp, host),
-                ROW
-            );
-            assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet, host));
-            assert_eq!(
-                CredentialedUpstream::policy_row(NetworkMode::NoNet, host),
-                format!("{ROW} (not in effect: none box)")
-            );
-        }
-        assert!(CredentialedUpstream::in_effect(
-            NetworkMode::HostNet,
-            Minvmd
-        ));
-        assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::HostNet, Minvmd),
-            ROW
-        );
-        assert!(!CredentialedUpstream::in_effect(
-            NetworkMode::HostNet,
-            Minimald
-        ));
-        assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::HostNet, Minimald),
-            format!("{ROW} (not in effect: host_ip box)")
-        );
     }
 
     fn record_with(network: NetworkMode, policy: BoxPolicy) -> Record {

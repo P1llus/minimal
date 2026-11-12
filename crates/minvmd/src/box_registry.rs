@@ -1150,7 +1150,7 @@ const SWITCH_REUSE_QUARANTINE: Duration = switch::SWITCH_ADDRESS_REUSE_QUARANTIN
 /// registry stops drawing them once the book could hand fewer than this,
 /// and a box is never refused because task slots took its address. Sixteen
 /// keeps room for sixteen new boxes once task slots stop being handed:
-/// about an eighth of a carved /24's hand-out run of 125, so the first
+/// about an eighth of a carved /24's hand-out run of 126, so the first
 /// twenty-odd boxes there still get their full
 /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] slots each, and a rounding error
 /// against the default plan's run of thousands.
@@ -7688,14 +7688,14 @@ mod tests {
     }
 
     /// A planned carved /24 — its hand-out run is 100.64.1.127 through
-    /// 100.64.1.251, 125 addresses — small enough to draw through, with the
+    /// 100.64.1.252, 126 addresses — small enough to draw through, with the
     /// one loopback address every box below registers at: the answerer's
     /// half is not under test, and with no withdrawal subscriber nothing
     /// holds it.
     fn carved() -> SwitchSubnet {
         SwitchSubnet::new(Ipv4Addr::new(100, 64, 1, 0), 24).expect("a /24 is a valid plan")
     }
-    const CARVED_RUN: usize = 125;
+    const CARVED_RUN: usize = 126;
     const CARVED_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 40);
 
     fn client_spec(name: &str) -> ClientBoxSpec {
@@ -8624,7 +8624,7 @@ mod tests {
         let said = error.to_string();
         assert!(
             said.contains(
-                "124 of 125 box addresses are in use and 1 was released but cannot be reused yet \
+                "125 of 126 box addresses are in use and 1 was released but cannot be reused yet \
                  (an address rests 300 s after its release); the next one frees in 200 s"
             ),
             "the refusal names the counts, got: {said}"
@@ -8649,19 +8649,19 @@ mod tests {
         );
         let said = error.to_string();
         assert!(
-            said.ends_with("125 of 125 box addresses are in use"),
+            said.ends_with("126 of 126 box addresses are in use"),
             "a run with every address live says only that, got: {said}"
         );
 
         let two = HandOutCounts {
-            live: 123,
+            live: 124,
             quarantined: 2,
-            capacity: 125,
+            capacity: 126,
             next_free_in: None,
         };
         assert_eq!(
             two.to_string(),
-            "123 of 125 box addresses are in use and 2 were released but cannot be reused yet \
+            "124 of 126 box addresses are in use and 2 were released but cannot be reused yet \
              (an address rests 300 s after its release)"
         );
     }

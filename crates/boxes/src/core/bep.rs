@@ -51,8 +51,8 @@ pub const UNENROLLED_NODE_EXIT_CODE: u8 = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Steering {
-    /// The box-zone resolver answers a credentialed name with the proxy's
-    /// address. The default (BEP-016).
+    /// The node redirects the box's connections to a credentialed name to
+    /// the proxy. The default.
     #[default]
     Dns,
     /// The box's `HTTPS_PROXY` and `HTTP_PROXY` point at the proxy.
@@ -73,12 +73,6 @@ impl Steering {
             Steering::Both => "both",
             Steering::Off => "off",
         }
-    }
-
-    /// Whether this mode needs the box-zone resolver.
-    #[must_use]
-    pub fn needs_resolver(self) -> bool {
-        matches!(self, Steering::Dns | Steering::Both)
     }
 }
 
@@ -394,26 +388,15 @@ pub type SecretGrants = BTreeMap<String, SecretGrant>;
 pub struct HostFacts {
     /// Whether the host is enrolled with a Gatehouse.
     pub enrolled: bool,
-    /// Whether the host resolves the credential module's names for this
-    /// box. The CLI sets it at creation and at `min box spec`, from the
-    /// host kind and the network mode. It is false on a native host, which
-    /// has no proxy, and for a `none` box. While it is false, `dns` and
-    /// `both` steering with a credentialed upstream is refused (BEP-017).
-    /// The steering does not change this fact.
-    pub box_zone_resolver: bool,
     /// Whether the client configuration sets
     /// [`FULL_BREADTH_ACKNOWLEDGEMENT`]. It matters only un-enrolled.
     pub full_breadth_acknowledged: bool,
 }
 
 impl HostFacts {
-    /// An un-enrolled host with no box-zone resolver and no acknowledgement:
-    /// a native host. A caller on the VM host sets
-    /// [`Self::box_zone_resolver`] over it, from the host kind and the
-    /// box's network mode.
+    /// An un-enrolled host with no acknowledgement.
     pub const LOCAL: Self = Self {
         enrolled: false,
-        box_zone_resolver: false,
         full_breadth_acknowledged: false,
     };
 }
@@ -431,10 +414,6 @@ pub struct ActivationSpec<'a> {
     /// The grants.
     pub secrets: &'a SecretGrants,
 }
-
-/// The port the Box Egress Proxy's listener answers on, which a box with a
-/// credentialed upstream is pointed at.
-pub const PROXY_LISTENER_PORT: u16 = 8118;
 
 /// Whether a box's egress admits every name without listing any: a
 /// `host_ip` box with no `egress` section. That box shares its host's
@@ -547,11 +526,6 @@ pub enum BepRefusal {
     },
     /// BEP-010: `steering = "off"` with `proxy_env = true`.
     SteeringOffWithProxyEnv,
-    /// BEP-017: `dns` or `both` steering with no box-zone resolver.
-    NoResolver {
-        /// The resolved steering mode.
-        steering: Steering,
-    },
     /// BEP-056: an `installation` grant on an un-enrolled host.
     InstallationUnenrolled {
         /// The grant's name.
@@ -613,7 +587,6 @@ impl BepRefusal {
             Self::HostsOutsideEgress { .. } => "BEP-008",
             Self::NoNetworkWithGrant { .. } => "BEP-009",
             Self::SteeringOffWithProxyEnv => "BEP-010",
-            Self::NoResolver { .. } => "BEP-017",
             Self::InstallationUnenrolled { .. } => "BEP-056",
             Self::NarrowScopesUnenrolled { .. } => "BEP-057",
             Self::SignInRequired { .. } | Self::UnenrolledNode { .. } => "BEP-003",
@@ -657,7 +630,6 @@ impl BepRefusal {
             Self::HostsOutsideEgress { .. } => "secrets, egress.allow_dns_hosts",
             Self::NoNetworkWithGrant { .. } => "secrets, network.mode",
             Self::SteeringOffWithProxyEnv => "network.bep.steering, network.bep.proxy_env",
-            Self::NoResolver { .. } => "secrets, network.bep.steering",
             Self::InstallationUnenrolled { .. } => "secrets.mode",
             Self::NarrowScopesUnenrolled { .. } => {
                 "secrets.scopes, config [secrets] acknowledge_full_breadth_unenrolled"
@@ -694,12 +666,6 @@ impl fmt::Display for BepRefusal {
                  With steering off the box does not trust the proxy, so every HTTPS \
                  request through the proxy fails. Remove proxy_env, or set \
                  steering = \"proxy_env\"."
-            ),
-            Self::NoResolver { steering } => write!(
-                f,
-                "This box declares a secret with steering = \"{}\", but this host has no \
-                 box DNS resolver. Set steering = \"proxy_env\" in [network.bep].",
-                steering.word()
             ),
             Self::InstallationUnenrolled { grant } => write!(
                 f,
@@ -915,11 +881,6 @@ pub fn refusals(
         out.push(BepRefusal::SteeringOffWithProxyEnv);
     }
 
-    // BEP-017: `dns` and `both` need the box-zone resolver.
-    if !host.box_zone_resolver && steering.needs_resolver() && spec.has_credentialed_upstream() {
-        out.push(BepRefusal::NoResolver { steering });
-    }
-
     // BEP-056: an un-enrolled host has no GitHub App key.
     if !host.enrolled {
         for (name, grant) in spec.secrets {
@@ -968,7 +929,6 @@ pub fn check_activation(
             tracing::debug!(
                 rule = refusal.rule(),
                 fields = refusal.fields(),
-                box_zone_resolver = host.box_zone_resolver,
                 reason = %refusal,
                 "box spec refused at activation"
             );
@@ -1253,12 +1213,6 @@ mod tests {
         "codeload.github.com",
     ];
 
-    const RESOLVER_HOST: HostFacts = HostFacts {
-        enrolled: false,
-        box_zone_resolver: true,
-        full_breadth_acknowledged: false,
-    };
-
     fn github_grant(mode: Option<GrantMode>) -> SecretGrant {
         SecretGrant {
             source: GrantSource::Broker,
@@ -1440,9 +1394,8 @@ mod tests {
     }
 
     fn any_host() -> impl Strategy<Value = HostFacts> {
-        (any::<bool>(), any::<bool>()).prop_map(|(enrolled, box_zone_resolver)| HostFacts {
+        any::<bool>().prop_map(|enrolled| HostFacts {
             enrolled,
-            box_zone_resolver,
             full_breadth_acknowledged: false,
         })
     }
@@ -1530,58 +1483,6 @@ mod tests {
             }
         }
 
-        /// BEP-017: with no box-zone resolver, the refusal fires iff a
-        /// broker or store grant is declared and the resolved steering is `dns` or
-        /// `both`. Grants that are all `client_env` never fire it.
-        #[test]
-        fn prop_dns_steering_without_resolver_is_exit_3(
-            network in any_network(),
-            egress in any_egress(),
-            bep in any_bep(),
-            secrets in any_grants(),
-            client in client_env_grants(),
-            enrolled in any::<bool>(),
-        ) {
-            let host = HostFacts { enrolled, box_zone_resolver: false, full_breadth_acknowledged: false };
-
-            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
-            let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
-                .iter()
-                .any(|r| matches!(r, BepRefusal::NoResolver { .. }));
-            prop_assert!(!client_fired);
-            if !(bep.steering == Some(Steering::Off) && bep.proxy_env) {
-                let plan = check_activation(&client_spec, host, GITHUB_HOSTS);
-                prop_assert!(plan.is_ok_and(|plan| !plan.inject_ca));
-            }
-
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
-            let resolved = bep.steering.unwrap_or(Steering::Dns);
-            let expected = secrets.values().any(SecretGrant::is_credentialed)
-                && matches!(resolved, Steering::Dns | Steering::Both);
-            let fired = refusals(&spec, host, GITHUB_HOSTS)
-                .iter()
-                .any(|r| matches!(r, BepRefusal::NoResolver { .. }));
-            prop_assert_eq!(fired, expected);
-            if expected {
-                let refused = check_activation(&spec, host, GITHUB_HOSTS).expect_err("refused");
-                prop_assert_eq!(refused.exit_code(), 3);
-                prop_assert!(refused.to_string().contains("no box DNS resolver"));
-            }
-
-            // With the resolver, BEP-017 never fires, and the steering mode
-            // adds no refusal of its own (BEP-080).
-            let without = refusals(&spec, host, GITHUB_HOSTS);
-            let host = HostFacts { box_zone_resolver: true, ..host };
-            let found = refusals(&spec, host, GITHUB_HOSTS);
-            let no_resolver = found.iter().any(|r| matches!(r, BepRefusal::NoResolver { .. }));
-            prop_assert!(!no_resolver);
-            let rest: Vec<_> = without
-                .into_iter()
-                .filter(|r| !matches!(r, BepRefusal::NoResolver { .. }))
-                .collect();
-            prop_assert_eq!(found, rest);
-        }
-
         /// BEP-056: on an un-enrolled host the refusal fires iff a GitHub
         /// grant sets `mode = "installation"`, once per such grant, naming
         /// it.
@@ -1591,9 +1492,8 @@ mod tests {
             egress in any_egress(),
             bep in any_bep(),
             secrets in any_grants(),
-            box_zone_resolver in any::<bool>(),
         ) {
-            let host = HostFacts { enrolled: false, box_zone_resolver, full_breadth_acknowledged: false };
+            let host = HostFacts { enrolled: false, full_breadth_acknowledged: false };
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
             let expected: Vec<String> = secrets
                 .iter()
@@ -1627,11 +1527,10 @@ mod tests {
             egress in any_egress(),
             bep in any_bep(),
             secrets in any_grants(),
-            box_zone_resolver in any::<bool>(),
             enrolled in any::<bool>(),
             acknowledged in any::<bool>(),
         ) {
-            let host = HostFacts { enrolled, box_zone_resolver, full_breadth_acknowledged: acknowledged };
+            let host = HostFacts { enrolled, full_breadth_acknowledged: acknowledged };
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
             let expected: Vec<String> = if enrolled || acknowledged {
                 Vec::new()
@@ -1858,22 +1757,16 @@ mod tests {
             bep: &bep,
             secrets: &secrets,
         };
-        // Where the host resolves box names, the default `dns` is admitted.
-        let plan = check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect("admitted");
+        let plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("admitted");
         assert_eq!(plan.steering, Steering::Dns);
     }
 
-    /// BEP-080: the proxy takes a `dns`-steered box's direct TLS, so `dns`
-    /// is admitted wherever the host has the box-zone resolver, and BEP-017
-    /// still refuses it where the host has none.
+    /// Steering that redirects is admitted in every mode with a network,
+    /// and the box then trusts the proxy's root.
     #[test]
-    fn dns_steering_is_admitted_with_the_resolver_and_no_interim_refusal() {
+    fn redirecting_steering_is_admitted_in_both_modes() {
         let secrets = grants(github_grant(None));
         let egress = egress_with(GITHUB_HOSTS);
-        let no_resolver = HostFacts {
-            box_zone_resolver: false,
-            ..RESOLVER_HOST
-        };
         for steering in [None, Some(Steering::Dns), Some(Steering::Both)] {
             let bep = BepSettings {
                 steering,
@@ -1887,22 +1780,15 @@ mod tests {
                     secrets: &secrets,
                 };
                 let case = format!("{steering:?} {network:?}");
-                assert_eq!(refusals(&spec, RESOLVER_HOST, GITHUB_HOSTS), [], "{case}");
-                let plan = check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS)
+                assert_eq!(
+                    refusals(&spec, HostFacts::LOCAL, GITHUB_HOSTS),
+                    [],
+                    "{case}"
+                );
+                let plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS)
                     .unwrap_or_else(|err| panic!("{case}: {err}"));
                 assert_eq!(plan.steering, bep.resolved_steering(), "{case}");
                 assert!(plan.inject_ca, "{case}");
-
-                let refused = check_activation(&spec, no_resolver, GITHUB_HOSTS)
-                    .expect_err("BEP-017 still holds without a resolver");
-                assert_eq!(refused.exit_code(), 3, "{case}");
-                assert_eq!(
-                    refused.refusals,
-                    vec![BepRefusal::NoResolver {
-                        steering: bep.resolved_steering()
-                    }],
-                    "{case}"
-                );
             }
         }
     }
@@ -2006,7 +1892,7 @@ mod tests {
                 secrets: &secrets,
             };
             let refused =
-                check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect_err("refused");
+                check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect_err("refused");
             assert_eq!(refused.exit_code(), 3);
             assert_eq!(
                 refused.refusals,
@@ -2134,7 +2020,7 @@ mod tests {
                 bep: &bep,
                 secrets: &secrets,
             };
-            refusals(&spec, RESOLVER_HOST, GITHUB_HOSTS)
+            refusals(&spec, HostFacts::LOCAL, GITHUB_HOSTS)
                 .iter()
                 .any(|refusal| matches!(refusal, BepRefusal::HostsOutsideEgress { .. }))
         };

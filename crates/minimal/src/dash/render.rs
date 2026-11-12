@@ -484,9 +484,6 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
     let detail = model.details.get(key);
     let record = detail.and_then(|d| d.record.as_ref());
     let network = record.map(|r| r.network);
-    // BEP-085: the credentialed-upstream row reads the box's host kind, from
-    // the sidebar group the box is listed under.
-    let host_kind = crate::dash::rpc::host_kind_of_label(&key.host);
     let mut lines: Vec<Line> = Vec::new();
 
     if network == Some(boxes::NetworkMode::NoNet) {
@@ -496,18 +493,6 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
             "This box has no network (--network none)",
             Style::default().fg(Color::Gray),
         ));
-        // A lane the box declared is still shown, marked as not in effect,
-        // as `min session policy` shows it (NET-134).
-        if let Some(network) = network
-            && detail
-                .and_then(|d| d.policy.as_ref())
-                .is_some_and(|p| p.credentialed_upstream.is_some())
-        {
-            lines.push(Line::raw(format!(
-                "  {}",
-                boxes::CredentialedUpstream::policy_row(network, host_kind)
-            )));
-        }
     } else {
         match detail.and_then(|d| d.policy.as_ref()) {
             None => match detail.and_then(|d| d.policy_error.as_deref()) {
@@ -558,17 +543,6 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                             lines.push(Line::raw(format!("  deny subnets  {}", subnets.join(", "))))
                         }
                     }
-                }
-                // The credentialed-upstream lane (NET-134), in the row text
-                // `min session policy` prints: shown whenever the box
-                // declared it, marked where its mode leaves it without
-                // effect. A mode not yet loaded prints the unmarked row.
-                if policy.credentialed_upstream.is_some() {
-                    let row = network.map_or_else(
-                        || boxes::CredentialedUpstream::POLICY_ROW.to_string(),
-                        |network| boxes::CredentialedUpstream::policy_row(network, host_kind),
-                    );
-                    lines.push(Line::raw(format!("  {row}")));
                 }
                 // Ingress is an own-address surface: the switch's static
                 // forwarder is the only per-session ingress minimald applies,
@@ -1160,51 +1134,6 @@ mod tests {
         assert!(
             subnets_only.contains("egress\n  subnets  10.0.0.0/8\n  dns hosts  (none)\n"),
             "a subnets-only box must spell its empty names row, got:\n{subnets_only}"
-        );
-    }
-
-    /// NET-134: the pane shows a declared credentialed-upstream lane in the
-    /// same row text `min session policy` prints — unmarked on an
-    /// own-address box, marked as not in effect on a host-address one —
-    /// and prints no row for a box that declared no lane.
-    #[test]
-    fn policy_pane_shows_the_credentialed_upstream_lane_when_declared() {
-        let laned = boxes::BoxPolicy {
-            egress: Some(boxes::EgressPolicy::deny_all()),
-            ingress: None,
-            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
-        };
-        let unlaned = boxes::BoxPolicy {
-            credentialed_upstream: None,
-            ..laned.clone()
-        };
-
-        let own = policy_text(boxes::NetworkMode::OwnIp, laned.clone());
-        assert!(
-            own.contains(
-                "egress\n  deny-all\n  credentialed upstream  allowed to reach the Box Egress Proxy\n"
-            ),
-            "a laned own-address box must show the lane row, got:\n{own}"
-        );
-
-        let bare = policy_text(boxes::NetworkMode::OwnIp, unlaned);
-        assert!(
-            !bare.contains("credentialed upstream"),
-            "a box without a lane must show no lane row, got:\n{bare}"
-        );
-
-        let none = policy_text(boxes::NetworkMode::NoNet, laned.clone());
-        assert!(
-            none.starts_with("This box has no network (--network none)\n"),
-            "a none box must open with the note `min session policy` prints, got:\n{none}"
-        );
-
-        let host = policy_text(boxes::NetworkMode::HostNet, laned);
-        assert!(
-            host.contains(
-                "  credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)"
-            ),
-            "a laned host-address box must show the lane, marked, got:\n{host}"
         );
     }
 }

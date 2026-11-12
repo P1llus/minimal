@@ -741,23 +741,6 @@ impl BoxActor {
         // sealed values join this layer here, so the shell's launch
         // environment holds them before its entrypoint runs.
         let mut attach_env = attach_env;
-        // BEP-012: the proxy variables join the same layer, at the proxy's
-        // address on this daemon's switch subnet.
-        // BEP-085: a host_ip box gets them on a VM host only, so the
-        // launch reads the host kind from the switch's transport.
-        let (subnet, host_kind) = {
-            let switch = self.net_switch.lock().await;
-            (
-                switch.subnet(),
-                box_runtime::host_kind_of(switch.transport()),
-            )
-        };
-        box_runtime::place_launch_proxy_env(
-            &mut attach_env,
-            &record,
-            host_kind,
-            &box_runtime::launch_proxy_env(&record, subnet, host_kind),
-        );
         let connection_env = box_runtime::place_launch_deliveries(
             &mut attach_env,
             record.id,

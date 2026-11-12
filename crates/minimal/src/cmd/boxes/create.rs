@@ -1700,15 +1700,12 @@ fn put_store_upstreams(policy: &mut boxes::BoxPolicy, accepted: &boxes::core::be
 /// whether or not they declare a credentialed upstream, so a contradiction
 /// in `[session.network.bep]` alone is still refused. The refusal ends the
 /// run with exit 3 (`main.rs`). Every host today is un-enrolled.
-/// `box_zone_resolver` is [`host_resolves_box_names`] for this host and
-/// box (BEP-017).
 fn refuse_unhonourable_grants(
     network: boxes::NetworkMode,
     egress: Option<&boxes::EgressPolicy>,
     settings: &boxes::core::bep::BepSettings,
     secrets: &boxes::core::bep::SecretGrants,
     full_breadth_acknowledged: bool,
-    box_zone_resolver: bool,
     spec_env: &[String],
 ) -> Result<Vec<boxes::core::bep::BepWarning>, anyhow::Error> {
     use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
@@ -1727,12 +1724,10 @@ fn refuse_unhonourable_grants(
     // `min box spec` reads, so the preview and the start agree.
     let host = HostFacts {
         full_breadth_acknowledged,
-        box_zone_resolver,
         ..HostFacts::LOCAL
     };
     let checked = check_activation(&spec, host, &hosts);
     tracing::info!(
-        box_zone_resolver = host.box_zone_resolver,
         steering = settings.resolved_steering().word(),
         accepted = checked.is_ok(),
         "checked the box spec's grants against this host"
@@ -1756,34 +1751,6 @@ pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::Net
             network,
             boxes::NetworkMode::HostNet | boxes::NetworkMode::NoNet
         )
-}
-
-/// Whether a box with `network` on a host of `kind` has its lookups go
-/// through a resolver that steers the credential module's names (BEP-017,
-/// BEP-062, BEP-081). This is a host fact and does not read the steering.
-/// A native host has no proxy, so a steered name there always fails
-/// closed, and a `none` box
-/// has no steered lookups of its own. `min box spec` reads it for the
-/// network its `--network` flag names. Where this is true, a `dns`-steered
-/// box opens TLS to the proxy's address on port 443, and the proxy routes
-/// it by its SNI (BEP-080).
-pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
-    kind == paths::HostKind::Minvmd
-        && matches!(
-            network,
-            boxes::NetworkMode::OwnIp | boxes::NetworkMode::HostNet
-        )
-}
-
-/// The network and the host fact a creation reads, for a host of `kind`:
-/// the box's `--network` mode, and whether the switch resolves that box's
-/// names. `min box spec` reads the same fact for the same mode.
-pub(crate) fn creation_host(
-    kind: paths::HostKind,
-    args: &crate::cli::ActivateArgs,
-) -> (boxes::NetworkMode, bool) {
-    let network: boxes::NetworkMode = args.network.into();
-    (network, host_resolves_box_names(kind, network))
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -3146,14 +3113,12 @@ pub(crate) async fn activate_box(
                 .values()
                 .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
                 && crate::config::full_breadth_acknowledged(global)?;
-            let (network, box_zone_resolver) = creation_host(daemon_host_kind(global), &args);
             refuse_unhonourable_grants(
-                network,
+                args.network.into(),
                 policy.egress.as_ref(),
                 &project_bep,
                 &project_secrets,
                 full_breadth_acknowledged,
-                box_zone_resolver,
                 &project_env,
             )?;
             // BEP-034/035/036: each store reference needs a rule that admits
@@ -5273,7 +5238,6 @@ mod tests {
                 &bep,
                 &secrets,
                 acknowledged,
-                false,
                 &spec_env,
             )
             .expect_err("refused for the egress");
@@ -5326,7 +5290,6 @@ mod tests {
                 &bep,
                 &secrets,
                 false,
-                false,
                 &spec_env,
             )
             .expect("accepted")
@@ -5364,7 +5327,6 @@ mod tests {
             None,
             &bep,
             &secrets,
-            false,
             false,
             &spec_env,
         )
@@ -5824,16 +5786,9 @@ mod tests {
         };
         let secrets = boxes::core::bep::SecretGrants::new();
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
-        let err = refuse_unhonourable_grants(
-            boxes::NetworkMode::OwnIp,
-            None,
-            &bep,
-            &secrets,
-            false,
-            false,
-            &[],
-        )
-        .expect_err("refused");
+        let err =
+            refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false, &[])
+                .expect_err("refused");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");
@@ -5864,37 +5819,12 @@ mod tests {
         ));
     }
 
-    /// BEP-017, BEP-062, BEP-080, BEP-081: a GitHub grant box with `dns`
-    /// steering, declared or by default, or with `both`, is created on the
-    /// VM host for `own_ip` and `host_ip`, and `min box spec` shows it. On
-    /// a native host, and for a `none` box, both are refused for the
-    /// missing resolver. For every case, `min box spec` refuses exactly
-    /// when creation does, with the same text.
+    /// `min box spec --network <mode>` refuses a grant box exactly when
+    /// `min session activate --network <mode>` does, with the same text: a
+    /// box with no network, and no other mode. With no flag both are of a
+    /// `host_ip` box.
     #[test]
-    fn vm_host_admits_dns_and_both_for_own_ip_and_host_ip() {
-        use boxes::core::bep::Steering;
-        use paths::HostKind;
-        // The host fact does not read the steering.
-        assert!(host_resolves_box_names(
-            HostKind::Minvmd,
-            boxes::NetworkMode::OwnIp
-        ));
-        assert!(!host_resolves_box_names(
-            HostKind::Minimald,
-            boxes::NetworkMode::OwnIp
-        ));
-        assert!(host_resolves_box_names(
-            HostKind::Minvmd,
-            boxes::NetworkMode::HostNet
-        ));
-        assert!(!host_resolves_box_names(
-            HostKind::Minimald,
-            boxes::NetworkMode::HostNet
-        ));
-        assert!(!host_resolves_box_names(
-            HostKind::Minvmd,
-            boxes::NetworkMode::NoNet
-        ));
+    fn box_spec_and_creation_refuse_the_same_grant_boxes() {
         let github_hosts: Vec<&str> = bep::module::GITHUB
             .hosts
             .iter()
@@ -5909,6 +5839,7 @@ mod tests {
             ("", "dns"),
             ("steering = \"dns\"\n", "dns"),
             ("steering = \"both\"\n", "both"),
+            ("steering = \"proxy_env\"\n", "proxy_env"),
         ] {
             let project = tempfile::tempdir().expect("project dir");
             std::fs::write(
@@ -5924,22 +5855,18 @@ mod tests {
             let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
             assert!(credentialed_upstream_for(false, &bep, &secrets).is_some());
             assert_eq!(bep.resolved_steering().word(), word);
-            assert_eq!(bep.resolved_steering() == Steering::Both, word == "both");
-            let no_resolver = format!(
-                "This box declares a secret with steering = \"{word}\", but this host \
-                 has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
-            );
 
-            for (kind, network) in [
-                (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
-                (HostKind::Minimald, boxes::NetworkMode::OwnIp),
-                (HostKind::Minvmd, boxes::NetworkMode::HostNet),
-                (HostKind::Minimald, boxes::NetworkMode::HostNet),
-            ] {
-                let resolver = host_resolves_box_names(kind, network);
-                let accepted = resolver;
-                let refusal = no_resolver.as_str();
-                let case = format!("{word} {kind:?} {network:?}");
+            for flag in [None, Some("none"), Some("host_ip"), Some("own_ip")] {
+                let mut activate = vec!["min", "session", "activate"];
+                let mut spec = vec!["min", "box", "spec"];
+                if let Some(mode) = flag {
+                    activate.extend(["--network", mode]);
+                    spec.extend(["--network", mode]);
+                }
+                let network: boxes::NetworkMode = parsed_activate_args(&activate).network.into();
+                let spec_network: boxes::NetworkMode = parsed_box_spec_args(&spec).network.into();
+                let case = format!("{word} --network {flag:?}");
+                assert_eq!(network, spec_network, "{case}: same network");
 
                 let created = refuse_unhonourable_grants(
                     network,
@@ -5947,10 +5874,8 @@ mod tests {
                     &bep,
                     &secrets,
                     false,
-                    resolver,
                     &spec_env,
                 );
-                // `min box spec` reads the same fact for this host.
                 let rules = boxes::core::bep::StoreRules::new();
                 let mut out = Vec::new();
                 let previewed = crate::cmd::box_spec::render(
@@ -5959,117 +5884,25 @@ mod tests {
                         bep: &bep,
                         secrets: &secrets,
                         acknowledged: false,
-                        network,
-                        box_zone_resolver: resolver,
+                        network: spec_network,
                         github_hosts: &github_hosts,
                         store_rules: &rules,
                     },
                     &mut out,
                 );
-                assert_eq!(
-                    created.is_ok(),
-                    previewed.is_ok(),
-                    "{case}: min box spec and creation agree"
-                );
-
-                if accepted {
-                    let warnings = created.unwrap_or_else(|err| panic!("{case}: accepted: {err}"));
-                    assert!(warnings.is_empty(), "{case}: no warning: {warnings:?}");
+                let created = created.map(|_| ()).map_err(|err| err.to_string());
+                let previewed = previewed.map_err(|err| err.to_string());
+                assert_eq!(created, previewed, "{case}: same refusal");
+                if flag == Some("none") {
+                    let refused = previewed.expect_err("a box with no network is refused");
+                    assert!(refused.contains("has no network"), "{case}: {refused}");
+                } else {
+                    assert_eq!(previewed, Ok(()), "{case}: admitted");
                     let text = String::from_utf8(out).expect("utf-8");
                     assert!(
                         text.contains(&format!("steering  {word}\n")),
                         "{case}: {text}"
                     );
-                    continue;
-                }
-                for err in [
-                    created.expect_err("creation refuses"),
-                    previewed.expect_err("min box spec refuses"),
-                ] {
-                    let refused = err
-                        .downcast_ref::<boxes::core::bep::ActivationRefused>()
-                        .expect("the refusal is the box spec refusal");
-                    assert_eq!(refused.exit_code(), 3, "{case}");
-                    assert_eq!(refused.to_string(), refusal, "{case}");
-                }
-            }
-
-            // `min box spec --network <mode>` and `min session activate
-            // --network <mode>`, parsed as the command line gives them, read
-            // the same network and host fact, so they give the same refusal
-            // for every mode on both host kinds. With no flag, both are of a
-            // `host_ip` box.
-            for flag in [None, Some("none"), Some("host_ip"), Some("own_ip")] {
-                for kind in [HostKind::Minvmd, HostKind::Minimald] {
-                    let mut activate = vec!["min", "session", "activate"];
-                    let mut spec = vec!["min", "box", "spec"];
-                    if let Some(mode) = flag {
-                        activate.extend(["--network", mode]);
-                        spec.extend(["--network", mode]);
-                    }
-                    let activate_args = parsed_activate_args(&activate);
-                    let spec_args = parsed_box_spec_args(&spec);
-                    let (network, resolver) = creation_host(kind, &activate_args);
-                    let (spec_network, spec_resolver) =
-                        crate::cmd::box_spec::preview_host(kind, &spec_args);
-                    let case = format!("{word} {kind:?} --network {flag:?}");
-                    assert_eq!(network, spec_network, "{case}: same network");
-                    assert_eq!(resolver, spec_resolver, "{case}: same host fact");
-
-                    let created = refuse_unhonourable_grants(
-                        network,
-                        Some(&egress),
-                        &bep,
-                        &secrets,
-                        false,
-                        resolver,
-                        &spec_env,
-                    );
-                    let rules = boxes::core::bep::StoreRules::new();
-                    let mut out = Vec::new();
-                    let previewed = crate::cmd::box_spec::render(
-                        &crate::cmd::box_spec::SpecInputs {
-                            root_fingerprint: None,
-                            bep: &bep,
-                            secrets: &secrets,
-                            acknowledged: false,
-                            network: spec_network,
-                            box_zone_resolver: spec_resolver,
-                            github_hosts: &github_hosts,
-                            store_rules: &rules,
-                        },
-                        &mut out,
-                    );
-                    let created = created.map(|_| ()).map_err(|err| err.to_string());
-                    let previewed = previewed.map_err(|err| err.to_string());
-                    assert_eq!(created, previewed, "{case}: same refusal");
-
-                    // With no flag the box is a `host_ip` box.
-                    let admitted_on_vm_host = kind == HostKind::Minvmd
-                        && matches!(flag, None | Some("host_ip") | Some("own_ip"));
-                    if admitted_on_vm_host {
-                        // On the VM host, `min box spec --network own_ip`
-                        // and `--network host_ip` admit a `dns` or `both`
-                        // spec with a credentialed upstream (BEP-081).
-                        assert_eq!(previewed, Ok(()), "{case}: admitted");
-                        let text = String::from_utf8(out).expect("utf-8");
-                        assert!(
-                            text.contains(&format!("steering  {word}\n")),
-                            "{case}: {text}"
-                        );
-                    } else {
-                        // A native host, and a `none` box, have no
-                        // steered lookups, so the spec is refused for the
-                        // missing resolver. A `none` box is also refused
-                        // for its missing network.
-                        let refused = previewed.expect_err("min box spec refuses");
-                        assert!(refused.ends_with(no_resolver.as_str()), "{case}: {refused}");
-                        if flag == Some("none") {
-                            assert!(refused.contains("has no network"), "{case}: {refused}");
-                        } else {
-                            assert_eq!(refused, no_resolver, "{case}");
-                        }
-                    }
                 }
             }
         }

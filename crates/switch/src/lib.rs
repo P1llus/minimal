@@ -35,15 +35,6 @@ pub const TCP_CONNECT_TIMEOUT_SECS: u32 = 30;
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
-/// How long the Box Egress Proxy leg's smoltcp neighbour cache keeps an
-/// entry: smoltcp 0.14's `iface::neighbor::Cache::ENTRY_LIFETIME`, which the
-/// crate keeps `pub(crate)`, so it is restated here. A switch address handed
-/// again wears the same derived MAC ([`MacAddr::for_switch_ip`]), so an
-/// allocator that reuses addresses must quarantine a released one for longer
-/// than this, or the leg could still answer the new holder from the old
-/// holder's entry. Change it with the smoltcp version.
-pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// How long a released switch address waits before it may be handed again,
 /// by either allocator that hands them: the in-VM or native daemon's
 /// self-allocation reserve and the VM host daemon's hand-out run. One value
@@ -51,16 +42,11 @@ pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duratio
 /// ([`MacAddr::for_switch_ip`]) on the one switch.
 ///
 /// It must outlast every record that can still name a released address once
-/// its holder is gone: [`BEP_NEIGHBOUR_CACHE_LIFETIME`] (asserted below).
-/// Waiting it out is necessary, not sufficient: each allocator also skips an
-/// address its own live state still names.
+/// its holder is gone. The daemon asserts that against the lifetime of a
+/// name pin. Waiting it out is necessary, not sufficient: each allocator
+/// also skips an address its own live state still names.
 pub const SWITCH_ADDRESS_REUSE_QUARANTINE: std::time::Duration =
     std::time::Duration::from_secs(300);
-
-const _: () = assert!(
-    SWITCH_ADDRESS_REUSE_QUARANTINE.as_millis() > BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
-    "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
-);
 
 /// Default gvproxy switch subnet: the RFC 6598 (CGNAT) `100.64.0.0/16` block.
 ///
@@ -245,8 +231,9 @@ impl SwitchSubnet {
     /// # Errors
     ///
     /// Returns [`InvalidPrefix`] for a prefix outside `8..=29`. A prefix narrower
-    /// than /29 has no room for the reserved network/gateway/proxy/daemon/
-    /// host-alias/broadcast addresses plus a PTask address. A prefix wider than /8 lets the high octet
+    /// than /29 has no room for the reserved network/gateway/daemon/
+    /// host-alias/broadcast addresses plus the PTask addresses of both
+    /// allocators. A prefix wider than /8 lets the high octet
     /// vary, which [`MacAddr::for_switch_ip`] does not fold into the derived MAC,
     /// so two addresses differing only in that octet would collide.
     pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, InvalidPrefix> {
@@ -323,16 +310,6 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
     }
 
-    /// The Box Egress Proxy address (the address below [`Self::daemon_ip`],
-    /// `broadcast - 3`): a second infrastructure address above the PTask lease
-    /// pool that the host-side stack peer owns directly. Reserved, never
-    /// handed to a PTask, and kept out of gvproxy's NAT/virtual-IP tables so
-    /// the peer can answer ARP and reset stray TCP packets itself.
-    #[must_use]
-    pub fn box_egress_proxy_address(self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.daemon_ip()) - 1)
-    }
-
     /// The daemon address (the address below [`Self::host_alias`],
     /// `broadcast - 2`): the guest node's own address, which gives
     /// `minimald` itself egress through the host gvproxy (so it can fetch
@@ -351,9 +328,8 @@ impl SwitchSubnet {
     }
 
     /// The last address that may be allocated to a PTask: the address below
-    /// the lowest reserved one, [`Self::box_egress_proxy_address`]
-    /// (`broadcast - 4`), leaving the proxy at `broadcast - 3`, the daemon at
-    /// `broadcast - 2` and the host alias at `broadcast - 1` reserved.
+    /// the lowest reserved one, [`Self::daemon_ip`] (`broadcast - 2`),
+    /// leaving the daemon and the host alias at `broadcast - 1` reserved.
     ///
     /// This is the one place the lease run's end is derived; every consumer
     /// — the daemon's lease book and its self-allocation reserve, the VM
@@ -361,7 +337,7 @@ impl SwitchSubnet {
     /// from here rather than computing an offset of its own.
     #[must_use]
     pub fn last_ptask(self) -> u32 {
-        u32::from(self.box_egress_proxy_address()) - 1
+        u32::from(self.daemon_ip()) - 1
     }
 }
 
@@ -547,7 +523,7 @@ mod tests {
         assert_eq!(net.to_string(), "100.64.0.0/16");
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
         assert_eq!(
-            net.box_egress_proxy_address(),
+            Ipv4Addr::from(net.last_ptask()),
             Ipv4Addr::new(100, 64, 255, 252)
         );
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
@@ -570,7 +546,7 @@ mod tests {
     /// [`SwitchSubnet::last_ptask`], and the rendered switch configuration
     /// seeds leases only inside that run while naming none of the reserved
     /// addresses above it except the host alias. The reserved addresses sit
-    /// above the run in a fixed order: last PTask, proxy, daemon, host alias,
+    /// above the run in a fixed order: last PTask, daemon, host alias,
     /// broadcast.
     #[test]
     fn lease_run_gate_run_and_rendered_pool_agree() {
@@ -580,13 +556,15 @@ mod tests {
             SwitchSubnet::new(Ipv4Addr::new(10, 1, 0, 0), 24).unwrap(),
         ] {
             let run = net.first_ptask()..=net.last_ptask();
-            let proxy = u32::from(net.box_egress_proxy_address());
             let daemon = u32::from(net.daemon_ip());
             let alias = u32::from(net.host_alias());
             let broadcast = u32::from(net.broadcast());
             assert!(!run.is_empty(), "{net}: the PTask run holds an address");
-            assert_eq!(*run.end() + 1, proxy, "{net}: the run ends below the proxy");
-            assert_eq!(proxy + 1, daemon, "{net}: the proxy sits below the daemon");
+            assert_eq!(
+                *run.end() + 1,
+                daemon,
+                "{net}: the run ends below the daemon"
+            );
             assert_eq!(
                 daemon + 1,
                 alias,
@@ -597,15 +575,11 @@ mod tests {
                 broadcast,
                 "{net}: the host alias sits below broadcast"
             );
-            assert!(
-                net.last_ptask() < proxy && proxy < daemon && daemon < alias,
-                "{net}: last_ptask < proxy < daemon < host alias"
-            );
 
             // The rendered configuration seeds leases from the run's two ends
             // and keeps every reserved address but the host alias out of its
-            // tables: the switch neither answers ARP for the proxy or daemon
-            // addresses nor translates them.
+            // tables: the switch neither answers ARP for the daemon address
+            // nor translates it.
             let first = Ipv4Addr::from(*run.start());
             let last = Ipv4Addr::from(*run.end());
             let yaml = render_gvproxy_config(
@@ -620,7 +594,6 @@ mod tests {
                 MacAddr::for_switch_ip(first)
             )));
             assert!(yaml.contains(&format!("\"{last}\": \"{}\"", MacAddr::for_switch_ip(last))));
-            assert!(!yaml.contains(&net.box_egress_proxy_address().to_string()));
             assert!(!yaml.contains(&net.daemon_ip().to_string()));
             assert!(!yaml.contains(&net.host_alias().to_string()));
         }

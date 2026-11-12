@@ -212,10 +212,8 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// How long a released drawn address waits before it may be handed again.
 ///
 /// It outlasts every record that can still name the address once its
-/// holder is gone: a pin another box holds for it and the Box Egress Proxy
-/// leg's neighbour-cache entry, which would otherwise answer the new holder,
-/// wearing the same derived MAC, from the old holder's entry. Both are
-/// asserted below at compile time. Waiting out the quarantine is necessary
+/// holder is gone: a pin another box holds for it, which is asserted below
+/// at compile time. Waiting out the quarantine is necessary
 /// but not sufficient: [`IpAllocator`] also skips an address a live ingress
 /// gate is still registered at.
 ///
@@ -225,10 +223,6 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// switch never wait out different spans.
 pub const REUSE_QUARANTINE: Duration = ::switch::SWITCH_ADDRESS_REUSE_QUARANTINE;
 
-const _: () = assert!(
-    REUSE_QUARANTINE.as_millis() > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
-    "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
-);
 // A pin a box holds for the address of a peer that is gone must have run
 // out before another box gets the address.
 #[cfg(target_os = "linux")]
@@ -963,18 +957,18 @@ mod tests {
 
     #[test]
     fn allocator_exhausts_a_tiny_subnet() {
-        // /29 => 8 addresses; network, gateway, proxy, daemon, host-alias and
-        // broadcast reserved, leaving two allocatable hosts (.2 and .3). The
-        // run's ends are the switch crate's, read rather than restated: the
-        // run splits at its midpoint, so this daemon's reserve is .2 alone
-        // and the host's hand-out run is .3 — exhaustion is explicit on each
-        // side while every address is held.
+        // /29 => 8 addresses; network, gateway, daemon, host-alias and
+        // broadcast reserved, leaving three allocatable hosts (.2 to .4).
+        // The run's ends are the switch crate's, read rather than restated:
+        // the run splits at its midpoint, so this daemon's reserve is .2
+        // alone and the host's hand-out run is .3 and .4 — exhaustion is
+        // explicit on each side while every address is held.
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         let first = Ipv4Addr::from(subnet.first_ptask());
         let last = Ipv4Addr::from(subnet.last_ptask());
         assert_eq!(
             (first, last),
-            (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3))
+            (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 4))
         );
         let mut a = IpAllocator::new(subnet);
         assert_eq!(a.allocate().unwrap().ip, first);
@@ -986,9 +980,9 @@ mod tests {
             a.hand(last),
             Err(NetError::HandedAddressCollision { .. })
         ));
-        // The address above the run is the proxy's, outside the plan's run.
+        // The address above the run is the node's, outside the plan's run.
         assert!(matches!(
-            a.hand(subnet.box_egress_proxy_address()),
+            a.hand(subnet.daemon_ip()),
             Err(NetError::HandedAddressOutsidePlan { .. })
         ));
     }
@@ -1337,10 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn reuse_quarantine_outlasts_the_bep_neighbour_cache() {
-        // A reused address wears the same derived MAC, so the BEP leg's
-        // neighbour cache must have dropped the old holder's entry first.
-        assert!(REUSE_QUARANTINE > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME);
+    fn reuse_quarantine_is_five_minutes_or_more() {
         assert!(REUSE_QUARANTINE >= Duration::from_secs(300));
     }
 

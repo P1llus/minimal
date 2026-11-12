@@ -4875,46 +4875,6 @@ async fn box_output_logged_from_start_complete_after_disconnect() {
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
-/// BEP-085: a `host_ip` box with `proxy_env` or `both` steering gets the four
-/// proxy variables on a VM host, where the host-side gate admits it to the
-/// proxy's listener. On a native host it shares the host's network,
-/// no gate admits it, and it gets none.
-#[test]
-fn host_ip_box_on_vm_host_gets_the_proxy_variables() {
-    use super::proxy_env_tests::{record, steering};
-    use boxes::NetworkMode;
-    use boxes::core::bep::Steering;
-
-    for mode in [Steering::ProxyEnv, Steering::Both] {
-        let laned = record(NetworkMode::HostNet, Some(steering(mode)));
-        let vars = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minvmd);
-        let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "HTTPS_PROXY",
-                "HTTP_PROXY",
-                "NO_PROXY",
-                "NODE_USE_ENV_PROXY"
-            ],
-            "{mode:?}: {vars:?}"
-        );
-        assert_eq!(vars[0].1, "http://100.64.255.252:8118", "{mode:?}");
-
-        let native = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minimald);
-        assert!(native.is_empty(), "{mode:?} on a native host: {native:?}");
-    }
-    // The launch reads the host kind from the switch's transport.
-    assert_eq!(
-        host_kind_of(crate::net::SwitchTransport::VmHost),
-        paths::HostKind::Minvmd
-    );
-    assert_eq!(
-        host_kind_of(crate::net::SwitchTransport::LocalSpawn),
-        paths::HostKind::Minimald
-    );
-}
-
 /// Creates and finalizes a task box for task `check` whose entrypoint is
 /// `argv`, as `min task run` creates one, and returns its id.
 async fn create_task_box_for_run(
