@@ -152,6 +152,78 @@ fn pins_follow_their_names_through_a_change_of_policy() {
     assert_eq!(h.handles.pinned_sets(id, itself), []);
 }
 
+/// A refusal names its rule by number, and a change of policy gives the
+/// numbers to other rules. The record says which policy judged, so a
+/// reader that comes after the change finds no policy to count in.
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn an_event_names_the_policy_that_judged_it() {
+    let Some(mut h) =
+        Harness::start("cases::reconfigure::an_event_names_the_policy_that_judged_it")
+    else {
+        return;
+    };
+    let mut events = h.handles.take_events().expect("event source");
+    let port = servers::banner().to_string();
+    let denied = IpAddr::V4(h.v4(1, 9));
+    let deny = |hosts: &[IpAddr]| BoxPolicy {
+        deny: hosts.iter().map(|host| Prefix::host(*host)).collect(),
+        ..BoxPolicy::default()
+    };
+    let refusal = |h: &Harness, events: &mut boxbpf::events::Source| {
+        assert_eq!(
+            h.probe("g", &["tcp", &denied.to_string(), &port, "500"]),
+            refused()
+        );
+        Harness::drain(events)
+            .into_iter()
+            .find(|e| e.dst == denied && e.reason == netpol::Reason::Rule)
+            .expect("an event for the denied host")
+    };
+
+    let mut live = h.install("g", host_ip(), deny(&[denied]));
+    let id = live.id();
+    let first = refusal(&h, &mut events);
+    let judged_by = h
+        .handles
+        .policy_at(id, first.generation)
+        .expect("the policy in force");
+    let rule = usize::from(first.rule.expect("rule number"));
+    assert_eq!(
+        judged_by.rules[rule].target,
+        Target::Net(Prefix::host(denied))
+    );
+
+    // Another deny in front moves the rule to another number.
+    let spec = with_policy(&live, deny(&[IpAddr::V4(h.v4(1, 8)), denied]));
+    h.handles.reconfigure(&mut live, spec).expect("reconfigure");
+    assert!(
+        h.handles.policy_at(id, first.generation).is_none(),
+        "the first policy is not in force any more"
+    );
+    let second = refusal(&h, &mut events);
+    assert_ne!(second.generation, first.generation);
+    let judged_by = h
+        .handles
+        .policy_at(id, second.generation)
+        .expect("the policy in force");
+    let rule = usize::from(second.rule.expect("rule number"));
+    assert_eq!(
+        judged_by.rules[rule].target,
+        Target::Net(Prefix::host(denied))
+    );
+
+    // A record of a box without a policy names none.
+    h.new_box("bare");
+    let _refused = h.probe("bare", &["tcp", &denied.to_string(), &port, "500"]);
+    let bare = Harness::drain(&mut events);
+    assert!(
+        bare.iter()
+            .any(|e| e.reason == netpol::Reason::NoConfig && e.generation == 0),
+        "{bare:?}"
+    );
+}
+
 fn prefixes(h: &Harness, group: u8, count: u8) -> Vec<Prefix> {
     (0..count)
         .map(|host| Prefix::host(IpAddr::V4(h.v4(group, host))))

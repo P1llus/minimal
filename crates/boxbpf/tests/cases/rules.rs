@@ -185,8 +185,13 @@ fn rules_by_prefix_port_and_protocol_for_both_families() {
         (live.id().0, port, 6)
     );
     assert_ne!(by_rule.pid, 0);
-    // The rule number is the position in the compiled list.
-    let rule = &live.compiled().rules[usize::from(by_rule.rule.expect("rule number"))];
+    // The rule number is the position in the compiled list of the policy
+    // that judged, which the record names by its generation.
+    let judged_by = h
+        .handles
+        .policy_at(live.id(), by_rule.generation)
+        .expect("the box's first policy is still in force");
+    let rule = &judged_by.rules[usize::from(by_rule.rule.expect("rule number"))];
     assert_eq!(rule.target, Target::Net(netpol::Prefix::host(denied4)));
     assert!(
         seen.iter()

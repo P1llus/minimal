@@ -105,40 +105,45 @@ pub(crate) fn snake(value: &impl serde::Serialize) -> String {
 }
 
 impl NetRefusal {
-    /// A refusal the kernel programs reported, for the box whose compiled
-    /// policy is `compiled`.
+    /// The other end of the flow `event` reports, and the flow's
+    /// direction: where an outbound flow was headed, where an inbound one
+    /// came from, the address a bind asked for.
+    pub(crate) fn flow_of(event: &netpol::event::NetEvent) -> (IpAddr, netpol::Direction) {
+        use netpol::abi::Hook;
+
+        match event.hook {
+            Hook::Bind4 | Hook::Bind6 => (event.dst, netpol::Direction::Bind),
+            Hook::Ingress => (event.src, netpol::Direction::Ingress),
+            _ => (event.dst, netpol::Direction::Egress),
+        }
+    }
+
+    /// A refusal the kernel programs reported. `judged_by` is the policy
+    /// that judged the flow, in which the event's rule number counts.
+    /// `None` when the box has another policy by now: the refusal then
+    /// names no rule.
     pub(crate) fn from_kernel(
         event: &netpol::event::NetEvent,
-        compiled: &netpol::Compiled,
+        judged_by: Option<&netpol::Compiled>,
     ) -> Self {
         use netpol::abi::Hook;
 
-        let direction = match event.hook {
-            Hook::Bind4 | Hook::Bind6 => netpol::Direction::Bind,
-            Hook::Ingress => netpol::Direction::Ingress,
-            _ => netpol::Direction::Egress,
-        };
+        let (remote, direction) = Self::flow_of(event);
         let protocol = match event.protocol {
             6 => Some(netpol::Protocol::Tcp),
             17 => Some(netpol::Protocol::Udp),
             1 | 58 => Some(netpol::Protocol::Icmp),
             _ => None,
         };
-        // The other end of the flow: where an outbound one was headed,
-        // where an inbound one came from, the address a bind asked for.
-        let (remote, port) = match direction {
-            netpol::Direction::Ingress => (event.src, event.dst_port),
-            _ => (event.dst, event.dst_port),
-        };
         Self {
             source: Source::Kernel(event.hook),
             direction,
             protocol,
             remote: (!remote.is_unspecified()).then_some(remote),
-            port: (event.hook != Hook::SockCreate).then_some(port),
+            port: (event.hook != Hook::SockCreate).then_some(event.dst_port),
             name: None,
             reason: snake(&event.reason),
-            rule: RuleRef::of(compiled, event.rule),
+            rule: judged_by.and_then(|compiled| RuleRef::of(compiled, event.rule)),
             pid: (event.pid != 0).then_some(event.pid),
         }
     }
@@ -561,6 +566,7 @@ mod tests {
             hook: netpol::abi::Hook::Connect4,
             outcome: Outcome::Denied,
             reason: netpol::abi::Reason::Rule,
+            generation: 3,
             rule: Some(u16::try_from(rule).expect("fits")),
             protocol: 6,
             sock_type: 1,
@@ -571,7 +577,7 @@ mod tests {
             pid: 4242,
             cookie: 0,
         };
-        let refusal = NetRefusal::from_kernel(&event, &compiled);
+        let refusal = NetRefusal::from_kernel(&event, Some(&compiled));
         let data = refusal.data(3);
         let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
         assert_eq!(text("source").as_deref(), Some("kernel"));
@@ -584,5 +590,18 @@ mod tests {
         assert_eq!(data.get("port").and_then(Value::as_u64), Some(443));
         assert_eq!(data.get("pid").and_then(Value::as_u64), Some(4242));
         assert_eq!(data.get("repeats").and_then(Value::as_u64), Some(3));
+
+        // The box has another policy by now. The number would name
+        // whatever rule sits at that place in it.
+        let late = NetRefusal::from_kernel(&event, None);
+        assert_eq!(late.rule, None);
+        let data = late.data(1);
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("rule"),
+            "{data:?}"
+        );
+        assert_eq!(data.get("rule_origin"), None, "{data:?}");
+        assert_eq!(data.get("remote").and_then(Value::as_str), Some("10.1.2.3"));
     }
 }

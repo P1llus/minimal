@@ -115,6 +115,7 @@ static __always_inline void sa_event(struct bpf_sock_addr *ctx, __u8 hook, const
 	a.box = f->box;
 	a.cookie = bpf_get_socket_cookie(ctx);
 	a.pid = bpf_get_current_pid_tgid() >> 32;
+	a.generation = v->generation;
 	a.rule = v->rule;
 	a.l4proto = ctx->protocol;
 	a.sock_type = ctx->type;

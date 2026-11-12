@@ -28,7 +28,10 @@ pub struct NetEvent {
     pub hook: Hook,
     pub outcome: Outcome,
     pub reason: Reason,
-    /// Position of the deciding rule in the box's compiled rule list.
+    /// The generation of the box's policy that judged the flow, 0 when
+    /// none did. The box may have another policy by the time this is read.
+    pub generation: u32,
+    /// Position of the deciding rule in the rule list of that generation.
     pub rule: Option<u16>,
     /// IP protocol number. For a refused socket, the one asked for.
     pub protocol: u16,
@@ -113,6 +116,8 @@ pub fn decode(record: &[u8]) -> Option<Event> {
     let _cpu = c.u32()?;
     let time_ns = c.u64()?;
     let box_id = c.u64()?;
+    let generation = c.u32()?;
+    let _pad = c.u32()?;
     if size > record.len() || size < size_of::<abi::EvHdr>() {
         return None;
     }
@@ -172,6 +177,7 @@ pub fn decode(record: &[u8]) -> Option<Event> {
         hook,
         outcome,
         reason,
+        generation,
         rule: u16::try_from(rule).ok().filter(|r| *r != NO_RULE),
         protocol,
         sock_type,
@@ -195,6 +201,8 @@ mod tests {
         r.extend(3u32.to_ne_bytes());
         r.extend(1_000u64.to_ne_bytes());
         r.extend(42u64.to_ne_bytes());
+        r.extend(11u32.to_ne_bytes());
+        r.extend(0u32.to_ne_bytes());
         r.extend([Hook::Connect6.code(), verdict, Reason::Rule.code(), 6]);
         r.extend(6u16.to_ne_bytes());
         r.extend(1u16.to_ne_bytes());
@@ -216,7 +224,7 @@ mod tests {
 
     #[test]
     fn a_network_record_decodes() {
-        let r = record(EVENT_NET, 88, abi::ACTION_DENY);
+        let r = record(EVENT_NET, 96, abi::ACTION_DENY);
         assert_eq!(r.len(), size_of::<abi::EvNet>());
         let Some(Event::Net(e)) = decode(&r) else {
             panic!("not a net event")
@@ -226,8 +234,8 @@ mod tests {
             (42, 1_000, Hook::Connect6, Outcome::Denied)
         );
         assert_eq!(
-            (e.reason, e.rule, e.protocol, e.pid, e.cookie),
-            (Reason::Rule, Some(5), 6, 77, 9)
+            (e.reason, e.generation, e.rule, e.protocol, e.pid, e.cookie),
+            (Reason::Rule, 11, Some(5), 6, 77, 9)
         );
         assert_eq!(
             (e.dst.to_string().as_str(), e.dst_port),
@@ -237,14 +245,14 @@ mod tests {
 
     #[test]
     fn a_longer_record_of_a_known_kind_still_decodes() {
-        let mut r = record(EVENT_NET, 96, abi::ACTION_ALLOW);
+        let mut r = record(EVENT_NET, 104, abi::ACTION_ALLOW);
         r.extend([0xaa; 8]);
         assert!(matches!(decode(&r), Some(Event::Net(e)) if e.outcome == Outcome::Allowed));
     }
 
     #[test]
     fn unknown_kinds_and_codes_keep_the_header() {
-        let r = record(7, 88, 0);
+        let r = record(7, 96, 0);
         assert_eq!(
             decode(&r),
             Some(Event::Unknown {
@@ -253,7 +261,7 @@ mod tests {
                 time_ns: 1_000
             })
         );
-        let r = record(EVENT_NET, 88, 9);
+        let r = record(EVENT_NET, 96, 9);
         assert_eq!(
             decode(&r),
             Some(Event::Unknown {
@@ -268,10 +276,11 @@ mod tests {
     fn a_listen_record_decodes() {
         let mut r = Vec::new();
         r.extend(EVENT_LISTEN.to_ne_bytes());
-        r.extend(40u16.to_ne_bytes());
+        r.extend(48u16.to_ne_bytes());
         r.extend(0u32.to_ne_bytes());
         r.extend(1_000u64.to_ne_bytes());
         r.extend(42u64.to_ne_bytes());
+        r.extend(0u64.to_ne_bytes());
         r.extend(7u64.to_ne_bytes());
         r.extend(8080u16.to_ne_bytes());
         r.extend([6, 1]);
@@ -288,13 +297,13 @@ mod tests {
                 open: true,
             }))
         );
-        assert_eq!(decode(&r[..30]), None);
+        assert_eq!(decode(&r[..38]), None);
     }
 
     #[test]
     fn short_records_are_rejected() {
-        let r = record(EVENT_NET, 88, 0);
-        assert_eq!(decode(&r[..87]), None);
+        let r = record(EVENT_NET, 96, 0);
+        assert_eq!(decode(&r[..95]), None);
         assert_eq!(decode(&r[..10]), None);
         // A header that claims more than there is.
         assert_eq!(decode(&record(7, 200, 0)), None);

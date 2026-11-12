@@ -21,7 +21,7 @@ use crate::{
     model::{Action, Direction, Protocols, SetId, Verdict},
 };
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Endpoint indexes of a box are below this.
 pub const ENDPOINTS_MAX: u8 = 4;
@@ -272,6 +272,10 @@ pub struct EvHdr {
     /// Boot-time clock.
     pub ts_ns: u64,
     pub box_id: u64,
+    /// The generation of the box's policy that judged what the record
+    /// reports. 0 when no policy judged.
+    pub generation: u32,
+    pub _pad: u32,
 }
 
 /// The network record, [`EVENT_NET`].
@@ -560,10 +564,10 @@ layouts! {
     Usage = "bp_usage", 8 { flows, listens }
     ListenKey = "bp_listen_key", 24 { box_id, netns, cookie }
     Listen = "bp_listen", 24 { addr, port, family }
-    EvListen = "bp_ev_listen", 40 { hdr, netns, port, family, open }
+    EvListen = "bp_ev_listen", 48 { hdr, netns, port, family, open }
     FlowVal = "bp_flow_val", 32 { box_id, orig_addr, orig_port, orig_family, endpoint }
-    EvHdr = "bp_ev_hdr", 24 { kind, size, cpu, ts_ns, box_id }
-    EvNet = "bp_ev_net", 88 {
+    EvHdr = "bp_ev_hdr", 32 { kind, size, cpu, ts_ns, box_id, generation }
+    EvNet = "bp_ev_net", 96 {
         hdr, hook, verdict, reason, family, l4proto, sock_type, sport, dport, pid, rule, saddr, daddr, cookie
     }
 }
@@ -882,9 +886,9 @@ mod tests {
     fn asserts_cover_every_struct_and_constant() {
         let c = c_static_asserts();
         assert!(c.contains("_Static_assert(sizeof(struct bp_box_cfg) == 16,"));
-        assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 80"));
+        assert!(c.contains("__builtin_offsetof(struct bp_ev_net, cookie) == 88"));
         assert!(c.contains("__builtin_offsetof(struct bp_rule6_key, addr) == 20"));
-        assert!(c.contains("BP_ABI_VERSION == 4"));
+        assert!(c.contains("BP_ABI_VERSION == 5"));
         assert!(c.contains("BP_H_INGRESS == 9"));
         assert!(c.contains("BP_R_NO_ENDPOINT == 9"));
         assert_eq!(c.matches("_Static_assert(sizeof(struct").count(), 19);

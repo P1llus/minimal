@@ -1152,6 +1152,17 @@ impl Handles {
         ))
     }
 
+    /// The box's policy, when `generation` is the one in force. An event
+    /// carries the generation that judged it, and its rule number counts
+    /// in that policy only.
+    #[must_use]
+    pub fn policy_at(&self, id: BoxId, generation: u32) -> Option<Arc<Compiled>> {
+        self.boxes
+            .get(&id.0)
+            .filter(|held| held.generation == generation)
+            .map(|held| Arc::clone(&held.compiled))
+    }
+
     /// Whether a refusal of a flow to `addr` at rule number `rule` came
     /// from a merged list that did not fit: such a list refuses in the
     /// place of the first rule left out of it, and that rule refused

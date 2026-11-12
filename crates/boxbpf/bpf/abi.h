@@ -14,7 +14,7 @@
 #ifndef BOXBPF_ABI_H
 #define BOXBPF_ABI_H
 
-#define BP_ABI_VERSION 4
+#define BP_ABI_VERSION 5
 
 /* Directions. They index bp_box_cfg.default_action and are part of rule keys. */
 #define BP_DIR_EGRESS  0 /* address = destination, port = destination port */
@@ -230,6 +230,11 @@ struct bp_ev_hdr {
 	__u32 cpu;
 	__u64 ts_ns; /* boot-time clock */
 	__u64 box_id;
+	/* The generation of the box's policy that judged what the record
+	 * reports: a rule number in the record counts in that policy. 0 when
+	 * no policy judged. */
+	__u32 generation;
+	__u32 _pad;
 };
 
 /* Record kinds. */

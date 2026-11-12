@@ -862,16 +862,25 @@ impl Engine {
                 }
                 continue;
             };
-            let mut refusal = events::NetRefusal::from_kernel(&event, &of.compiled());
-            if event.reason == netpol::Reason::SetRule
-                && let (Some(rule), Some(remote)) = (event.rule, refusal.remote)
-                && let Some(attached) = self.attached_state()
-                && attached
-                    .handles
-                    .lock()
-                    .expect("engine lock")
-                    .refused_at_overflow(of.id, remote, refusal.direction, rule)
-            {
+            let Some(attached) = self.attached_state() else {
+                return;
+            };
+            // The rule number counts in the policy that judged the flow.
+            // A box that has another policy by now gets the refusal
+            // without a rule.
+            let (judged_by, at_overflow) = {
+                let handles = attached.handles.lock().expect("engine lock");
+                let judged_by = handles.policy_at(of.id, event.generation);
+                let at_overflow = judged_by.is_some()
+                    && event.reason == netpol::Reason::SetRule
+                    && event.rule.is_some_and(|rule| {
+                        let (remote, direction) = events::NetRefusal::flow_of(&event);
+                        handles.refused_at_overflow(of.id, remote, direction, rule)
+                    });
+                (judged_by, at_overflow)
+            };
+            let mut refusal = events::NetRefusal::from_kernel(&event, judged_by.as_deref());
+            if at_overflow {
                 refusal = refusal.at_overflow();
             }
             self.observe(of, refusal);

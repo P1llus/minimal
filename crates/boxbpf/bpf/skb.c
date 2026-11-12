@@ -118,6 +118,7 @@ static __always_inline void skb_event(struct __sk_buff *skb, __u64 box, __u8 hoo
 
 	a.box = box;
 	a.cookie = bpf_get_socket_cookie(skb);
+	a.generation = v->generation;
 	a.rule = v->rule;
 	a.l4proto = p->l4;
 	a.sport = p->sport;

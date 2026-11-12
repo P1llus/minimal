@@ -223,7 +223,8 @@ struct flow {
 };
 
 struct verdict {
-	__u16 rule; /* prio of the deciding rule, BP_NO_RULE if none */
+	__u32 generation; /* of the policy that decided; 0 before decide() */
+	__u16 rule;       /* prio of the deciding rule, BP_NO_RULE if none */
 	__u8  action;
 	__u8  reason;
 	__u8  endpoint;
@@ -232,6 +233,7 @@ struct verdict {
 struct ev_args {
 	__u64 box;
 	__u64 cookie;
+	__u32 generation;
 	__u32 pid;
 	__u32 rule;
 	__u16 l4proto;
@@ -295,6 +297,8 @@ static __always_inline void emit_net(const struct ev_args *a)
 	e->hdr.cpu = bpf_get_smp_processor_id();
 	e->hdr.ts_ns = now;
 	e->hdr.box_id = a->box;
+	e->hdr.generation = a->generation;
+	e->hdr._pad = 0;
 	e->hook = a->hook;
 	e->verdict = a->verdict;
 	e->reason = a->reason;
@@ -336,6 +340,8 @@ static __always_inline void emit_listen(__u64 box, __u64 netns, __u16 port, __u8
 	e->hdr.cpu = bpf_get_smp_processor_id();
 	e->hdr.ts_ns = now;
 	e->hdr.box_id = box;
+	e->hdr.generation = 0;
+	e->hdr._pad = 0;
 	e->netns = netns;
 	e->port = port;
 	e->family = family;
@@ -376,6 +382,7 @@ static __always_inline void decide(const struct bp_box_cfg *cfg, const struct fl
 	const struct bp_rules *rs;
 	__u32 generation = cfg->generation;
 
+	v->generation = generation;
 	v->rule = BP_NO_RULE;
 	v->endpoint = 0;
 
