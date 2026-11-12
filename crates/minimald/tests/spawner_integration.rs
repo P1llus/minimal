@@ -124,10 +124,9 @@ impl Fixture {
         for (program, file) in extra {
             std::fs::copy(file, bin.join(program)).unwrap();
         }
-        let config = Config::new(name)
+        let config = Config::new(name, cgroup.cloned())
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
-            .with_dns(false)
-            .with_box_cgroup(cgroup.cloned());
+            .with_dns(false);
         let mut sandbox = config
             .build(self.dir.path().join(name), ())
             .await
@@ -381,7 +380,7 @@ async fn everything_of_a_box_starts_in_its_cgroup() {
     // records, and no process stays behind.
     let socket = fixture
         .spawner
-        .socket(Some(&sibling), false, false)
+        .socket(&sibling, false, false)
         .expect("a socket for the sibling box");
     let mut kind: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

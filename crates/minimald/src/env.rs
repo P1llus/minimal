@@ -590,7 +590,7 @@ impl Env {
             ships_bundle,
         );
 
-        let config = Config::new(args.name.clone())
+        let config = Config::new(args.name.clone(), box_cgroup.clone())
             .with_session_dirs(
                 args.home.as_utf8_path().as_std_path().to_path_buf(),
                 args.cwd.as_utf8_path().as_std_path().to_path_buf(),
@@ -611,7 +611,6 @@ impl Env {
         let box_id = box_cgroup
             .as_ref()
             .map_or_else(|| args.name.clone(), |cgroup| cgroup.name().to_owned());
-        let config = config.with_box_cgroup(box_cgroup.clone());
 
         // Wire up the channel actor and build the sandbox around the bridge.
         let (tx, rx) = mpsc::channel(8);

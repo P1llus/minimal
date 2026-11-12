@@ -355,14 +355,9 @@ impl Spawner {
     /// # Errors
     ///
     /// Fails if the spawner is gone or the socket cannot be created.
-    pub fn socket(
-        &self,
-        cgroup: Option<&BoxCgroup>,
-        v6: bool,
-        datagram: bool,
-    ) -> io::Result<OwnedFd> {
+    pub fn socket(&self, cgroup: &BoxCgroup, v6: bool, datagram: bool) -> io::Result<OwnedFd> {
         self.connection()?
-            .socket(None, v6, datagram, cgroup.map(BoxCgroup::dir_fd))
+            .socket(None, v6, datagram, Some(cgroup.dir_fd()))
     }
 
     /// Closes the socket to the running spawner, as the end of the

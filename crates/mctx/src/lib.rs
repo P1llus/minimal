@@ -1644,6 +1644,8 @@ mod tests {
                 stdout_writer: None,
                 stderr_writer: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
+                box_cgroup: None,
+                box_network: None,
             };
             let opts = op::Options {
                 cache: ctx.local_cache(),

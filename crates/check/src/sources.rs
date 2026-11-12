@@ -112,6 +112,8 @@ mod tests {
             cache,
             None,
             None,
+            None,
+            None,
         )
     }
 

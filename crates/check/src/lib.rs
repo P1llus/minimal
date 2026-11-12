@@ -377,6 +377,13 @@ pub struct CheckCtx {
     pub ot: Option<OpTracker>,
     pub daemon_id: Option<String>,
 
+    /// The cgroup of the box the checks run for, if any. The sandboxes of
+    /// standalone tests run in it.
+    pub box_cgroup: Option<sandbox::cgroup::BoxCgroup>,
+    /// The network of the box the checks run for, as a build takes it
+    /// ([`op::SpecBuild::box_network`]).
+    pub box_network: Option<op::BuildNetwork>,
+
     /// Fires when the caller wants the run to stop.
     ///
     /// Checkers observe this at coarse-grained points - between checkers, per
@@ -405,6 +412,8 @@ impl CheckCtx {
         cache: Cache<LocalDir>,
         ot: Option<OpTracker>,
         daemon_id: Option<String>,
+        box_cgroup: Option<sandbox::cgroup::BoxCgroup>,
+        box_network: Option<op::BuildNetwork>,
     ) -> Self {
         Self {
             filter_names,
@@ -415,6 +424,8 @@ impl CheckCtx {
             cache,
             ot,
             daemon_id,
+            box_cgroup,
+            box_network,
             cancel: CancellationToken::new(),
             semaphore: Arc::new(Semaphore::new(20)),
             check_cache: Arc::new(CheckCache::new()),
@@ -1058,6 +1069,8 @@ impl GraphBasedChecker for StandaloneTestCheck {
             let graph2 = graph.deref().clone();
             let cancel = ctx.cancel.clone();
             let daemon_id = ctx.daemon_id.clone();
+            let box_cgroup = ctx.box_cgroup.clone();
+            let box_network = ctx.box_network.clone();
             drop(graph);
             // The task outlives the check stream it was spawned from, so it
             // gets a root of its own, linked to the request's span
@@ -1091,6 +1104,8 @@ impl GraphBasedChecker for StandaloneTestCheck {
                             stdout_writer: Some(Box::new(stdout_buf.clone())),
                             stderr_writer: Some(Box::new(stderr_buf.clone())),
                             cancel: cancel.clone(),
+                            box_cgroup: box_cgroup.clone(),
+                            box_network: box_network.clone(),
                         };
                         let opts = Options {
                             cache: cache.clone(),
@@ -1454,6 +1469,8 @@ mod tests {
             None,
             dir.to_path_buf(),
             Cache::at_dir(dir).expect("Cache::at_dir"),
+            None,
+            None,
             None,
             None,
         )

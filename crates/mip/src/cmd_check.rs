@@ -101,6 +101,9 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         ctx.local_cache(),
         None,
         ctx.daemon_id(),
+        // `mip` runs checks for no box.
+        None,
+        None,
     );
 
     let mut checks_stream = check::run_checks(

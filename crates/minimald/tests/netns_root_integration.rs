@@ -517,7 +517,7 @@ async fn network_none_blocks_all_outside_sockets() {
         .plan()
         .await
         .expect("the production NoNet provider plans do not fail");
-    let config = Config::new("none-sockets")
+    let config = Config::new("none-sockets", None)
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(no_net);
@@ -591,7 +591,7 @@ async fn network_none_attach_works() {
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let config = Config::new("none-attach")
+    let config = Config::new("none-attach", None)
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::isolated());
@@ -1080,7 +1080,7 @@ async fn injected_process_lacks_cap_net_raw() {
     let source = base.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let config = Config::new("caps-inject")
+    let config = Config::new("caps-inject", None)
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::host());
@@ -1252,7 +1252,7 @@ async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOu
     let source = base.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let config = Config::new("group-kill")
+    let config = Config::new("group-kill", None)
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::host());
@@ -1532,7 +1532,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
     let source = base.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let config = Config::new("join-vsock")
+    let config = Config::new("join-vsock", None)
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::host());

@@ -27,6 +27,12 @@ struct EnvChannel<'a> {
 
     daemon_id: Option<String>,
     ot: Option<OpTracker>,
+
+    /// What the environment was built with. A task started from inside it
+    /// gets the same, so it is on its box's network and sees its box's home.
+    network: std::sync::Arc<dyn sandbox::Network>,
+    home: PatchHome,
+    wd_layout: WdLayout,
 }
 
 impl EnvChannel<'_> {
@@ -192,6 +198,8 @@ impl EnvChannel<'_> {
                 check_ctx.local_cache(),
                 self.ot.clone(),
                 self.daemon_id.clone(),
+                check_ctx.box_cgroup.clone(),
+                check_ctx.box_network.clone(),
             ),
         ) {
             Err(e) => return EnvChannel::write_error(e.into(), stream),
@@ -265,10 +273,10 @@ impl EnvChannel<'_> {
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
                 remote_cache: remote_cache.as_ref(),
-                // NET-155: a client-side patched build runs for no box, so it
-                // stays the caller's own traffic.
-                box_cgroup: None,
-                box_network: None,
+                // The build runs where the context's other builds run: for
+                // the context's box, or for no box under `mip`.
+                box_cgroup: build_ctx.box_cgroup.clone(),
+                box_network: build_ctx.box_network.clone(),
             }
             .run(&op::Options {
                 cache,
@@ -368,7 +376,7 @@ impl EnvChannel<'_> {
             .unwrap();
         let result: Result<(), Error> = rt.block_on(async {
             let mut env = build_ctx
-                .make_env(
+                .make_env_with_network(
                     task_name,
                     &mut graph,
                     if task.inherit_cwd {
@@ -380,11 +388,13 @@ impl EnvChannel<'_> {
                     Some(&task.patch),
                     Some(&task.vars),
                     task.packages.clone(),
-                    // A nested `min task` inside a bound-dir sandbox: paths
-                    // are mirrored one-for-one and `sandbox` gave this process
-                    // the outer environment's `HOME`, so the ambient home is
-                    // the outer home, which is the one `~/` meant all along.
-                    PatchHome::Ambient,
+                    // The nested task is as much the box's as the task it
+                    // was started from, so it gets that task's network, home
+                    // and layout. Under `mip` those are the host's network
+                    // and the invoking user's home with paths mirrored.
+                    std::sync::Arc::clone(&self.network),
+                    self.home.clone(),
+                    self.wd_layout.clone(),
                 )
                 .await?;
 
@@ -1326,7 +1336,8 @@ impl<'a> Env<'a> {
         }
 
         let mut config = apply_wd_layout(
-            sandbox::config::Config::new(args.name),
+            // What the context runs for a box runs in the box's cgroup.
+            sandbox::config::Config::new(args.name, ctx.box_cgroup.clone()),
             &args.wd_layout,
             &args.cwd,
             home.as_deref(),
@@ -1345,7 +1356,7 @@ impl<'a> Env<'a> {
             .with_state_dir(&args.state_base_dir)
             // The provider's plan names the resolver too, so the packages'
             // own DNS need does not enter into it.
-            .with_network(args.network)
+            .with_network(std::sync::Arc::clone(&args.network))
             .with_env_vars(pkg_env_vars.into_iter());
         if let Some(id) = ctx.daemon_id() {
             config = config.with_daemon_id(id);
@@ -1369,6 +1380,9 @@ impl<'a> Env<'a> {
                     has_packages: args.transitives.keys().cloned().collect(),
                     ot: args.ot.clone(),
                     daemon_id,
+                    network: args.network,
+                    home: args.home,
+                    wd_layout: args.wd_layout,
                 },
             )
             .await
@@ -1858,7 +1872,7 @@ mod tests {
     #[test]
     fn wd_layout_selects_session_or_bound_dir() {
         let session = apply_wd_layout(
-            sandbox::config::Config::new("task"),
+            sandbox::config::Config::new("task", None),
             &WdLayout::Session {
                 home: PathBuf::from("/var/lib/minimal/sessions/s1/home"),
                 working: PathBuf::from("/var/lib/minimal/sessions/s1/tree"),
@@ -1871,7 +1885,7 @@ mod tests {
         assert_eq!(session.sandbox_home(), "/home");
 
         let bound = apply_wd_layout(
-            sandbox::config::Config::new("task"),
+            sandbox::config::Config::new("task", None),
             &WdLayout::BoundDir,
             Path::new("/var/lib/minimal/sessions/s1/tree"),
             Some(Path::new("/home/dev")),
@@ -1900,7 +1914,7 @@ mod tests {
         let home = "/var/lib/minimal/sessions/s1/home";
         let working = "/var/lib/minimal/sessions/s1/tree";
         let config = apply_wd_layout(
-            sandbox::config::Config::new("task"),
+            sandbox::config::Config::new("task", None),
             &WdLayout::Session {
                 home: PathBuf::from(home),
                 working: PathBuf::from(working),
@@ -2404,6 +2418,9 @@ mod tests {
             has_packages: HashSet::new(),
             ot: None,
             daemon_id: None,
+            network: std::sync::Arc::new(sandbox::HostNet),
+            home: PatchHome::Ambient,
+            wd_layout: WdLayout::BoundDir,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2431,6 +2448,9 @@ mod tests {
             has_packages: HashSet::new(),
             ot: None,
             daemon_id: None,
+            network: std::sync::Arc::new(sandbox::HostNet),
+            home: PatchHome::Ambient,
+            wd_layout: WdLayout::BoundDir,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2458,6 +2478,9 @@ mod tests {
             has_packages: HashSet::new(),
             ot: None,
             daemon_id: None,
+            network: std::sync::Arc::new(sandbox::HostNet),
+            home: PatchHome::Ambient,
+            wd_layout: WdLayout::BoundDir,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2486,6 +2509,9 @@ mod tests {
             has_packages: HashSet::new(),
             ot: None,
             daemon_id: None,
+            network: std::sync::Arc::new(sandbox::HostNet),
+            home: PatchHome::Ambient,
+            wd_layout: WdLayout::BoundDir,
         };
 
         assert!(!std::fs::exists(rootfs.path().join("bin")).unwrap());

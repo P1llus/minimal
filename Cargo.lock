@@ -867,6 +867,7 @@ dependencies = [
  "ot",
  "path-absolutize",
  "regex",
+ "sandbox",
  "tempfile",
  "tokio",
  "tokio-util",

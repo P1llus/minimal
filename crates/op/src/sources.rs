@@ -117,7 +117,7 @@ fn box_sockets(cgroup: &BoxCgroup) -> Placement {
     let cgroup = cgroup.clone();
     let spawner = sandbox::Spawner::current();
     Placement::Box(common::Sockets::new(move |v6, kind| {
-        spawner.socket(Some(&cgroup), v6, kind == common::SocketKind::Datagram)
+        spawner.socket(&cgroup, v6, kind == common::SocketKind::Datagram)
     }))
 }
 

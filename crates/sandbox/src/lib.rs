@@ -2055,10 +2055,9 @@ async fn held_sandbox(
         .map_err(|e| Error::IO("create held rootfs", base_dir.to_path_buf(), e))?;
     let usr = rootfs.path().join("usr");
     fs::create_dir(&usr).map_err(|e| Error::IO("create held rootfs usr", usr, e))?;
-    Config::new("held-network")
+    Config::new("held-network", cgroup)
         .with_add_rootfs(config::SandboxMapped::TempDir(rootfs))
         .with_network(network)
-        .with_box_cgroup(cgroup)
         .build(base_dir, ())
         .await
 }
@@ -2648,7 +2647,7 @@ mod tests {
     async fn both_spawn_paths_apply_the_network() {
         let recorder = std::sync::Arc::new(Recorder::default());
         let (_tmp, base) = make_base_with_synth();
-        let config = Config::new("test-both-paths")
+        let config = Config::new("test-both-paths", None)
             .with_network(recorder.clone() as std::sync::Arc<dyn network::Network>);
         let sandbox = Sandbox::new(base, config, ()).unwrap();
 
@@ -2668,7 +2667,8 @@ mod tests {
         );
 
         let (_tmp, base) = make_base_with_synth();
-        let config = Config::new("test-both-paths-bare").with_plan(network::NetPlan::isolated());
+        let config =
+            Config::new("test-both-paths-bare", None).with_plan(network::NetPlan::isolated());
         let sandbox = Sandbox::new(base, config, ()).unwrap();
         let from_invocation = sandbox.plan_launch().await.expect("plan");
         let from_caller = PlannedLaunch::begin(std::sync::Arc::new(sandbox.built_in_plan()))
@@ -2698,7 +2698,7 @@ mod tests {
     #[test]
     fn the_mode_bounds_the_network_access() {
         let plan_for = |plan, dns| {
-            let mut cfg = Config::new("t").with_plan(plan);
+            let mut cfg = Config::new("t", None).with_plan(plan);
             cfg.setup_dns_config = dns;
             plan_from_config(&cfg)
         };
@@ -3045,7 +3045,8 @@ ff02::2\tip6-allrouters
         let base = tmp.path().to_path_buf();
         // A file path that need not exist — the error is returned before it is accessed.
         let phantom = base.join("phantom.txt");
-        let config = Config::new("test-reject-file").with_add_rootfs(SandboxMapped::File(phantom));
+        let config =
+            Config::new("test-reject-file", None).with_add_rootfs(SandboxMapped::File(phantom));
         let result = Sandbox::new(base, config, ());
         assert!(
             matches!(result, Err(Error::MappedFile(_))),
@@ -3061,7 +3062,7 @@ ff02::2\tip6-allrouters
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path().join("sandboxes");
         std::fs::create_dir(&base).unwrap();
-        let result = Config::new("test-cleanup")
+        let result = Config::new("test-cleanup", None)
             .with_add_rootfs(SandboxMapped::File(tmp.path().join("phantom.txt")))
             .build(&base, ())
             .await;
@@ -3077,7 +3078,7 @@ ff02::2\tip6-allrouters
     #[cfg(target_os = "linux")]
     fn sandbox_new_derives_state_dir_from_base() {
         let (_tmp, base) = make_base_with_synth();
-        let config = Config::new("test-state-default");
+        let config = Config::new("test-state-default", None);
         let sandbox = Sandbox::new(base.clone(), config, ()).unwrap();
         assert_eq!(
             sandbox.state_dir,
@@ -3095,7 +3096,7 @@ ff02::2\tip6-allrouters
         let (_tmp, base) = make_base_with_synth();
         let state_tmp = tempfile::TempDir::new().unwrap();
         let state_path = state_tmp.path().to_path_buf();
-        let config = Config::new("test-state-explicit").with_state_dir(state_path.clone());
+        let config = Config::new("test-state-explicit", None).with_state_dir(state_path.clone());
         let sandbox = Sandbox::new(base, config, ()).unwrap();
         assert_eq!(
             sandbox.state_dir, state_path,
@@ -3110,7 +3111,7 @@ ff02::2\tip6-allrouters
     fn sandbox_new_minenv_socket_is_connectable() {
         use std::os::unix::net::UnixStream;
         let (_tmp, base) = make_base_with_synth();
-        let config = Config::new("test-socket");
+        let config = Config::new("test-socket", None);
         let sandbox = Sandbox::new(base, config, ()).unwrap();
         let sock = sandbox.base_dir.join("run").join("minenv_sock");
         UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
@@ -3141,7 +3142,7 @@ ff02::2\tip6-allrouters
             is_file: false,
             ..Default::default()
         };
-        let config = Config::new("test-bound-dir").with_wd(
+        let config = Config::new("test-bound-dir", None).with_wd(
             "/work/project",
             false,
             vec![file_mapping, dir_mapping],
@@ -3386,10 +3387,9 @@ ff02::2\tip6-allrouters
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
 
-        let config = Config::new(name)
+        let config = Config::new(name, cgroup)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
-            .with_dns(false)
-            .with_box_cgroup(cgroup);
+            .with_dns(false);
         let sandbox_home = tempfile::tempdir_in(&base_dir)
             .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
         let mut sandbox = config
@@ -3501,7 +3501,7 @@ ff02::2\tip6-allrouters
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
         let sandbox_home = tempfile::tempdir_in(&base_dir).expect("a temp dir");
-        let mut sandbox = Config::new(name)
+        let mut sandbox = Config::new(name, None)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false)
             .build(sandbox_home.path().join("sandbox"), ())
@@ -3579,7 +3579,7 @@ ff02::2\tip6-allrouters
         probe_rootfs(&source, &probe);
         let sandbox_home = tempfile::tempdir_in(&base_dir)
             .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
-        let mut sandbox = Config::new(name)
+        let mut sandbox = Config::new(name, None)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false)
             .build(sandbox_home.path().join("sandbox"), ())
@@ -3697,7 +3697,7 @@ ff02::2\tip6-allrouters
         let probe = compile_cgroup_probe(build.path());
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
-        let mut sandbox = Config::new(name)
+        let mut sandbox = Config::new(name, None)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false)
             .build(build.path().join("sandbox"), ())
@@ -3842,7 +3842,7 @@ ff02::2\tip6-allrouters
         let probe = compile_cgroup_probe(build.path());
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
-        let mut sandbox = Config::new(name)
+        let mut sandbox = Config::new(name, None)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false)
             .build(build.path().join("sandbox"), ())

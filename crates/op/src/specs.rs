@@ -548,7 +548,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         needs_internet: bool,
         daemon_id: Option<&String>,
     ) -> sandbox::config::Config {
-        let mut config = sandbox::config::Config::new(&build.name)
+        let mut config = sandbox::config::Config::new(&build.name, self.box_cgroup.clone())
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
             .with_dns(needs_dns)
@@ -567,7 +567,6 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         if let Some(id) = daemon_id {
             config = config.with_daemon_id(id.clone());
         }
-        config = config.with_box_cgroup(self.box_cgroup.clone());
         // NET-155: a build that needs the network, for an own-address box,
         // runs on that box's network and under its egress verdict.
         if let Some(network) = &self.box_network

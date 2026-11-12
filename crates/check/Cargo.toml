@@ -29,6 +29,7 @@ graph.workspace = true
 lcache.workspace = true
 op.workspace = true
 ot.workspace = true
+sandbox.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

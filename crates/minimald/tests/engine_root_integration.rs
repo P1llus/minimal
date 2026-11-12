@@ -36,7 +36,15 @@ const PUBLIC6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
 /// the same time and each removes its addresses when it ends.
 const OWN_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 17);
 const OWN_NAMED4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 18);
+/// The addresses of the tests of task runs.
+const TASK_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 27);
+const TASK_SHUT4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 28);
+const OWN_TASK_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 37);
+const OWN_TASK_SHUT4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 38);
 const REFUSED: &str = "Operation not permitted";
+/// How long the task that stays sleeps. No other process has it on its
+/// command line.
+const STAYS: &str = "86427";
 
 fn gated(test: &str) -> bool {
     if std::env::var_os(GATE).is_some() {
@@ -376,11 +384,18 @@ impl Daemon {
 
     /// Starts a command in the box that runs until its client is ended.
     fn run_in(&self, name: &str, argv: &[&str]) -> Running {
+        let mut args = vec!["box", "exec", name, "--"];
+        args.extend_from_slice(argv);
+        self.min_running(&args)
+    }
+
+    /// Starts `min` with `args` and leaves it running.
+    fn min_running(&self, args: &[&str]) -> Running {
         let child = Command::new(min_binary())
             .arg("--minimal-dir")
             .arg(&self.state)
-            .args(["--no-input", "box", "exec", name, "--"])
-            .args(argv)
+            .arg("--no-input")
+            .args(args)
             .current_dir(&self.project)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -388,6 +403,51 @@ impl Daemon {
             .spawn()
             .expect("run min");
         Running(child)
+    }
+
+    /// Adds the tasks of the task run tests to the project: one that
+    /// stays, one that dials `open` and one that dials `shut` at `port`,
+    /// and one that starts those two from inside itself.
+    fn declare_tasks(&self, open: Ipv4Addr, shut: Ipv4Addr, port: u16) {
+        let dial = |to: Ipv4Addr| format!("exec 3<>/dev/tcp/{to}/{port} && echo reached");
+        let tasks = format!(
+            "\n[tasks.stay]\npackages = [\"base\"]\nbash = \"sleep {STAYS}\"\n\
+             \n[tasks.dial-open]\npackages = [\"base\"]\nbash = \"{}\"\n\
+             \n[tasks.dial-shut]\npackages = [\"base\"]\nbash = \"{}\"\n\
+             \n[tasks.nested]\npackages = [\"base\"]\n\
+             bash = \"min task run dial-open; min task run dial-shut; true\"\n",
+            dial(open),
+            dial(shut),
+        );
+        let file = self.project.join("minimal.toml");
+        let mut project = std::fs::read_to_string(&file).expect("project file");
+        project.push_str(&tasks);
+        std::fs::write(&file, project).expect("project file");
+    }
+
+    /// The id of the box `name`, which names its cgroup.
+    fn box_id(&self, name: &str) -> String {
+        let listing = self.min(&["ls"]);
+        listing
+            .lines()
+            .find_map(|line| {
+                let mut words = line.split_whitespace();
+                let id = words.next()?;
+                (words.next() == Some(name)).then(|| id.to_owned())
+            })
+            .unwrap_or_else(|| panic!("no box {name} in:\n{listing}"))
+    }
+
+    /// The cgroups, below the daemon's root, of the processes of the task
+    /// that stays. Waits for the task to run.
+    fn cgroups_of_the_staying_task(&self) -> Vec<PathBuf> {
+        let root = self.cgroup_root();
+        let mut found = Vec::new();
+        wait_for("the task that stays", Duration::from_secs(120), || {
+            found = cgroups_running(&root, STAYS);
+            !found.is_empty()
+        });
+        found
     }
 
     /// The loopback address the host reaches the box's published ports at.
@@ -448,6 +508,25 @@ impl Daemon {
             .join(own.trim_end_matches("/supervisor"))
             .clone()
     }
+}
+
+/// The cgroups at and below `dir` that hold a process with `marker` on its
+/// command line, each as often as it holds one.
+fn cgroups_running(dir: &Path, marker: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let pids = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+    for pid in pids.lines() {
+        let command = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if String::from_utf8_lossy(&command).contains(marker) {
+            found.push(dir.to_path_buf());
+        }
+    }
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(cgroups_running(&entry.path(), marker));
+        }
+    }
+    found
 }
 
 /// A command running in a box. Ending its client ends it.
@@ -879,6 +958,125 @@ fn a_box_with_its_own_address_is_judged_published_and_named() {
     let refused = daemon.connect("peer", &public, port);
     assert!(refused.contains(REFUSED), "{refused}");
     drop(declared);
+}
+
+/// Whether a dialling task printed that its connection was made.
+fn reached(output: &str) -> bool {
+    output.lines().any(|line| line == "reached")
+}
+
+/// Runs the task that stays with `args` and checks that every process of
+/// it is in the cgroup of the box `name`.
+fn assert_stays_in_its_box(daemon: &Daemon, args: &[&str], name: &str) {
+    let staying = daemon.min_running(args);
+    let cgroups = daemon.cgroups_of_the_staying_task();
+    let own = daemon.cgroup_root().join("boxes").join(daemon.box_id(name));
+    assert!(
+        cgroups.iter().all(|cgroup| *cgroup == own),
+        "the task of {name} runs in {cgroups:?}, and its box's cgroup is {}",
+        own.display()
+    );
+    staying.end();
+}
+
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_task_runs_in_its_box_s_cgroup_and_under_its_policy() {
+    if !gated("a_task_runs_in_its_box_s_cgroup_and_under_its_policy") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
+    let _addrs = LoopbackAddrs::add(&[v4(TASK_OPEN4), v4(TASK_SHUT4)]);
+    let loader = Loader::start(dir.path());
+    let port = targets(&[v4(TASK_OPEN4), v4(TASK_SHUT4)], v4(TASK_OPEN4));
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    daemon.declare_tasks(TASK_OPEN4, TASK_SHUT4, port);
+    let subnet = format!("{TASK_OPEN4}/32");
+    let restricted = ["--network", "host_ip", "--allow-subnets", &subnet];
+
+    // A box that allows everything fills the package cache for the
+    // restricted ones, with the packages of a task as well.
+    daemon.activate("open", &["--network", "host_ip"]);
+    let filled = daemon.min(&["session", "run", "open", "dial-shut"]);
+    assert!(reached(&filled), "{filled}");
+
+    // A task run in a box that exists.
+    let out = daemon.activate("sub", &restricted);
+    let open = daemon.min(&["session", "run", "sub", "dial-open"]);
+    assert!(reached(&open), "{out}{open}");
+    let refused = daemon.min(&["session", "run", "sub", "dial-shut"]);
+    assert!(refused.contains(REFUSED), "{refused}");
+    assert!(!reached(&refused), "{refused}");
+    let events = daemon.min(&["box", "events", "sub"]);
+    assert!(events.contains("net_refused"), "{events}");
+    assert_stays_in_its_box(&daemon, &["session", "run", "sub", "stay"], "sub");
+
+    // A task started from inside a task is the same box's.
+    let nested = daemon.min(&["session", "run", "sub", "nested"]);
+    assert!(reached(&nested), "{nested}");
+    assert!(nested.contains(REFUSED), "{nested}");
+
+    // A task run that makes its own box.
+    let mut run = vec!["task", "run"];
+    run.extend_from_slice(&restricted);
+    let open = daemon.min(&[&run[..], &["dial-open"]].concat());
+    assert!(reached(&open), "{open}");
+    let refused = daemon.min(&[&run[..], &["dial-shut"]].concat());
+    assert!(refused.contains(REFUSED), "{refused}");
+    assert!(!reached(&refused), "{refused}");
+    assert_stays_in_its_box(&daemon, &[&run[..], &["stay"]].concat(), "stay-1");
+
+    // Nothing of a box runs beside the daemon and its spawner.
+    let supervisor = daemon.cgroup_root().join("supervisor");
+    let beside = std::fs::read_to_string(supervisor.join("cgroup.procs")).unwrap_or_default();
+    assert_eq!(beside.lines().count(), 2, "{beside}");
+}
+
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_task_of_a_box_with_its_own_address_is_under_the_box_s_policy() {
+    if !gated("a_task_of_a_box_with_its_own_address_is_under_the_box_s_policy") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
+    let _addrs = LoopbackAddrs::add(&[v4(OWN_TASK_OPEN4), v4(OWN_TASK_SHUT4)]);
+    let loader = Loader::start(dir.path());
+    // The virtual network dials these from the host, where they are local.
+    let port = targets(
+        &[v4(OWN_TASK_OPEN4), v4(OWN_TASK_SHUT4)],
+        v4(OWN_TASK_OPEN4),
+    );
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    daemon.declare_tasks(OWN_TASK_OPEN4, OWN_TASK_SHUT4, port);
+    let subnet = format!("{OWN_TASK_OPEN4}/32");
+    let restricted = ["--network", "own_ip", "--allow-subnets", &subnet];
+
+    daemon.activate("open", &["--network", "host_ip"]);
+    let filled = daemon.min(&["session", "run", "open", "dial-shut"]);
+    assert!(reached(&filled), "{filled}");
+
+    // The task has a network namespace and an address of its own, and the
+    // box's rules.
+    let out = daemon.activate("web", &restricted);
+    let open = daemon.min(&["session", "run", "web", "dial-open"]);
+    assert!(reached(&open), "{out}{open}");
+    let refused = daemon.min(&["session", "run", "web", "dial-shut"]);
+    assert!(refused.contains(REFUSED), "{refused}");
+    assert_stays_in_its_box(&daemon, &["session", "run", "web", "stay"], "web");
+
+    let nested = daemon.min(&["session", "run", "web", "nested"]);
+    assert!(reached(&nested), "{nested}");
+    assert!(nested.contains(REFUSED), "{nested}");
+
+    let mut run = vec!["task", "run"];
+    run.extend_from_slice(&restricted);
+    let open = daemon.min(&[&run[..], &["dial-open"]].concat());
+    assert!(reached(&open), "{open}");
+    let refused = daemon.min(&[&run[..], &["dial-shut"]].concat());
+    assert!(refused.contains(REFUSED), "{refused}");
+    assert_stays_in_its_box(&daemon, &[&run[..], &["stay"]].concat(), "stay-1");
 }
 
 #[test]

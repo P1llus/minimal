@@ -739,6 +739,8 @@ impl SideOp {
                         ctx.local_cache(),
                         ctx.op_tracker(),
                         ctx.daemon_id(),
+                        ctx.box_cgroup().cloned(),
+                        ctx.box_network().cloned(),
                     )
                     .with_cancel(check_cancel),
                 );

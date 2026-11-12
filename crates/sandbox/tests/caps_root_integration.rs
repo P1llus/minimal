@@ -417,7 +417,7 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
     let source = base.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let config = Config::new("cap-probe")
+    let config = Config::new("cap-probe", None)
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(plan);

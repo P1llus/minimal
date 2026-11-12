@@ -239,8 +239,9 @@ pub struct Config {
     /// The cgroup of the box this sandbox runs in or for. Every process of
     /// the sandbox starts in it, and the box's cgroup namespace is rooted
     /// there. `None` runs the sandbox in the cgroup of the process that
-    /// starts it.
-    pub box_cgroup: Option<crate::cgroup::BoxCgroup>,
+    /// starts it. Set where the config is made and nowhere else, so no
+    /// sandbox is configured without its cgroup being named.
+    pub(crate) box_cgroup: Option<crate::cgroup::BoxCgroup>,
 }
 
 /// A command to be run in the sandbox.
@@ -419,8 +420,13 @@ impl Config {
         env
     }
 
-    /// Initializes an empty config with the given name.
-    pub fn new<S: Into<String>>(name: S) -> Self {
+    /// An empty config named `name`, for a sandbox that runs in `cgroup`.
+    ///
+    /// A caller with a cgroup root passes the cgroup of the box the sandbox
+    /// runs in or for. A spawner with a root starts no container without
+    /// one. `None` is for a caller with no cgroup root, whose sandboxes run
+    /// in its own cgroup.
+    pub fn new<S: Into<String>>(name: S, cgroup: Option<crate::cgroup::BoxCgroup>) -> Self {
         Self {
             name: name.into(),
             setup_dns_config: true,
@@ -437,7 +443,7 @@ impl Config {
                 working_inputs: Vec::with_capacity(6),
             },
             daemon_id: None,
-            box_cgroup: None,
+            box_cgroup: cgroup,
         }
     }
 
@@ -587,14 +593,6 @@ impl Config {
     /// Sets the identifier for the process/daemon doing the build.
     pub fn with_daemon_id(mut self, id: String) -> Self {
         self.daemon_id = Some(id);
-        self
-    }
-
-    /// Runs the sandbox in `cgroup`, the cgroup of the box it belongs to,
-    /// when the box has one.
-    #[must_use]
-    pub fn with_box_cgroup(mut self, cgroup: Option<crate::cgroup::BoxCgroup>) -> Self {
-        self.box_cgroup = cgroup;
         self
     }
 
@@ -873,7 +871,7 @@ mod tests {
     }
 
     fn session_config() -> Config {
-        let mut config = Config::new("test");
+        let mut config = Config::new("test", None);
         config.wd = WdSetup::Session {
             home: PathBuf::from("/tmp/home"),
             working: PathBuf::from("/tmp/working"),
@@ -960,7 +958,7 @@ mod tests {
     /// default, which has no `/home/.local/bin`.
     #[test]
     fn a_build_sandbox_expands_a_composed_path_against_its_default() {
-        let mut config = Config::new("test");
+        let mut config = Config::new("test", None);
         config
             .env_vars
             .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
@@ -993,7 +991,7 @@ mod tests {
     /// logic out of `command_inner` must not have moved the task plane.
     #[test]
     fn a_build_sandbox_keeps_its_own_layout() {
-        let config = Config::new("test");
+        let config = Config::new("test", None);
 
         assert_eq!(config.command_cwd().unwrap(), "/build");
         let env = config.command_env();
@@ -1009,7 +1007,7 @@ mod tests {
     /// a directory anything can be patched into (#1204).
     #[test]
     fn a_bound_dir_sandbox_takes_the_home_it_is_given() {
-        let config = Config::new("test")
+        let config = Config::new("test", None)
             .with_wd("/workbench", false, Vec::new())
             .with_home(Some("/var/lib/minimal/sessions/s1/home"));
 
@@ -1027,7 +1025,7 @@ mod tests {
         let session = session_config().with_home(Some("/elsewhere"));
         assert_eq!(session.sandbox_home(), "/home");
 
-        let build = Config::new("test").with_home(Some("/elsewhere"));
+        let build = Config::new("test", None).with_home(Some("/elsewhere"));
         assert_eq!(build.sandbox_home(), "/state/home");
     }
 

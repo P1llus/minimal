@@ -26,6 +26,15 @@ pub struct StandaloneTest<'a> {
 
     /// Cancellation token to stop the test.
     pub cancel: tokio_util::sync::CancellationToken,
+
+    /// The cgroup of the box this test runs for, if any. `None` runs the
+    /// test in the cgroup of its caller.
+    pub box_cgroup: Option<sandbox::cgroup::BoxCgroup>,
+
+    /// The network of the box this test runs for, if the box has a network
+    /// namespace of its own or no network at all. A test that needs the
+    /// network attaches to it. `None` keeps the plan below.
+    pub box_network: Option<crate::BuildNetwork>,
 }
 
 impl<'a> StandaloneTest<'a> {
@@ -202,8 +211,19 @@ impl<'a> Runnable for StandaloneTest<'a> {
         });
 
         let (deps, needs_dns, needs_internet) = self.dependencies(build, test, opts).await?;
+        let needs_network = needs_dns || needs_internet;
+        if needs_network
+            && self
+                .box_network
+                .as_ref()
+                .is_some_and(crate::BuildNetwork::is_none)
+        {
+            return Err(Error::Other(anyhow!(
+                "the test needs the network and the box has none"
+            )));
+        }
 
-        let mut config = sandbox::config::Config::new("test")
+        let mut config = sandbox::config::Config::new("test", self.box_cgroup.clone())
             .with_rootfs(deps.into_iter())
             .with_dns(needs_dns)
             // A test that needs neither DNS nor the internet runs in an empty
@@ -218,6 +238,13 @@ impl<'a> Runnable for StandaloneTest<'a> {
             .with_env_var("HOME", "/tmp");
         if let Some(id) = &opts.daemon_id {
             config = config.with_daemon_id(id.clone());
+        }
+        // For a box with a network namespace of its own, the test's
+        // connections are made in one of that box's namespaces.
+        if let Some(network) = &self.box_network
+            && needs_network
+        {
+            config = config.with_network(network.network());
         }
         let mut sandbox = config.build(&opts.exec_base, ()).await?;
 
