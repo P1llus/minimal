@@ -482,6 +482,8 @@ static NOT_STARTED: Engine = Engine {
 
 /// How often expired name pins are deleted from the maps.
 const PIN_SWEEP: Duration = Duration::from_secs(30);
+/// The shortest wait between two sweeps.
+const PIN_SWEEP_SOONEST: Duration = Duration::from_millis(10);
 /// Events waiting to be written. Each box's limiter runs before this
 /// queue, so one box cannot fill it. What does not fit is counted for its
 /// box and reported in the box's next summary.
@@ -711,16 +713,22 @@ impl Engine {
             })
         }));
         runtime.spawn(async move {
-            let mut tick = tokio::time::interval(PIN_SWEEP);
+            let mut wait = PIN_SWEEP;
             loop {
-                tick.tick().await;
+                tokio::time::sleep(wait).await;
                 let Some(attached) = self.attached_state() else {
                     return;
                 };
-                let swept = attached.handles.lock().expect("engine lock").sweep_pins();
+                let (swept, next) = {
+                    let mut handles = attached.handles.lock().expect("engine lock");
+                    (handles.sweep_pins(), handles.next_pin_change())
+                };
                 if let Err(error) = swept {
                     tracing::warn!(%error, "deleting expired name pins");
                 }
+                // An address that two names share has no pin from the
+                // moment the first runs out until the sweep after it.
+                wait = next.map_or(PIN_SWEEP, |next| next.clamp(PIN_SWEEP_SOONEST, PIN_SWEEP));
             }
         });
     }
@@ -1410,18 +1418,52 @@ impl Engine {
     /// lifetime.
     pub(crate) fn pin(
         &self,
-        of: &Installed,
+        of: &Arc<Installed>,
         addr: IpAddr,
         name: &str,
     ) -> Result<(), boxbpf::Error> {
         let Some(attached) = self.attached_state() else {
             return Ok(());
         };
-        attached
-            .handles
-            .lock()
-            .expect("engine lock")
-            .pin(of.id, addr, name, netpol::pins::PIN_TTL)
+        let (pinned, overflow) = {
+            let mut handles = attached.handles.lock().expect("engine lock");
+            let pinned = handles.pin(of.id, addr, name, netpol::pins::PIN_TTL);
+            (pinned, handles.take_set_overflow(of.id))
+        };
+        if let Some(overflow) = overflow {
+            self.report_set_overflow(of, &overflow);
+        }
+        pinned
+    }
+
+    /// Says once per box that the rules of the names of one address did
+    /// not fit one list. The list refuses what its missing rules would
+    /// have judged, so the user needs to know why a name stopped working.
+    fn report_set_overflow(&self, of: &Arc<Installed>, overflow: &boxbpf::SetOverflow) {
+        let names = overflow.names.join(", ");
+        tracing::warn!(
+            box_id = %of.session,
+            address = %overflow.address,
+            %names,
+            rules = overflow.overflow.rules,
+            limit = netpol::abi::RULES_MAX,
+            "the names of one address have more rules between them than one list holds; \
+             the rules that did not fit refuse what they would have judged"
+        );
+        self.observe(
+            Arc::clone(of),
+            events::NetRefusal {
+                source: events::Source::Resolver,
+                direction: overflow.overflow.direction,
+                protocol: None,
+                remote: Some(overflow.address),
+                port: None,
+                name: Some(names),
+                reason: "name_rules_overflow".to_owned(),
+                rule: None,
+                pid: None,
+            },
+        );
     }
 
     /// Judges a flow of the box as the kernel programs would. `name` is
@@ -1434,16 +1476,17 @@ impl Engine {
         name: Option<&str>,
     ) -> netpol::Decision {
         let compiled = of.compiled();
-        let pinned = name
-            .and_then(|name| compiled.set_for_name(name))
-            .or_else(|| {
-                self.attached_state()?
+        let pinned = match name.and_then(|name| compiled.set_for_name(name)) {
+            Some(set) => vec![set],
+            None => self.attached_state().map_or_else(Vec::new, |attached| {
+                attached
                     .handles
                     .lock()
                     .expect("engine lock")
-                    .pinned_set(of.id, flow.remote)
-            });
-        compiled.evaluate(flow, |_| pinned)
+                    .pinned_sets(of.id, flow.remote)
+            }),
+        };
+        compiled.evaluate(flow, |_| pinned.clone())
     }
 
     /// Makes the box's entry match `facts`, when a launch finds the entry

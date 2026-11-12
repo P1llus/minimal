@@ -54,13 +54,39 @@ const ADDRS: [&str; 16] = [
     "2001:db8::1",
     "::1",
 ];
-const NAMES: [&str; 6] = [
-    "example.com",
-    "www.example.com",
-    "x.a.example.com",
-    "y.a.example.com",
-    "other.org",
-    "nomatch.net",
+/// What an address can be pinned for: one name, or several that resolve
+/// to it.
+const NAME_LISTS: [&[&str]; 24] = [
+    &["example.com"],
+    &["www.example.com"],
+    &["x.a.example.com"],
+    &["y.a.example.com"],
+    &["other.org"],
+    &["nomatch.net"],
+    &["example.com", "www.example.com"],
+    &["example.com", "x.a.example.com"],
+    &["example.com", "y.a.example.com"],
+    &["example.com", "other.org"],
+    &["example.com", "nomatch.net"],
+    &["www.example.com", "x.a.example.com"],
+    &["www.example.com", "y.a.example.com"],
+    &["www.example.com", "other.org"],
+    &["www.example.com", "nomatch.net"],
+    &["x.a.example.com", "y.a.example.com"],
+    &["x.a.example.com", "other.org"],
+    &["x.a.example.com", "nomatch.net"],
+    &["y.a.example.com", "other.org"],
+    &["y.a.example.com", "nomatch.net"],
+    &["other.org", "nomatch.net"],
+    &["example.com", "x.a.example.com", "other.org"],
+    &["www.example.com", "y.a.example.com", "nomatch.net"],
+    &[
+        "example.com",
+        "www.example.com",
+        "x.a.example.com",
+        "y.a.example.com",
+        "other.org",
+    ],
 ];
 const PORTS: [u16; 6] = [0, 53, 443, 450, 1023, 8080];
 
@@ -146,12 +172,12 @@ fn verdict() -> impl Strategy<Value = Verdict> {
     prop::sample::select(vec![Verdict::Allow, Verdict::Deny])
 }
 
-/// What the remote address of a flow is pinned as: nothing, a name, or one
-/// of the box's own addresses.
+/// What the remote address of a flow is pinned as: nothing, the names that
+/// resolve to it, or one of the box's own addresses.
 fn pinned() -> impl Strategy<Value = Pinned<'static>> {
     prop_oneof![
         3 => Just(Pinned::No),
-        4 => prop::sample::select(NAMES.to_vec()).prop_map(Pinned::Name),
+        4 => prop::sample::select(NAME_LISTS.to_vec()).prop_map(Pinned::Names),
         2 => Just(Pinned::Own),
     ]
 }
@@ -178,14 +204,31 @@ fn flow() -> impl Strategy<Value = (Flow, Pinned<'static>)> {
         })
 }
 
+/// The sets an address pinned as `name` is in.
+fn sets_of(c: &Compiled, name: Pinned<'_>) -> Vec<SetId> {
+    let mut sets: Vec<SetId> = match name {
+        Pinned::No => Vec::new(),
+        Pinned::Names(names) => names.iter().filter_map(|n| c.set_for_name(n)).collect(),
+        Pinned::Own => vec![SetId::OWN],
+    };
+    sets.sort_unstable();
+    sets.dedup();
+    sets
+}
+
 /// Checks one flow against both evaluators.
 fn agree(c: &Compiled, flow: &Flow, name: Pinned<'_>) -> Result<(), TestCaseError> {
-    let set = match name {
-        Pinned::No => None,
-        Pinned::Name(n) => c.set_for_name(n),
-        Pinned::Own => Some(SetId::OWN),
-    };
-    let got = c.evaluate(flow, |_| set);
+    let sets = sets_of(c, name);
+    let got = c.evaluate(flow, |_| sets.clone());
+    // With nothing left out, the list read rule by rule says the same.
+    prop_assert_eq!(
+        c.evaluate_skipping(flow, |_| sets.clone(), |_| false),
+        got,
+        "flow {:?} name {:?}\n{}",
+        flow,
+        name,
+        c
+    );
     let (index, action) = evaluate_ordered(&c.rules, &c.protected, &c.config.defaults, flow, name);
     let want = match action {
         Action::Allow => FlowVerdict::Allow,
@@ -259,6 +302,39 @@ proptest! {
                 prop_assert!(needed > max && max == RULES_MAX);
             }
             Err(other) => prop_assert!(false, "unexpected error {other}"),
+        }
+    }
+
+    #[test]
+    fn the_list_without_some_rules_judges_as_the_shorter_list_does(
+        rules in prop::collection::vec(rule(), 0..10),
+        protected in protected(),
+        (egress, ingress, bind) in (verdict(), verdict(), verdict()),
+        flows in prop::collection::vec(flow(), 1..40),
+    ) {
+        let base = bare(rules, protected, egress, ingress, bind);
+        let Ok(c) = compile(&base, &BoxPolicy::default(), Options::default()) else { return Ok(()) };
+        let left_out = |r: &Rule| r.origin == Origin::Published;
+        let kept: Vec<Rule> = c.rules.iter().filter(|r| !left_out(r)).cloned().collect();
+        for (flow, name) in &flows {
+            let sets = sets_of(&c, *name);
+            let got = c.evaluate_skipping(flow, |_| sets.clone(), left_out);
+            let (index, action) = evaluate_ordered(&kept, &c.protected, &c.config.defaults, flow, *name);
+            let denied = match action {
+                Action::Deny => true,
+                Action::Allow => false,
+                Action::Redirect(index) => {
+                    let endpoint = c.endpoint(index).expect("a redirect names an endpoint");
+                    match netpol::eval::canonical(flow.remote) {
+                        IpAddr::V4(_) => endpoint.v4.is_none(),
+                        IpAddr::V6(_) => endpoint.v6.is_none(),
+                    }
+                }
+            };
+            prop_assert_eq!(got.verdict == FlowVerdict::Deny, denied, "flow {:?} name {:?}\n{}", flow, name, c);
+            // The deciding rule is the same rule, under its number in the whole list.
+            let rule = got.rule.map(|prio| &c.rules[usize::from(prio)]);
+            prop_assert_eq!(rule, index.map(|i| &kept[i]), "flow {:?} name {:?}\n{}", flow, name, c);
         }
     }
 

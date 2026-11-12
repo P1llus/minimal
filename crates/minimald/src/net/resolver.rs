@@ -508,7 +508,7 @@ impl Resolver {
         );
     }
 
-    fn pin(&self, of: &Installed, address: IpAddr, name: &str) {
+    fn pin(&self, of: &Arc<Installed>, address: IpAddr, name: &str) {
         if let Err(error) = self.engine.pin(of, address, name) {
             tracing::warn!(
                 box_id = %of.session(),

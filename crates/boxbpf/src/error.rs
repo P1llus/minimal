@@ -38,6 +38,10 @@ pub enum Error {
     RuleEntryLimit { needed: usize, limit: usize },
     #[error("the box has {limit} addresses pinned, the most a box may have")]
     PinLimit { limit: usize },
+    #[error("names of more than {limit} rules of the box resolve to the address")]
+    NamesPerAddress { limit: usize },
+    #[error("the set for an address of several names has the id of another set of the box")]
+    MergedSetClash,
     #[error("no rule of the box names {0}")]
     NameWithoutRule(String),
     #[error("{0} map descriptors were handed over, {1} are needed")]

@@ -526,7 +526,7 @@ fn a_box_in_its_own_network_namespace() {
     };
     assert_eq!(inbound(BOX4), "err timeout");
     assert_eq!(
-        live.compiled().evaluate(&ingress, |_| None).verdict,
+        live.compiled().evaluate(&ingress, |_| Vec::new()).verdict,
         FlowVerdict::Deny
     );
     let seen = Harness::drain(&mut events);
@@ -551,7 +551,7 @@ fn a_box_in_its_own_network_namespace() {
         inbound(BOX6)
     );
     assert_eq!(
-        live.compiled().evaluate(&ingress, |_| None).verdict,
+        live.compiled().evaluate(&ingress, |_| Vec::new()).verdict,
         FlowVerdict::Allow
     );
 

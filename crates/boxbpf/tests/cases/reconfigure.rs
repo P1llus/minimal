@@ -103,12 +103,14 @@ fn pins_follow_their_names_through_a_change_of_policy() {
         refused(),
         "the pin follows its name to the more specific rule"
     );
-    assert_eq!(h.handles.pinned_set(id, gone), None);
+    assert_eq!(h.handles.pinned_sets(id, gone), []);
     assert_eq!(
-        h.handles.pinned_set(id, kept),
-        live.compiled().set_for_name("kept.test")
+        h.handles.pinned_sets(id, kept),
+        [live.compiled().set_for_name("kept.test").expect("a set")]
     );
-    let exact = h.handles.pinned_set(id, api).expect("still pinned");
+    let [exact] = h.handles.pinned_sets(id, api)[..] else {
+        panic!("still pinned, to one set");
+    };
     assert_ne!(exact, wild);
     assert_eq!(Some(exact), live.compiled().set_for_name("api.wild.test"));
     // The evaluator, given the pins the kernel has, says the same.
@@ -122,7 +124,7 @@ fn pins_follow_their_names_through_a_change_of_policy() {
         };
         let verdict = live
             .compiled()
-            .evaluate(&flow, |addr| h.handles.pinned_set(id, addr))
+            .evaluate(&flow, |addr| h.handles.pinned_sets(id, addr))
             .verdict;
         assert_eq!(verdict == FlowVerdict::Deny, denied, "{addr}");
     }
@@ -135,7 +137,7 @@ fn pins_follow_their_names_through_a_change_of_policy() {
     h.handles
         .pin(id, itself, "kept.test", Duration::from_millis(1))
         .expect("a name that resolves to the box itself");
-    assert_eq!(h.handles.pinned_set(id, itself), Some(netpol::SetId::OWN));
+    assert_eq!(h.handles.pinned_sets(id, itself), [netpol::SetId::OWN]);
     assert_eq!(h.handles.usage(id).expect("usage").pins, 2);
     std::thread::sleep(Duration::from_millis(5));
     assert_eq!(h.handles.sweep_pins().expect("sweep"), 0);
@@ -143,11 +145,11 @@ fn pins_follow_their_names_through_a_change_of_policy() {
     h.handles
         .reconfigure(&mut live, again)
         .expect("reconfigure");
-    assert_eq!(h.handles.pinned_set(id, itself), Some(netpol::SetId::OWN));
+    assert_eq!(h.handles.pinned_sets(id, itself), [netpol::SetId::OWN]);
     h.handles
         .remove_own_address(id, itself)
         .expect("remove the address");
-    assert_eq!(h.handles.pinned_set(id, itself), None);
+    assert_eq!(h.handles.pinned_sets(id, itself), []);
 }
 
 fn prefixes(h: &Harness, group: u8, count: u8) -> Vec<Prefix> {

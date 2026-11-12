@@ -20,7 +20,7 @@ fn kernel_denies(result: &str) -> bool {
 
 fn evaluator_denies(h: &Harness, id: BoxId, compiled: &Compiled, flow: &Flow) -> bool {
     compiled
-        .evaluate(flow, |addr| h.handles.pinned_set(id, addr))
+        .evaluate(flow, |addr| h.handles.pinned_sets(id, addr))
         .verdict
         == FlowVerdict::Deny
 }
@@ -301,7 +301,7 @@ fn a_rule_that_names_no_protocol_does_not_end_the_list() {
         port: 9,
         local: None,
     };
-    let decision = compiled.evaluate(&flow, |_| None);
+    let decision = compiled.evaluate(&flow, |_| Vec::new());
     assert_eq!(
         (decision.verdict, decision.rule),
         (FlowVerdict::Deny, Some(1))
