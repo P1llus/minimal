@@ -1,0 +1,566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minimal <noreply@minimal.dev>
+Date: Thu, 12 Nov 2026 00:00:00 +0000
+Subject: [PATCH] gvproxy: no route from the virtual network to the host's
+ loopback
+
+A configuration that names no NAT entry gets one from upstream: the host
+address, by default the last usable address of the subnet, is translated to
+127.0.0.1, and the gateway answers ARP for it. Anything that can put a frame
+on the virtual network then reaches every TCP and UDP port on the host's
+loopback. An empty map in the YAML does not switch the default off.
+
+Minimal gives boxes a named set of host loopback ports through its own
+relay and wants no other way there.
+
+Remove both defaults, so a NAT entry and a virtual address of the gateway
+exist only when the configuration names them.
+
+The TCP, UDP and ICMP forwarders refuse a destination that a dial from this
+process takes to the host itself, after NAT translation: a loopback address
+and the unspecified address, which connect(2) reads as this host. A UDP
+datagram to 0.0.0.0 arrived at a listener on the host's loopback before
+this change.
+
+Every changed file carries a notice that it was modified, as section 4(b)
+of the Apache License 2.0 asks.
+
+Applies to containers/gvisor-tap-vsock v0.9.0
+(6dbb5d4fa0033356c72a201346f8350594229868) after patch 0001.
+---
+diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
+index 16cbad470493..bcf99eeb6a1e 100644
+--- a/cmd/gvproxy/config.go
++++ b/cmd/gvproxy/config.go
+@@ -1,3 +1,7 @@
++// Modified by gominimal/minimal (vendor/gvproxy/patches/0002): no default
++// NAT entry from the host address to 127.0.0.1 and no default virtual
++// address of the gateway.
++
+ package main
+ 
+ import (
+@@ -251,16 +255,9 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
+ 	if config.Stack.GatewayMacAddress == "" {
+ 		config.Stack.GatewayMacAddress = "5a:94:ef:e4:0c:dd"
+ 	}
+-	if len(config.Stack.NAT) == 0 {
+-		config.Stack.NAT = map[string]string{
+-			config.Stack.HostIP: "127.0.0.1",
+-		}
+-	}
+-	if len(config.Stack.GatewayVirtualIPs) == 0 {
+-		config.Stack.GatewayVirtualIPs = []string{
+-			config.Stack.HostIP,
+-		}
+-	}
++	// No default for stack.nat or stack.gatewayVirtualIPs: upstream maps
++	// the host address to 127.0.0.1 and has the gateway answer ARP for it
++	// whenever the configuration names neither.
+ 
+ 	// Default DNS zone enabled only for the default mode
+ 	// Default DNS search domains enabled only for the default mode
+diff --git a/cmd/gvproxy/config_test.go b/cmd/gvproxy/config_test.go
+index 2fcbf3ac987c..2a28fa27f513 100644
+--- a/cmd/gvproxy/config_test.go
++++ b/cmd/gvproxy/config_test.go
+@@ -1,3 +1,6 @@
++// Modified by gominimal/minimal (vendor/gvproxy/patches/0002): the expected
++// configurations carry no default NAT entry and no default virtual address.
++
+ package main
+ 
+ import (
+@@ -121,10 +124,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -156,10 +155,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -190,10 +185,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -231,10 +222,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -275,10 +262,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -319,10 +302,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -363,10 +342,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -407,10 +382,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -431,10 +402,6 @@ stack:
+     deviceIP: 192.168.127.2
+     hostIP: 192.168.127.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+ `,
+ 		},
+ 		{
+@@ -455,10 +422,6 @@ stack:
+     deviceIP: 192.168.127.2
+     hostIP: 192.168.127.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+ interfaces:
+     qemu: unix:///tmp/qemu.sock
+ `,
+@@ -484,10 +447,6 @@ stack:
+     deviceIP: 10.0.0.2
+     hostIP: 10.0.255.254
+     gatewayMacAddress: "10:11:11:11:11:00"
+-    nat:
+-        10.0.255.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 10.0.255.254
+ `,
+ 		},
+ 		{
+@@ -508,10 +467,6 @@ stack:
+     deviceIP: 10.0.0.2
+     hostIP: 10.0.255.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        10.0.255.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 10.0.255.254
+     dhcpStaticLeases:
+         10.0.0.2: "10:11:11:11:11:02"
+         10.0.0.3: "10:11:11:11:11:03"
+@@ -540,10 +495,6 @@ stack:
+         127.0.0.1:59022: 192.168.127.2:22
+         127.0.0.1:59080: 192.168.127.2:80
+         127.0.0.1:59443: 192.168.127.2:443
+-    nat:
+-        10.0.255.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 10.0.255.254
+ `,
+ 		},
+ 		{
+@@ -565,10 +516,6 @@ stack:
+     deviceIP: 10.0.0.2
+     hostIP: 10.0.255.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        10.0.255.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 10.0.255.254
+ forwards:
+     - socket: ???
+       dest: ???
+@@ -590,10 +537,6 @@ stack:
+     deviceIP: 192.168.127.2
+     hostIP: 192.168.127.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+ `,
+ 		},
+ 		{
+@@ -609,10 +552,6 @@ stack:
+     deviceIP: 192.168.127.2
+     hostIP: 192.168.127.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+ `,
+ 		},
+ 		{
+@@ -646,10 +585,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -685,10 +620,6 @@ stack:
+               ip: 192.168.127.254
+     forwards:
+         127.0.0.1:2222: 192.168.127.2:22
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     dhcpStaticLeases:
+         192.168.127.2: 5a:94:ef:e4:0c:ee
+     vpnKitUUIDMacAddresses:
+@@ -710,10 +641,6 @@ stack:
+     deviceIP: 192.168.127.2
+     hostIP: 192.168.127.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+ interfaces:
+     stdio: accept
+ `,
+@@ -733,13 +660,28 @@ stack:
+     deviceIP: 192.168.127.2
+     hostIP: 192.168.127.254
+     gatewayMacAddress: 5a:94:ef:e4:0c:dd
+-    nat:
+-        192.168.127.254: 127.0.0.1
+-    gatewayVirtualIPs:
+-        - 192.168.127.254
+     tcpMaxInFlight: 500
+     tcpConnectTimeout: 10
+ `,
+ 		},
+ 	}
+ }
++
++// A configuration that names no NAT entry and no virtual address gets
++// neither, with a config file and without one.
++func TestNoDefaultRouteToTheHostsLoopback(t *testing.T) {
++	t.Parallel()
++	for _, argv := range [][]string{{}, {"-config", "unused.yaml"}} {
++		var cnf GvproxyConfig
++		var args GvproxyArgs
++		flagSet := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
++		_, err := GvproxyArgParse(flagSet, &args, argv)
++		require.NoError(t, err)
++		require.NoError(t, yaml.Unmarshal([]byte("stack:\n    subnet: 100.64.0.0/16\n"), &cnf))
++		got, err := GvproxyConfigure(&cnf, &args, "testing")
++		require.NoError(t, err)
++		assert.Equal(t, "100.64.255.254", got.Stack.HostIP)
++		assert.Empty(t, got.Stack.NAT, "args %v", argv)
++		assert.Empty(t, got.Stack.GatewayVirtualIPs, "args %v", argv)
++	}
++}
+diff --git a/pkg/services/forwarder/icmp.go b/pkg/services/forwarder/icmp.go
+index fbf52f10c92c..1d856be7fdfe 100644
+--- a/pkg/services/forwarder/icmp.go
++++ b/pkg/services/forwarder/icmp.go
+@@ -1,3 +1,6 @@
++// Modified by gominimal/minimal (vendor/gvproxy/patches/0002): a destination
++// that a dial from this process would take to the host itself is refused.
++
+ package forwarder
+ 
+ import (
+@@ -29,6 +32,9 @@ func ICMP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mut
+ 			localAddress = replaced
+ 		}
+ 		natLock.Unlock()
++		if dialsThisHost(localAddress) {
++			return
++		}
+ 
+ 		pkt := r.Packet()
+ 		if pkt == nil {
+diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
+index 6a1f548a60a1..7e98fd92c59b 100644
+--- a/pkg/services/forwarder/tcp.go
++++ b/pkg/services/forwarder/tcp.go
+@@ -1,3 +1,6 @@
++// Modified by gominimal/minimal (vendor/gvproxy/patches/0002): a destination
++// that a dial from this process would take to the host itself is refused.
++
+ package forwarder
+ 
+ import (
+@@ -43,6 +46,10 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
+ 		}
+ 		natLock.Unlock()
++		if dialsThisHost(localAddress) {
++			r.Complete(true)
++			return
++		}
+ 		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
+ 		if err != nil {
+ 			log.Tracef("net.DialTimeout() = %v", err)
+diff --git a/pkg/services/forwarder/this_host.go b/pkg/services/forwarder/this_host.go
+new file mode 100644
+index 000000000000..703d54443eb9
+--- /dev/null
++++ b/pkg/services/forwarder/this_host.go
+@@ -0,0 +1,17 @@
++// Added by gominimal/minimal (vendor/gvproxy/patches/0002).
++
++package forwarder
++
++import (
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++)
++
++// dialsThisHost reports whether a dial to address from this process ends at
++// the host itself: a loopback address, or the unspecified address, which
++// connect(2) takes as this host. The forwarders refuse such a destination
++// after NAT translation, so no frame and no NAT entry reaches a service
++// that listens on the host's loopback.
++func dialsThisHost(address tcpip.Address) bool {
++	return address.Unspecified() || header.IsV4LoopbackAddress(address)
++}
+diff --git a/pkg/services/forwarder/this_host_test.go b/pkg/services/forwarder/this_host_test.go
+new file mode 100644
+index 000000000000..4fd8b682d6e6
+--- /dev/null
++++ b/pkg/services/forwarder/this_host_test.go
+@@ -0,0 +1,158 @@
++// Added by gominimal/minimal (vendor/gvproxy/patches/0002): proves that the
++// forwarders dial no destination that ends at the host itself.
++
++package forwarder
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
++)
++
++func TestDialsThisHost(t *testing.T) {
++	for address, want := range map[string]bool{
++		"127.0.0.1":       true,
++		"127.0.64.2":      true,
++		"127.255.255.254": true,
++		"0.0.0.0":         true,
++		"100.64.255.254":  false,
++		"192.0.2.1":       false,
++		"128.0.0.1":       false,
++	} {
++		got := dialsThisHost(tcpip.AddrFrom4Slice(net.ParseIP(address).To4()))
++		if got != want {
++			t.Errorf("dialsThisHost(%s) = %v, want %v", address, got, want)
++		}
++	}
++}
++
++var thisHostGuest = tcpip.AddrFrom4([4]byte{100, 64, 0, 9})
++
++// forwardingStack is a gvisor stack whose one NIC hands every packet it
++// sends back in, with the TCP and UDP forwarders and the given NAT. What a
++// socket on it sends from the guest address arrives at the forwarders as a
++// guest's packet would.
++func forwardingStack(t *testing.T, nat map[tcpip.Address]tcpip.Address) *stack.Stack {
++	t.Helper()
++	s := stack.New(stack.Options{
++		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
++		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
++	})
++	if err := s.CreateNIC(1, loopback.New()); err != nil {
++		t.Fatalf("create NIC: %v", err)
++	}
++	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
++		Protocol:          ipv4.ProtocolNumber,
++		AddressWithPrefix: thisHostGuest.WithPrefix(),
++	}, stack.AddressProperties{}); err != nil {
++		t.Fatalf("add address: %v", err)
++	}
++	s.SetSpoofing(1, true)
++	s.SetPromiscuousMode(1, true)
++	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
++	var natLock sync.Mutex
++	s.SetTransportProtocolHandler(tcp.ProtocolNumber, TCP(s, nat, &natLock, false, 0, time.Second).HandlePacket)
++	s.SetTransportProtocolHandler(udp.ProtocolNumber, UDP(s, nat, &natLock, false).HandlePacket)
++	t.Cleanup(s.Destroy)
++	return s
++}
++
++func sendFromGuest(t *testing.T, s *stack.Stack, dst tcpip.Address, udpPort, tcpPort uint16) {
++	t.Helper()
++	conn, err := gonet.DialUDP(s, &tcpip.FullAddress{NIC: 1, Addr: thisHostGuest},
++		&tcpip.FullAddress{NIC: 1, Addr: dst, Port: udpPort}, ipv4.ProtocolNumber)
++	if err != nil {
++		t.Fatalf("udp socket to %s: %v", dst, err)
++	}
++	defer conn.Close()
++	if _, err := conn.Write([]byte("ping")); err != nil {
++		t.Fatalf("udp send to %s: %v", dst, err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
++	defer cancel()
++	stream, err := gonet.DialTCPWithBind(ctx, s, tcpip.FullAddress{NIC: 1, Addr: thisHostGuest},
++		tcpip.FullAddress{NIC: 1, Addr: dst, Port: tcpPort}, ipv4.ProtocolNumber)
++	if err == nil {
++		stream.Close()
++	}
++}
++
++// A datagram or connection for a loopback address, or for an address a NAT
++// entry maps to loopback, never arrives at a listener on the host's
++// loopback. One for the host's own non-loopback address does arrive, which
++// shows the forwarders saw the packets at all.
++func TestForwardersDialNoDestinationOnTheHostItself(t *testing.T) {
++	alias := tcpip.AddrFrom4([4]byte{100, 64, 255, 254})
++	s := forwardingStack(t, map[tcpip.Address]tcpip.Address{
++		alias: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}),
++	})
++
++	udpListener, err := net.ListenUDP("udp4", &net.UDPAddr{})
++	if err != nil {
++		t.Fatalf("listen udp: %v", err)
++	}
++	defer udpListener.Close()
++	udpPort := uint16(udpListener.LocalAddr().(*net.UDPAddr).Port)
++	tcpListener, err := net.ListenTCP("tcp4", &net.TCPAddr{})
++	if err != nil {
++		t.Fatalf("listen tcp: %v", err)
++	}
++	defer tcpListener.Close()
++	tcpPort := uint16(tcpListener.Addr().(*net.TCPAddr).Port)
++
++	for _, dst := range []tcpip.Address{
++		tcpip.AddrFrom4([4]byte{127, 0, 0, 1}),
++		tcpip.AddrFrom4([4]byte{127, 0, 64, 2}),
++		alias,
++	} {
++		sendFromGuest(t, s, dst, udpPort, tcpPort)
++	}
++	_ = udpListener.SetReadDeadline(time.Now().Add(time.Second))
++	buf := make([]byte, 16)
++	if n, from, err := udpListener.ReadFrom(buf); err == nil {
++		t.Errorf("a datagram reached the host through loopback: %q from %v", buf[:n], from)
++	}
++	_ = tcpListener.SetDeadline(time.Now().Add(300 * time.Millisecond))
++	if conn, err := tcpListener.Accept(); err == nil {
++		t.Errorf("a connection reached the host through loopback from %v", conn.RemoteAddr())
++		conn.Close()
++	}
++
++	own := ownAddress()
++	if own == nil {
++		t.Log("this host has no address besides loopback, so the forwarded case did not run")
++		return
++	}
++	sendFromGuest(t, s, tcpip.AddrFrom4Slice(own), udpPort, tcpPort)
++	_ = udpListener.SetReadDeadline(time.Now().Add(3 * time.Second))
++	if _, _, err := udpListener.ReadFrom(buf); err != nil {
++		t.Errorf("no datagram for %v arrived, so the forwarders saw none of the packets: %v", own, err)
++	}
++}
++
++// ownAddress is an IPv4 address of this host that is not loopback.
++func ownAddress() net.IP {
++	addrs, err := net.InterfaceAddrs()
++	if err != nil {
++		return nil
++	}
++	for _, addr := range addrs {
++		if ipNet, ok := addr.(*net.IPNet); ok {
++			if ip := ipNet.IP.To4(); ip != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
++				return ip
++			}
++		}
++	}
++	return nil
++}
+diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
+index 126944960a57..0173d24f11b9 100644
+--- a/pkg/services/forwarder/udp.go
++++ b/pkg/services/forwarder/udp.go
+@@ -1,3 +1,6 @@
++// Modified by gominimal/minimal (vendor/gvproxy/patches/0002): a destination
++// that a dial from this process would take to the host itself is refused.
++
+ package forwarder
+ 
+ import (
+@@ -27,6 +30,9 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
+ 		}
+ 		natLock.Unlock()
++		if dialsThisHost(localAddress) {
++			return true
++		}
+ 
+ 		var wq waiter.Queue
+ 		ep, tcpErr := r.CreateEndpoint(&wq)

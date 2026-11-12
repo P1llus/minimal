@@ -86,6 +86,8 @@ version.workspace = true
 bep = { path = "../bep" }
 
 [dev-dependencies]
+# The guest of hand-built frames the gvproxy tests attach to the switch.
+switch = { workspace = true, features = ["pump", "fake-guest"] }
 camino.workspace = true
 serial_test.workspace = true
 sha2.workspace = true

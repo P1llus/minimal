@@ -4,9 +4,9 @@
 # the per-host switch.
 #
 # The switch is built from the pinned source plus vendor/gvproxy/patches/ by
-# scripts/build-gvproxy.sh, not downloaded: the upstream release leaves a
-# withdrawn port's accepted connections open. The build is reproducible, so
-# its result must match the lock's digest for the asset.
+# scripts/build-gvproxy.sh, not downloaded: the patches change behaviour the
+# upstream release has. The build is reproducible, so its result must match
+# the lock's digest for the asset.
 #
 # The asset defaults to the host platform's binary; pass an explicit asset name
 # (2nd arg) to build a different platform's binary regardless of the host arch —

@@ -9,6 +9,9 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+pub mod api_token;
+#[cfg(feature = "fake-guest")]
+pub mod fake_guest;
 pub mod loopback;
 #[cfg(feature = "pump")]
 pub mod pump;
@@ -315,9 +318,10 @@ impl SwitchSubnet {
         self.gateway()
     }
 
-    /// The host alias address (`broadcast - 1`): a virtual IP that gvproxy NATs
-    /// to the host loopback so a PTask can reach host services. Reserved, never
-    /// handed to a PTask.
+    /// The host alias address (`broadcast - 1`). No packet is ever routed to
+    /// it: a box's policy redirects TCP for it into the box's host relay
+    /// endpoint, and gvproxy neither answers ARP for it nor translates it.
+    /// Reserved, never leased.
     #[must_use]
     pub fn host_alias(self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
@@ -504,10 +508,11 @@ impl MacAddr {
 /// expressed through a `-config` YAML file: gvproxy v0.9.0 also takes the
 /// subnet and gateway as CLI flags, but the rest is YAML-only.
 ///
-/// The config has no NAT entry and no DNS zone. A NAT entry for the host
-/// alias would let anything on the virtual network reach every port of the
-/// host's loopback. The daemon that serves the boxes answers the box-name
-/// zone and the alias name itself. gvproxy reads this file only at spawn
+/// The config has no NAT entry and no DNS zone. The gvproxy we build adds
+/// none of its own (`vendor/gvproxy/patches/0002`), where upstream would
+/// translate the host alias to the host's loopback on every port. The daemon
+/// that serves the boxes answers the box-name zone and the alias name
+/// itself. gvproxy reads this file only at spawn
 /// time; an `OwnIp` PTask configures its switch address statically rather than
 /// via DHCP, so `dhcpStaticLeases` is a startup-time seed, not a live source.
 ///

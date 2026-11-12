@@ -404,6 +404,75 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
     );
     println!("host alias {HOST_ALIAS}:{service} from the box: {direct}");
 
+    // A guest that owns its network device writes any frame it likes. A
+    // second client on gvproxy's switch socket stands in for it: frames
+    // for the alias and for the addresses that mean this host, sent to
+    // the gateway's MAC without asking who has them.
+    {
+        use switch::fake_guest::{FakeGuest, Seen, TCP_SYN_ACK};
+
+        let alias: Ipv4Addr = HOST_ALIAS.parse().unwrap();
+        let gateway: Ipv4Addr = GATEWAY.parse().unwrap();
+        let unexposed = TcpListener::bind("127.0.0.1:0").unwrap();
+        unexposed.set_nonblocking(true).unwrap();
+        let tcp_port = unexposed.local_addr().unwrap().port();
+        let datagrams = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        datagrams.set_nonblocking(true).unwrap();
+        let udp_port = datagrams.local_addr().unwrap().port();
+
+        let mut guest = FakeGuest::attach(
+            &vm.host_dir.join("gvproxy-switch.sock"),
+            Ipv4Addr::new(100, 64, 254, 9),
+            gateway,
+        )
+        .expect("attaching a second guest to the switch");
+        guest.arp_request(alias).unwrap();
+        let this_host = [alias, Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED];
+        for to in this_host {
+            guest.tcp_syn(SocketAddrV4::new(to, tcp_port)).unwrap();
+            guest.udp(SocketAddrV4::new(to, udp_port), b"ping").unwrap();
+        }
+        let seen = guest.listen(Duration::from_secs(3)).unwrap();
+        for frame in &seen {
+            let answered = match frame {
+                Seen::ArpReply { owner } => *owner == alias,
+                Seen::Tcp { from, flags, .. } => {
+                    this_host.contains(from.ip()) && *flags == TCP_SYN_ACK
+                }
+                Seen::Udp { from, .. } => this_host.contains(from.ip()),
+                Seen::Icmp { .. } => false,
+            };
+            assert!(!answered, "the switch answered for this host: {frame:?}");
+        }
+        assert!(
+            unexposed.accept().is_err(),
+            "a connection arrived on the host's loopback"
+        );
+        assert!(
+            datagrams.recv_from(&mut [0u8; 16]).is_err(),
+            "a datagram arrived on the host's loopback"
+        );
+        // The gateway does answer this guest, and its API asks for a token.
+        let reply = guest
+            .tcp_request(
+                SocketAddrV4::new(gateway, 80),
+                b"GET /services/forwarder/all HTTP/1.0\r\n\r\n",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            reply.starts_with("HTTP/1.0 401") || reply.starts_with("HTTP/1.1 401"),
+            "the gateway's API answered: {reply:?}"
+        );
+        println!(
+            "a guest of raw frames on the switch: {} frames back, none for this host; \
+             gateway API: {}",
+            seen.len(),
+            reply.lines().next().unwrap_or_default()
+        );
+    }
+
     let host_port = format!(
         r#"{{"box_id":"{}","purpose":{{"kind":"host_port","port":{service}}}}}"#,
         web.box_id

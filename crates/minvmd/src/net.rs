@@ -109,12 +109,6 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
     }
 }
 
-/// The file gvproxy reads its API token from, beside its socket.
-const API_TOKEN_FILE: &str = "gvproxy-api.token";
-
-/// The environment variable gvproxy would also take a token from.
-const API_TOKEN_ENV: &str = "GV_API_TOKEN";
-
 /// The waits between attempts to start gvproxy again after it died.
 const RESPAWN_MIN: Duration = Duration::from_millis(250);
 const RESPAWN_MAX: Duration = Duration::from_secs(4);
@@ -148,7 +142,7 @@ impl GvproxyConfig {
     pub fn new(binary: PathBuf, switch_socket: PathBuf) -> Self {
         let dir = switch_socket.parent().unwrap_or_else(|| Path::new("."));
         let config_path = dir.join("gvproxy.yaml");
-        let token_path = dir.join(API_TOKEN_FILE);
+        let token_path = dir.join(switch::api_token::FILE);
         Self {
             binary,
             switch_socket,
@@ -192,7 +186,7 @@ impl GvproxyConfig {
             format!("unix://{}", self.switch_socket.display()),
             "-ssh-port".to_string(),
             "-1".to_string(),
-            "-api-token-file".to_string(),
+            switch::api_token::FLAG.to_string(),
             self.token_path.display().to_string(),
         ]
     }
@@ -203,43 +197,14 @@ impl GvproxyConfig {
         &self.token_path
     }
 
-    /// Writes a fresh API token for the next gvproxy start, readable by
-    /// this user only.
-    ///
-    /// gvproxy serves its forwarder API inside the virtual network at the
-    /// gateway address. With a token set it answers 401 there to anyone who
-    /// does not present it. Nobody is given this token: minvmd itself uses
-    /// the unix socket, which needs none. So nothing in the VM can list,
-    /// add or remove a forward.
+    /// Writes a fresh API token for the next gvproxy start
+    /// ([`switch::api_token`]).
     ///
     /// # Errors
     ///
     /// The I/O error of reading the random source or writing the file.
     pub fn write_token(&self) -> io::Result<()> {
-        use std::io::{Read as _, Write as _};
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut random = [0u8; 32];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-        let mut token = String::with_capacity(64);
-        for byte in random {
-            token.push_str(&format!("{byte:02x}"));
-        }
-        if let Some(dir) = self.token_path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        // A new file each time, so the mode is this call's and an old
-        // file's wider mode cannot carry over.
-        match std::fs::remove_file(&self.token_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&self.token_path)?
-            .write_all(token.as_bytes())
+        switch::api_token::write(&self.token_path)
     }
 
     /// The command that starts gvproxy.
@@ -249,7 +214,7 @@ impl GvproxyConfig {
             .args(self.argv())
             // gvproxy also reads a token from this variable. Only the file
             // above may set it.
-            .env_remove(API_TOKEN_ENV);
+            .env_remove(switch::api_token::ENV);
         command
     }
 
