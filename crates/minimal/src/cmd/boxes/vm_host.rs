@@ -1170,7 +1170,14 @@ mod tests {
                 request.hold,
                 "the activation holds its registration as a lease"
             );
-            assert_eq!(request.ingress_ports, vec![8080, 5432]);
+            assert_eq!(
+                Some(request.ingress_ports),
+                policy
+                    .ingress
+                    .as_ref()
+                    .map(|ingress| ingress.port_mappings.clone()),
+                "the mappings as declared, so the host forwards a port only as declared"
+            );
             assert!(
                 !seen[0].contains("box_id"),
                 "the client never presents a box id; the host mints it: {}",

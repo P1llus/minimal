@@ -730,22 +730,15 @@ async fn register_box_at(
     policy: &boxes::BoxPolicy,
     host_ip: bool,
 ) -> anyhow::Result<RegisteredWithVmHost> {
-    // The declaration, as this activation expanded it: the ingress rules
-    // reduced to the external ports they admit — the shape the host row
-    // holds — and the egress policy verbatim. No box id: the host mints
-    // one for this creation (NET-133).
+    // The declaration: the ingress mappings and the credentialed upstream as
+    // the policy carries them. No box id: the host mints one for this
+    // creation (NET-133).
     let request = minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),
         ingress_ports: policy
             .ingress
             .as_ref()
-            .map(|ingress| {
-                ingress
-                    .port_mappings
-                    .iter()
-                    .map(|mapping| mapping.external_port)
-                    .collect()
-            })
+            .map(|ingress| ingress.port_mappings.clone())
             .unwrap_or_default(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
         // The dynamic-ingress grant (NET-045, NET-138), from the same

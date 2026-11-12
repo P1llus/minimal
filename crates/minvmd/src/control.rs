@@ -3235,7 +3235,7 @@ mod tests {
     use switch::SwitchSubnet;
 
     use crate::box_registry::PENDING_ASKS_PER_ROW;
-    use crate::test_support::CaptureWriter;
+    use crate::test_support::{CaptureWriter, tcp_mapping};
 
     use super::*;
 
@@ -4642,7 +4642,7 @@ mod tests {
                 &sock_path,
                 &RegisterBoxRequest {
                     name: "web".to_string(),
-                    ingress_ports: vec![8080],
+                    ingress_ports: vec![tcp_mapping(8080, 80)],
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
@@ -5569,7 +5569,7 @@ mod tests {
             &sock_path,
             &RegisterBoxRequest {
                 name: "web".to_string(),
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
@@ -6627,7 +6627,7 @@ mod tests {
         fn register(
             &self,
             name: &str,
-            ports: &[u16],
+            ports: &[boxes::PortMapping],
             dynamic: Option<(u16, u16)>,
         ) -> RegisteredBox {
             handed(
@@ -6708,8 +6708,8 @@ mod tests {
     fn the_guest_door_publishes_only_what_the_registration_grants() {
         use minimald_rpc::{PublishOrigin, PublishRefusal};
         let host = PublishHost::start();
-        let web = host.register("web", &[8080], Some((3000, 3999)));
-        let other = host.register("other", &[9090], None);
+        let web = host.register("web", &[tcp_mapping(8080, 80)], Some((3000, 3999)));
+        let other = host.register("other", &[tcp_mapping(9090, 90)], None);
         assert!(host.standing(web.box_id));
 
         let GuestDoorReply::Published {
@@ -6762,6 +6762,16 @@ mod tests {
             refusal_of(host.publish(&other, 8080, 80, PublishOrigin::Declared)),
             PublishRefusal::NotDeclared
         );
+        // A declared host port, to a port in the box its creator did not
+        // name. The forward stays where it leads.
+        assert_eq!(
+            refusal_of(host.publish(&web, 8080, 22, PublishOrigin::Declared)),
+            PublishRefusal::NotDeclared
+        );
+        assert_eq!(
+            host.fake.dials(&listener.to_string(), "tcp"),
+            Some(format!("{}:80", web.switch_address))
+        );
         // A box the host never registered.
         let stranger = RegisteredBox {
             box_id: minimald_rpc::BoxId::mint(),
@@ -6793,7 +6803,7 @@ mod tests {
     fn the_guest_door_unpublishes_and_ends_a_box() {
         use minimald_rpc::{PublishOrigin, PublishRefusal};
         let host = PublishHost::start();
-        let web = host.register("web", &[8080], Some((3000, 3999)));
+        let web = host.register("web", &[tcp_mapping(8080, 80)], Some((3000, 3999)));
         host.publish(&web, 8080, 80, PublishOrigin::Declared);
         host.publish(&web, 3000, 3000, PublishOrigin::Expose);
 
@@ -6864,7 +6874,7 @@ mod tests {
     #[test]
     fn each_door_serves_only_its_own_verbs() {
         let host = PublishHost::start();
-        let web = host.register("web", &[8080], None);
+        let web = host.register("web", &[tcp_mapping(8080, 80)], None);
         let publish = serde_json_lenient::to_string(&GuestDoorRequest::PublishPort(
             minimald_rpc::PublishPortRequest {
                 box_id: web.box_id,
@@ -6913,7 +6923,7 @@ mod tests {
                 &sock_path,
                 &RegisterBoxRequest {
                     name: "web".to_string(),
-                    ingress_ports: vec![8080, 9090],
+                    ingress_ports: vec![tcp_mapping(8080, 80), tcp_mapping(9090, 90)],
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
@@ -6979,7 +6989,7 @@ mod tests {
                 &sock_path,
                 &RegisterBoxRequest {
                     name: "db".to_string(),
-                    ingress_ports: vec![5432],
+                    ingress_ports: vec![tcp_mapping(5432, 5432)],
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,

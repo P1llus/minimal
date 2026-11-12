@@ -55,3 +55,12 @@ pub(crate) fn capture_log() -> (CaptureWriter, tracing::subscriber::DefaultGuard
     let guard = tracing::subscriber::set_default(subscriber);
     (log, guard)
 }
+
+/// A declared TCP mapping from a host port to a port in the box.
+pub(crate) const fn tcp_mapping(external: u16, internal: u16) -> boxes::PortMapping {
+    boxes::PortMapping {
+        external_port: external,
+        internal_port: internal,
+        proto: boxes::IpProto::Tcp,
+    }
+}

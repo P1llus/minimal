@@ -85,10 +85,17 @@ impl Vm {
         std::fs::read_to_string(&self.console).unwrap_or_default()
     }
 
-    fn register(&self, name: &str, ports: &[u16], credentialed: bool) -> RegisteredBox {
+    fn register(&self, name: &str, ports: &[(u16, u16)], credentialed: bool) -> RegisteredBox {
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             name: name.to_string(),
-            ingress_ports: ports.to_vec(),
+            ingress_ports: ports
+                .iter()
+                .map(|&(external_port, internal_port)| boxes::PortMapping {
+                    external_port,
+                    internal_port,
+                    proto: IpProto::Tcp,
+                })
+                .collect(),
             credentialed_upstream: credentialed.then(boxes::CredentialedUpstream::default),
             dynamic_ingress: None,
             dynamic_allowed_range: None,
@@ -356,7 +363,7 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
 
     // A box registered by a host client, with two declared ports: the
     // probe's page and its shell.
-    let web = vm.register("probe", &[18080, 18022], false);
+    let web = vm.register("probe", &[(18080, 8080), (18022, 8022)], false);
     assert_eq!(
         web.switch_address, PROBE_BOX,
         "the probe's box address is the first one the VM host hands out"
@@ -391,6 +398,20 @@ fn the_vm_reaches_the_network_only_through_the_uplink_and_the_two_doors() {
         "{undeclared:?}"
     );
     println!("undeclared publish: {undeclared:?}");
+    // A declared host port leads only to the port the registration names.
+    let elsewhere = vm.guest(&GuestDoorRequest::PublishPort(PublishPortRequest {
+        box_id: web.box_id,
+        external: 18080,
+        internal: 8022,
+        proto: IpProto::Tcp,
+        origin: PublishOrigin::Declared,
+    }));
+    assert!(
+        matches!(elsewhere, GuestDoorReply::PublishRefused { .. }),
+        "{elsewhere:?}"
+    );
+    assert!(http_get(page).is_some_and(|answer| answer.contains("probe box page")));
+    println!("declared port to another port in the box: {elsewhere:?}");
 
     // The host's loopback: no route through the virtual network, and the
     // stream door only at an exposed port.

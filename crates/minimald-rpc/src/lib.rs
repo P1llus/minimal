@@ -730,12 +730,11 @@ pub struct RegisterBoxRequest {
     /// carries, so the host-side row and the session identify the same box.
     /// A box's id on the host is its name.
     pub name: String,
-    /// The external ports the box's ingress rules admit, as the client
-    /// expanded them. The host row holds the expanded ports rather than the
-    /// rules so the rule grammar stays the client's: the attaching side
-    /// reaches ports without re-parsing declarations.
+    /// The port mappings the box's ingress declares. The host forwards a
+    /// declared port only as one of these: the host port, the port in the
+    /// box and the protocol.
     #[serde(default)]
-    pub ingress_ports: Vec<u16>,
+    pub ingress_ports: Vec<PortMapping>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
     /// from the session's policy: `Some` marks the Box Egress Proxy's
     /// listener as the box's infrastructure — the one destination its

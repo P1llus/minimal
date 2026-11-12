@@ -351,8 +351,14 @@ impl Publisher {
             request: *request,
             kind,
         };
-        if row.admitted_ports().contains(&request.external) {
-            return Decision::Bind(grant(GrantKind::Declared));
+        // A host port the box declared is forwarded as declared and no
+        // other way: to the port in the box its creator named.
+        match row.declared_internal(request.external, request.proto) {
+            Some(internal) if internal == request.internal => {
+                return Decision::Bind(grant(GrantKind::Declared));
+            }
+            Some(_) => return Decision::Refuse(PublishRefusal::NotDeclared),
+            None => {}
         }
         // A run-time publish is one TCP port, the same on both sides.
         if request.origin == PublishOrigin::Declared
@@ -457,22 +463,10 @@ impl Publisher {
         match admit {
             Admit::Same(State::Bound) => return Ok(ForwardState::Bound),
             Admit::Same(State::Waiting) | Admit::Waiting => return Ok(ForwardState::Waiting),
-            Admit::HeldElsewhere => return Err(PublishRefusal::ListenerHeld),
+            // A box's host port leads to one port in the box: the declared
+            // one, or for a run-time publish the same number.
+            Admit::HeldElsewhere | Admit::Retarget => return Err(PublishRefusal::ListenerHeld),
             Admit::Full => return Err(PublishRefusal::LedgerFull),
-            Admit::Retarget => {
-                // The owner's forward moves to a new port in the box.
-                if self
-                    .inner
-                    .api
-                    .unexpose(forward.listener, forward.proto)
-                    .is_err()
-                {
-                    return Err(PublishRefusal::SwitchUnavailable);
-                }
-                let mut ledger = self.ledger();
-                ledger.release(forward.listener, forward.proto, forward.owner);
-                ledger.admit(forward);
-            }
             Admit::New | Admit::Same(State::Owed) => {}
         }
         match self.expose(&forward) {
@@ -1027,6 +1021,7 @@ mod tests {
     use super::*;
     use crate::box_registry::ClientBoxSpec;
     use crate::net::gvproxy_api::testing::FakeSwitch;
+    use crate::test_support::tcp_mapping;
     use boxes::DynamicIngress;
 
     struct Bed {
@@ -1103,7 +1098,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("web")
             },
             OWN,
@@ -1131,7 +1126,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("web")
             },
             Ipv4Addr::LOCALHOST,
@@ -1150,7 +1145,7 @@ mod tests {
         let bed = bed();
         let deny = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("deny")
             },
             OWN,
@@ -1206,6 +1201,53 @@ mod tests {
         assert_eq!(
             bed.publish(request(&no_range, 3000, 3000, PublishOrigin::Expose)),
             Err(PublishRefusal::NoRange)
+        );
+    }
+
+    /// The guest names the port in the box and the protocol of a publish.
+    /// For a host port the box declared, the host takes neither from it.
+    #[test]
+    fn a_declared_port_is_forwarded_only_as_its_creator_declared_it() {
+        let bed = bed();
+        let row = bed.register(
+            &ClientBoxSpec {
+                ingress_ports: vec![tcp_mapping(8080, 80)],
+                dynamic_ingress: Some(DynamicIngress::Allow),
+                dynamic_allowed_range: Some((8000, 8999)),
+                ..spec("web")
+            },
+            OWN,
+        );
+        // Another port in the box.
+        assert_eq!(
+            bed.publish(request(&row, 8080, 22, PublishOrigin::Declared)),
+            Err(PublishRefusal::NotDeclared)
+        );
+        // Another protocol.
+        let mut udp = request(&row, 8080, 80, PublishOrigin::Declared);
+        udp.proto = IpProto::Udp;
+        assert_eq!(bed.publish(udp), Err(PublishRefusal::NotDeclared));
+        // The dynamic grant covers the number, and the port is not its to
+        // give: the declaration holds it.
+        for origin in [PublishOrigin::Expose, PublishOrigin::Listen] {
+            assert_eq!(
+                bed.publish(request(&row, 8080, 8080, origin)),
+                Err(PublishRefusal::NotDeclared)
+            );
+        }
+        assert!(bed.fake.forwards().is_empty());
+        assert!(row.runtime_port_numbers().is_empty());
+
+        bed.publish(request(&row, 8080, 80, PublishOrigin::Declared))
+            .unwrap();
+        // Bound, it stays where it was declared to lead.
+        assert_eq!(
+            bed.publish(request(&row, 8080, 22, PublishOrigin::Declared)),
+            Err(PublishRefusal::NotDeclared)
+        );
+        assert_eq!(
+            bed.fake.dials("127.0.64.2:8080", "tcp"),
+            Some(format!("{}:80", row.switch_addr()))
         );
     }
 
@@ -1308,7 +1350,7 @@ mod tests {
         // declared is decided by the first box's grant.
         let declared = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8443],
+                ingress_ports: vec![tcp_mapping(8443, 8443)],
                 ..spec("declared")
             },
             OWN,
@@ -1326,7 +1368,7 @@ mod tests {
         bed.fake.report_closed(2);
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 dynamic_ingress: Some(DynamicIngress::Allow),
                 dynamic_allowed_range: Some((3000, 3999)),
                 ..spec("web")
@@ -1356,7 +1398,7 @@ mod tests {
         bed.fake.occupy("127.0.64.2:8080");
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("web")
             },
             OWN,
@@ -1376,12 +1418,12 @@ mod tests {
     #[test]
     fn a_declared_port_waits_for_its_listener_and_binds_when_the_holder_ends() {
         let bed = bed();
-        let declared = |name: &str| ClientBoxSpec {
-            ingress_ports: vec![8080],
+        let declared = |name: &str, internal| ClientBoxSpec {
+            ingress_ports: vec![tcp_mapping(8080, internal)],
             ..spec(name)
         };
-        let holder = bed.register(&declared("holder"), Ipv4Addr::LOCALHOST);
-        let waiter = bed.register(&declared("waiter"), Ipv4Addr::LOCALHOST);
+        let holder = bed.register(&declared("holder", 80), Ipv4Addr::LOCALHOST);
+        let waiter = bed.register(&declared("waiter", 81), Ipv4Addr::LOCALHOST);
         bed.publish(request(&holder, 8080, 80, PublishOrigin::Declared))
             .unwrap();
         assert_eq!(
@@ -1421,7 +1463,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080, 8081],
+                ingress_ports: vec![tcp_mapping(8080, 80), tcp_mapping(8081, 81)],
                 ..spec("web")
             },
             OWN,
@@ -1447,7 +1489,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("web")
             },
             OWN,
@@ -1491,7 +1533,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 dynamic_ingress: Some(DynamicIngress::Allow),
                 dynamic_allowed_range: Some((3000, 3999)),
                 ..spec("web")
@@ -1520,7 +1562,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("web")
             },
             OWN,
@@ -1543,7 +1585,7 @@ mod tests {
         let bed = bed();
         let row = bed.register(
             &ClientBoxSpec {
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 ..spec("web")
             },
             OWN,
@@ -1605,7 +1647,7 @@ mod tests {
         let row = boxes
             .register_client_box_at(
                 ClientBoxSpec {
-                    ingress_ports: vec![8080],
+                    ingress_ports: vec![tcp_mapping(8080, 80)],
                     ..spec("web")
                 },
                 OWN,

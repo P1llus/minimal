@@ -318,6 +318,9 @@ pub struct BoxRecord {
     loopback_addr: Ipv4Addr,
     /// The external ports the box declared.
     admitted_ports: Vec<u16>,
+    /// The mappings the box declared, which a declared port is forwarded
+    /// as. Empty for a row that is no client's box.
+    port_mappings: Vec<boxes::PortMapping>,
     /// Further names the row may answer under.
     declared_names: Vec<String>,
     /// Whether the box was created with a credentialed upstream.
@@ -346,6 +349,7 @@ impl PartialEq for BoxRecord {
             && self.switch_addr == other.switch_addr
             && self.loopback_addr == other.loopback_addr
             && self.admitted_ports == other.admitted_ports
+            && self.port_mappings == other.port_mappings
             && self.declared_names == other.declared_names
             && self.credentialed_upstream == other.credentialed_upstream
             && self.dynamic_ingress == other.dynamic_ingress
@@ -494,6 +498,16 @@ impl BoxRecord {
         &self.admitted_ports
     }
 
+    /// The port in the box that the box declared for `external` under
+    /// `proto`, when it declared that host port.
+    #[must_use]
+    pub fn declared_internal(&self, external: u16, proto: IpProto) -> Option<u16> {
+        self.port_mappings
+            .iter()
+            .find(|mapping| mapping.external_port == external && mapping.proto == proto)
+            .map(|mapping| mapping.internal_port)
+    }
+
     /// The zone names this namespace declared, in the order the declaration
     /// carried them.
     #[must_use]
@@ -579,6 +593,7 @@ pub struct BoxRegistration {
     switch_addr: Ipv4Addr,
     loopback_addr: Ipv4Addr,
     admitted_ports: Vec<u16>,
+    port_mappings: Vec<boxes::PortMapping>,
     declared_names: Vec<String>,
     credentialed_upstream: Option<boxes::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
@@ -598,6 +613,7 @@ impl BoxRegistration {
             switch_addr,
             loopback_addr,
             admitted_ports: Vec::new(),
+            port_mappings: Vec::new(),
             declared_names: Vec::new(),
             credentialed_upstream: None,
             dynamic_ingress: None,
@@ -618,6 +634,18 @@ impl BoxRegistration {
     #[must_use]
     pub fn with_admitted_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
         self.admitted_ports = ports.into_iter().collect();
+        self
+    }
+
+    /// The mappings a box declared ([`BoxRecord::declared_internal`]). Their
+    /// host ports are the ports the namespace admitted.
+    #[must_use]
+    pub fn with_port_mappings(mut self, mappings: Vec<boxes::PortMapping>) -> Self {
+        self.admitted_ports = mappings
+            .iter()
+            .map(|mapping| mapping.external_port)
+            .collect();
+        self.port_mappings = mappings;
         self
     }
 
@@ -670,9 +698,8 @@ pub struct ClientBoxSpec {
     /// The box's name: what the row is named by, and the name the create
     /// request will carry — a box's id on the host is its name.
     pub name: String,
-    /// The external ports the box's ingress rules admit, as the client
-    /// expanded them.
-    pub ingress_ports: Vec<u16>,
+    /// The port mappings the box's ingress declares.
+    pub ingress_ports: Vec<boxes::PortMapping>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
     /// from the session's policy. The one field a client that predates
     /// NET-134 sends absent, every time.
@@ -717,7 +744,7 @@ struct Creation {
     box_id: minimald_rpc::BoxId,
     switch_address: Ipv4Addr,
     loopback_address: Ipv4Addr,
-    ingress_ports: Vec<u16>,
+    ingress_ports: Vec<boxes::PortMapping>,
     credentialed_upstream: Option<boxes::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
@@ -3826,6 +3853,7 @@ impl BoxRegistry {
                     switch_addr: task_addr,
                     loopback_addr: registration.loopback_addr,
                     admitted_ports: Vec::new(),
+                    port_mappings: Vec::new(),
                     declared_names: Vec::new(),
                     credentialed_upstream: false,
                     dynamic_ingress: DynamicIngress::Deny,
@@ -3850,6 +3878,7 @@ impl BoxRegistry {
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
+            port_mappings: registration.port_mappings,
             declared_names: registration.declared_names,
             task_row_of: None,
             task_addrs: registration.task_addrs,
@@ -4395,7 +4424,7 @@ impl BoxRegistry {
         id: BoxId,
     ) -> BoxRegistration {
         let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
-            .with_admitted_ports(spec.ingress_ports)
+            .with_port_mappings(spec.ingress_ports)
             .with_task_addresses(task_addrs);
         if let Some(declaration) = spec.credentialed_upstream {
             registration = registration.with_credentialed_upstream(declaration);
@@ -7195,6 +7224,7 @@ mod tests {
     use switch::SwitchSubnet;
 
     use super::*;
+    use crate::test_support::tcp_mapping;
 
     /// The default switch subnet, the plan every registry below is built for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
@@ -7484,7 +7514,7 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         let spec = |name: &str| ClientBoxSpec {
             name: name.to_string(),
-            ingress_ports: vec![8080],
+            ingress_ports: vec![tcp_mapping(8080, 80)],
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
@@ -7536,7 +7566,7 @@ mod tests {
         let web = registry
             .register_client_box(ClientBoxSpec {
                 name: "web".to_string(),
-                ingress_ports: vec![8080],
+                ingress_ports: vec![tcp_mapping(8080, 80)],
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
@@ -7615,7 +7645,7 @@ mod tests {
         let withdrawn = registry.table().subscribe_row_withdrawals();
         let spec = |name: &str| ClientBoxSpec {
             name: name.to_string(),
-            ingress_ports: vec![8080],
+            ingress_ports: vec![tcp_mapping(8080, 80)],
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
@@ -7657,7 +7687,7 @@ mod tests {
         let withdrawn = registry.table().subscribe_row_withdrawals();
         let spec = |name: &str| ClientBoxSpec {
             name: name.to_string(),
-            ingress_ports: vec![8080],
+            ingress_ports: vec![tcp_mapping(8080, 80)],
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
@@ -8998,7 +9028,7 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         let spec = || ClientBoxSpec {
             name: "web".to_string(),
-            ingress_ports: vec![8080],
+            ingress_ports: vec![tcp_mapping(8080, 80)],
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
@@ -10928,7 +10958,7 @@ mod tests {
         let web = registry
             .register_client_box_with_task_slots(
                 ClientBoxSpec {
-                    ingress_ports: vec![8080],
+                    ingress_ports: vec![tcp_mapping(8080, 80)],
                     ..client_spec("web")
                 },
                 2,
