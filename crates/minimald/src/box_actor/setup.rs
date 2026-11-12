@@ -226,57 +226,6 @@ impl fmt::Debug for WorkspaceBaseline {
 }
 
 impl BoxActor {
-    /// Watches for the range verdict to land, for a box that finalized at
-    /// the shared `127.0.0.1` fallback under a pending verdict while another
-    /// box there held one of its declared ports (NET-144). Under a pending
-    /// verdict the box yields the port, because a present landing moves it
-    /// to its own address. When the verdict lands absent, the box stays at
-    /// the fallback with the port unbound. The box is `Active` by then, so
-    /// the watcher reports the held port in one warn line with the same
-    /// fields as a refused activation, and does not destroy the box. A box
-    /// that moved off the fallback, or no longer publishes, is not reported.
-    #[cfg(target_os = "linux")]
-    fn watch_fallback_landing(&self, record: &Record, ingress: &boxes::IngressPolicy) {
-        let book = Arc::clone(&self.loopback);
-        let hostnames = Arc::clone(&self.hostnames);
-        let session = record.id;
-        let mappings = ingress.port_mappings.clone();
-        crate::traced::spawn_detached(
-            tracing::info_span!(parent: None, "session.fallback_port_watch", session = %session),
-            async move {
-                if book.await_landing().await != crate::net::dns::RangeVerdict::Absent {
-                    return;
-                }
-                let held = hostnames
-                    .read()
-                    .expect("hostname registry lock poisoned")
-                    .fallback_port_refusal(session);
-                let Some((port, holder)) = held else {
-                    return;
-                };
-                let box_port = mappings
-                    .iter()
-                    .find(|mapping| mapping.external_port == port)
-                    .map_or(port, |mapping| mapping.internal_port);
-                let refusal = minimald_rpc::PortInUseRefusal {
-                    port,
-                    box_port,
-                    holder: minimald_rpc::PortHolder::Box(holder),
-                };
-                tracing::warn!(
-                    session = %session,
-                    port = refusal.port,
-                    address = %std::net::Ipv4Addr::LOCALHOST,
-                    holder = %refusal.holder.log_label(),
-                    action = "host-port-in-use",
-                    "the range verdict landed absent, so this active box stays at the \
-                     127.0.0.1 fallback, where another box holds its declared ingress \
-                     port; the port is not bound for this box"
-                );
-            },
-        );
-    }
-
     /// Compose this session's loadout from its project config and the
     /// client's wire contribution, then either finalize it (`Ok(None)`, the
     /// session is now `Active`) or park it in `Draft` holding the resume
@@ -673,9 +622,8 @@ impl BoxActor {
                 // nothing and comes up exactly as before.
                 //
                 // The box's name and publish come first (NET-010/NET-011):
-                // the box's first finalize, the one registration that may
-                // wait for the range verdict (NET-123 §7.1), runs before
-                // the hook launch below, because that launch is the box's
+                // the box's first finalize runs before the hook launch
+                // below, because that launch is the box's
                 // first attach. An own-address box that declared ingress
                 // binds its forwards at the address this registration
                 // publishes, and an attach that finds none fails with "no
@@ -716,13 +664,7 @@ impl BoxActor {
                 //
                 // Another box that holds the port at the shared `127.0.0.1`
                 // fallback refuses the box: nobody chose to share that
-                // address. Only a landed range verdict keeps a box there.
-                // Under a pending verdict the interim is a waypoint, the box
-                // moves to its hand when the verdict lands present, and the
-                // port is yielded as before. If the verdict then lands absent,
-                // the box stays at the fallback, and a watcher reports the
-                // held port in the daemon log ([`Self::watch_fallback_landing`]).
-                // At a node's shared address the port is yielded too
+                // address. At a node's shared address the port is yielded
                 // (NET-129). Then the daemon checks the ports that something
                 // outside the registry holds. On a native host the forwarder
                 // binds in the daemon's own network namespace, so the daemon
@@ -746,14 +688,6 @@ impl BoxActor {
                             hostnames.published_own_address(record.id),
                             hostnames.fallback_port_refusal(record.id),
                         )
-                    };
-                    let fallback_refusal = if fallback_refusal.is_some()
-                        && self.loopback.range_verdict() == crate::net::dns::RangeVerdict::Pending
-                    {
-                        self.watch_fallback_landing(&record, ingress);
-                        None
-                    } else {
-                        fallback_refusal
                     };
                     let box_port = |port: u16| {
                         ingress

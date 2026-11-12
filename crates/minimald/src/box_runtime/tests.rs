@@ -1934,10 +1934,7 @@ async fn dynamic_ingress_box(
     mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> (boxes::SessionId, crate::box_actor::BoxHandle) {
-    // The loopback verdict vouches for the handed address, so the registry
-    // publishes the box at it — the address a runtime publish binds at.
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let id =
         finalize_dynamic_ingress_session(client, name, ASK_SWITCH, ASK_LOOPBACK, mode, range).await;
     let handle = manager
@@ -3310,7 +3307,6 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     // An address no other test's box uses: the live-gate table is
     // process-wide.
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 92);
@@ -3466,7 +3462,6 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     // An address no other test's box uses: the live-gate table is
     // process-wide, and this test's point is the gate's own state.
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 93);

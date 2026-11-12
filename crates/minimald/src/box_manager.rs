@@ -1341,13 +1341,15 @@ pub struct BoxManager {
 
 impl BoxManager {
     /// Launches a sessions manager managing sessions in
-    /// the given minimal state dir.
+    /// the given minimal state dir. `range` is whether the reserved local
+    /// range binds where this daemon's boxes publish.
     pub async fn init(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
         deny_all_opt_out: bool,
+        range: crate::net::dns::RangeVerdict,
     ) -> Result<BoxManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
@@ -1383,10 +1385,8 @@ impl BoxManager {
         // as its children: they live exactly as long, and a lifetime loop
         // that is a root of its own reads as a stray trace in the export.
         // Its ids are noted (`adopt_trace` with no caller), so the work no
-        // request asks for (the boot resume, a hand-over the daemon's own
-        // range walk makes) joins this trace instead of starting one. Made
-        // before the registry below, so a microVM daemon's start walk runs
-        // in it too.
+        // request asks for (the boot resume) joins this trace instead of
+        // starting one.
         //
         // The root closes when the mainloop ends: the loops end with the
         // mainloop (`mainloop_done`), not at the runtime's drop, so a root
@@ -1429,11 +1429,6 @@ impl BoxManager {
         // below frees the grants of boxes whose sessions are gone, and every
         // box that is still live keeps its line for its resumed session to
         // re-register with.
-        //
-        // A VM daemon asks for one address for its *node* before any box does
-        // (NET-129: "one allocated address per VM node") — the address its
-        // host-address boxes answer at. A native node's address is the host
-        // loopback itself, which it already owns.
         #[cfg(target_os = "linux")]
         #[cfg(target_os = "linux")]
         let (hostnames, loopback) = {
@@ -1446,54 +1441,15 @@ impl BoxManager {
             // dead by a snapshot that predates them.
             let daemon_start = crate::net::dns::unix_now_secs();
             let switch = net_switch.lock().await;
-            let transport = switch.transport();
-            let on_switch = matches!(transport, crate::net::SwitchTransport::HostShuttle { .. });
-            // A native node publishes on its own loopback, so it asks that
-            // whether the reserved range binds. In a VM the VM host picks
-            // where each port listens and answers every publish with the
-            // address, so the range is the host's to vouch for.
-            let probe = match transport {
-                crate::net::SwitchTransport::HostShuttle { .. } => None,
-                _ => Some(
-                    crate::traced::spawn_blocking(crate::net::loopback::probe)
-                        .await
-                        .unwrap_or_else(|join_error| {
-                            tracing::warn!(
-                                error = %join_error,
-                                "the daemon-start loopback probe was lost; \
-                                 reading the range absent",
-                            );
-                            crate::net::loopback::RangeProbe::failed_to_run()
-                        }),
-                ),
-            };
-            if let Some(probe) = probe.as_ref() {
-                tracing::info!(
-                    surface = probe.surface(),
-                    interim = probe.interim(),
-                    first_failure = ?probe.first_failure,
-                    "daemon-start loopback probe picked the publish surface",
-                );
-            }
-            let present = probe.as_ref().is_some_and(|probe| probe.present());
-            // The state the book opens on. Where a probe ran, its answer is
-            // the host's: a native daemon's own loopback is its publish
-            // surface, so it measures the range itself on the way here. The
-            // one arm that leaves `probe` unset — the gvproxy switch above —
-            // is the daemon that cannot measure its own, so its book opens
-            // pending and the spawned walk below lands the verdict. That a
-            // book can be open without one is the whole reason the verdict is
-            // a state and not a fact.
-            let verdict = match (&probe, present) {
-                (None, _) => crate::net::dns::RangeVerdict::Present,
-                (Some(_), true) => crate::net::dns::RangeVerdict::Present,
-                (Some(_), false) => crate::net::dns::RangeVerdict::Absent,
-            };
+            let on_switch = matches!(
+                switch.transport(),
+                crate::net::SwitchTransport::HostShuttle { .. }
+            );
             // The answerer's record for this host, under the state root every
             // daemon instance on it shares. Unreadable records withhold
             // grants (never guess an address another namespace may hold);
             // absent ranges grant nothing, the interim's business.
-            let book = crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, verdict)?;
+            let book = crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, range)?;
             let swept = book.release_dead_boxes(&live_session_ids(&store).await?, daemon_start);
             if !swept.is_empty() {
                 tracing::info!(
@@ -1518,12 +1474,7 @@ impl BoxManager {
             for address in book.unrecorded_publishes() {
                 crate::net::dns::warn_publish_collision(address);
             }
-            // The node's own address (NET-129): a native node's is the host
-            // loopback it already owns, and a VM node's is a grant the range
-            // verdict gates — so on a VM node it is the spawned walk's to
-            // make, not this block's, and the registry opens on the interim
-            // address a withheld grant falls back to (`new`'s own default,
-            // named here because it is the interim, not an omission).
+            // The node's own address is the host loopback.
             let registry =
                 crate::net::dns::HostnameRegistry::new(switch.host_id().to_owned(), on_switch)
                     .with_node_address(Ipv4Addr::LOCALHOST);
@@ -1532,6 +1483,8 @@ impl BoxManager {
             let loopback = Arc::new(book);
             (hostnames, loopback)
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = range;
         let in_shutdown = CancellationToken::new();
         let handle = BoxManagerHandle {
             sender,
@@ -1540,8 +1493,6 @@ impl BoxManager {
             lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
-            #[cfg(all(test, target_os = "linux"))]
-            loopback: Arc::clone(&loopback),
         };
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
@@ -2391,7 +2342,7 @@ impl BoxManager {
     /// under its resume bound, which the VM's cold boot must fit inside.
     ///
     /// Resuming through [`BoxActor::run`] keeps one registration path, with
-    /// its collision rules and its rule never to wait on the range verdict.
+    /// its collision rules.
     /// It is idempotent: a session already in `running` is skipped, and a
     /// later RPC that names a resumed session finds its actor there rather
     /// than registering it again.
@@ -4724,6 +4675,7 @@ mod create_stamp_tests {
             daemon_ctx,
             switch,
             false,
+            crate::net::dns::RangeVerdict::Present,
         )
         .await
         .unwrap();
@@ -4942,6 +4894,7 @@ mod ended_box_tests {
             daemon_ctx,
             switch,
             false,
+            crate::net::dns::RangeVerdict::Present,
         )
         .await
         .unwrap();

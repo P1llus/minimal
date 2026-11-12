@@ -3748,12 +3748,10 @@ async fn finalize_handed_own_ip_session(
     id
 }
 
-/// The FinalizeSession step of the helpers above, on its own — for the
-/// tests that send it from a second connection while the daemon's
-/// registration waits on the range verdict, so the walk can land inside
-/// that bounded wait (NET-123 §7.1). Returns the reply, so a test can
-/// read what the finalize reported — the collisions a shared-address box
-/// yielded among them. Asks for that list, as the current `min` does.
+/// The FinalizeSession step of the helpers above, on its own. Returns the
+/// reply, so a test can read what the finalize reported — the collisions a
+/// shared-address box yielded among them. Asks for that list, as the
+/// current `min` does.
 async fn finalize_session(
     client: &mut TestClient,
     id: SessionId,
@@ -3783,9 +3781,7 @@ async fn finalize_session_asking(
 }
 
 /// Drives Create → ConfigureLoadout for an own-address box nobody handed
-/// an address, leaving the finalize to the caller. Split from
-/// [`finalize_own_ip_session`] for the tests that drive the finalize
-/// against a landing's timing.
+/// an address, leaving the finalize to the caller.
 async fn create_own_ip_session(client: &mut TestClient, name: &str) -> SessionId {
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     let id = client
@@ -3931,10 +3927,9 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fallback() {
     let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
-    let manager = server.state.sessions_manager().await;
     // No reserved range on this host: every box publishes at `127.0.0.1`.
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let server = TestServer::new_without_reserved_range().await;
+    let manager = server.state.sessions_manager().await;
     let mut client = server.connect().await;
     let first = create_handed_own_ip_session(
         &mut client,
@@ -3986,103 +3981,6 @@ async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fal
             && line.contains("holder=box:first")),
         "the warn line names the holding box, got: {logged}"
     );
-}
-
-/// NET-144, under a pending range verdict: a second box at the `127.0.0.1`
-/// interim yields the declared port the first box holds there, because a
-/// present landing moves both to their own addresses. When the verdict
-/// lands absent, the second box stays at the fallback with the port unbound,
-/// and the daemon log reports it with the port and the holder. The first
-/// box, which holds the port, is not reported.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict_lands_absent() {
-    let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
-    let manager = server.state.sessions_manager().await;
-    manager.hold_range_verdict_pending();
-    // The bound is shrunk so both finalizes publish at the interim.
-    manager.reset_hand_verdict_deadline(100);
-    let mut client = server.connect().await;
-    let first = finalize_handed_own_ip_session(
-        &mut client,
-        "first",
-        std::net::Ipv4Addr::new(100, 64, 128, 81),
-        std::net::Ipv4Addr::new(127, 0, 64, 81),
-    )
-    .await;
-    let second = create_handed_own_ip_session(
-        &mut client,
-        "second",
-        std::net::Ipv4Addr::new(100, 64, 128, 82),
-        std::net::Ipv4Addr::new(127, 0, 64, 82),
-    )
-    .await;
-    let finalized = finalize_session(&mut client, second).await;
-    assert!(
-        finalized
-            .shared_port_collisions
-            .iter()
-            .any(|collision| collision.port == declared_port()
-                && collision.held_by.starts_with("first")),
-        "under the pending verdict the second box yields the port: {finalized:?}"
-    );
-    let registry = manager.hostnames();
-    for id in [first, second] {
-        assert_eq!(
-            registry
-                .read()
-                .expect("registry lock")
-                .published_own_address(id),
-            Some(std::net::Ipv4Addr::LOCALHOST),
-            "both boxes stand at the interim while the verdict walks"
-        );
-    }
-    let reported = |logged: &str, id: SessionId| {
-        logged.lines().any(|line| {
-            line.contains("host-port-in-use")
-                && line.contains("127.0.0.1 fallback")
-                && line.contains(&format!("session={id}"))
-        })
-    };
-    assert!(
-        !reported(&capture.contents(), second),
-        "nothing is reported while the verdict is pending"
-    );
-
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Absent);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !reported(&capture.contents(), second) && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let logged = capture.contents();
-    assert!(
-        logged.lines().any(|line| line.contains("host-port-in-use")
-            && line.contains("127.0.0.1 fallback")
-            && line.contains(&format!("session={second}"))
-            && line.contains(&format!("port={}", declared_port()))
-            && line.contains("address=127.0.0.1")
-            && line.contains("holder=box:first")),
-        "the absent landing reports the held port, the address and the holder, got: {logged}"
-    );
-    assert!(
-        !reported(&logged, first),
-        "the box that holds the port is not reported: {logged}"
-    );
-}
-
-/// Waits until a registration is parked on the range verdict, so the
-/// landing a test makes next provably answers a waiter rather than a
-/// registration that has not yet begun to wait (NET-123 §7.1).
-#[cfg(target_os = "linux")]
-async fn await_verdict_waiter(manager: &crate::box_manager::BoxManagerHandle) {
-    for _ in 0..12_000 {
-        if manager.verdict_waiters() >= 1 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("no registration began to wait on the range verdict");
 }
 
 /// The A answer a live box's name carries, and the session that owns it —
@@ -4194,8 +4092,7 @@ async fn name_registered_at_finalize() {
 /// to bind its forwards at. The withheld-grant shapes a fault makes — a
 /// spent pool, an unreadable record — register no name and fail the attach
 /// with "no published address handed" (proved in the gvproxy network
-/// proofs); the shapes the host's publish surface makes — an absent range,
-/// a verdict still walking — publish the box on the `127.0.0.1` interim
+/// proofs); an absent range publishes the box on the `127.0.0.1` interim
 /// (NET-123), which the dns proofs pin beside the hand's verdict gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_nobody_handed_an_address_publishes_at_the_answerers_grant() {
@@ -4847,10 +4744,8 @@ async fn stopped_shared_address_box_is_nodata_through_actor() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     // The NODATA gate in zone_answer requires the box's address to equal the
-    // node's address (NET-128). After the verdict lands, the node address is
-    // the granted address from the loopback lease book — use it as the shared
+    // node's address (NET-128). Use the node address as the shared
     // address so the stopped box triggers the NODATA path.
     let shared = manager
         .hostnames()
@@ -4924,7 +4819,6 @@ async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let shared = manager
         .hostnames()
         .read()
@@ -5046,7 +4940,6 @@ async fn stop_with_unreadable_record_still_marks_name_stopped() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let shared = manager
         .hostnames()
         .read()
@@ -5752,198 +5645,22 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on
     );
 }
 
-/// A deadline held open far longer than any registration that does not wait
-/// can take, so a test tells "did not wait" from "waited" by the clock.
-#[cfg(target_os = "linux")]
-const DEADLINE_HELD_OPEN_MS: u64 = 60_000;
-
-/// What "did not wait" means against [`DEADLINE_HELD_OPEN_MS`]: half of it,
-/// generous for an RPC under emulation, and still a whole half-minute short
-/// of a registration that waited.
-#[cfg(target_os = "linux")]
-const NO_WAIT_BOUND: Duration = Duration::from_secs(30);
-
-/// The destroy of a box whose actor is down brings the actor up to run its
-/// hooks — inside the manager's own message handling — and that bring-up
-/// must not wait for the verdict either (NET-123 §7.1): the destroy returns
-/// well inside a deadline held open for a minute, its registration stands
-/// the handed box at the interim for the moment it lives, and a present
-/// landing afterwards resurrects nothing.
+/// A handed address inside the reserved local range goes through the lease
+/// book's gate at finalize. Under an absent range the box publishes at
+/// `127.0.0.1`, with one warn line naming the hand it left. Under a present
+/// range it publishes at the hand. The name answers where the box publishes.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_destroy_under_a_pending_verdict_does_not_wait_and_publishes_the_interim() {
+async fn a_handed_reserved_address_publishes_only_on_a_present_range() {
     let capture = crate::test_harness::captured_log();
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
-    let doomed = finalize_handed_own_ip_session(
-        &mut client,
-        "doomed",
-        std::net::Ipv4Addr::new(100, 64, 128, 9),
-        handed,
-    )
-    .await;
-
-    // A restarted daemon: the box's actor is down, so the destroy below is
-    // the one that brings it up to run its hooks.
-    server
-        .state
-        .sessions_manager()
-        .await
-        .shutdown(true)
-        .await
-        .expect("a forced shutdown has nothing left to refuse it");
-    drop(client);
-    let state = server.into_state_dir();
-    let server = TestServer::new_in(state).await;
-    let manager = server.state.sessions_manager().await;
-    manager.hold_range_verdict_pending();
-    manager.reset_hand_verdict_deadline(DEADLINE_HELD_OPEN_MS);
-
-    let mut client = server.connect().await;
-    let started = std::time::Instant::now();
-    destroy_session(&mut client, doomed).await;
-    assert!(
-        started.elapsed() < NO_WAIT_BOUND,
-        "a destroy's hook bring-up never waits for the verdict, took {:?}",
-        started.elapsed()
-    );
-    // The bring-up stood the handed box at the interim, said out loud.
-    let logged = capture.contents();
-    let moved = logged
-        .lines()
-        .find(|line| {
-            line.contains("loopback-hand-to-interim") && line.contains("session_name=\"doomed\"")
-        })
-        .unwrap_or_else(|| {
-            panic!("the bring-up's hand→interim move must be logged, got: {logged}")
-        });
-    assert!(
-        moved.contains(&format!("from={handed}")) && moved.contains("to=127.0.0.1"),
-        "the move names both addresses, got: {moved}"
-    );
-
-    // The landing that follows finds nothing to move: the destroy withdrew
-    // the publish, and the name stays absent.
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
-    assert_eq!(
-        manager
-            .hostnames()
-            .read()
-            .expect("registry lock")
-            .published_own_address(doomed),
-        None,
-        "a destroyed box is not resurrected by the landing"
-    );
-    assert!(
-        zone_answer_for(&server, "doomed.min.internal")
-            .await
-            .is_none(),
-        "the destroyed box's name stays absent"
-    );
-}
-
-/// The registration's own promotion is ordered against a destroy by the
-/// session's mailbox, not by a runtime check: a first finalize waiting at
-/// the verdict deadline holds the actor, so a destroy sent meanwhile queues
-/// behind it. When the present landing wakes the wait, the box publishes at
-/// its hand first and the queued destroy removes it after — and no name is
-/// left.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_destroy_queued_behind_a_waiting_finalize_runs_after_the_promotion() {
-    let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
-    let manager = server.state.sessions_manager().await;
-    manager.hold_range_verdict_pending();
-    manager.reset_hand_verdict_deadline(DEADLINE_HELD_OPEN_MS);
-    let mut client = server.connect().await;
-    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
-    let id = create_handed_own_ip_session(
-        &mut client,
-        "queued",
-        std::net::Ipv4Addr::new(100, 64, 128, 9),
-        handed,
-    )
-    .await;
-
-    let mut finalize_client = server.connect().await;
-    let finalize =
-        crate::traced::spawn(async move { finalize_session(&mut finalize_client, id).await });
-    await_verdict_waiter(&manager).await;
-    let mut destroy_client = server.connect().await;
-    let destroy =
-        crate::traced::spawn(async move { destroy_session(&mut destroy_client, id).await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !destroy.is_finished(),
-        "the destroy queues behind the finalize waiting on the verdict"
-    );
-
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
-    finalize.await.expect("the finalize's task runs to its end");
-    destroy.await.expect("the destroy's task runs to its end");
-
-    let logged = capture.contents();
-    let lines: Vec<&str> = logged
-        .lines()
-        .filter(|line| line.contains(&format!("session_id={id}")))
-        .collect();
-    let registered = lines
-        .iter()
-        .position(|line| {
-            line.contains("action=\"registered\"") && line.contains(&format!("ip={handed}"))
-        })
-        .unwrap_or_else(|| panic!("the promotion to the hand must be logged, got: {lines:?}"));
-    let removed = lines
-        .iter()
-        .position(|line| line.contains("action=\"deregistered\""))
-        .unwrap_or_else(|| panic!("the destroy's removal must be logged, got: {lines:?}"));
-    assert!(
-        registered < removed,
-        "the promotion happens before the removal: {lines:?}"
-    );
-    assert_eq!(
-        manager
-            .hostnames()
-            .read()
-            .expect("registry lock")
-            .published_own_address(id),
-        None,
-        "the destroy withdrew the publish"
-    );
-    assert!(
-        zone_answer_for(&server, "queued.min.internal")
-            .await
-            .is_none(),
-        "no name is left"
-    );
-}
-
-/// The wiring test for the hand's verdict gate (the `.filter(vouches_for)`
-/// and the bounded wait on the hand's read, §7.1): a handed reserved address
-/// finalizes to `published_own_address == 127.0.0.1` under an absent book —
-/// the hand names an address the surface cannot bind, so it publishes
-/// nothing and the ask answers with the interim — to the hand under a
-/// pending book whose walk lands **present inside the session-start
-/// deadline** the registration waits bounded by, and to the interim again
-/// when that deadline expires with the walk still out. Remove the gate and
-/// the absent half fails at the hand; remove the wait and the second half
-/// publishes the interim a verdict that has not answered was never asked to.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handed_reserved_address_waits_for_the_verdict_before_it_publishes() {
-    // An absent book: the landing ran before any box existed, so its sweep
-    // found nothing and only the verdict is in play.
     {
-        let server = TestServer::new().await;
+        let server = TestServer::new_without_reserved_range().await;
         let manager = server.state.sessions_manager().await;
-        manager.set_range_verdict(crate::net::dns::RangeVerdict::Absent);
         let mut client = server.connect().await;
-        let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
         let web = finalize_handed_own_ip_session(
             &mut client,
-            "web",
+            "absent",
             std::net::Ipv4Addr::new(100, 64, 128, 9),
             handed,
         )
@@ -5955,44 +5672,41 @@ async fn a_handed_reserved_address_waits_for_the_verdict_before_it_publishes() {
                 .expect("registry lock")
                 .published_own_address(web),
             Some(std::net::Ipv4Addr::LOCALHOST),
-            "under an absent book the hand is unvouched, so the finalize \
+            "under an absent range the hand is unvouched, so the finalize \
              publishes the interim"
         );
-        let (_, address) = zone_answer_for(&server, "web.min.internal")
+        let (_, address) = zone_answer_for(&server, "absent.min.internal")
             .await
-            .expect("the name is held under an absent book");
+            .expect("the name is held under an absent range");
         assert_eq!(
             address,
             std::net::Ipv4Addr::LOCALHOST,
             "the name answers at the interim, never at the unbindable hand"
         );
+        let logged = capture.contents();
+        let moved = logged
+            .lines()
+            .find(|line| {
+                line.contains("action=\"loopback-hand-to-interim\"")
+                    && line.contains("session_name=\"absent\"")
+            })
+            .unwrap_or_else(|| panic!("the hand's move to the interim is logged, got: {logged}"));
+        assert!(
+            moved.contains(&format!("from={handed}")) && moved.contains("to=127.0.0.1"),
+            "the line names both addresses, got: {moved}"
+        );
     }
-
-    // A pending book whose walk lands present inside the deadline: the
-    // finalize's registration waits for it, and the hand it vouches for is
-    // the address the name publishes at — once, never the interim first.
     {
         let server = TestServer::new().await;
         let manager = server.state.sessions_manager().await;
-        manager.hold_range_verdict_pending();
-        // Far off, so the finalize reaches its wait whatever the load: the
-        // landing below answers it long before the deadline would.
-        manager.reset_hand_verdict_deadline(DEADLINE_HELD_OPEN_MS);
         let mut client = server.connect().await;
-        let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
-        let web = create_handed_own_ip_session(
+        let web = finalize_handed_own_ip_session(
             &mut client,
-            "web",
+            "present",
             std::net::Ipv4Addr::new(100, 64, 128, 9),
             handed,
         )
         .await;
-        let mut finalize_client = server.connect().await;
-        let finalize =
-            crate::traced::spawn(async move { finalize_session(&mut finalize_client, web).await });
-        await_verdict_waiter(&manager).await;
-        manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
-        finalize.await.expect("the finalize's task runs to its end");
         assert_eq!(
             manager
                 .hostnames()
@@ -6000,54 +5714,19 @@ async fn a_handed_reserved_address_waits_for_the_verdict_before_it_publishes() {
                 .expect("registry lock")
                 .published_own_address(web),
             Some(handed),
-            "a verdict that lands present inside the deadline publishes the \
-             hand it vouches for"
+            "a present range vouches for the hand, so the finalize publishes it"
         );
-        let (_, address) = zone_answer_for(&server, "web.min.internal")
+        let (_, address) = zone_answer_for(&server, "present.min.internal")
             .await
-            .expect("the name is held once the wait ends");
-        assert_eq!(
-            address, handed,
-            "the name answers at the hand — the interim was never published"
-        );
-    }
-
-    // A pending book whose walk never answers: the deadline expires and the
-    // box publishes the interim, the address the surface can always bind —
-    // the landing's sweep upgrades it to the hand if the walk ever lands.
-    {
-        let server = TestServer::new().await;
-        let manager = server.state.sessions_manager().await;
-        manager.hold_range_verdict_pending();
-        // The deadline is shrunk to the test's patience: the expiry shape is
-        // the one being driven, not the real five seconds of it.
-        manager.reset_hand_verdict_deadline(100);
-        let mut client = server.connect().await;
-        let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
-        let web = finalize_handed_own_ip_session(
-            &mut client,
-            "web",
-            std::net::Ipv4Addr::new(100, 64, 128, 9),
-            handed,
-        )
-        .await;
-        assert_eq!(
-            manager
-                .hostnames()
-                .read()
-                .expect("registry lock")
-                .published_own_address(web),
-            Some(std::net::Ipv4Addr::LOCALHOST),
-            "a verdict that never lands inside the deadline publishes the \
-             interim, so the box has an address at all"
-        );
-        let (_, address) = zone_answer_for(&server, "web.min.internal")
-            .await
-            .expect("the name is held on the interim");
-        assert_eq!(
-            address,
-            std::net::Ipv4Addr::LOCALHOST,
-            "the name answers at the interim while the walk is still out"
+            .expect("the name is held under a present range");
+        assert_eq!(address, handed, "the name answers at the hand");
+        let logged = capture.contents();
+        assert!(
+            !logged.lines().any(|line| {
+                line.contains("action=\"loopback-hand-to-interim\"")
+                    && line.contains("session_name=\"present\"")
+            }),
+            "a vouched hand is not moved, got: {logged}"
         );
     }
 }
@@ -6771,240 +6450,6 @@ async fn a_hand_over_bind_the_switch_refuses_leaves_the_election_standing() {
     );
 }
 
-/// The write-lock promotion `register_hostname` runs after its wait, driven
-/// directly with no timers: a registration that took the `127.0.0.1` interim
-/// moves to its hand once the verdict vouches for it — whether the name is
-/// still unregistered (a first finalize) or already its own (a resume) —
-/// and stays on the interim under an absent verdict, or when another session
-/// holds the name.
-#[test]
-fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
-    use crate::net::dns::{HostnameRegistry, LoopbackLeaseBook, RangeVerdict};
-    use std::collections::BTreeSet;
-    use std::net::Ipv4Addr;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let state_root = paths::DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap();
-    let present = LoopbackLeaseBook::open(&state_root, RangeVerdict::Present).unwrap();
-    let absent_tmp = tempfile::tempdir().unwrap();
-    let absent_root = paths::DaemonAbsPath::try_new(absent_tmp.path().to_str().unwrap()).unwrap();
-    let absent = LoopbackLeaseBook::open(&absent_root, RangeVerdict::Absent).unwrap();
-
-    let me = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-    let other = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-    let hand = Ipv4Addr::new(127, 0, 64, 9);
-    let interim = Some(Ipv4Addr::LOCALHOST);
-    let mut reg = HostnameRegistry::new("dev", false);
-
-    // Present, name not yet registered (a first finalize): the hand.
-    assert_eq!(
-        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
-        Some(hand)
-    );
-    // Absent: the hand is not vouched for, so the interim stands.
-    assert_eq!(
-        super::naming::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
-        None
-    );
-    // Only an interim publish with a hand behind it moves.
-    assert_eq!(
-        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
-        None
-    );
-    assert_eq!(
-        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
-        None
-    );
-
-    // Present, the name already this session's own (a resume): the hand.
-    reg.publish_own_address(me, "promo", Ipv4Addr::LOCALHOST, BTreeSet::new());
-    reg.register_own_ip(me, "promo", BTreeSet::new());
-    assert!(reg.name_held_by(me, "promo"));
-    assert_eq!(
-        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
-        Some(hand)
-    );
-
-    // Present, but the session no longer holds the name — another box
-    // took it: no promotion over that box's name.
-    reg.withdraw_own_name(me, "promo");
-    reg.publish_own_address(
-        other,
-        "promo",
-        Ipv4Addr::new(127, 0, 64, 10),
-        BTreeSet::new(),
-    );
-    reg.register_own_ip(other, "promo", BTreeSet::new());
-    assert!(reg.name_held_by(other, "promo"));
-    assert_eq!(
-        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
-        None
-    );
-}
-
-/// The call that helper was extracted from, driven through
-/// `register_hostname` itself rather than `promote_interim_to_hand` on its
-/// own ([`the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only`]
-/// pins the decision; this pins that the registration makes the call): a
-/// registration whose ask the unvouched verdict answered with the
-/// `127.0.0.1` interim publishes at its hand instead when the verdict
-/// lands present before the write lock — the window the re-read under the
-/// lock exists for, so a registration that skips the call leaves the box
-/// standing at the interim.
-///
-/// The window is driven deterministically, with no timer deciding
-/// anything: the box's first finalize is the one registration that waits
-/// for the verdict, and that wait — the one await between the ask and the
-/// publish — is where the test takes the registry's write lock. An
-/// **absent** landing wakes the ask, which answers the interim (one
-/// `loopback-hand-to-interim` line) and parks the registration on the
-/// held lock; the waiters count reaching zero is the proof the ask
-/// consumed the absent answer before the next landing is stored. A
-/// **present** landing then goes in through the raw verdict store — the
-/// half of a real landing that runs *before* its sweep takes this very
-/// lock, so the sweep cannot be what moves the box; the sweep's own move
-/// is [`an_interim_handed_publish_takes_its_hand_when_the_verdict_lands_late`]'s
-/// to pin. The whole window is one synchronous region — the registration
-/// is the task parked, on a worker, and the write lock is never held
-/// across an await. Releasing the lock lets the registration publish, and
-/// it must take its hand.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
-    let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
-    let manager = server.state.sessions_manager().await;
-    manager.hold_range_verdict_pending();
-    // Far out, so nothing here is decided by the deadline: the window's two
-    // ends are landings, not expiries.
-    manager.reset_hand_verdict_deadline(DEADLINE_HELD_OPEN_MS);
-    let mut client = server.connect().await;
-    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
-    let web = create_handed_own_ip_session(
-        &mut client,
-        "web",
-        std::net::Ipv4Addr::new(100, 64, 128, 9),
-        handed,
-    )
-    .await;
-
-    // The finalize's registration parks on the pending verdict — past its
-    // read of the registry, ahead of its publish.
-    let mut finalize_client = server.connect().await;
-    let finalize =
-        crate::traced::spawn(async move { finalize_session(&mut finalize_client, web).await });
-    await_verdict_waiter(&manager).await;
-
-    // The registry's write lock, held across both landings in one
-    // synchronous region — the registration is the task that parks here,
-    // with the interim answer in hand, so the lock is never held across an
-    // await: the parked registration has already read the registry, and
-    // this is exactly the spot its re-read under the lock exists for.
-    let registry = manager.hostnames();
-    {
-        let parked = registry.write().expect("registry lock");
-
-        // The ask answers the interim: an absent landing wakes the parked
-        // waiter with "not vouched", and the registration heads for
-        // `127.0.0.1`.
-        manager
-            .loopback_book()
-            .set_range_verdict(crate::net::dns::RangeVerdict::Absent);
-        // The ask has consumed the absent answer only once its waiter is
-        // gone — before that, a present landing could still be the one it
-        // reads. Waited out synchronously: the registration parks on this
-        // very lock while this thread waits, and the lock must not cross
-        // an await.
-        for _ in 0..12_000 {
-            if manager.verdict_waiters() == 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            manager.verdict_waiters(),
-            0,
-            "the registration left its wait on the absent landing"
-        );
-
-        // The verdict lands present through the raw store — not the
-        // landing's sweep, which would take this very lock — so the
-        // registration's own re-read is the only thing that can move the
-        // box.
-        manager
-            .loopback_book()
-            .set_range_verdict(crate::net::dns::RangeVerdict::Present);
-
-        // The registration, parked on this lock since its ask answered the
-        // interim, takes it now.
-        drop(parked);
-    }
-
-    finalize.await.expect("the finalize's task runs to its end");
-
-    // The hand is the published address — never the interim the ask
-    // answered with — and the name answers with it.
-    assert_eq!(
-        registry
-            .read()
-            .expect("registry lock")
-            .published_own_address(web),
-        Some(handed),
-        "a registration headed for the interim publishes at its own hand"
-    );
-    let (_, address) = zone_answer_for(&server, "web.min.internal")
-        .await
-        .expect("the name is held once the registration ends");
-    assert_eq!(
-        address, handed,
-        "the name answers at the hand, moved with the publish"
-    );
-    assert_eq!(
-        registry
-            .read()
-            .expect("registry lock")
-            .resolve(&format!("web.min.internal:{}", declared_port()))
-            .expect("the name routes at the hand")
-            .upstream(declared_port()),
-        Some(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(handed),
-            declared_port()
-        )),
-        "the box's declared port is published at its own hand, exactly where \
-         the attach path binds its forwards"
-    );
-
-    // The two lines the drive leaves: the interim answer it took under the
-    // unvouched verdict, and the promotion that moved it — the one line
-    // only the re-read emits, naming both addresses and the box.
-    let logged = capture.contents();
-    let interim_line = logged
-        .lines()
-        .find(|line| {
-            line.contains("action=\"loopback-hand-to-interim\"")
-                && line.contains("session_name=\"web\"")
-        })
-        .unwrap_or_else(|| panic!("the ask's interim answer must be logged, got: {logged}"));
-    assert!(
-        interim_line.contains(&format!("from={handed}")) && interim_line.contains("to=127.0.0.1"),
-        "the interim answer names the hand it refused and the interim it \
-         took: {interim_line}"
-    );
-    let promotion_line = logged
-        .lines()
-        .find(|line| {
-            line.contains("action=\"loopback-range-present-box\"")
-                && line.contains("session_name=\"web\"")
-        })
-        .unwrap_or_else(|| panic!("the promotion must be logged, got: {logged}"));
-    assert!(
-        promotion_line.contains("from=127.0.0.1")
-            && promotion_line.contains(&format!("to={handed}")),
-        "the promotion names the interim it moved off and the hand it moved \
-         to: {promotion_line}"
-    );
-}
-
 /// The box a `min net expose` request is decided against: an own-address box
 /// whose ingress declares a dynamic-ingress mode and port range, and whose
 /// creator handed it the address pair a publish needs (the T66 hand) — so the
@@ -7445,10 +6890,7 @@ async fn create_logs_dynamic_ingress() {
 async fn expose_unenrolled_local_rpc_evaluates_dynamic_ingress() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    // The hand vouched for, so the registry publishes it: the publish below
-    // binds at the address the box's name answers at, deterministically.
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         "web",
@@ -7549,10 +6991,7 @@ async fn expose_allow_publishes_and_lists() {
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    // The hand vouched for, so the registry publishes it and the publish
-    // binds at the address the box's name answers at.
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     // Addresses no other test's box uses: the live-gate table the proxy and
     // the expose both read is process-wide.
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 96);
@@ -7747,7 +7186,6 @@ async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     // An address no other test's box uses: the live-gate table is
     // process-wide.
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 91);
@@ -8415,12 +7853,11 @@ async fn expose_out_of_range_refusal_names_range() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expose_colliding_on_shared_address_is_a_bind_error() {
     let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
     // An absent range: the interim both boxes publish at, so one address's
     // port carries one forward at most.
+    let server = TestServer::new_without_reserved_range().await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Absent);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         // This test's own box names: under the shared capture every test's
@@ -8586,12 +8023,11 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
 /// what the forward delivers to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expose_publishes_at_the_registered_address() {
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
     // An absent range: the hand is unvouched, so the finalize publishes the
     // interim — the hand stands only in the record.
+    let server = TestServer::new_without_reserved_range().await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Absent);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         "web",
@@ -8700,7 +8136,6 @@ async fn expose_on_stopped_box_refused() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         // This test's own box name: under the shared capture every test's
@@ -8880,7 +8315,6 @@ async fn expose_logs_every_path() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
 
     // A box that publishes, and then refuses its own duplicate. The three
     // boxes are this test's own names: under the shared capture every
@@ -9224,10 +8658,6 @@ async fn box_with_scripted_plan(
     tokio::sync::watch::Sender<u64>,
     boxes::SessionId,
 ) {
-    // The hand vouched for, so the registry publishes the loopback hand's
-    // address: both surfaces' forwards bind at the address the box's name
-    // answers at, exactly as they do for a production box.
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let id = if handed {
         finalize_dynamic_ingress_session(
             client,
@@ -12197,7 +11627,6 @@ async fn stop_box_with_an_unwritable_record_still_marks_name_stopped() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
     let shared = manager
         .hostnames()
         .read()

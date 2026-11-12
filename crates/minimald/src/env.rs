@@ -6346,10 +6346,7 @@ exit $rc
     async fn expose_reply_is_a_plain_publish_for_declared_and_runtime_ports() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        // The hand vouched for, so the registry publishes it: both publishes
-        // below bind at the box's own address.
         let manager = server.state.sessions_manager().await;
-        manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
         let web = crate::box_actor::tests::finalize_declared_dynamic_ingress_session(
             &mut client,
             "web",
@@ -6667,10 +6664,7 @@ exit $rc
     async fn in_box_expose_cannot_change_ingress_policy() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        // The hand vouched for, so the registry publishes it: the allowed
-        // publish below binds at the box's own address.
         let manager = server.state.sessions_manager().await;
-        manager.set_range_verdict(crate::net::dns::RangeVerdict::Present);
         let web = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",

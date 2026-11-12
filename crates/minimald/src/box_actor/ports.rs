@@ -950,8 +950,7 @@ impl BoxActor {
         // own address, the one source the declared path reads too, through
         // `OwnAddressReporter::published_address`. Never the raw handed
         // loopback address: a hand the loopback verdict has not vouched for
-        // publishes at the `127.0.0.1` interim (NET-123 §7.1), and a hand a
-        // landed verdict overrules is moved off by the landing's sweep — the
+        // publishes at the `127.0.0.1` interim (NET-123 §7.1) — the
         // registry row is the address that actually binds, so the runtime
         // publish and the declaration answer at the one address a connection
         // reaches. The hand's `switch_address` (T66) — or, for a native

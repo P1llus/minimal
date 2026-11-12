@@ -32,6 +32,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use minimald_rpc::OneshotSshRpc;
 
 use crate::connection::Connection;
+use crate::net::dns::RangeVerdict;
 use crate::server::{Config, HostKey, ServerStateHandle};
 
 /// A `MakeWriter` accumulating everything written into a shared buffer, so a
@@ -249,7 +250,8 @@ pub struct TestServer {
 
 impl TestServer {
     /// Spins up a fresh server backed by an empty tempdir. The tempdir
-    /// lives as long as the [`TestServer`].
+    /// lives as long as the [`TestServer`]. The reserved local range reads
+    /// present.
     pub async fn new() -> Self {
         Self::new_in(TempDir::new().unwrap()).await
     }
@@ -266,7 +268,14 @@ impl TestServer {
     /// one server's [`Self::into_state_dir`] to a second server to prove
     /// per-session state survives a restart.
     pub async fn new_in(temp: TempDir) -> Self {
-        Self::over(config_in(&temp, false), temp).await
+        Self::over(config_in(&temp, false), temp, RangeVerdict::Present).await
+    }
+
+    /// [`Self::new`] on a host whose publish surface cannot bind the
+    /// reserved local range, so every box publishes at `127.0.0.1`.
+    pub async fn new_without_reserved_range() -> Self {
+        let temp = TempDir::new().unwrap();
+        Self::over(config_in(&temp, false), temp, RangeVerdict::Absent).await
     }
 
     /// [`Self::new_in`] on a daemon that opted out of the deny-all egress
@@ -276,13 +285,16 @@ impl TestServer {
     /// own-address boxes with no `egress` section reach nothing outside
     /// themselves.
     pub async fn new_opted_out_in(temp: TempDir) -> Self {
-        Self::over(config_in(&temp, true), temp).await
+        Self::over(config_in(&temp, true), temp, RangeVerdict::Present).await
     }
 
-    /// Boots a server on `config`, owning `temp` for its lifetime. The two
-    /// public constructors differ only in the config's `deny_all_opt_out`.
-    async fn over(config: Config, temp: TempDir) -> Self {
-        let state = ServerStateHandle::new(config, None).await.unwrap();
+    /// Boots a server on `config`, owning `temp` for its lifetime. `range`
+    /// is fixed rather than probed, so a test's addresses do not depend on
+    /// the host it runs on.
+    async fn over(config: Config, temp: TempDir, range: RangeVerdict) -> Self {
+        let state = ServerStateHandle::on_range(config, None, range)
+            .await
+            .unwrap();
         // `Server::run` installs the housekeeping actor; a harness server never
         // runs it, so do the same here — otherwise the `CleanCache` RPC has
         // nothing to ask. Its own timer won't fire inside a test's lifetime.

@@ -1064,13 +1064,11 @@ impl BoxActor {
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
         //
-        // Never waiting on the range verdict (NET-123 §7.1): this runs
+        // Never waiting for the answerer to acknowledge the name: this runs
         // inside the manager's own message handling — the resume an RPC
         // naming the box brings up, the create, and the bring-up a destroy
         // makes to run its hooks — so a wait here would park every other
-        // session's operation behind it. A resumed handed box the verdict
-        // has not vouched for publishes at the `127.0.0.1` interim at once,
-        // and the present landing's sweep moves it to its hand.
+        // session's operation behind it.
         //
         // A teardown-only bring-up (`registers_name: false`) skips this:
         // the box is about to be destroyed, and a registration here would

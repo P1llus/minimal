@@ -222,6 +222,7 @@ async fn manager_over(state: &std::path::Path, cache: &std::path::Path) -> BoxMa
         daemon_ctx,
         switch,
         false,
+        crate::net::dns::RangeVerdict::Present,
     )
     .await
     .unwrap()

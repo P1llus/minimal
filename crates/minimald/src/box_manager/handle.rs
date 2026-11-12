@@ -31,15 +31,6 @@ pub struct BoxManagerHandle {
     /// through the actor mainloop.
     #[cfg(target_os = "linux")]
     pub(super) hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
-    /// The forwarder-conducted range walk of a microVM daemon, set at init
-    /// when the daemon publishes through the host's forwarder. Empty on a
-    /// native daemon, whose own loopback is its publish surface.
-    /// The actor's lease book, held only for the one test seam below: a test
-    /// that needs this daemon to be in the state a daemon whose deferred
-    /// probe is still walking holds its book in. Production callers reach
-    /// the book through the manager actor, which owns it.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(super) loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
 /// A non-owning handle to the [`BoxManager`](super::BoxManager) actor.
@@ -62,11 +53,6 @@ pub struct WeakBoxManagerHandle {
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     pub(super) hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
-    /// Mirrors [`BoxManagerHandle::range_walk`].
-    /// Mirrors [`BoxManagerHandle::loopback`], for the same reason: the test seam
-    /// must survive an upgrade.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(super) loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
 impl WeakBoxManagerHandle {
@@ -81,8 +67,6 @@ impl WeakBoxManagerHandle {
             lifetime: self.lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
-            #[cfg(all(test, target_os = "linux"))]
-            loopback: Arc::clone(&self.loopback),
         })
     }
 }
@@ -159,8 +143,6 @@ impl BoxManagerHandle {
             lifetime: self.lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
-            #[cfg(all(test, target_os = "linux"))]
-            loopback: Arc::clone(&self.loopback),
         }
     }
 
@@ -171,66 +153,6 @@ impl BoxManagerHandle {
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)
-    }
-
-    /// Puts this daemon's verdict over the reserved local range back in the
-    /// state a daemon whose forwarder-conducted probe is still walking holds
-    /// its book in ([`crate::net::dns::RangeVerdict::Pending`]) — the window a
-    /// microVM daemon is already serving RPCs in, and the one a box resumed
-    /// by the first of them must still be answered in (NET-013).
-    ///
-    /// Test-only: no production path needs to *un-know* a verdict it has, and
-    /// one that did would want a message, not a setter.
-    ///
-    /// The daemon's one verdict deadline restarts with it, as it does for a
-    /// daemon that has just started, so the window is the full
-    /// [`crate::net::dns::HAND_VERDICT_WAIT`] however long the harness took
-    /// to come up.
-    /// Sets what the daemon knows about the reserved range on its publish
-    /// surface, as its start does once.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn set_range_verdict(&self, verdict: crate::net::dns::RangeVerdict) {
-        self.loopback.set_range_verdict(verdict);
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn hold_range_verdict_pending(&self) {
-        self.loopback
-            .set_range_verdict(crate::net::dns::RangeVerdict::Pending);
-        self.loopback
-            .reset_hand_verdict_deadline(crate::net::dns::HAND_VERDICT_WAIT.as_millis() as u64);
-    }
-
-    /// The daemon's answerer lease book, for the tests that drive a
-    /// landing's two halves apart — the draw and the apply between which a
-    /// box can die — the way the walk's single landing never does.
-    ///
-    /// Test-only: production code reaches the book through the paths that
-    /// ask it, not by handle.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn loopback_book(&self) -> &std::sync::Arc<crate::net::dns::LoopbackLeaseBook> {
-        &self.loopback
-    }
-
-    /// Moves the daemon's one verdict deadline to `millis` from now, so a
-    /// test proves the expiry shape — the interim published when the
-    /// deadline runs out — without paying the real deadline, or holds the
-    /// window open long enough to tell a registration that waited from one
-    /// that did not.
-    ///
-    /// Test-only: no production path changes a deadline it is itself bounded
-    /// by.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn reset_hand_verdict_deadline(&self, millis: u64) {
-        self.loopback.reset_hand_verdict_deadline(millis);
-    }
-
-    /// How many registrations are waiting on the range verdict right now
-    /// ([`crate::net::dns::LoopbackLeaseBook::verdict_waiters`]), so a test
-    /// lands the verdict only once a registration provably waits for it.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn verdict_waiters(&self) -> usize {
-        self.loopback.verdict_waiters()
     }
 
     /// Enqueues the resume of every active session restored from the store
@@ -244,8 +166,8 @@ impl BoxManagerHandle {
     /// [`crate::server::Server::run`] enqueues this once, before its accept
     /// loop opens, and awaits the answer off that path. It is a message
     /// rather than part of [`BoxManager::init`](super::BoxManager::init) so the test harness, which
-    /// builds the manager without `Server::run`, can open a window (a
-    /// pending range verdict, say) before the resume.
+    /// builds the manager without `Server::run`, can open a window before
+    /// the resume.
     #[cfg(target_os = "linux")]
     pub async fn enqueue_resume_active_sessions(
         &self,

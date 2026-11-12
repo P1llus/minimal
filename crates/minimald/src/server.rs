@@ -456,9 +456,12 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// `range` is whether the reserved local range binds where this
+    /// daemon's boxes publish.
     pub async fn new(
         config: Config,
         log_release: Option<DaemonLogRelease>,
+        range: crate::net::dns::RangeVerdict,
     ) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
@@ -577,6 +580,7 @@ impl ServerState {
                 // task path resolve the same effective egress the daemon
                 // was started with (NET-074/NET-077).
                 config.deny_all_opt_out,
+                range,
             )
             .await?,
             config,
@@ -590,6 +594,40 @@ impl ServerState {
             hostname_proxy_port: None,
             zone_answerer_port: None,
         })
+    }
+}
+
+/// Whether the reserved local range binds where this daemon's boxes publish,
+/// measured once at daemon start.
+///
+/// A native node publishes on its own loopback, so it asks that whether the
+/// reserved range binds. In a VM the VM host picks where each port listens
+/// and answers every publish with the address, so the range is the host's to
+/// vouch for.
+async fn reserved_range(in_microvm: bool) -> crate::net::dns::RangeVerdict {
+    if in_microvm {
+        return crate::net::dns::RangeVerdict::Present;
+    }
+    let probe = crate::traced::spawn_blocking(crate::net::loopback::probe)
+        .await
+        .unwrap_or_else(|join_error| {
+            tracing::warn!(
+                error = %join_error,
+                "the daemon-start loopback probe was lost; \
+                 reading the range absent",
+            );
+            crate::net::loopback::RangeProbe::failed_to_run()
+        });
+    tracing::info!(
+        surface = probe.surface(),
+        interim = probe.interim(),
+        first_failure = ?probe.first_failure,
+        "daemon-start loopback probe picked the publish surface",
+    );
+    if probe.present() {
+        crate::net::dns::RangeVerdict::Present
+    } else {
+        crate::net::dns::RangeVerdict::Absent
     }
 }
 
@@ -707,8 +745,19 @@ impl ServerStateHandle {
         config: Config,
         log_release: Option<DaemonLogRelease>,
     ) -> Result<Self, std::io::Error> {
+        let range = reserved_range(config.in_microvm).await;
+        Self::on_range(config, log_release, range).await
+    }
+
+    /// [`Self::new`] for a daemon that already knows whether the reserved
+    /// local range binds where its boxes publish.
+    pub(crate) async fn on_range(
+        config: Config,
+        log_release: Option<DaemonLogRelease>,
+        range: crate::net::dns::RangeVerdict,
+    ) -> Result<Self, std::io::Error> {
         Ok(Self(Arc::new(Mutex::new(
-            ServerState::new(config, log_release).await?,
+            ServerState::new(config, log_release, range).await?,
         ))))
     }
 
