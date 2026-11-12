@@ -910,6 +910,64 @@ impl Engine {
         }
     }
 
+    /// Writes what happened to the node's virtual network into the events
+    /// of every box that is on it. Rare, so no limiter decides.
+    pub(crate) fn uplink_changed(&self, change: &super::UplinkChange) {
+        use super::UplinkChange;
+
+        let Some(attached) = self.attached_state() else {
+            return;
+        };
+        let mut data = boxes::events::EventData::new();
+        let mut put = |key: &str, value: serde_json_lenient::Value| {
+            data.insert(key.to_owned(), value);
+        };
+        match change {
+            UplinkChange::Restored {
+                cause,
+                offline,
+                forwards,
+                forwards_failed,
+            } => {
+                put("state", "restored".into());
+                put("cause", cause.clone().into());
+                put(
+                    "offline_ms",
+                    u64::try_from(offline.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .into(),
+                );
+                put("forwards", (*forwards).into());
+                if *forwards_failed > 0 {
+                    put("forwards_failed", (*forwards_failed).into());
+                }
+            }
+            UplinkChange::Down { cause, starts } => {
+                put("state", "down".into());
+                put("cause", cause.clone().into());
+                put("starts", (*starts).into());
+            }
+        }
+        let on_it: Vec<_> = attached
+            .boxes
+            .read()
+            .expect("engine lock")
+            .values()
+            .filter(|of| of.own_namespace())
+            .cloned()
+            .collect();
+        for of in on_it {
+            let write = events::Write {
+                of,
+                kind: boxes::events::BoxEventType::NetUplink,
+                data: data.clone(),
+            };
+            if let Err(full) = attached.events.try_send(write) {
+                full.into_inner().of.limiter().lost();
+            }
+        }
+    }
+
     /// Whether the box gets a credential proxy endpoint: it declares a
     /// credentialed upstream, has a network, and its steering is not `off`.
     fn credential_proxy(mode: NetworkMode, policy: &BoxPolicy) -> bool {

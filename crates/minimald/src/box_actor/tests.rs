@@ -8665,7 +8665,7 @@ async fn box_with_scripted_plan(
         crate::box_actor::listen_plan_seam::Seeded {
             lease: switch,
             published: loopback,
-            control: crate::net::policy::ControlChannel::Unix(sock),
+            control: crate::net::policy::ControlChannel::unix(sock),
             gate: std::sync::Arc::clone(&gate),
         },
     );
@@ -10266,7 +10266,7 @@ async fn respawn_frees_published_ports() {
         crate::box_actor::listen_plan_seam::Seeded {
             lease: switch,
             published: loopback,
-            control: crate::net::policy::ControlChannel::Unix(sock),
+            control: crate::net::policy::ControlChannel::unix(sock),
             gate: std::sync::Arc::clone(&gate),
         },
     );
@@ -10312,7 +10312,7 @@ async fn respawn_frees_published_ports() {
         crate::box_actor::listen_plan_seam::Seeded {
             lease: switch,
             published: loopback,
-            control: crate::net::policy::ControlChannel::Unix(sock),
+            control: crate::net::policy::ControlChannel::unix(sock),
             gate: std::sync::Arc::clone(&gate),
         },
     );

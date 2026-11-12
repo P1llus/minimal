@@ -15,6 +15,7 @@ pub mod fake_guest;
 pub mod loopback;
 #[cfg(feature = "pump")]
 pub mod pump;
+pub mod restart;
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;

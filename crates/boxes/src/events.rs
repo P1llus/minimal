@@ -40,6 +40,9 @@ pub enum BoxEventType {
     /// The box's network policy refused something: a connection, a
     /// datagram, a bind, a name, or a proxied request.
     NetRefused,
+    /// The virtual network under the box went away: it is back, or it
+    /// stays down.
+    NetUplink,
     /// A type this build does not know, written by a newer one, under the
     /// name it was written with. Readers pass it on as it is and do not
     /// fail on it.
@@ -62,6 +65,7 @@ impl BoxEventType {
             Self::Resumed => "resumed",
             Self::Detached => "detached",
             Self::NetRefused => "net_refused",
+            Self::NetUplink => "net_uplink",
             Self::Unknown(name) => name,
         }
     }

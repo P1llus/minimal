@@ -41,6 +41,8 @@ const TASK_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 27);
 const TASK_SHUT4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 28);
 const OWN_TASK_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 37);
 const OWN_TASK_SHUT4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 38);
+const REVIVED_OPEN4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 47);
+const REVIVED_SHUT4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 48);
 const REFUSED: &str = "Operation not permitted";
 /// How long the task that stays sleeps. No other process has it on its
 /// command line.
@@ -1221,6 +1223,115 @@ fn a_task_resolves_and_reaches_the_host_as_a_session_of_its_box_does() {
     assert!(sees_its_box_s_files(&files), "{out}{files}");
     let host = daemon.min(&["session", "run", "web", "host"]);
     assert!(greeted(&host), "{host}");
+}
+
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn the_virtual_network_comes_back_when_gvproxy_dies() {
+    if !gated("the_virtual_network_comes_back_when_gvproxy_dies") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let v4 = |a: Ipv4Addr| IpAddr::V4(a);
+    let _addrs = LoopbackAddrs::add(&[v4(REVIVED_OPEN4), v4(REVIVED_SHUT4)]);
+    let loader = Loader::start(dir.path());
+    // The virtual network dials these from the host, where they are local.
+    let port = targets(&[v4(REVIVED_OPEN4), v4(REVIVED_SHUT4)], v4(REVIVED_OPEN4));
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    let (open, shut) = (REVIVED_OPEN4.to_string(), REVIVED_SHUT4.to_string());
+    let subnet = format!("{open}/32");
+
+    // A box that publishes a port and reaches one address, and a peer that
+    // may reach only that box.
+    let web = [
+        "--network",
+        "own_ip",
+        "--allow-subnets",
+        &subnet,
+        "--ingress",
+        // Not the host port of another test: the tests' daemons run at once
+        // and share the host's published addresses.
+        "18093:8080",
+    ];
+    let out = daemon.activate("web", &web);
+    let serving = daemon.run_in(
+        "web",
+        &[
+            "git",
+            "daemon",
+            "--listen=0.0.0.0",
+            "--port=8080",
+            "--base-path=/tmp",
+        ],
+    );
+    let peer = [
+        "--network",
+        "own_ip",
+        "--allow-dns-hosts",
+        "web.min.internal",
+    ];
+    daemon.activate("peer", &peer);
+    let published = SocketAddr::new(IpAddr::V4(daemon.published_address("web")), 18093);
+    wait_for("the declared port", Duration::from_secs(20), || {
+        stays_open(published)
+    });
+    assert_eq!(daemon.connect("web", &open, port).trim(), "ok", "{out}");
+    assert_eq!(
+        daemon.connect("peer", "web.min.internal", 8080).trim(),
+        "ok"
+    );
+
+    // gvproxy is the daemon's one helper while no git runs for a box.
+    let before = daemon.helpers();
+    let [gvproxy] = before.as_slice() else {
+        panic!("one helper, gvproxy: {before:?}");
+    };
+    assert!(sudo(&["kill", "-9", gvproxy]), "kill gvproxy");
+    let killed = std::time::Instant::now();
+
+    // Nobody attaches a box. The daemon starts gvproxy again by itself,
+    // and what the boxes had is back within seconds.
+    wait_for("another gvproxy", Duration::from_secs(10), || {
+        let now = daemon.helpers();
+        !now.is_empty() && now != before
+    });
+    wait_for("the box's way out", Duration::from_secs(10), || {
+        daemon.connect("web", &open, port).trim() == "ok"
+    });
+    wait_for("the declared port again", Duration::from_secs(10), || {
+        stays_open(published)
+    });
+    wait_for("the peer's way to the box", Duration::from_secs(10), || {
+        daemon.connect("peer", "web.min.internal", 8080).trim() == "ok"
+    });
+    let took = killed.elapsed();
+    assert!(took < Duration::from_secs(15), "back after {took:?}");
+
+    // The engine judged the boxes all along and still does.
+    let refused = daemon.connect("web", &shut, port);
+    assert!(refused.contains(REFUSED), "{refused}");
+    let refused = daemon.connect("peer", &open, port);
+    assert!(refused.contains(REFUSED), "{refused}");
+
+    // Each box on the virtual network has the outage in its events, and
+    // the daemon's log has it too.
+    for name in ["web", "peer"] {
+        let events = daemon.min(&["box", "events", name]);
+        let told = events
+            .lines()
+            .find(|line| line.contains("net_uplink"))
+            .unwrap_or_else(|| panic!("no net_uplink event for {name}:\n{events}"));
+        assert!(
+            told.contains("\"state\":\"restored\"")
+                && told.contains("gvproxy was killed by signal 9")
+                && told.contains("\"forwards\":1"),
+            "{told}"
+        );
+    }
+    let log = daemon.log();
+    assert!(log.contains("gvproxy ended by itself"), "{log}");
+    assert!(log.contains("gvproxy is up again"), "{log}");
+    drop(serving);
 }
 
 #[test]

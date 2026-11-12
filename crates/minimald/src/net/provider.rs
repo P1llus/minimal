@@ -615,8 +615,8 @@ impl OwnIpNetwork {
             subnet: reserved.subnet,
         };
         let uplink: Box<dyn crate::net::attach::Uplink> = match &reserved.control {
-            ControlChannel::Unix(gvproxy) => {
-                Box::new(crate::net::attach::tap::TapUplink::new(gvproxy.clone()))
+            ControlChannel::Unix(own) => {
+                Box::new(crate::net::attach::tap::TapUplink::new(own.socket.clone()))
             }
             ControlChannel::VmHost { .. } => Box::new(crate::net::attach::veth::VethUplink),
         };

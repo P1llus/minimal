@@ -497,20 +497,34 @@ impl ServerState {
         // network that address is on.
         #[cfg(target_os = "linux")]
         crate::net::engine::Engine::current().set_node_switch(switch_subnet);
-        let net_switch = Arc::new(Mutex::new(
-            crate::net::SwitchClient::with_subnet(
-                config.gvproxy_bin_path(),
-                minimal_state_dir
-                    .as_utf8_path()
-                    .join("gvproxy")
-                    .join(&daemon_id),
-                switch_subnet,
-            )
-            .with_transport(transport)
-            // The hostname registry mints names under the host label the
-            // switch carries, so two daemons on one host need distinct ones.
-            .with_host_id(daemon_id.clone()),
-        ));
+        let mut net_switch = crate::net::SwitchClient::with_subnet(
+            config.gvproxy_bin_path(),
+            minimal_state_dir
+                .as_utf8_path()
+                .join("gvproxy")
+                .join(&daemon_id),
+            switch_subnet,
+        )
+        .with_transport(transport)
+        // The hostname registry mints names under the host label the
+        // switch carries, so two daemons on one host need distinct ones.
+        .with_host_id(daemon_id.clone());
+        // A native node runs gvproxy itself, so it is the one to start it
+        // again when it dies under running boxes. The boxes' events say
+        // what happened to their network.
+        #[cfg(target_os = "linux")]
+        let gvproxy_deaths = matches!(transport, crate::net::SwitchTransport::LocalSpawn)
+            .then(|| {
+                net_switch.watched(crate::net::UplinkWatch::new(|change| {
+                    crate::net::engine::Engine::current().uplink_changed(change);
+                }))
+            })
+            .flatten();
+        let net_switch = Arc::new(Mutex::new(net_switch));
+        #[cfg(target_os = "linux")]
+        if let Some(deaths) = gvproxy_deaths {
+            crate::net::SwitchClient::supervise(&net_switch, deaths);
+        }
         // One line at daemon start naming the switch subnet this instance's
         // boxes lease on and the pool its published addresses are granted
         // from — the facts a reader of two daemons' logs (a diagnostics

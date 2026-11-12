@@ -48,9 +48,11 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, oneshot, watch};
 
 // The switch primitives live in the `switch` crate, which `minvmd` links too.
 pub use ::switch::{DEFAULT_SUBNET, MacAddr, SwitchSubnet, render_gvproxy_config};
@@ -473,11 +475,150 @@ pub(crate) fn gvproxy_missing(binary: &Path) -> Option<String> {
     ))
 }
 
-///
+/// How a gvproxy process ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ended {
+    code: Option<i32>,
+    /// For a log line and a box event.
+    cause: String,
+}
+
+impl Ended {
+    fn of(status: Option<std::process::ExitStatus>) -> Self {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let code = status.and_then(|status| status.code());
+        let signal = status.and_then(|status| status.signal());
+        let cause = match (code, signal) {
+            (Some(code), _) => format!("gvproxy exited with status {code}"),
+            (None, Some(signal)) => format!("gvproxy was killed by signal {signal}"),
+            (None, None) => "gvproxy ended and left no status".to_owned(),
+        };
+        Self { code, cause }
+    }
+}
+
+/// A gvproxy that ended without being asked to.
+#[derive(Debug)]
+pub(crate) struct Died {
+    cause: String,
+    /// How long it ran.
+    ran: Duration,
+}
+
+/// A started gvproxy. A task of its own waits for the process, so the
+/// daemon learns of its end when it happens and not at the next attach.
+#[derive(Debug)]
+struct Gvproxy {
+    pid: u32,
+    /// Asks the task to end the process.
+    stop: Option<oneshot::Sender<()>>,
+    /// How the process ended, once it has.
+    ended: watch::Receiver<Option<Ended>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Gvproxy {
+    fn drop(&mut self) {
+        // The task holds the child, which is killed when dropped.
+        self.task.abort();
+    }
+}
+
+/// Waits for `child` to end. An end nobody asked for is reported on
+/// `died`, once the gvproxy was `up`: whoever starts it sees for itself
+/// that it never came up. A stop sends `SIGTERM`, and `SIGKILL` after
+/// [`TERM_GRACE`].
+async fn tend(
+    mut child: Child,
+    pid: u32,
+    stop: oneshot::Receiver<()>,
+    ended: watch::Sender<Option<Ended>>,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    died: mpsc::UnboundedSender<Died>,
+) {
+    let started = Instant::now();
+    tokio::select! {
+        status = child.wait() => {
+            let end = Ended::of(status.ok());
+            let cause = end.cause.clone();
+            ended.send_replace(Some(end));
+            if up.load(std::sync::atomic::Ordering::SeqCst) {
+                // Nobody listens in a daemon that does not supervise its
+                // switch.
+                let _unsupervised = died.send(Died { cause, ran: started.elapsed() });
+            }
+        }
+        // A dropped sender is a stop as well: nobody holds the switch.
+        _ = stop => {
+            tracing::info!(pid, "stopping gvproxy switch (SIGTERM)");
+            if let Ok(pid) = libc::pid_t::try_from(pid) {
+                // SAFETY: the signal goes to the child this task still owns
+                // and has not reaped, so the pid is that child's.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+            let status = match tokio::time::timeout(TERM_GRACE, child.wait()).await {
+                Ok(status) => status.ok(),
+                Err(_) => {
+                    tracing::warn!("gvproxy did not exit after SIGTERM; sending SIGKILL");
+                    let _gone = child.start_kill();
+                    child.wait().await.ok()
+                }
+            };
+            tracing::info!(?status, "gvproxy switch stopped");
+            ended.send_replace(Some(Ended::of(status)));
+        }
+    }
+}
+
+/// The virtual network went away under attached boxes.
+#[derive(Debug, Clone)]
+struct Outage {
+    since: Instant,
+    cause: String,
+}
+
+/// What happened to the virtual network under the boxes attached to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UplinkChange {
+    /// gvproxy ended by itself, was started again, and holds the boxes'
+    /// forwards again.
+    Restored {
+        cause: String,
+        offline: Duration,
+        /// The forwards the new gvproxy took, and those it refused.
+        forwards: usize,
+        forwards_failed: usize,
+    },
+    /// gvproxy keeps dying and is not started again until a box attaches.
+    Down { cause: String, starts: u32 },
+}
+
+/// Told of every [`UplinkChange`].
+#[derive(Clone)]
+pub(crate) struct UplinkWatch(Arc<dyn Fn(&UplinkChange) + Send + Sync>);
+
+impl UplinkWatch {
+    pub(crate) fn new(told: impl Fn(&UplinkChange) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(told))
+    }
+}
+
+impl std::fmt::Debug for UplinkWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UplinkWatch")
+    }
+}
+
 /// The switch is reference-counted against the set of attached `OwnIp` PTasks:
 /// it is spawned lazily on the first attach and torn down after the last
 /// detach. Teardown follows the same `SIGTERM` → grace → `SIGKILL` escalation
 /// the vmm child uses.
+///
+/// A gvproxy that ends by itself while boxes are attached is started again
+/// ([`Self::supervise`]). The frame pump of each box redials by itself.
 #[derive(Debug)]
 pub struct SwitchClient {
     /// Path to the pinned gvproxy binary (see `scripts/fetch-gvproxy.sh`).
@@ -488,9 +629,20 @@ pub struct SwitchClient {
     allocator: IpAllocator,
     /// Number of attached PTasks; the switch runs while this is non-zero.
     attached: usize,
-    /// The running gvproxy child, if started. Always `None` in
+    /// The running gvproxy, if started. Always `None` in
     /// [`SwitchTransport::VmHost`] mode (the host owns gvproxy).
-    child: Option<Child>,
+    gvproxy: Option<Gvproxy>,
+    /// Where a gvproxy's own end is reported, and the receiving side until
+    /// [`Self::watched`] hands it to the supervising task.
+    died: mpsc::UnboundedSender<Died>,
+    deaths: Option<mpsc::UnboundedReceiver<Died>>,
+    /// Set from gvproxy's death under attached boxes until a gvproxy runs
+    /// for them again.
+    outage: Option<Outage>,
+    /// The forwards gvproxy holds for boxes. A new gvproxy gets them back.
+    forwards: Arc<policy::Forwards>,
+    /// Who is told what happened to the boxes' network.
+    watch: Option<UplinkWatch>,
     /// Whose gvproxy the switch is: spawned here (DM2) or the VM host's
     /// (DM1/3/4).
     transport: SwitchTransport,
@@ -522,12 +674,18 @@ impl SwitchClient {
         state_dir: impl Into<PathBuf>,
         subnet: SwitchSubnet,
     ) -> Self {
+        let (died, deaths) = mpsc::unbounded_channel();
         Self {
             binary: binary.into(),
             state_dir: state_dir.into(),
             allocator: IpAllocator::new(subnet),
             attached: 0,
-            child: None,
+            gvproxy: None,
+            died,
+            deaths: Some(deaths),
+            outage: None,
+            forwards: Arc::default(),
+            watch: None,
             transport: SwitchTransport::default(),
             host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
             #[cfg(test)]
@@ -548,6 +706,36 @@ impl SwitchClient {
     #[must_use]
     pub fn host_id(&self) -> &str {
         &self.host_id
+    }
+
+    /// Names who is told when the boxes' network went away and came back.
+    /// Returns the ends of gvproxy for [`Self::supervise`], once.
+    pub(crate) fn watched(&mut self, watch: UplinkWatch) -> Option<mpsc::UnboundedReceiver<Died>> {
+        self.watch = Some(watch);
+        self.deaths.take()
+    }
+
+    /// Starts gvproxy again whenever it ends by itself while boxes are
+    /// attached, until `switch` is dropped. Each start waits longer than
+    /// the one before, and a gvproxy that keeps dying is left down
+    /// ([`::switch::restart::Restarts`]). Must be called on the runtime.
+    pub(crate) fn supervise(
+        switch: &Arc<tokio::sync::Mutex<Self>>,
+        deaths: mpsc::UnboundedReceiver<Died>,
+    ) {
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "net.switch.supervise"),
+            revive(
+                Arc::downgrade(switch),
+                deaths,
+                ::switch::restart::Restarts::gvproxy(),
+            ),
+        );
+    }
+
+    /// The forwards this node's gvproxy holds.
+    pub(crate) fn forwards(&self) -> Arc<policy::Forwards> {
+        Arc::clone(&self.forwards)
     }
 
     /// Sets whose gvproxy the switch is. The DM2 default is
@@ -791,6 +979,8 @@ impl SwitchClient {
         }
         tracing::info!(attached = self.attached, "detached OwnIp PTask from switch");
         if self.attached == 0 {
+            // No box is left to restore the network for.
+            self.outage = None;
             self.stop().await?;
         }
         Ok(())
@@ -816,24 +1006,44 @@ impl SwitchClient {
             .map_err(|source| NetError::WriteConfig { path, source })
     }
 
-    /// Spawns gvproxy if it is not already running and waits for its control
-    /// socket to appear.
-    async fn ensure_running(&mut self) -> Result<(), NetError> {
-        if let Some(child) = &mut self.child {
-            // Detect a switch that died out from under us so the caller does
-            // not connect to a dead socket (R1.4 unexpected-exit handling).
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::error!(?status, "gvproxy exited unexpectedly; starting it again");
-                    self.child = None;
-                    // `attached` stays: the PTasks attached before the exit
-                    // still detach, and each detach counts down once.
-                }
-                Ok(None) => return Ok(()),
-                Err(e) => return Err(NetError::Io(e)),
-            }
+    /// Forgets a gvproxy that has ended. With boxes attached their network
+    /// is down from here on, until [`Self::restore`] after the next start.
+    fn forget_ended(&mut self) {
+        let Some(running) = &self.gvproxy else {
+            return;
+        };
+        let Some(ended) = running.ended.borrow().clone() else {
+            return;
+        };
+        tracing::error!(
+            pid = running.pid,
+            cause = %ended.cause,
+            attached = self.attached,
+            "gvproxy ended by itself"
+        );
+        self.gvproxy = None;
+        if self.attached > 0 && self.outage.is_none() {
+            self.outage = Some(Outage {
+                since: Instant::now(),
+                cause: ended.cause,
+            });
         }
+    }
 
+    /// Starts gvproxy if it is not running and waits for its control socket
+    /// to accept. A start that follows gvproxy's own end restores what the
+    /// attached boxes had.
+    async fn ensure_running(&mut self) -> Result<(), NetError> {
+        self.forget_ended();
+        if self.gvproxy.is_some() {
+            return Ok(());
+        }
+        self.start().await?;
+        self.restore().await;
+        Ok(())
+    }
+
+    async fn start(&mut self) -> Result<(), NetError> {
         let sock = self.control_socket();
         // A stale socket from a previous run blocks gvproxy's own bind. If it
         // cannot be cleared, fail now rather than let `wait_for_socket` mistake
@@ -857,8 +1067,8 @@ impl SwitchClient {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // If the supervisor is dropped without a clean `stop()` (an error path
-        // or a panic), make sure gvproxy is reaped rather than orphaned.
+        // The task that waits for the child holds it. A task that is
+        // dropped without a stop takes gvproxy with it.
         cmd.kill_on_drop(true);
 
         tracing::info!(binary = %self.binary.display(), socket = %sock.display(), "spawning gvproxy switch");
@@ -866,7 +1076,27 @@ impl SwitchClient {
             path: self.binary.clone(),
             source,
         })?;
-        self.child = Some(child);
+        let pid = child.id().unwrap_or_default();
+        let (stop, stopped) = oneshot::channel();
+        let (ended_tx, ended) = watch::channel(None);
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "net.switch.gvproxy", pid),
+            tend(
+                child,
+                pid,
+                stopped,
+                ended_tx,
+                Arc::clone(&up),
+                self.died.clone(),
+            ),
+        );
+        self.gvproxy = Some(Gvproxy {
+            pid,
+            stop: Some(stop),
+            ended,
+            task,
+        });
 
         // If the control socket never appears, tear the half-started child down
         // so its timeout cannot leave gvproxy orphaned and a later attach does
@@ -875,7 +1105,67 @@ impl SwitchClient {
             let _ = self.stop().await;
             return Err(e);
         }
+        // From here its end is the supervisor's to act on. One that ended
+        // between the socket's answer and this line never came up.
+        up.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ended = self
+            .gvproxy
+            .as_ref()
+            .and_then(|running| running.ended.borrow().clone());
+        if let Some(ended) = ended {
+            self.gvproxy = None;
+            return Err(NetError::UnexpectedExit(ended.code));
+        }
         Ok(())
+    }
+
+    /// After a start that follows gvproxy's own end under attached boxes:
+    /// gives the new gvproxy the forwards the old one held and tells who
+    /// watches. The boxes' frame pumps redial by themselves.
+    async fn restore(&mut self) {
+        let Some(outage) = self.outage.take() else {
+            return;
+        };
+        let (forwards, forwards_failed) = self.forwards.replay(&self.control_socket()).await;
+        let offline = outage.since.elapsed();
+        tracing::info!(
+            cause = %outage.cause,
+            offline_ms = u64::try_from(offline.as_millis()).unwrap_or(u64::MAX),
+            attached = self.attached,
+            forwards,
+            forwards_failed,
+            "gvproxy is up again and holds the boxes' forwards"
+        );
+        self.tell(&UplinkChange::Restored {
+            cause: outage.cause,
+            offline,
+            forwards,
+            forwards_failed,
+        });
+    }
+
+    /// Leaves gvproxy down after `starts` starts that did not last. The
+    /// outage stays on record: the start a later attach makes restores the
+    /// boxes that are still attached.
+    fn give_up(&self, starts: u32) {
+        let cause = self
+            .outage
+            .as_ref()
+            .map_or_else(|| "gvproxy ended".to_owned(), |outage| outage.cause.clone());
+        tracing::error!(
+            %cause,
+            starts,
+            attached = self.attached,
+            "gvproxy keeps dying and is not started again; the boxes attached to it have no \
+             network until a box attaches and gvproxy stays up"
+        );
+        self.tell(&UplinkChange::Down { cause, starts });
+    }
+
+    fn tell(&self, change: &UplinkChange) {
+        if let Some(UplinkWatch(told)) = &self.watch {
+            told(change);
+        }
     }
 
     async fn wait_for_socket(&mut self, sock: &Path) -> Result<(), NetError> {
@@ -894,22 +1184,14 @@ impl SwitchClient {
                 Err(e) => return Err(NetError::Io(e)),
             }
             // If gvproxy died during startup, surface its status rather than
-            // spinning until the timeout. A try_wait() error (e.g. the child was
-            // already reaped) is surfaced too, not swallowed into a misleading
-            // SocketTimeout.
-            if let Some(child) = self.child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let code = status.code();
-                        self.child = None;
-                        return Err(NetError::UnexpectedExit(code));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        self.child = None;
-                        return Err(NetError::Io(e));
-                    }
-                }
+            // spinning until the timeout.
+            let ended = self
+                .gvproxy
+                .as_ref()
+                .and_then(|running| running.ended.borrow().clone());
+            if let Some(ended) = ended {
+                self.gvproxy = None;
+                return Err(NetError::UnexpectedExit(ended.code));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(NetError::SocketTimeout(
@@ -925,34 +1207,72 @@ impl SwitchClient {
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from awaiting the child.
+    /// None today. The signature is the one its callers handle.
     pub async fn stop(&mut self) -> Result<(), NetError> {
-        let Some(mut child) = self.child.take() else {
+        let Some(mut running) = self.gvproxy.take() else {
             return Ok(());
         };
-        if let Some(pid) = child.id() {
-            tracing::info!(pid, "stopping gvproxy switch (SIGTERM)");
-            // SAFETY: kill(pid, SIGTERM) only delivers a signal to the named,
-            // still-owned child process; it has no other effect and cannot
-            // violate any memory invariant.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
+        if let Some(stop) = running.stop.take() {
+            // The task is gone when gvproxy ended by itself.
+            let _ended = stop.send(());
         }
-        match tokio::time::timeout(TERM_GRACE, child.wait()).await {
-            Ok(Ok(status)) => {
-                tracing::info!(?status, "gvproxy switch stopped");
-            }
-            Ok(Err(e)) => return Err(NetError::Io(e)),
-            Err(_) => {
-                tracing::warn!("gvproxy did not exit after SIGTERM; sending SIGKILL");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
-        }
+        // The task ends the process and reaps it within the grace.
+        let _reaped = (&mut running.task).await;
         let _ = tokio::fs::remove_file(self.control_socket()).await;
         let _ = tokio::fs::remove_file(self.token_path()).await;
         Ok(())
+    }
+}
+
+/// The supervising task of [`SwitchClient::supervise`].
+async fn revive(
+    switch: Weak<tokio::sync::Mutex<SwitchClient>>,
+    mut deaths: mpsc::UnboundedReceiver<Died>,
+    mut restarts: ::switch::restart::Restarts,
+) {
+    while let Some(died) = deaths.recv().await {
+        let mut wait = restarts.died(died.ran);
+        loop {
+            let Some(switch) = switch.upgrade() else {
+                return;
+            };
+            {
+                let mut switch = switch.lock().await;
+                switch.forget_ended();
+                // An attach started it meanwhile, or no box is left.
+                if switch.gvproxy.is_some() || switch.attached == 0 {
+                    break;
+                }
+                if wait.is_none() {
+                    switch.give_up(restarts.starts());
+                    break;
+                }
+            }
+            // The switch is free while this waits, so an attach is not held up.
+            tokio::time::sleep(wait.unwrap_or_default()).await;
+            let mut switch = switch.lock().await;
+            switch.forget_ended();
+            if switch.gvproxy.is_some() || switch.attached == 0 {
+                break;
+            }
+            let started = match switch.write_config().await {
+                Ok(()) => switch.start().await,
+                Err(error) => Err(error),
+            };
+            match started {
+                Ok(()) => {
+                    switch.restore().await;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, died = %died.cause, "gvproxy was not started again");
+                    if let Some(outage) = switch.outage.as_mut() {
+                        outage.cause = format!("{}; then: {error}", died.cause);
+                    }
+                    wait = restarts.failed_to_start();
+                }
+            }
+        }
     }
 }
 
@@ -1241,6 +1561,119 @@ mod tests {
     /// A switch the VM host owns, pointed at a gvproxy binary that does not
     /// exist: `minvmd` owns gvproxy in VmHost mode, so nothing here may
     /// try to spawn it.
+    /// A stand-in for gvproxy that exits at once with status 3.
+    fn dying_gvproxy(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join("dying-gvproxy.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 3\n").expect("write the stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the stand-in");
+        path
+    }
+
+    /// A gvproxy that dies under an attached box is started again a
+    /// bounded number of times. Then the box is told its network is down,
+    /// and the next attach fails with what gvproxy did.
+    #[tokio::test]
+    async fn a_gvproxy_that_keeps_dying_is_left_down_and_the_boxes_are_told() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut switch = SwitchClient::new(dying_gvproxy(dir.path()), dir.path().join("gvproxy"));
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&told);
+        let deaths = switch
+            .watched(UplinkWatch::new(move |change| {
+                heard.lock().unwrap().push(change.clone());
+            }))
+            .expect("the first watch gets the ends of gvproxy");
+        // A box is attached, and its gvproxy was just killed.
+        switch.attached = 1;
+        switch.outage = Some(Outage {
+            since: Instant::now(),
+            cause: "gvproxy was killed by signal 9".to_owned(),
+        });
+        let died = switch.died.clone();
+        let switch = Arc::new(tokio::sync::Mutex::new(switch));
+        let ms = Duration::from_millis(1);
+        let quick = ::switch::restart::Restarts::new(
+            ::switch::restart::Backoff::new(ms, 4 * ms),
+            3,
+            Duration::from_secs(30),
+        );
+        let supervisor = crate::traced::spawn(revive(Arc::downgrade(&switch), deaths, quick));
+        died.send(Died {
+            cause: "gvproxy was killed by signal 9".to_owned(),
+            ran: Duration::from_secs(1),
+        })
+        .expect("the supervisor listens");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while told.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the supervisor never gave up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let told = told.lock().unwrap().clone();
+        let [UplinkChange::Down { cause, starts }] = told.as_slice() else {
+            panic!("one report, that the network is down: {told:?}");
+        };
+        assert_eq!(*starts, 3);
+        assert!(
+            cause.starts_with("gvproxy was killed by signal 9; then: ")
+                && cause.contains("status Some(3)"),
+            "{cause}"
+        );
+
+        // The box is still attached and no gvproxy runs. An attach starts
+        // one, and says how that went.
+        let mut switch = switch.lock().await;
+        assert!(switch.gvproxy.is_none() && switch.outage.is_some());
+        let refused = switch.attach().await.expect_err("gvproxy dies at once");
+        assert!(
+            matches!(refused, NetError::UnexpectedExit(Some(3))),
+            "{refused}"
+        );
+        assert_eq!(switch.attached, 1, "a failed attach holds no place");
+        supervisor.abort();
+    }
+
+    /// A gvproxy that never came up is its starter's to report, and one
+    /// that ended with no box attached is nobody's to start again.
+    #[tokio::test]
+    async fn a_gvproxy_nobody_needs_is_not_started_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut switch = SwitchClient::new(dying_gvproxy(dir.path()), dir.path().join("gvproxy"));
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&told);
+        let mut deaths = switch
+            .watched(UplinkWatch::new(move |change| {
+                heard.lock().unwrap().push(change.clone());
+            }))
+            .expect("the ends of gvproxy");
+        // The first attach of a box: gvproxy dies during its start, and
+        // the attach says so.
+        let refused = switch.attach().await.expect_err("gvproxy dies at once");
+        assert!(matches!(refused, NetError::UnexpectedExit(Some(3))));
+        assert_eq!(switch.attached, 0);
+        assert!(deaths.try_recv().is_err(), "the attach reported it");
+
+        let died = switch.died.clone();
+        let switch = Arc::new(tokio::sync::Mutex::new(switch));
+        let supervisor = crate::traced::spawn(revive(
+            Arc::downgrade(&switch),
+            deaths,
+            ::switch::restart::Restarts::gvproxy(),
+        ));
+        died.send(Died {
+            cause: "gvproxy exited with status 3".to_owned(),
+            ran: Duration::from_secs(1),
+        })
+        .expect("the supervisor listens");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(told.lock().unwrap().is_empty(), "no box was attached");
+        assert!(switch.lock().await.outage.is_none());
+        supervisor.abort();
+    }
+
     fn vm_host_switch(dir: &std::path::Path) -> SwitchClient {
         SwitchClient::new("/nonexistent/gvproxy-binary", dir.join("gvproxy"))
             .with_transport(SwitchTransport::VmHost)

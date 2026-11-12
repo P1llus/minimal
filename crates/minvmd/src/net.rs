@@ -109,10 +109,6 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
     }
 }
 
-/// The waits between attempts to start gvproxy again after it died.
-const RESPAWN_MIN: Duration = Duration::from_millis(250);
-const RESPAWN_MAX: Duration = Duration::from_secs(4);
-
 /// Builder for the per-host gvproxy switch process.
 #[derive(Debug, Clone)]
 pub struct GvproxyConfig {
@@ -848,13 +844,12 @@ async fn respawn(
     sock: &Path,
     stop: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Option<(GvproxySupervisor, SwitchExit)> {
-    let mut wait = RESPAWN_MIN;
+    let mut backoff = switch::restart::Backoff::gvproxy();
     loop {
         tokio::select! {
             _ = &mut *stop => return None,
-            () = tokio::time::sleep(wait) => {}
+            () = tokio::time::sleep(backoff.wait()) => {}
         }
-        wait = (wait * 2).min(RESPAWN_MAX);
         // The dead gvproxy's socket file would make the next one fail to
         // bind. A socket that still accepts is not a dead one's.
         if tokio::net::UnixStream::connect(sock).await.is_err() {

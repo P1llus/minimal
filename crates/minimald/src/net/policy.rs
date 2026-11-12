@@ -44,12 +44,88 @@ pub struct UnexposeRequest {
     pub protocol: String,
 }
 
+/// The forwards the node's own gvproxy holds for boxes. gvproxy keeps
+/// them in memory only, so one that is started again gets them from here.
+#[derive(Debug, Default)]
+pub struct Forwards(tokio::sync::Mutex<Vec<ExposeRequest>>);
+
+impl Forwards {
+    /// Opens a forward and records it. The lock is held across the request,
+    /// so a replay either sees the forward or runs before it.
+    async fn open(&self, sock: &std::path::Path, req: &ExposeRequest) -> io::Result<()> {
+        let mut held = self.0.lock().await;
+        post_json(sock, "/services/forwarder/expose", req).await?;
+        held.push(req.clone());
+        Ok(())
+    }
+
+    /// Ends a forward. It leaves the record first: a forward its box gave
+    /// up must not come back with the next gvproxy, whatever this one says.
+    async fn close(
+        &self,
+        sock: &std::path::Path,
+        mapping: &ExposedMapping,
+    ) -> io::Result<ClosedConnections> {
+        let mut held = self.0.lock().await;
+        held.retain(|open| open.local != mapping.local || open.protocol != mapping.protocol);
+        let req = UnexposeRequest {
+            local: mapping.local.clone(),
+            protocol: mapping.protocol.clone(),
+        };
+        post_json_reply_within(
+            sock,
+            "/services/forwarder/unexpose",
+            &req,
+            GVPROXY_CONTROL_TIMEOUT,
+        )
+        .await
+        .map(|body| ClosedConnections::from_reply(&body))
+    }
+
+    /// Gives a gvproxy that was just started the forwards the last one
+    /// held. Returns how many it took and how many it refused.
+    pub(crate) async fn replay(&self, sock: &std::path::Path) -> (usize, usize) {
+        let held = self.0.lock().await;
+        let (mut taken, mut refused) = (0, 0);
+        for forward in held.iter() {
+            match post_json(sock, "/services/forwarder/expose", forward).await {
+                Ok(()) => taken += 1,
+                Err(error) => {
+                    refused += 1;
+                    tracing::warn!(
+                        local = %forward.local,
+                        remote = %forward.remote,
+                        protocol = %forward.protocol,
+                        %error,
+                        "the restarted gvproxy did not take a forward"
+                    );
+                }
+            }
+        }
+        (taken, refused)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn held(&self) -> Vec<ExposeRequest> {
+        self.0.lock().await.clone()
+    }
+}
+
+/// The node's own gvproxy as the holder of forwards.
+#[derive(Debug, Clone)]
+pub struct OwnSwitch {
+    /// gvproxy's control socket.
+    pub socket: std::path::PathBuf,
+    /// What it holds, for the gvproxy that follows it.
+    pub forwards: Arc<Forwards>,
+}
+
 /// What holds the forwards that carry connections from outside the virtual
 /// network to a box.
 #[derive(Debug, Clone)]
 pub enum ControlChannel {
-    /// The node's own gvproxy, at its control socket.
-    Unix(std::path::PathBuf),
+    /// The node's own gvproxy.
+    Unix(OwnSwitch),
     /// The VM host, asked through the guest door. It knows a box by the id
     /// it minted, and a box it did not register has none.
     VmHost {
@@ -63,12 +139,25 @@ impl ControlChannel {
     #[must_use]
     pub fn of(switch: &crate::net::SwitchClient, box_id: Option<boxes::BoxId>) -> Self {
         match switch.transport() {
-            crate::net::SwitchTransport::LocalSpawn => Self::Unix(switch.control_socket()),
+            crate::net::SwitchTransport::LocalSpawn => Self::Unix(OwnSwitch {
+                socket: switch.control_socket(),
+                forwards: switch.forwards(),
+            }),
             crate::net::SwitchTransport::VmHost => Self::VmHost {
                 door: super::door::of_this_guest(),
                 box_id,
             },
         }
+    }
+
+    /// A gvproxy at `socket` that no switch client runs, with a record of
+    /// its forwards that nothing replays.
+    #[cfg(test)]
+    pub(crate) fn unix(socket: impl Into<std::path::PathBuf>) -> Self {
+        Self::Unix(OwnSwitch {
+            socket: socket.into(),
+            forwards: Arc::default(),
+        })
     }
 
     /// Whether the VM host holds a row for the box. `None` on a node that
@@ -195,8 +284,8 @@ async fn open_forward(
 ) -> io::Result<ExposedMapping> {
     let req = expose_request(mapping, published, ptask_ip);
     match control {
-        ControlChannel::Unix(sock) => {
-            post_json(sock, "/services/forwarder/expose", &req).await?;
+        ControlChannel::Unix(own) => {
+            own.forwards.open(&own.socket, &req).await?;
             Ok(ExposedMapping {
                 local: req.local,
                 protocol: req.protocol,
@@ -234,20 +323,7 @@ async fn close_forward(
     mapping: &ExposedMapping,
 ) -> io::Result<ClosedConnections> {
     match control {
-        ControlChannel::Unix(sock) => {
-            let req = UnexposeRequest {
-                local: mapping.local.clone(),
-                protocol: mapping.protocol.clone(),
-            };
-            post_json_reply_within(
-                sock,
-                "/services/forwarder/unexpose",
-                &req,
-                GVPROXY_CONTROL_TIMEOUT,
-            )
-            .await
-            .map(|body| ClosedConnections::from_reply(&body))
-        }
+        ControlChannel::Unix(own) => own.forwards.close(&own.socket, mapping).await,
         ControlChannel::VmHost { door, box_id } => {
             let (Some(box_id), Some((_, external))) = (*box_id, mapping.host_port()) else {
                 return Err(io::Error::new(
@@ -1958,6 +2034,61 @@ mod tests {
             (handle, rx)
         }
 
+        /// gvproxy holds forwards in memory. One that is started again
+        /// gets the forwards that are open, and none that was ended.
+        #[tokio::test]
+        async fn a_gvproxy_that_is_started_again_gets_the_open_forwards() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (first, mut asked) = spawn_switch(sock.clone(), |_| String::new());
+            let control = ControlChannel::unix(sock.clone());
+            let ControlChannel::Unix(own) = &control else {
+                unreachable!("the node's own gvproxy")
+            };
+            let published = Ipv4Addr::new(127, 0, 0, 5);
+            let lease = Ipv4Addr::new(100, 64, 0, 2);
+            let kept = expose_mapping(&control, published, lease, 8080)
+                .await
+                .expect("the first forward opens");
+            let ended = expose_mapping(&control, published, lease, 9090)
+                .await
+                .expect("the second forward opens");
+            unexpose_mapping(&control, &ended)
+                .await
+                .expect("the second forward ends");
+            for _ in 0..3 {
+                asked.recv().await.expect("a request of the first gvproxy");
+            }
+            assert_eq!(
+                own.forwards.held().await,
+                [ExposeRequest {
+                    local: kept.local().to_owned(),
+                    remote: "100.64.0.2:8080".to_owned(),
+                    protocol: "tcp".to_owned(),
+                }]
+            );
+
+            // gvproxy dies and another one listens on the same socket.
+            first.abort();
+            let _gone = first.await;
+            std::fs::remove_file(&sock).unwrap();
+            let (_second, mut asked) = spawn_switch(sock.clone(), |_| String::new());
+            assert_eq!(own.forwards.replay(&sock).await, (1, 0));
+            let replayed = asked.recv().await.expect("the replayed forward");
+            assert!(
+                replayed.contains("127.0.0.5:8080") && replayed.contains("100.64.0.2:8080"),
+                "{replayed}"
+            );
+            assert!(asked.try_recv().is_err(), "one forward, once");
+
+            // A forward that could not be opened is not on record.
+            std::fs::remove_file(&sock).unwrap();
+            expose_mapping(&control, published, lease, 7070)
+                .await
+                .expect_err("nothing listens");
+            assert_eq!(own.forwards.held().await.len(), 1);
+        }
+
         #[tokio::test]
         async fn retracting_one_publish_closes_only_its_accepted_connections() {
             let dir = tempfile::TempDir::new().unwrap();
@@ -1979,7 +2110,7 @@ mod tests {
                     String::new()
                 }
             });
-            let control = ControlChannel::Unix(sock);
+            let control = ControlChannel::unix(sock);
 
             let log = LogCapture::default();
             let subscriber = tracing_subscriber::fmt()
@@ -2234,7 +2365,7 @@ mod tests {
             let forwarder = forwarder_answering_once(sock.clone(), 200, "");
 
             let tracked =
-                bind_handed_port(&ControlChannel::Unix(sock), PUBLISHED, LEASE, &mapping())
+                bind_handed_port(&ControlChannel::unix(sock), PUBLISHED, LEASE, &mapping())
                     .await
                     .expect("the switch bound the forward");
 
@@ -2289,7 +2420,7 @@ mod tests {
             let sock = dir.path().join("gvproxy.sock");
             let (forwarder, mut asked) =
                 spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
-            let control = ControlChannel::Unix(sock);
+            let control = ControlChannel::unix(sock);
             assert!(!control.host_unbinds_declared_forwards());
 
             release_declared_ingress(&control, &[declared_at("127.0.64.202:18202")]).await;
@@ -2391,7 +2522,7 @@ mod tests {
             let forwarder =
                 forwarder_answering_in_turn(sock.clone(), vec![(200, ""), IN_USE, (200, "")]);
             let err = match apply_ingress(
-                &ControlChannel::Unix(sock),
+                &ControlChannel::unix(sock),
                 PUBLISHED,
                 LEASE,
                 &ingress(&[18080, 18999]),
@@ -2438,7 +2569,7 @@ mod tests {
         /// names the port. A port held across every bind still is.
         #[test]
         fn a_port_held_only_for_a_moment_is_not_reported() {
-            let native = ControlChannel::Unix("/nonexistent/gvproxy.sock".into());
+            let native = ControlChannel::unix("/nonexistent/gvproxy.sock");
             let in_use = || Err(io::Error::from(io::ErrorKind::AddrInUse));
             for free_at in 2..=PORT_HELD_BINDS {
                 let mut binds = 0;
@@ -2496,7 +2627,7 @@ mod tests {
                 vec![(200, ""), (500, "listen tcp: permission denied")],
             );
             let err = match apply_ingress(
-                &ControlChannel::Unix(sock),
+                &ControlChannel::unix(sock),
                 PUBLISHED,
                 LEASE,
                 &ingress(&[18080, 18181]),

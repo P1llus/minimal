@@ -860,7 +860,7 @@ mod tests {
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
             &refused_switch,
             no_link(),
-            ControlChannel::Unix(refused.control_path.clone()),
+            ControlChannel::unix(refused.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -973,7 +973,7 @@ mod tests {
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
             &failed_switch,
             no_link(),
-            ControlChannel::Unix(failed.control_path.clone()),
+            ControlChannel::unix(failed.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -1055,7 +1055,7 @@ mod tests {
         let err = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             no_link(),
-            ControlChannel::Unix(bare.control_path.clone()),
+            ControlChannel::unix(bare.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -1121,7 +1121,7 @@ mod tests {
         let err = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             no_link(),
-            ControlChannel::Unix(unhand.control_path.clone()),
+            ControlChannel::unix(unhand.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -1201,7 +1201,7 @@ mod tests {
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             no_link(),
-            ControlChannel::Unix(scenario.control_path.clone()),
+            ControlChannel::unix(scenario.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -1268,7 +1268,7 @@ mod tests {
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             no_link(),
-            ControlChannel::Unix(scenario.control_path.clone()),
+            ControlChannel::unix(scenario.control_path.clone()),
             attached,
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -1366,7 +1366,7 @@ mod tests {
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             no_link(),
-            ControlChannel::Unix(scenario.control_path.clone()),
+            ControlChannel::unix(scenario.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
@@ -1438,7 +1438,7 @@ mod tests {
         );
         let switch = vm_host_switch();
         let policy = declared_two_ports();
-        let control = ControlChannel::Unix(scenario.control_path.clone());
+        let control = ControlChannel::unix(scenario.control_path.clone());
         scenario
             .registry
             .write()
@@ -1616,7 +1616,7 @@ mod tests {
         let guard = match crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
             no_link(),
-            ControlChannel::Unix(scenario.control_path.clone()),
+            ControlChannel::unix(scenario.control_path.clone()),
             lease_at(LEASE),
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
