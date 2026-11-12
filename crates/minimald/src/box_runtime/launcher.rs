@@ -937,13 +937,13 @@ impl BoxLauncher for SandboxLauncher {
             ctx.box_cgroup().and_then(|cgroup| {
                 let engine = crate::net::engine::Engine::current();
                 engine
-                    .of_cgroup(cgroup)
+                    .of_cgroup(cgroup.id())
                     .map(|of| crate::net::gvproxy_network::EngineBox { engine, of })
             }),
         );
         let network = match ctx
             .box_cgroup()
-            .and_then(|cgroup| crate::net::engine::Engine::current().resolver_address(cgroup))
+            .and_then(|cgroup| crate::net::engine::Engine::current().resolver_address(cgroup.id()))
         {
             Some(resolver) => crate::net::provider::with_box_resolver(network, resolver),
             None => network,

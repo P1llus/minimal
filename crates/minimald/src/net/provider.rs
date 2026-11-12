@@ -211,7 +211,6 @@ impl RuntimeIngress {
 impl OwnAddressReporter {
     /// Builds the reporter for one session's launches.
     #[must_use]
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn new(
         registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
         session_id: SessionId,
@@ -266,7 +265,6 @@ impl OwnAddressReporter {
 
     /// The switch lease the attach reported for this box ([`Self::report`]),
     /// or `None` before an attach reported one.
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn lease(&self) -> Option<Ipv4Addr> {
         self.registry
             .read()
@@ -678,6 +676,20 @@ mod tests {
                 .with_transport(crate::net::SwitchTransport::VmHost)
                 .allowing_self_allocation(),
         ))
+    }
+
+    /// The launch reads the box's address on the virtual network from the
+    /// reporter once the attach has reported it.
+    #[test]
+    fn a_reporter_knows_the_lease_its_attach_reported() {
+        let registry = Arc::new(std::sync::RwLock::new(
+            crate::net::dns::HostnameRegistry::new("aaaa1", false),
+        ));
+        let reporter = OwnAddressReporter::new(Arc::clone(&registry), boxes::SessionId::nil());
+        assert_eq!(reporter.lease(), None);
+        let lease = std::net::Ipv4Addr::new(100, 64, 0, 9);
+        reporter.report("web", lease, std::collections::BTreeMap::new());
+        assert_eq!(reporter.lease(), Some(lease));
     }
 
     #[tokio::test]

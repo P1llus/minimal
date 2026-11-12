@@ -1373,21 +1373,18 @@ impl Engine {
         }
     }
 
-    /// The address to write into the box's resolver file, when the box's
-    /// DNS goes to an endpoint of its own.
-    // Only the real launcher asks, which the unit tests replace.
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn resolver_address(&self, cgroup: &BoxCgroup) -> Option<std::net::Ipv4Addr> {
-        self.by_cgroup(BoxId(cgroup.id()))
+    /// The address to write into the resolver file of the box whose cgroup
+    /// has the id `cgroup`, when the box's DNS goes to an endpoint of its
+    /// own.
+    pub(crate) fn resolver_address(&self, cgroup: u64) -> Option<std::net::Ipv4Addr> {
+        self.by_cgroup(BoxId(cgroup))
             .filter(|of| of.wants.resolver)
             .map(|_| endpoints::V4)
     }
 
-    /// The box whose cgroup is `cgroup`, when the engine judges it.
-    // Only the real launches ask, which the unit tests replace.
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn of_cgroup(&self, cgroup: &BoxCgroup) -> Option<Arc<Installed>> {
-        self.by_cgroup(BoxId(cgroup.id()))
+    /// The box whose cgroup has the id `cgroup`, when the engine judges it.
+    pub(crate) fn of_cgroup(&self, cgroup: u64) -> Option<Arc<Installed>> {
+        self.by_cgroup(BoxId(cgroup))
     }
 
     pub(crate) fn installed(&self, session: SessionId) -> Option<Arc<Installed>> {
@@ -1655,6 +1652,15 @@ mod tests {
         assert!(text(Absent::NoCgroupRoot).contains("Delegate=yes"));
         let refused = text(Absent::LoaderRefused("the peer runs in /x".to_owned()));
         assert!(refused.contains("the peer runs in /x") && !refused.ends_with(' '));
+    }
+
+    /// Without an engine no box is judged, and no box's DNS is sent to an
+    /// endpoint: a launch then leaves the box's resolver file alone.
+    #[test]
+    fn a_daemon_without_an_engine_judges_no_box() {
+        let engine = Engine::absent(Absent::NotStarted);
+        assert!(engine.of_cgroup(7).is_none());
+        assert_eq!(engine.resolver_address(7), None);
     }
 
     #[test]
