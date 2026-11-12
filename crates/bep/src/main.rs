@@ -39,7 +39,7 @@ use bep::control::{Control, KeyBound, Registry, RotationReply, RotationRequest};
 use bep::forward::Redeemer;
 use bep::handle::{self as store_handle, Rules, StoreRule};
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
-use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
+use bep::listener::{Listener, TOKEN_LEN};
 use bep::module::GITHUB;
 use bep::proxy::{self, Admission, AuditWriter, Proxy, StoreAuthorities, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
@@ -1570,7 +1570,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
         keep_signing_renewed(Arc::clone(&ca));
-        let listener = Listener::bind(&args.listener, token, Arc::new(PeerAttested))
+        let listener = Listener::bind(&args.listener, token)
             .map_err(|err| format!("bep did not listen on {}: {err}", args.listener.display()))?;
         // The redeemer reads the client keys and the boxes this socket
         // registers, at each request.

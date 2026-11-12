@@ -1849,22 +1849,15 @@ mod tests {
         assert_eq!(parent.permissions().mode() & 0o777, 0o700);
 
         // The listener cannot take the control socket's path.
-        let err = crate::listener::Listener::bind(
-            &path,
-            [0; crate::listener::TOKEN_LEN],
-            Arc::new(crate::listener::PeerAttested),
-        )
-        .unwrap_err();
+        let err =
+            crate::listener::Listener::bind(&path, [0; crate::listener::TOKEN_LEN]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
 
         // A registration sent to the listener gets no reply and registers
         // nothing.
-        let listener = crate::listener::Listener::bind(
-            &listener_path,
-            [1; crate::listener::TOKEN_LEN],
-            Arc::new(crate::listener::PeerAttested),
-        )
-        .unwrap();
+        let listener =
+            crate::listener::Listener::bind(&listener_path, [1; crate::listener::TOKEN_LEN])
+                .unwrap();
         let served = tokio::spawn(listener.run(|_, _| async {}));
         let other = p256::ecdsa::SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
         let line = serde_json::to_string(&Request::RegisterClientKey {

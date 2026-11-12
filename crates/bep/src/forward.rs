@@ -2860,7 +2860,7 @@ mod tests {
         let flow = store_flow(&store, bearer_form(), audit);
         let mut sent = None;
         let log = logged_spans(|| {
-            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let _entered = crate::proxy::connection_span("b", &"dialled").entered();
             sent = Some(send_store(
                 &flow,
                 &format!("Authorization: Bearer {sealed}"),
@@ -2882,7 +2882,7 @@ mod tests {
 
         // No reference: the span has no store and no identifier.
         let log = logged_spans(|| {
-            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let _entered = crate::proxy::connection_span("b", &"dialled").entered();
             let _ = send_store(&flow, "Accept: */*");
         });
         let close = log
@@ -2895,7 +2895,7 @@ mod tests {
         // A refused reference: nothing was injected, so the span has no
         // store and no identifier, and says the substitution was refused.
         let log = logged_spans(|| {
-            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let _entered = crate::proxy::connection_span("b", &"dialled").entered();
             let (_, end) = send_store(&flow, &format!("x-api-key: {sealed}"));
             assert_eq!(refusal(&end), Some(SEALED_HEADER_MISPLACED), "{end:?}");
         });

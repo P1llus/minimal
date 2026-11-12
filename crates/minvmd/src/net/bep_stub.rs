@@ -20,7 +20,7 @@ use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use bep::listener::{DELIVERY_HEADER_LEN, Delivery, TOKEN_LEN};
+use bep::listener::{DELIVERY_HEADER_LEN, Delivery, Entry, TOKEN_LEN};
 
 /// How long one connection may take to present its token and header. The
 /// pool writes both in one go, so this bound only catches a connection that
@@ -256,13 +256,11 @@ fn peer_credentials(stream: &UnixStream) -> std::io::Result<(u32, Option<u32>)> 
     Ok((uid, None))
 }
 
-/// Serve one presented connection: check the credentials, read the token,
-/// then the header, attribute the connection to the live box the
-/// attachment table holds for the header's source — cross-checking the box
-/// id the header carries against it — and answer the one line naming the
-/// source; anything the presentation fails is refused and audited, closing
-/// the connection without an answer, so nothing refused is ever presented
-/// as a box.
+/// Serves one presented connection: checks the credentials, reads the
+/// token, then the header, and answers one line that names the box and how
+/// its flow entered. Anything the presentation fails is refused and
+/// audited, and the connection is closed without an answer, so nothing
+/// refused is ever presented as a box.
 fn serve_connection(mut stream: UnixStream, shared: &Shared) {
     if let Err(error) = stream.set_read_timeout(Some(PRESENT_TIMEOUT)) {
         tracing::debug!(error = %error, "box egress proxy stand-in could not arm its read bound");
@@ -302,7 +300,7 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
         return;
     }
     let Some(delivery) = Delivery::parse(&head) else {
-        audit(shared, "version");
+        audit(shared, "header");
         return;
     };
     // The mint cannot make a zero id, so a zero id is a header that was
@@ -311,18 +309,19 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
         audit(shared, "box_id");
         return;
     }
+    let entry = match delivery.entry {
+        Entry::Redirected { destination } => format!("redirected destination={destination}"),
+        Entry::Dialled => "dialled".to_owned(),
+    };
     let line = format!(
-        "box_id={} source={} destination={}\n",
+        "box_id={} entry={entry}\n",
         crate::bep_attach::BoxIdText(&delivery.box_id),
-        delivery.source,
-        delivery.destination
     );
     if stream.write_all(line.as_bytes()).is_err() {
         return;
     }
     tracing::debug!(
-        source = %delivery.source,
-        destination = %delivery.destination,
+        entry = %delivery.entry,
         "credential proxy stand-in answered a delivered connection"
     );
     shared
@@ -369,8 +368,9 @@ mod tests {
     fn delivery(box_id: [u8; 16]) -> Delivery {
         Delivery {
             box_id,
-            source: "100.64.128.2:51234".parse().unwrap(),
-            destination: "140.82.112.3:443".parse().unwrap(),
+            entry: Entry::Redirected {
+                destination: "140.82.112.3:443".parse().unwrap(),
+            },
         }
     }
 
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(
             answer,
             format!(
-                "box_id={} source=100.64.128.2:51234 destination=140.82.112.3:443\n",
+                "box_id={} entry=redirected destination=140.82.112.3:443\n",
                 crate::bep_attach::BoxIdText(&id)
             )
         );
@@ -429,7 +429,7 @@ mod tests {
 
         assert_eq!(
             until_refusals(&stub, 4),
-            vec!["token", "version", "box_id", "short"]
+            vec!["token", "header", "box_id", "short"]
         );
         assert!(stub.presented().is_empty());
     }

@@ -2336,20 +2336,44 @@ fn guest_door_replies_round_trip() {
 #[test]
 fn stream_door_header_and_reply_round_trip() {
     let box_id = BoxId::mint();
-    let proxy = StreamOpen {
-        box_id,
-        purpose: StreamPurpose::CredentialProxy {
-            source_port: 51234,
-            destination: "140.82.112.3:443".parse().unwrap(),
-        },
-    };
-    let wire = serde_json_lenient::to_string(&proxy).unwrap();
-    assert!(wire.contains(r#""kind":"credential_proxy""#), "{wire}");
-    assert!(wire.len() < STREAM_OPEN_MAX);
-    assert_eq!(
-        serde_json_lenient::from_str::<StreamOpen>(&wire).unwrap(),
-        proxy
-    );
+    let entries = [
+        (
+            ProxyEntry::Redirected {
+                destination: "140.82.112.3:443".parse().unwrap(),
+            },
+            r#""entry":{"via":"redirected","destination":"140.82.112.3:443"}"#,
+        ),
+        (
+            // The longest address there is.
+            ProxyEntry::Redirected {
+                destination: "[2001:db8:1111:2222:3333:4444:5555:6666]:65535"
+                    .parse()
+                    .unwrap(),
+            },
+            r#""via":"redirected""#,
+        ),
+        (ProxyEntry::Dialled {}, r#""entry":{"via":"dialled"}"#),
+    ];
+    for (entry, spelled) in entries {
+        let proxy = StreamOpen {
+            box_id,
+            purpose: StreamPurpose::CredentialProxy { entry },
+        };
+        let wire = serde_json_lenient::to_string(&proxy).unwrap();
+        assert!(wire.contains(r#""kind":"credential_proxy""#), "{wire}");
+        assert!(wire.contains(spelled), "{wire}");
+        assert!(wire.len() < STREAM_OPEN_MAX);
+        assert_eq!(
+            serde_json_lenient::from_str::<StreamOpen>(&wire).unwrap(),
+            proxy
+        );
+        // Neither entry takes a field of the guest's own.
+        let with_more = wire.replace(r#""via":"#, r#""source":"10.0.0.1","via":"#);
+        assert!(
+            serde_json_lenient::from_str::<StreamOpen>(&with_more).is_err(),
+            "{with_more}"
+        );
+    }
 
     let host = StreamOpen {
         box_id,
