@@ -103,6 +103,29 @@ pub fn denies_by_default(
         == Verdict::Deny
 }
 
+/// Whether the section opens every address of a family and has no name
+/// answered: it allows a subnet of prefix length 0 and lists no name. A
+/// subnet rule grants addresses, and a section with an allow list gets
+/// only the names it lists resolved, so a box with such a section reaches
+/// hosts by address only.
+#[must_use]
+pub fn allows_every_address_and_no_name(egress: Option<&EgressPolicy>) -> bool {
+    let Some(section) = egress else {
+        return false;
+    };
+    let lists_a_name = section
+        .allow_dns_hosts
+        .as_ref()
+        .is_some_and(|names| !names.is_empty());
+    let every_address = section.allow_subnets.iter().flatten().any(|entry| {
+        entry
+            .trim()
+            .parse::<Prefix>()
+            .is_ok_and(|prefix| [Prefix::V4_ALL, Prefix::V6_ALL].contains(&prefix))
+    });
+    every_address && !lists_a_name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +180,39 @@ mod tests {
                 "{s:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_section_that_opens_every_address_and_lists_no_name_is_told_apart() {
+        let told = |s: &EgressPolicy| allows_every_address_and_no_name(Some(s));
+        for s in [
+            section(|s| s.allow_subnets = list(&["0.0.0.0/0"])),
+            section(|s| s.allow_subnets = list(&["10.0.0.0/8", "::/0"])),
+            // Host bits do not narrow a prefix of length 0.
+            section(|s| s.allow_subnets = list(&["10.1.2.3/0"])),
+            section(|s| {
+                s.allow_subnets = list(&["0.0.0.0/0"]);
+                s.allow_dns_hosts = list(&[]);
+                s.deny_subnets = list(&["10.0.0.0/8"]);
+            }),
+        ] {
+            assert!(told(&s), "{s:?}");
+        }
+        for s in [
+            // A listed name is resolved.
+            section(|s| {
+                s.allow_subnets = list(&["0.0.0.0/0"]);
+                s.allow_dns_hosts = list(&["example.com"]);
+            }),
+            // A narrower subnet is a choice of addresses.
+            section(|s| s.allow_subnets = list(&["10.0.0.0/8", "0.0.0.0/1"])),
+            // Without an allow list every name is answered.
+            section(|s| s.deny_subnets = list(&["0.0.0.0/0"])),
+            EgressPolicy::deny_all(),
+        ] {
+            assert!(!told(&s), "{s:?}");
+        }
+        assert!(!allows_every_address_and_no_name(None));
     }
 
     #[test]

@@ -14,6 +14,21 @@ pub const DENY_ALL_DEFAULT_NOTICE: &str = "This box can reach no external addres
      activate a new session with --allow-subnets or --allow-dns-hosts, for example \
      --allow-dns-hosts github.com.";
 
+/// The note a box-creating command prints for a box whose egress rules
+/// allow every address and list no name. Such a box looks up no name: its
+/// resolver answers only names a rule admits, and a subnet rule admits
+/// addresses.
+pub const NO_NAME_RESOLVES_NOTICE: &str = "This box can look up no external host name, because      its egress rules allow every address but list no name, and a subnet rule grants addresses      only. Add each name the box needs with --allow-dns-hosts, or with allow_dns_hosts in      minimal.toml.";
+
+/// [`NO_NAME_RESOLVES_NOTICE`] when the box `config` describes is such a
+/// box.
+#[must_use]
+pub fn no_name_resolves_notice(config: &minimald_rpc::BoxConfig) -> Option<&'static str> {
+    (config.network != boxes::NetworkMode::NoNet
+        && boxes::egress::allows_every_address_and_no_name(config.policy.egress.as_ref()))
+    .then_some(NO_NAME_RESOLVES_NOTICE)
+}
+
 /// The words `min session policy` and `min ls` both print for a box's
 /// egress posture (T110), so the two surfaces cannot drift. A default is
 /// marked as one. A declared deny-all is not, because the box chose it. A

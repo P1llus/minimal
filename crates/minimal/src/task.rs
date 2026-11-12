@@ -339,8 +339,9 @@ impl std::error::Error for RunFlagMisplaced {}
 
 /// Writes what a run prints once its box exists, as `min session activate`
 /// prints it: the deny-all default note for an `own_ip` box with no egress
-/// rules on a daemon that has not opted out, and the masked form
-/// of each subnet flag that carries host bits. `mode_layer` is the table
+/// rules on a daemon that has not opted out, the note for rules that allow
+/// every address and list no name, and the masked form of each subnet flag
+/// that carries host bits. `mode_layer` is the table
 /// that set an `own_ip` mode, when the file set it.
 pub(crate) fn write_run_notices(
     out: &mut impl std::io::Write,
@@ -373,6 +374,9 @@ pub(crate) fn write_run_notices(
              again with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts \
              github.com{file_remedy}."
         )?;
+    }
+    if let Some(notice) = crate::no_name_resolves_notice(&request.config) {
+        writeln!(out, "{notice}")?;
     }
     for line in crate::subnet_notices(egress) {
         writeln!(out, "{line}")?;
@@ -3690,6 +3694,33 @@ mod tests {
             "--allow-subnets 10.0.0.1/8 is read as 10.0.0.0/8\n\
              --deny-subnets 192.168.1.1/16 is read as 192.168.0.0/16\n"
         );
+    }
+
+    /// A box whose rules allow every address and list no name is told that
+    /// it looks up no name, in either mode that has a network. One listed
+    /// name ends the note.
+    #[test]
+    fn run_says_when_the_rules_allow_every_address_and_no_name() {
+        let flags = |names: &[&str]| crate::EgressArgs {
+            allow_subnets: vec!["0.0.0.0/0".into()],
+            allow_dns_hosts: names.iter().map(ToString::to_string).collect(),
+            ..crate::EgressArgs::default()
+        };
+        let note = |mode, flags: &crate::EgressArgs| {
+            run_notices(
+                mode,
+                crate::flag_egress(flags).unwrap(),
+                &create_reply(false),
+                flags,
+                None,
+            )
+        };
+        let told = format!("{}\n", crate::NO_NAME_RESOLVES_NOTICE);
+        assert!(told.contains("--allow-dns-hosts") && told.contains("can look up no"));
+        for mode in [boxes::NetworkMode::OwnIp, boxes::NetworkMode::HostNet] {
+            assert_eq!(note(mode, &flags(&[])), told, "{mode:?}");
+            assert_eq!(note(mode, &flags(&["github.com"])), "", "{mode:?}");
+        }
     }
 
     /// A network or egress flag typed after the task's first argument is

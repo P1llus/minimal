@@ -3945,6 +3945,9 @@ pub(crate) async fn activate_box(
             {
                 eprintln!("{DENY_ALL_DEFAULT_NOTICE}");
             }
+            if let Some(notice) = no_name_resolves_notice(&request.config) {
+                eprintln!("{notice}");
+            }
 
             // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
             // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
