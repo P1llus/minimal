@@ -152,7 +152,6 @@ impl OwnIpAttach {
         // A declared port bound for this spawn after its attach, at a
         // shared-address port's hand-over (NET-129), is released with the
         // ones the attach bound.
-        let ends_box = runtime_ingress.is_some();
         if let Some(runtime_ingress) = &runtime_ingress {
             exposed.extend(runtime_ingress.detach_handed());
         }
@@ -181,30 +180,6 @@ impl OwnIpAttach {
         drop(link);
         if let Err(e) = switch.lock().await.detach(lease).await {
             tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
-        }
-        // A task's namespace is not its box's: the box's own launch ends it.
-        if ends_box
-            && let ControlChannel::VmHost {
-                door,
-                box_id: Some(box_id),
-            } = control
-        {
-            // The VM host unbinds the box's forwards on this message only,
-            // so it is told until it answers, whatever becomes of this
-            // launch.
-            crate::traced::spawn_detached(
-                tracing::info_span!(parent: None, "net.end_box", %box_id),
-                async move {
-                    let ended = door.end_box(box_id).await;
-                    tracing::info!(
-                        %box_id,
-                        ended = ended.ended,
-                        forwards_unbound = ended.forwards_unbound,
-                        still_bound = ended.still_bound,
-                        "told the VM host that the box's network is gone"
-                    );
-                },
-            );
         }
     }
 }

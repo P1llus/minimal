@@ -613,6 +613,9 @@ pub struct BoxActor {
     /// The box's cgroup, while it has one: every process that runs in or
     /// for the box starts in it.
     cgroup: Option<sandbox::cgroup::BoxCgroup>,
+    /// Set when the box's cgroup and its entry in the policy engine went,
+    /// until [`Self::report_end_to_vm_host`] has looked at it.
+    engine_entry_removed: bool,
 
     /// The ports this box published at runtime with its own `min net expose`
     /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
@@ -844,6 +847,7 @@ impl BoxActor {
             daemon_ctx,
             net_switch,
             cgroup: None,
+            engine_entry_removed: false,
             deny_all_opt_out,
             tracker: OpTracker::new_root(),
             inner,
@@ -2119,6 +2123,7 @@ impl BoxActor {
         let _clear_slot = ClearSlotOnExit(Arc::clone(&self.host_slot));
         self.publish_host();
         loop {
+            self.report_end_to_vm_host();
             // Messages first: a stop or a destroy queued beside an exit
             // ends the box as it asked, and the exit is then nobody's.
             let next = tokio::select! {
@@ -2210,6 +2215,7 @@ impl BoxActor {
                 break;
             }
         }
+        self.report_end_to_vm_host();
         if matches!(teardown, Teardown::SelfInitiated) {
             let session_id = *self.record.id();
             let manager = self.manager.clone();
@@ -2219,6 +2225,29 @@ impl BoxActor {
                 manager.evict(session_id).await;
             }
         }
+    }
+
+    /// Tells the VM host that the box has ended, when the box lost its
+    /// entry in the policy engine since the last call and has none now. The
+    /// loop calls this between two messages. A restart takes the entry out
+    /// and puts one in within one message, so the box keeps what the VM
+    /// host holds for it.
+    fn report_end_to_vm_host(&mut self) {
+        if !std::mem::take(&mut self.engine_entry_removed) || self.cgroup.is_some() {
+            return;
+        }
+        let (switch, box_id) = (Arc::clone(&self.net_switch), *self.record.id());
+        // On a task of its own: the report waits for the switch's lock and
+        // for the VM host, and the box's end waits for neither.
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "net.end_box", %box_id),
+            async move {
+                switch_control_of(&switch, Some(box_id))
+                    .await
+                    .report_box_end()
+                    .await;
+            },
+        );
     }
 
     /// Ends the box when its entrypoint returned on its own (BOX-038): sets

@@ -217,6 +217,30 @@ impl ControlChannel {
         Some(Err(last))
     }
 
+    /// Tells the VM host that the box has ended, and asks until the VM host
+    /// answers. The VM host then drops what it holds for the box: the row
+    /// and the forwards of a box with its own address, the residency of a
+    /// box that shares the node's. `None` at once on a node that has no VM
+    /// host.
+    pub async fn report_box_end(&self) -> Option<super::door::BoxEnded> {
+        let Self::VmHost {
+            door,
+            box_id: Some(box_id),
+        } = self
+        else {
+            return None;
+        };
+        let ended = door.end_box(*box_id).await;
+        tracing::info!(
+            %box_id,
+            ended = ended.ended,
+            forwards_unbound = ended.forwards_unbound,
+            still_bound = ended.still_bound,
+            "told the VM host that the box has ended"
+        );
+        Some(ended)
+    }
+
     /// Whether the forwards are the VM host's. It ends a declared port's
     /// forward when the box ends, and refuses to end it earlier.
     #[must_use]
@@ -1512,6 +1536,38 @@ impl fmt::Display for Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end of a box reaches the VM host under the box's id. A node
+    /// with its own gvproxy has nobody to tell.
+    #[tokio::test]
+    async fn the_end_of_a_box_is_reported_to_the_vm_host_alone() {
+        use crate::net::door::testing::{FakeHost, box_id};
+        use minimald_rpc::{GuestDoorReply, GuestDoorRequest};
+
+        let (told, mut ended) = tokio::sync::mpsc::unbounded_channel();
+        let host = FakeHost::answering(move |request| {
+            let GuestDoorRequest::EndBox(end) = request else {
+                panic!("{request:?}")
+            };
+            told.send(end.box_id).expect("the test listens");
+            Some(GuestDoorReply::BoxEnded {
+                ended: true,
+                box_id: end.box_id,
+                forwards_unbound: 0,
+                still_bound: 0,
+            })
+        });
+        let in_a_vm = ControlChannel::VmHost {
+            door: Arc::new(crate::net::door::GuestDoor::new(host)),
+            box_id: Some(box_id(3)),
+        };
+        let answered = in_a_vm.report_box_end().await;
+        assert!(answered.is_some_and(|answered| answered.ended));
+        assert_eq!(ended.recv().await, Some(box_id(3)));
+
+        let native = ControlChannel::unix("/nonexistent/gvproxy.sock");
+        assert_eq!(native.report_box_end().await, None);
+    }
 
     #[test]
     fn expose_request_maps_host_port_to_ptask_ip() {

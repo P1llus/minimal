@@ -676,6 +676,7 @@ impl BoxActor {
             );
         }
         crate::net::engine::Engine::current().uninstall(*self.record.id());
+        self.engine_entry_removed = true;
     }
 
     /// The processes a stop of this box signals: its cgroup's, or its

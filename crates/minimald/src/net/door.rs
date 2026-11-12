@@ -221,9 +221,9 @@ impl<C: Connect> GuestDoor<C> {
         }
     }
 
-    /// Tells the VM host that a box's network is gone, and keeps trying
-    /// until the host has answered. The host unbinds the box's forwards on
-    /// this message only, so giving up would leave them bound.
+    /// Tells the VM host that a box has ended, and keeps trying until the
+    /// host has answered. The host drops what it holds for the box on this
+    /// message only, so giving up would leave its forwards bound.
     pub(crate) async fn end_box(&self, box_id: BoxId) -> BoxEnded {
         let request = GuestDoorRequest::EndBox(EndBoxRequest { box_id });
         let mut wait = END_BOX_FIRST_WAIT;
@@ -447,6 +447,12 @@ pub(crate) mod testing {
                     }
                 }
             })
+        }
+    }
+
+    impl std::fmt::Debug for FakeHost {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FakeHost").finish_non_exhaustive()
         }
     }
 

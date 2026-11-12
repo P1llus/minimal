@@ -93,6 +93,8 @@ serial_test.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
+# The spec of a box that a VM harness restarts.
+mfile.workspace = true
 # The supervisor's span-phase tests (`telemetry`) record what the OTel layer
 # exports in memory, with the same layer `mlog::otel` installs.
 opentelemetry.workspace = true
