@@ -103,6 +103,10 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
     }
 }
 
+/// The reason of the event for a request to a box that has no address on
+/// the asking box's network.
+const NO_ADDRESS_FOR_CALLER: &str = "no_address_for_caller";
+
 /// The rule the `network policy violation` line names for a request to a
 /// port the box has not published.
 const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
@@ -522,34 +526,55 @@ where
     let kind = request.kind;
     let port = port.unwrap_or(DEFAULT_UPSTREAM_PORT);
 
-    // A box at its own endpoint: its compiled policy judges the target as
-    // it would judge the box's own connection there. The name the request
-    // carries stands for a pin, so a peer the box lists by name is admitted.
+    // A box at its own endpoint is judged as its own connection to the
+    // target would be: at the address its resolver tells it for the name,
+    // by its compiled policy. The address this daemon dials below is the
+    // host's end of the target's port, which says nothing about what the
+    // asking box may reach. A box with its own address counts every
+    // loopback address as its own. The name stands for a pin, so a peer
+    // the box lists by name is admitted.
     if let Asker::Box(asker) = &asker {
+        let refuse = |remote: Option<std::net::IpAddr>, reason: String, rule| {
+            asker.engine.observe(
+                Arc::clone(&asker.of),
+                crate::events::NetRefusal {
+                    source: crate::events::Source::HostnameProxy,
+                    direction: netpol::Direction::Egress,
+                    protocol: Some(netpol::Protocol::Tcp),
+                    remote,
+                    port: Some(port),
+                    name: Some(host.to_owned()),
+                    reason,
+                    rule,
+                    pid: None,
+                },
+            );
+        };
+        let crate::net::resolver::ZoneAnswer::Address(reached_at) =
+            asker.engine.zone_answer(&asker.of, host)
+        else {
+            // The target has no address where the asking box is: a box
+            // that shares the host's address, asked for from the virtual
+            // network.
+            refuse(None, NO_ADDRESS_FOR_CALLER.to_owned(), None);
+            let reason = "the caller's network has no address for this box";
+            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
+        };
         let flow = netpol::Flow {
             direction: netpol::Direction::Egress,
             protocol: netpol::Protocol::Tcp,
-            remote: std::net::IpAddr::V4(route.address()),
+            remote: std::net::IpAddr::V4(reached_at),
             port,
             local: None,
         };
         let decision = asker.engine.evaluate(&asker.of, &flow, Some(host));
         if decision.verdict == netpol::FlowVerdict::Deny {
-            let reason = "the caller's egress policy denies this target";
-            asker.engine.observe(
-                Arc::clone(&asker.of),
-                crate::events::NetRefusal {
-                    source: crate::events::Source::HostnameProxy,
-                    direction: flow.direction,
-                    protocol: Some(flow.protocol),
-                    remote: Some(flow.remote),
-                    port: Some(port),
-                    name: Some(host.to_owned()),
-                    reason: crate::events::snake(&decision.reason),
-                    rule: crate::events::RuleRef::of(&asker.of.compiled(), decision.rule),
-                    pid: None,
-                },
+            refuse(
+                Some(flow.remote),
+                crate::events::snake(&decision.reason),
+                crate::events::RuleRef::of(&asker.of.compiled(), decision.rule),
             );
+            let reason = "the caller's egress policy denies this target";
             return write_refusal_status(&mut client, "403 Forbidden", reason).await;
         }
     }

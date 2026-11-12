@@ -483,6 +483,13 @@ pub(crate) struct Resolver {
 }
 
 impl Resolver {
+    /// What `of` is told for `name` of the box zone: the address it
+    /// reaches the name's box at, when it reaches it at all.
+    pub(crate) fn zone_answer(&self, of: &Installed, name: &str) -> ZoneAnswer {
+        self.zone
+            .lookup(name, of.on_virtual_network(), of.host_alias())
+    }
+
     pub(crate) const fn new(engine: &'static Engine, zone: Zone, upstream: Upstream) -> Self {
         Self {
             engine,
@@ -542,9 +549,7 @@ impl Resolver {
                 Some(reply)
             }
             Decided::Zone { name, query } => {
-                let answer = self
-                    .zone
-                    .lookup(&name, of.on_virtual_network(), of.host_alias());
+                let answer = self.zone_answer(of, &name);
                 let admitted = admit_zone(answer, &name, &view);
                 if let Some(address) = admitted.pin {
                     self.pin(of, address, &name);

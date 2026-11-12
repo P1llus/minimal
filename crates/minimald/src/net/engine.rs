@@ -1496,6 +1496,16 @@ impl Engine {
         );
     }
 
+    /// Where the box reaches `name` of the box zone, as its resolver
+    /// tells it. Without the daemon's resolver no box is told anything.
+    pub(crate) fn zone_answer(&self, of: &Installed, name: &str) -> super::resolver::ZoneAnswer {
+        self.attached_state()
+            .and_then(|attached| attached.serving.get())
+            .map_or(super::resolver::ZoneAnswer::NoSuchName, |serving| {
+                serving.resolver.zone_answer(of, name)
+            })
+    }
+
     /// Judges a flow of the box as the kernel programs would. `name` is
     /// the host name the flow is for, when the caller knows it: it stands
     /// for a pin of the destination.

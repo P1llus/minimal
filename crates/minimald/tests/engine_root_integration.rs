@@ -1266,6 +1266,100 @@ fn a_box_that_cannot_start_is_refused_or_leaves_nothing() {
     assert_eq!(daemon.exec("open", "echo still").trim(), "still");
 }
 
+/// A box asks the hostname proxy for another box. The proxy judges the
+/// request where the asking box would dial: at the address its resolver
+/// tells it for the name, by the box's own rules.
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn the_hostname_proxy_judges_a_box_s_request_where_the_box_would_dial() {
+    if !gated("the_hostname_proxy_judges_a_box_s_request_where_the_box_would_dial") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    // A service of the host on every address, which no box was given.
+    let host_service = target(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+    // A box that shares the host's address. Its name routes to whatever
+    // listens on the host at a port, the host's service included.
+    daemon.activate("shares", &["--network", "host_ip"]);
+    assert_eq!(daemon.exec("shares", "echo runs").trim(), "runs");
+    // A box with its own address and a published port.
+    daemon.activate("web", &["--network", "own_ip", "--ingress", "18080:8080"]);
+    let _serving = daemon.run_in(
+        "web",
+        &[
+            "git",
+            "daemon",
+            "--listen=0.0.0.0",
+            "--port=8080",
+            "--base-path=/tmp",
+        ],
+    );
+    let published = SocketAddr::new(IpAddr::V4(daemon.published_address("web")), 18080);
+    wait_for("the published port", Duration::from_secs(20), || {
+        stays_open(published)
+    });
+
+    // Three askers with their own address: one that lists another name
+    // only, one that allows every address, one that lists `web`.
+    daemon.activate(
+        "narrow",
+        &["--network", "own_ip", "--allow-dns-hosts", "example.com"],
+    );
+    daemon.activate(
+        "wide",
+        &["--network", "own_ip", "--allow-subnets", "0.0.0.0/0"],
+    );
+    daemon.activate(
+        "friend",
+        &[
+            "--network",
+            "own_ip",
+            "--allow-dns-hosts",
+            "web.min.internal",
+        ],
+    );
+    let proxy = daemon.proxy_port();
+    let connect = |asker: &str, authority: &str| {
+        daemon.exec(
+            asker,
+            &format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{proxy} && printf 'CONNECT {authority} HTTP/1.1\\r\\n\
+                 Host: {authority}\\r\\n\\r\\n' >&3 && head -1 <&3; true"
+            ),
+        )
+    };
+    let through_shares = format!("shares.min.internal:{host_service}");
+    for asker in ["narrow", "wide", "friend"] {
+        // A box on the virtual network has no address for a box that
+        // shares the host's, so it has no way to the host's service.
+        let answer = connect(asker, &through_shares);
+        assert!(
+            answer.contains("403"),
+            "{asker} -> {through_shares}: {answer}"
+        );
+    }
+    for asker in ["narrow", "wide"] {
+        // A peer the box does not list is closed to it, also when its
+        // rules allow every address: the peer's address is protected.
+        let answer = connect(asker, "web.min.internal:18080");
+        assert!(answer.contains("403"), "{asker} -> web: {answer}");
+    }
+    let answer = connect("friend", "web.min.internal:18080");
+    assert!(answer.contains("200"), "friend -> web: {answer}");
+
+    wait_for(
+        "the proxy's refusal events",
+        Duration::from_secs(10),
+        || {
+            let events = daemon.min(&["box", "events", "narrow"]);
+            events.contains("hostname_proxy") && events.contains("no_address_for_caller")
+        },
+    );
+}
+
 /// What a guest with no manners gets from the daemon's gvproxy: frames
 /// written straight to the switch, for the host alias and for the
 /// addresses that mean this host.
