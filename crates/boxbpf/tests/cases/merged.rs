@@ -9,7 +9,8 @@ use std::{
 
 use boxbpf::{BoxId, Error, Limits};
 use netpol::{
-    Compiled, Direction, Endpoint, Flow, FlowVerdict, PortRange, Protocol, Protocols, Spec, Target,
+    Compiled, Direction, Endpoint, Flow, FlowVerdict, PortRange, Prefix, Protocol, Protocols, Spec,
+    Target,
     base::{CREDENTIAL_PROXY, Steered},
     policy::{BoxAction, BoxPolicy, BoxRule},
 };
@@ -223,6 +224,117 @@ fn a_name_that_runs_out_takes_its_rules_from_the_address() {
     assert_eq!(h.handles.next_pin_change(), None);
     let usage = h.handles.usage(id).expect("usage");
     assert_eq!((usage.merged_sets, usage.pins), (0, 1));
+}
+
+#[test]
+#[ignore = "needs BOXBPF_ROOT_TEST=1, sudo -n and systemd (scripts/boxbpf-root-tests.sh)"]
+fn a_change_of_policy_that_fails_leaves_the_merged_sets_of_the_old_one() {
+    // Rule maps with room for 64 prefixes per family, for all boxes.
+    let Some(mut h) = Harness::start_sized(
+        "cases::merged::a_change_of_policy_that_fails_leaves_the_merged_sets_of_the_old_one",
+        "rule_entries",
+        64,
+    ) else {
+        return;
+    };
+    let (open, closed_for_a) = (servers::banner(), servers::banner());
+    let minute = Duration::from_secs(60);
+    let hosts = |h: &Harness, group: u8, count: u8| -> Vec<Prefix> {
+        (0..count)
+            .map(|host| Prefix::host(IpAddr::V4(h.v4(group, host))))
+            .collect()
+    };
+    // Box x takes 50 of the 64 entries.
+    let mut wide = hosts(&h, 1, 32);
+    wide.extend(hosts(&h, 2, 18));
+    let x = h.install(
+        "x",
+        host_ip(),
+        BoxPolicy {
+            allow: wide,
+            ..BoxPolicy::default()
+        },
+    );
+    let policy = BoxPolicy {
+        rules: vec![to_name(BoxAction::Deny, closed_for_a, "a.test")],
+        names: names(&["a.test", "b.test"]),
+        ..BoxPolicy::default()
+    };
+    let mut live = h.install("m", host_ip(), policy);
+    let id = live.id();
+    let (shared, alone) = (IpAddr::V4(h.v4(5, 7)), IpAddr::V4(h.v4(5, 8)));
+    let new_prefix = IpAddr::V4(h.v4(4, 0));
+    h.handles.pin(id, shared, "a.test", minute).expect("pin");
+    h.handles.pin(id, shared, "b.test", minute).expect("pin");
+    h.handles.pin(id, alone, "b.test", minute).expect("pin");
+    assert_eq!(tcp(&h, "m", shared, closed_for_a), refused());
+    let both = h.handles.pinned_sets(id, shared);
+    assert_eq!(both.len(), 2);
+    let counts = |h: &Harness| {
+        let usage = h.handles.usage(id).expect("usage");
+        (usage.merged_sets, usage.pins, usage.rule_entries)
+    };
+    let before = counts(&h);
+    assert_eq!((before.0, before.1), (1, 2));
+
+    // A policy without b.test and with thirty prefixes, which do not fit
+    // beside the fifty.
+    let bigger = Spec {
+        policy: BoxPolicy {
+            names: names(&["a.test"]),
+            allow: hosts(&h, 4, 30),
+            ..BoxPolicy::default()
+        },
+        ..live.spec().clone()
+    };
+    let error = h
+        .handles
+        .reconfigure(&mut live, bigger.clone())
+        .expect_err("the map is full");
+    assert!(
+        matches!(error, Error::Map { name: "rules4", .. }),
+        "{error}"
+    );
+
+    // The old policy judges, with the set of both names: the deny written
+    // for a.test still decides for the address they share.
+    assert!(tcp(&h, "m", shared, open).ends_with("data=hello"));
+    assert_eq!(tcp(&h, "m", shared, closed_for_a), refused());
+    assert_eq!(h.handles.pinned_sets(id, shared), both);
+    assert_eq!(
+        judged(&h, id, live.compiled(), shared, closed_for_a),
+        FlowVerdict::Deny
+    );
+    // The name the other policy had no rule for keeps its pin.
+    assert!(tcp(&h, "m", alone, closed_for_a).ends_with("data=hello"));
+    assert_eq!(tcp(&h, "m", new_prefix, open), refused());
+    // The set is there once, and goes with its last pin.
+    assert_eq!(counts(&h), before);
+    h.handles.unpin(id, shared).expect("unpin");
+    assert_eq!(
+        counts(&h),
+        (0, 1, netpol::abi::rule_entries(live.compiled()))
+    );
+    assert_eq!(tcp(&h, "m", shared, open), refused());
+
+    // With room the same change switches whole, and the set of both names
+    // goes with the name that has no rule any more.
+    h.handles.pin(id, shared, "a.test", minute).expect("pin");
+    h.handles.pin(id, shared, "b.test", minute).expect("pin");
+    assert_eq!(counts(&h), before);
+    h.handles.uninstall(&x).expect("remove x");
+    h.handles
+        .reconfigure(&mut live, bigger)
+        .expect("reconfigure");
+    let a = live.compiled().set_for_name("a.test").expect("a set");
+    assert_eq!(h.handles.pinned_sets(id, shared), [a]);
+    assert!(tcp(&h, "m", shared, closed_for_a).ends_with("data=hello"));
+    assert_eq!(tcp(&h, "m", alone, open), refused());
+    assert!(tcp(&h, "m", new_prefix, open).ends_with("data=hello"));
+    assert_eq!(
+        counts(&h),
+        (0, 1, netpol::abi::rule_entries(live.compiled()))
+    );
 }
 
 #[test]
