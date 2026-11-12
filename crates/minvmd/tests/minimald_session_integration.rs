@@ -663,7 +663,23 @@ async fn a_box_s_connections_reach_the_credential_proxy_under_its_own_id() {
             id, registered_id,
             "{name}: the box has the id its host minted"
         );
-        let id_text = id.to_string().replace('-', "");
+        if host_ip {
+            // The client that created the box tells the VM's host that it
+            // is resident now, with what it declares.
+            let admit = BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
+                session_id: id,
+                credentialed_upstream: true,
+            });
+            let reply = control_line(&control, &serde_json_lenient::to_string(&admit).unwrap());
+            assert!(
+                matches!(
+                    serde_json_lenient::from_str(&reply),
+                    Ok(BoxControlReply::HostIpBox { .. })
+                ),
+                "{name}: the admit was answered {reply}"
+            );
+        }
+        let id_text = id.to_string();
         let run = |script: String| {
             let handle = &handle;
             async move {
@@ -682,7 +698,7 @@ async fn a_box_s_connections_reach_the_credential_proxy_under_its_own_id() {
         let store = run(tls_probe(STORE_HOST, STORE_HOST)).await;
         let other_name = run(tls_probe("github.com", SHARES_ADDRESSES)).await;
         let by_its_name = run(tls_probe(SHARES_ADDRESSES, SHARES_ADDRESSES)).await;
-        let quic = run("echo x >/dev/udp/github.com/443".to_string()).await;
+        let quic = run("(echo x >/dev/udp/github.com/443) 2>&1".to_string()).await;
         let ssh = run(
             "exec 3<>/dev/tcp/github.com/22 && IFS= read -r -t 20 line <&3; echo \"${line:0:4}\""
                 .to_string(),

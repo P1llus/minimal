@@ -5,8 +5,9 @@
 //! acceptor checks first, the peer's credentials and the boot token, and
 //! reads the delivery header with the proxy's own parser. Like the proxy it
 //! takes the box id the supervisor wrote: the token proves who wrote it. It
-//! answers one line naming what it was presented and closes, and it keeps
-//! every line and every refusal for a test to read.
+//! answers one line naming what it was presented, ends its side, and reads
+//! what the box sends until the box ends its own. It keeps every line and
+//! every refusal for a test to read.
 
 use std::io::{Read, Write};
 // Both peer-credential reads ask the kernel over the stream's own fd —
@@ -324,6 +325,11 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
         .lock()
         .expect("the presented lock is never held across a panic, so it cannot be poisoned")
         .push(line);
+    // A client sends its request before it reads the answer. Closing with
+    // that unread resets the connection, and the answer is lost with it.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut rest = [0u8; 4096];
+    while matches!(stream.read(&mut rest), Ok(read) if read > 0) {}
 }
 
 /// Refuse one connection for `reason`: audit it and close it without an
