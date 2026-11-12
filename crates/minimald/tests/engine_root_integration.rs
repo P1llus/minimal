@@ -190,9 +190,18 @@ impl Upstream {
     }
 
     fn start() -> Self {
-        let udp = UdpSocket::bind("127.0.0.1:0").expect("bind the upstream resolver");
+        // One port for both transports. The kernel picks a port that is
+        // free for UDP, and another test may hold it for TCP.
+        let (udp, tcp) = loop {
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("bind the upstream resolver");
+            let at = udp.local_addr().expect("address");
+            match TcpListener::bind(at) {
+                Ok(tcp) => break (udp, tcp),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("bind the upstream resolver (TCP): {error}"),
+            }
+        };
         let at = udp.local_addr().expect("address");
-        let tcp = TcpListener::bind(at).expect("bind the upstream resolver (TCP)");
         let asked = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&asked);
         std::thread::spawn(move || {

@@ -4,6 +4,7 @@
 use std::{
     fs,
     os::fd::{AsFd, OwnedFd},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -283,22 +284,23 @@ fn a_daemon_without_a_delegated_cgroup_gets_a_root_from_the_loader() {
     assert_eq!(value("engine"), "ok");
     assert_ne!(value("before"), value("cgroup"));
 
-    // A daemon that asks and dies. Whatever the loader had made for it by
-    // then is gone again: no cgroup of that user is left behind.
+    // A daemon that asks and dies. The loader may have made its root by
+    // then, and may have moved it there. A root with no process left is
+    // removed when the loader hands out the next one, so no cgroup of that
+    // user stays behind: neither this one nor the one of the daemon above,
+    // which has ended too.
     let line = Cgroups::outside_probe(&["root-request-abandoned", &h.socket.to_string_lossy()]);
-    let pid = line
+    let abandoned = line
         .strip_prefix("ok pid=")
         .unwrap_or_else(|| panic!("{line}"));
-    // The loader serves one request at a time: when it answers this one,
-    // it is done with the one before.
-    let _refused = loader::request_root(&h.socket);
-    let name = format!("u{}-{pid}", nix::unistd::getuid().as_raw());
-    let left: Vec<_> = fs::read_dir("/sys/fs/cgroup")
-        .expect("list the cgroup mount")
-        .flatten()
-        .map(|base| base.path().join(&name))
-        .filter(|root| root.exists())
-        .collect();
+    let line = Cgroups::outside_probe(&["root-request", &h.socket.to_string_lossy()]);
+    assert!(line.starts_with("ok root="), "{line}");
+    let base = Path::new(&root).parent().expect("the base of the roots");
+    let ended = [
+        PathBuf::from(&root),
+        base.join(format!("u{}-{abandoned}", nix::unistd::getuid().as_raw())),
+    ];
+    let left: Vec<_> = ended.iter().filter(|root| root.exists()).collect();
     assert!(left.is_empty(), "{left:?}");
 }
 

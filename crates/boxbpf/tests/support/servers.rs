@@ -39,6 +39,14 @@ pub fn udp_echo(at: IpAddr) -> u16 {
     port
 }
 
+/// A UDP socket at `at` that takes datagrams and never answers, with its
+/// port. It is bound for as long as the caller keeps it.
+pub fn udp_silent(at: IpAddr) -> (UdpSocket, u16) {
+    let sock = UdpSocket::bind(SocketAddr::new(at, 0)).expect("bind a silent UDP socket");
+    let port = sock.local_addr().expect("local address").port();
+    (sock, port)
+}
+
 /// A UDP socket at exactly `at` that answers every datagram.
 pub fn udp_echo_at(at: SocketAddr) {
     let sock = UdpSocket::bind(at).expect("bind a UDP echo socket");

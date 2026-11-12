@@ -206,7 +206,11 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
     let seen4 = servers::proxy_endpoint(SocketAddr::V4(proxy.v4.expect("v4")), &flows);
     let seen6 = servers::proxy_endpoint(SocketAddr::V6(proxy.v6.expect("v6")), &flows);
     let banner = servers::banner().to_string();
-    let echo = servers::udp_echo(IpAddr::V4(h.v4(5, 8))).to_string();
+    // The peer of the flow that stays open never answers. An answer that
+    // comes in after a change of policy is a new inbound flow, which this
+    // box's ingress default admits, and a box may reply to what it admits.
+    let (_silent, silent) = servers::udp_silent(IpAddr::V4(h.v4(5, 8)));
+    let silent = silent.to_string();
 
     let mut deployment = host_ip();
     deployment.services.credential_proxy = Some(proxy);
@@ -329,7 +333,7 @@ fn steered_names_go_to_the_proxy_and_pins_expire() {
         h.probe("c", &["tcp", &target_s, &banner, "300"])
             .ends_with("data=hello")
     );
-    let mut open_flow = h.hold_probe("c", &["hold-udp", &target_s, &echo]);
+    let mut open_flow = h.hold_probe("c", &["hold-udp", &target_s, &silent]);
     std::thread::sleep(Duration::from_millis(1100));
 
     assert_eq!(h.handles.pinned_sets(id, target), []);
