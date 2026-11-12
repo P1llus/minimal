@@ -793,9 +793,6 @@ fn create_session_response_round_trips() {
         // line `min session activate` prints from it (NET-018) must not
         // be able to silently drop off.
         answerer_bound: true,
-        // And the classifier state (NET-079): the advisory a start
-        // prints and the enforcement a host-address box runs under
-        // must not be able to silently drop off either.
     };
     let json = serde_json_lenient::to_string(&resp).expect("serializes");
     assert!(

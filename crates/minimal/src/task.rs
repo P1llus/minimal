@@ -1558,9 +1558,9 @@ pub(crate) async fn run_entry(
     ) {
         tracing::debug!(%error, "the run's network notices did not print");
     }
-    // A `host_ip` task box has its egress admitted on the VM host daemon
-    // before it runs anything (NET-085), or the host gate drops
-    // every frame it sends outside the VM. The guard retires it on an early
+    // A `host_ip` task box is admitted on the VM host daemon before it
+    // runs anything (NET-085): the host's stream door refuses a box it does
+    // not hold as resident. The guard retires it on an early
     // return; the run's end retires it through `release_task_name_hold`.
     let mut host_ip_residency = crate::HostIpResidency::admit(
         crate::vm_host_control_sock(

@@ -1363,15 +1363,8 @@ impl Engine {
         spawned: &sandbox::Spawned,
         address: std::net::Ipv4Addr,
     ) -> Result<Namespace, InstallError> {
-        let Some(attached) = self.attached_state() else {
-            return Ok(Namespace {
-                engine: self,
-                of: Arc::clone(of),
-                address,
-                netns: None,
-                tasks: Vec::new(),
-            });
-        };
+        // A box is installed only in an attached engine.
+        let attached = self.attached_state().ok_or(InstallError::Removed)?;
         attached
             .handles
             .lock()

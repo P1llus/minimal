@@ -16,8 +16,8 @@ use minimal_client::box_registration::{
 };
 
 /// The host kind this invocation's daemon connection resolves through:
-/// `client_host_kind`, the same key the socket resolution itself and the
-/// fabric display turn on. Every gate that decides whether the host is
+/// `client_host_kind`, the same key the socket resolution itself turns
+/// on. Every gate that decides whether the host is
 /// VM-backed keys on this and never on `use_minvmd()` — the flag is the
 /// linux-only way to *ask* for the VM host, while macOS has no native
 /// backend, so a flagless invocation there is minvmd-backed all the same
@@ -34,8 +34,8 @@ pub(crate) fn daemon_host_kind(global: &GlobalArgs) -> paths::HostKind {
 /// finds both by the same rule — named VMs included, since the resolution
 /// reads the same process-global VM name.
 ///
-/// Keyed on the host kind — [`daemon_host_kind`], the rule the
-/// fabric display already uses — never on `use_minvmd()` alone: the flag is
+/// Keyed on the host kind — [`daemon_host_kind`] — never on
+/// `use_minvmd()` alone: the flag is
 /// how Linux asks for the VM host, and macOS reaches it with no flag at
 /// all, so the destroy and Ctrl-C withdrawals must resolve their socket for
 /// the kind, or a macOS box's row would stay published when its session
@@ -487,13 +487,13 @@ pub(crate) async fn rehold_held_name_before_attach(
     if !host_net && !holds_name(record) {
         return;
     }
-    // The box's egress, re-admitted before the attach or the exec for the
-    // same reason the name is re-held: a VM host daemon that restarted
-    // holds no `host_ip` box's policy, and its gate then drops every frame
-    // the box sends outside the VM (NET-085). Idempotent.
+    // The box is admitted again before the attach or the exec for the same
+    // reason the name is re-held: a VM host daemon that restarted holds no
+    // `host_ip` box as resident, and its stream door then refuses the box
+    // (NET-085). Idempotent.
     //
     // The record was read before the admit, so a destroy in between can
-    // retire the box first and leave its rules standing for a gone session.
+    // retire the box first and leave it resident for a gone session.
     // The session is looked up again once the admit is made, and a session
     // gone by then has its rules retired, as the name re-hold below undoes
     // its hold. A destroy that lands after that lookup retires them itself.
@@ -679,9 +679,8 @@ impl HostIpResidency {
     }
 
     /// [`Self::admit`] for a box that says whether it declares a
-    /// credentialed upstream (BEP-083): the host gate opens the `host_ip`
-    /// cohort's lane to the Box Egress Proxy's listener while it is
-    /// resident.
+    /// credentialed upstream (BEP-083): the VM host lets the box's streams
+    /// through to the credential proxy while it is resident.
     pub(crate) async fn admit_declaring(
         control_sock: Option<std::path::PathBuf>,
         id: boxes::SessionId,

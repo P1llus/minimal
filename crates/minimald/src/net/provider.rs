@@ -637,6 +637,12 @@ impl OwnIpNetwork {
             .await
             .map_err(NetworkError::new)?;
 
+        // A box with its own address never runs unjudged.
+        let Some(judge) = self.engine_box.as_ref() else {
+            return Err(NetworkError::new(std::io::Error::other(
+                "own-IP attach of a box the policy engine does not hold",
+            )));
+        };
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &self.switch,
             link,
@@ -646,7 +652,7 @@ impl OwnIpNetwork {
                 session_name: &self.identity,
                 policy: self.policy.as_ref(),
                 own_address: self.own_address.as_ref(),
-                engine_box: self.engine_box.as_ref(),
+                judge,
                 spawned: &spawned,
             },
         )

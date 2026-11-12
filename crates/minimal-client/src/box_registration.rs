@@ -618,8 +618,8 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
 /// A registration that cannot be made — an unresolvable host dir, a
 /// refusal, the deadline — fails the activation with its cause rather than
 /// degrading to a warning: a box that went on to create unregistered would
-/// run with no host-side row holding it (NET-138), its frames unattributed
-/// and its declared egress decided by no row the host gate (NET-081) reads,
+/// run with no host-side row holding it (NET-138), so the VM host would
+/// publish none of its ports and carry none of its streams,
 /// so the session does not start half-admitted. The error is the one line
 /// session start owes this failure.
 ///

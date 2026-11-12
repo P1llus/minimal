@@ -1450,8 +1450,8 @@ impl ActivationInterrupt {
 ///
 /// A `host_ip` box is retired first. The handler exits the process, so
 /// the activation's `HostIpResidency` never drops. Without this retire,
-/// the box's rules and its lane declaration stay in the host gate's
-/// union (NET-085, BEP-083).
+/// the VM host keeps the box resident, with its grant of the credential
+/// proxy (NET-085, BEP-083).
 async fn withdraw_interrupted_box(
     control_sock: Option<PathBuf>,
     record: &boxes::Record,
@@ -1483,8 +1483,8 @@ pub(crate) fn arm_activation_interrupt(
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the
     // same host dir's, and the borrow must not cross the spawn. Keyed
-    // on the host kind — the rule the socket resolution itself and the
-    // fabric display turn on — not on `use_minvmd()`, which is true only
+    // on the host kind — the rule the socket resolution itself turns
+    // on — not on `use_minvmd()`, which is true only
     // under an explicit `--provider local-minvmd`: on macOS every invocation
     // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
     // flag would leave exactly that host's box row published.
@@ -1664,7 +1664,7 @@ mod tests {
     /// failure paths do. The record has no address pair, so without the id
     /// the handler withdraws nothing and the host keeps the name. The box
     /// is retired first: the handler exits the process, so nothing else
-    /// takes its rules and its lane declaration out of the host gate.
+    /// ends its residency on the VM host.
     #[tokio::test]
     async fn interrupted_host_ip_activation_withdraws_its_name_by_id() {
         use std::io::{BufRead as _, Write as _};

@@ -16,9 +16,10 @@ use sandbox::NetGuard;
 use tokio::sync::Mutex;
 
 use crate::net::attach::Link;
-use crate::net::engine::{Engine, Installed, Namespace};
+use crate::net::engine::{Engine, Installed};
 use crate::net::ingress_gate::{self, IngressGate};
 use crate::net::ingress_gate::{Admission, EngineAdmission};
+use crate::net::listens::Listeners;
 use crate::net::policy::{ControlChannel, PortForwarder};
 use crate::net::{PtaskLease, SwitchClient};
 
@@ -29,17 +30,50 @@ pub(crate) struct EngineBox {
     pub(crate) of: Arc<Installed>,
 }
 
-/// An ingress side with no engine under it: every port is open, as it is
-/// for a box nothing judges.
-struct Unjudged;
+/// What judges the box whose namespace is attached.
+pub(crate) trait Judge: Send + Sync {
+    /// Makes `address` the box's own in the namespace of `spawned` and
+    /// serves the box's endpoints there.
+    fn serve(
+        &self,
+        spawned: &sandbox::Spawned,
+        address: std::net::Ipv4Addr,
+    ) -> io::Result<ServedNamespace>;
 
-impl Admission for Unjudged {
-    fn admit(&self, _: netpol::base::PortOf) -> Result<(), String> {
-        Ok(())
+    /// Where the ports the box publishes are opened and closed.
+    fn admission(&self) -> Arc<dyn Admission>;
+}
+
+/// The engine's side of one attached namespace.
+pub(crate) struct ServedNamespace {
+    /// The listening sockets of the box in the namespace, when the engine
+    /// records them.
+    pub(crate) listeners: Option<Arc<dyn Listeners>>,
+    /// The address and the endpoints, taken back when this is dropped.
+    pub(crate) held: Box<dyn Send + Sync>,
+}
+
+impl Judge for EngineBox {
+    fn serve(
+        &self,
+        spawned: &sandbox::Spawned,
+        address: std::net::Ipv4Addr,
+    ) -> io::Result<ServedNamespace> {
+        let namespace = self
+            .engine
+            .serve_namespace(&self.of, spawned, address)
+            .map_err(io::Error::other)?;
+        Ok(ServedNamespace {
+            listeners: namespace.listeners(),
+            held: Box::new(namespace),
+        })
     }
 
-    fn refuse(&self, _: netpol::base::PortOf) -> Result<(), String> {
-        Ok(())
+    fn admission(&self) -> Arc<dyn Admission> {
+        Arc::new(EngineAdmission {
+            engine: self.engine,
+            of: Arc::clone(&self.of),
+        })
     }
 }
 
@@ -49,7 +83,7 @@ struct Wired {
     _link: Link,
     /// The box's address in the engine and the daemon's endpoints inside
     /// the namespace.
-    namespace: Option<Namespace>,
+    namespace: Box<dyn Send + Sync>,
     /// Kept for the attach's life: the publication code finds it by lease.
     gate: Option<Arc<IngressGate>>,
 }
@@ -213,8 +247,8 @@ pub(crate) struct AttachInputs<'a> {
     pub(crate) session_name: &'a str,
     pub(crate) policy: Option<&'a boxes::BoxPolicy>,
     pub(crate) own_address: Option<&'a crate::net::provider::OwnAddressReporter>,
-    /// The box's entry in the engine. `None` for a box nothing judges.
-    pub(crate) engine_box: Option<&'a EngineBox>,
+    /// What judges the box: its entry in the engine.
+    pub(crate) judge: &'a dyn Judge,
     /// The container whose namespace is attached.
     pub(crate) spawned: &'a sandbox::Spawned,
 }
@@ -238,26 +272,19 @@ pub(crate) async fn complete_own_ip_attach(
         session_name,
         policy,
         own_address,
-        engine_box,
+        judge,
         spawned,
     } = inputs;
     let lease_ip = lease.ip;
-    let namespace = engine_box
-        .map(|of| of.engine.serve_namespace(&of.of, spawned, lease_ip))
-        .transpose()
-        .map_err(io::Error::other)?;
+    let namespace = judge.serve(spawned, lease_ip)?;
     let gate = policy
         .map(|policy| {
-            let admission: Arc<dyn Admission> = match engine_box {
-                Some(of) => Arc::new(EngineAdmission {
-                    engine: of.engine,
-                    of: Arc::clone(&of.of),
-                }),
-                None => Arc::new(Unjudged),
-            };
-            let listeners = namespace.as_ref().and_then(Namespace::listeners);
-            IngressGate::new(policy.ingress.as_ref(), admission, listeners)
-                .map_err(io::Error::other)
+            IngressGate::new(
+                policy.ingress.as_ref(),
+                judge.admission(),
+                namespace.listeners.clone(),
+            )
+            .map_err(io::Error::other)
         })
         .transpose()?;
     if let Some(gate) = &gate {
@@ -266,14 +293,13 @@ pub(crate) async fn complete_own_ip_attach(
     tracing::debug!(
         session = session_name,
         switch_address = %lease_ip,
-        judged = engine_box.is_some(),
         "own-address box attached to the switch"
     );
     finish_own_ip_attach(
         switch,
         Wired {
             _link: link,
-            namespace,
+            namespace: namespace.held,
             gate,
         },
         control,
@@ -447,6 +473,37 @@ mod tests {
     use crate::net::attach::Link;
     use crate::net::dns;
     use crate::net::policy::ControlChannel;
+
+    /// A judge that opens every port the box publishes and serves nothing
+    /// in its namespace.
+    struct Open;
+
+    impl crate::net::ingress_gate::Admission for Open {
+        fn admit(&self, _: netpol::base::PortOf) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn refuse(&self, _: netpol::base::PortOf) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl super::Judge for Open {
+        fn serve(
+            &self,
+            _: &sandbox::Spawned,
+            _: Ipv4Addr,
+        ) -> std::io::Result<super::ServedNamespace> {
+            Ok(super::ServedNamespace {
+                listeners: None,
+                held: Box::new(()),
+            })
+        }
+
+        fn admission(&self) -> Arc<dyn crate::net::ingress_gate::Admission> {
+            Arc::new(Self)
+        }
+    }
 
     /// A lease at `ip` for an attach whose switch never handed it: epoch 0,
     /// which no allocator hands, so its teardown releases nothing.
@@ -809,7 +866,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&refused_policy),
                 own_address: Some(&refused.reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -922,7 +979,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&failed_policy),
                 own_address: Some(&failed.reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1004,7 +1061,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: None,
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1070,7 +1127,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: Some(&unhand.reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1150,7 +1207,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: Some(&scenario.reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1217,7 +1274,7 @@ mod tests {
                 session_name: "web",
                 policy: None,
                 own_address: None,
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1315,7 +1372,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: Some(&scenario.reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1410,7 +1467,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: Some(&reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1476,7 +1533,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: Some(&reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )
@@ -1565,7 +1622,7 @@ mod tests {
                 session_name: "web",
                 policy: Some(&policy),
                 own_address: Some(&scenario.reporter),
-                engine_box: None,
+                judge: &Open,
                 spawned: &sandbox::Spawned::new(),
             },
         )

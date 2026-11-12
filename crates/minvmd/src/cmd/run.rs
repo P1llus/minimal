@@ -1287,7 +1287,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 /// supervisor looks beside its own binary, where `just minvmd-build` puts
 /// it. The installer does not ship `bep` yet: `scripts/dist-build.sh` and
 /// the release workflow build only `minvmd`, so an installed `minvmd`
-/// finds no proxy and boots without a credentialed lane. #2498
+/// finds no proxy and boots without a credential proxy. #2498
 /// (https://github.com/gominimal/minimal/issues/2498) owns that release gap.
 const BEP_BIN_ENV: &str = bep::store::PROXY_BIN_ENV;
 
@@ -1629,7 +1629,7 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
                     pid,
                     %status,
                     log = %log.display(),
-                    "box egress proxy exited; boxes have no credentialed lane until the next boot"
+                    "box egress proxy exited; boxes reach no credential proxy until the next boot"
                 );
                 return;
             }
@@ -1679,7 +1679,7 @@ fn start_bep_proxy(
     let Some(binary) = resolve_bep_binary() else {
         tracing::warn!(
             "box egress proxy binary not found beside minvmd; booting without \
-             a credentialed lane (set MINVMD_BEP_BIN to the bep binary)"
+             a credential proxy (set MINVMD_BEP_BIN to the bep binary)"
         );
         return None;
     };
@@ -1700,7 +1700,7 @@ fn start_bep_proxy(
             tracing::warn!(
                 %error,
                 binary = %binary.display(),
-                "failed to start the box egress proxy; booting without a credentialed lane"
+                "failed to start the box egress proxy; booting without a credential proxy"
             );
             None
         }

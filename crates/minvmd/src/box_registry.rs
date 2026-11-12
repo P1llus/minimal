@@ -94,7 +94,7 @@ const HELD_NAMES_FILE_VERSION: u32 = 1;
 
 /// The file the registry persists its minted `host_ip` box ids to, beside
 /// [`REGISTRY_FILE`]: every id it minted, and the ones admitted with a
-/// credentialed lane ([`HostIpIds`]). A file of its own, for the same
+/// credentialed upstream ([`HostIpIds`]). A file of its own, for the same
 /// reason as [`HELD_NAMES_FILE`]. A restart then still holds each id for
 /// the collision check, and still revokes a grant box's id at its destroy
 /// (BEP-043).
@@ -860,7 +860,7 @@ struct HeldNamesFile {
 
 /// The persisted `host_ip` box ids ([`HOST_IP_IDS_FILE`]): its format
 /// version, every id the registry minted, and the minted ids admitted with
-/// a credentialed lane.
+/// a credentialed upstream.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostIpIdsFile {
@@ -2811,7 +2811,7 @@ pub struct BoxRegistry {
     /// is of the newest creations, whichever handle wrote it.
     persist_turn: Arc<Mutex<()>>,
     /// The Box Egress Proxy's control socket, where the destroy of a live
-    /// box with a credentialed lane records its revocation
+    /// box with a credentialed upstream records its revocation
     /// ([`submit_revocation`], BEP-043). `None` sends nothing. [`Self::new`]
     /// sets `None`, and only the daemon's start path sets the socket
     /// ([`Self::with_proxy_control`]).
@@ -4793,7 +4793,7 @@ impl BoxRegistry {
             .as_deref()
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
-        // BEP-043: the destroy of a live box with a credentialed lane
+        // BEP-043: the destroy of a live box with a credentialed upstream
         // records a revocation of its id with the proxy. The destroy never
         // waits for it: with the proxy down, the attachment retired above
         // refuses the box's values (NET-133).
@@ -5946,7 +5946,7 @@ impl BoxRegistry {
         if ids_changed {
             self.persist_host_ip_ids();
         }
-        // BEP-043: the destroy of a host_ip box with a credentialed lane
+        // BEP-043: the destroy of a host_ip box with a credentialed upstream
         // records a revocation of its minted id with the proxy, as the
         // destroy of an own-address box does. A stop revokes nothing. The
         // id stays in the id set, so no later mint takes it (BEP-082). The
@@ -6984,7 +6984,7 @@ impl MirrorBinder for TestMirrorBinder {
 struct HostIpIds {
     ids: BTreeSet<BoxId>,
     by_name: BTreeMap<String, HostIpName>,
-    /// The minted ids admitted with a credentialed lane, until their box
+    /// The minted ids admitted with a credentialed upstream, until their box
     /// is destroyed. Their destroy revokes them, though a stop or a
     /// restart dropped the residency that said so (BEP-043).
     credentialed: BTreeSet<BoxId>,
@@ -10777,7 +10777,7 @@ mod tests {
         );
     }
 
-    // BEP-043: a grant box's minted id and its credentialed lane persist
+    // BEP-043: a grant box's minted id and its credentialed upstream persist
     // beside the registry file. After a VM host daemon restart the destroy
     // of the box finds no rules, and still revokes its id at the proxy.
     #[test]

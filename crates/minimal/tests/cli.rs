@@ -1712,7 +1712,7 @@ async fn session_policy_succeeds() {
 /// the schema stamp a client checks before anything else, the policy's
 /// blocks as keys, and the live mappings as the wire's own rows with each
 /// one's `pending` state carried (NET-044) — a port published at runtime
-/// that the relay gate has not admitted must not read as reachable to
+/// that is not bound yet must not read as reachable to
 /// something parsing the document, and the port the declaration named must
 /// read as the admitted forward it is. Driven through `write_policy_json`,
 /// the renderer the command goes through, with the effective policy fetched
@@ -2201,7 +2201,7 @@ async fn policy_shows_deny_all_default() {
 /// `--deny-all-egress` declares the deny-all section (NET-075's CLI half):
 /// the activation's record carries `boxes::EgressPolicy::deny_all()` —
 /// every allow list present and empty, nothing denied on top — the shape the
-/// host-address classifier decides its deny verdict on (NET-079), not four
+/// engine reads as deny-all, not four
 /// absent lists: present-and-empty is the declaration that reaches nothing,
 /// `None` is the allow-all default, and a box that declared deny-all by flag
 /// must read in the record exactly like one that declared it in its

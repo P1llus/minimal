@@ -3398,7 +3398,7 @@ pub(crate) async fn activate_box(
 
     // T66: an own-address box on a VM-backed host registers with the VM host
     // daemon just before the create — the host allocates the box's switch
-    // and loopback addresses into the table its egress gate decides by and
+    // and loopback addresses into its box table and
     // hands them back, and the create request carries them so the in-VM
     // daemon attaches with the handed switch address instead of drawing its
     // own. A `host_ip` box shares the node's own row, so it registers no
@@ -3641,13 +3641,12 @@ pub(crate) async fn activate_box(
         );
         box_name = Some(name);
     }
-    // A `host_ip` box's egress, admitted on the VM host daemon before the
-    // box runs anything (NET-085): the host gate decides every frame the box
-    // sends from the node's own address by the admitted policies, and drops
-    // a box's frames that none admits. The guard retires it unless the
-    // session outlives this activation. The admit carries the box's lane
-    // declaration (BEP-083), so a grant box reaches the proxy's listener
-    // from its first process on.
+    // A `host_ip` box is admitted on the VM host daemon before it runs
+    // anything (NET-085): the host's stream door refuses a box it does not
+    // hold as resident. The guard retires it unless the session outlives
+    // this activation. The admit says whether the box declares a
+    // credentialed upstream (BEP-083), so a grant box reaches the
+    // credential proxy from its first process on.
     let mut host_ip_residency = HostIpResidency::admit_declaring(
         control_sock.clone(),
         id,
