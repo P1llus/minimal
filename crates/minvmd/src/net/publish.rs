@@ -328,7 +328,12 @@ impl Publisher {
     pub(crate) fn decide(&self, request: &PublishPortRequest) -> Decision {
         let id = request.box_id.to_bytes();
         let Some(row) = self.inner.boxes.row_by_box_id(id) else {
-            return Decision::Refuse(if self.inner.boxes.holds_host_ip_id(id) {
+            // A box that shares the node's address has no row. It is known
+            // by the id minted for it, when it has a credentialed upstream,
+            // or as a resident, which is how the stream door knows it.
+            let shares_the_node = self.inner.boxes.holds_host_ip_id(id)
+                || self.inner.boxes.resident_host_ip_box(id).is_some();
+            return Decision::Refuse(if shares_the_node {
                 PublishRefusal::HostIpBox
             } else {
                 PublishRefusal::UnknownBox
@@ -1247,6 +1252,18 @@ mod tests {
         assert_eq!(
             bed.publish(PublishPortRequest {
                 box_id: minimald_rpc::BoxId::from_bytes(host_ip),
+                ..stranger
+            }),
+            Err(PublishRefusal::HostIpBox)
+        );
+        // A resident box with no credentialed upstream has no minted id.
+        // The stream door serves it by its session id, and a publish under
+        // that id gets the same answer as one under a minted id.
+        let resident = boxes::SessionId::from_bytes(minimald_rpc::BoxId::mint().to_bytes());
+        bed.boxes.admit_host_ip_box(resident, false);
+        assert_eq!(
+            bed.publish(PublishPortRequest {
+                box_id: minimald_rpc::BoxId::from_bytes(resident.to_bytes()),
                 ..stranger
             }),
             Err(PublishRefusal::HostIpBox)
