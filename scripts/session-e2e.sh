@@ -233,8 +233,10 @@
 #                                    answering from it, a second native
 #                                    node publishes there too, and its name
 #                                    still answers after A's session and
-#                                    daemon stop; NOT RUN without root, on
-#                                    macOS, or on a VM lane
+#                                    daemon stop; needs passwordless sudo;
+#                                    NOT RUN on macOS, on a VM lane, or
+#                                    where host lookups bypass
+#                                    systemd-resolved
 #   native_names_answer_on_time      on a native host with the box-name
 #                                    service installed: a new box's name
 #                                    answers at once after activate, first
@@ -242,8 +244,10 @@
 #                                    NXDOMAIN at once after destroy;
 #                                    host.min.internal is 127.0.0.1 on the
 #                                    host; a refused connect to a peer's
-#                                    address is a net_refused event; NOT RUN
-#                                    without root, a switch, or on a VM lane
+#                                    address is a net_refused event; needs
+#                                    passwordless sudo; NOT RUN without a
+#                                    switch, on a VM lane, or where host
+#                                    lookups bypass systemd-resolved
 #   local_range_reserved_by_privileged_step
 #                                    NET-123's macOS half: the advisory's one
 #                                    command installs the boot-time range unit;
@@ -673,19 +677,11 @@ fi
 # (crates/minimal/src/autospawn.rs) and the pair must come from one build.
 #
 # The provider args follow the same fact as the daemon name below: a
-# VM-backed run must drive the CLI with `--provider local-minvmd`, because
-# the flag is what makes the CLI treat minvmd as minvmd for its OWN
-# bookkeeping too. `GlobalArgs::use_minvmd()`
-# (crates/minimal/src/cli.rs) is a strict check of the flag, and it gates
-# the box registration with the VM host daemon and its withdrawal (T66,
-# crates/minimal/src/cmd/session.rs): an own_ip box that activates without
-# them runs UNREGISTERED — the guest self-allocates its switch address
-# from the reserve instead of running on the one the daemon handed it, the
-# box-egress pool has no row to partition a share from, and the pool's
-# prescreen resets the box's connection to the proxy's address
-# (crates/switch/src/bep_host.rs) with nothing on the CLI's stderr naming
-# the cause. The proxy-source case below is where that stops being a
-# silent posture difference and becomes a failed proof. macOS resolves
+# VM-backed run must drive the CLI with `--provider local-minvmd`.
+# `GlobalArgs::use_minvmd()` (crates/minimal/src/cli.rs) is a strict check
+# of the flag, and the CLI resolves the daemon's socket by it
+# (crates/minimal/src/cmd/session.rs), so a run without the flag talks to a
+# native daemon. macOS resolves
 # the minvmd backend either way (`client_host_kind` gates on the OS,
 # crates/minimal-client/src/lib.rs), so a run there is VM-backed with or
 # without the flag — and both of its lanes arrive here with no
@@ -7156,15 +7152,18 @@ answerer_service_teardown() {
     sudo -n rm -rf "/Library/PrivilegedHelperTools/Minimal.app" \
       "/Library/PrivilegedHelperTools/Minimal.app.old" >/dev/null 2>&1 || true
   else
+    # The same script installs the unit that re-creates the resolver link
+    # at boot. The link itself is reverted by the case that made it.
     sudo -n systemctl disable --now minzoned.socket \
-      minzoned.service >/dev/null 2>&1 || true
+      minzoned.service minzone0-link.service >/dev/null 2>&1 || true
     sudo -n rm -f /etc/systemd/system/minzoned.socket \
       /etc/systemd/system/minzoned.service \
+      /etc/systemd/system/minzone0-link.service \
       /usr/local/lib/minimal/minzoned >/dev/null 2>&1 || true
     sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
     sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
     sudo -n systemctl reset-failed minzoned.socket \
-      minzoned.service >/dev/null 2>&1 || true
+      minzoned.service minzone0-link.service >/dev/null 2>&1 || true
   fi
   sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
   # And the directory it sat in, when the command made it and it is now
@@ -7224,6 +7223,26 @@ setup_script_from() {
      && sed -n 2p "$1" | grep -qF -- "$NAMES_STEP_LABEL"; then
     cat "$1"
   fi
+}
+
+# Whether `min finalize-install` offers the box-name step on this host, for
+# a case that installs it. It offers none where host lookups bypass
+# systemd-resolved (a resolv.conf that names another server, as WSL writes
+# one), and says so once a daemon is up. Returns 1 after recording the case
+# as NOT RUN. A CI lane's host goes through the stub, so there it fails.
+# $1 names the case.
+names_step_offered() {
+  local nso_note="$WORK/$1-names-offered.note"
+  mnl ls >/dev/null 2>&1 || true
+  mnl finalize-install --show --script >/dev/null 2>"$nso_note" || true
+  grep -q -- 'bypass systemd-resolved' "$nso_note" 2>/dev/null || return 0
+  if [ -n "${CI:-}" ]; then
+    echo "::error::$1: this lane's host bypasses systemd-resolved's stub, so the box-name step cannot be installed on it"
+    cat "$nso_note" 2>/dev/null || true
+    fail
+  fi
+  not_run "$1" "this host's lookups bypass systemd-resolved, so min finalize-install offers no box-name step"
+  return 1
 }
 
 # Whether a case may run the setup script in $2 under sudo. Such a case
@@ -7509,7 +7528,7 @@ proof_native_resolution_without_proxy_env() {
       # touched it — and `ip link del`, removing the dedicated link the
       # command created.
       NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
-        | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
+        | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p' | head -n1)"
       if [ -z "$NATIVE_REVERT_LINK" ]; then
         echo "::error::could not find the link in the advisory's command, so it was not run — this run cannot undo a command it cannot name (got: '$native_cmd')"
         echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
@@ -8795,7 +8814,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # step fails.
   if [ -n "$bn_cmd" ]; then
     BN_REVERT_LINK="$(printf '%s\n' "$bn_cmd" \
-      | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
+      | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p' | head -n1)"
     if [ -z "$BN_REVERT_LINK" ]; then
       echo "::error::could not find the link in the advisory's command, so it was not run — this run cannot undo a command it cannot name (got: '$bn_cmd')"
       echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
@@ -9020,22 +9039,19 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_page "http://$BN_WEB_NAME.min.internal:$BN_BOX_PORT/" "$BN_WEB_MARKER"
   bn_page "http://$BN_API_NAME.min.internal:$BN_BOX_PORT/" "$BN_API_MARKER"
 
-  # The answerer's own record of the lookup the first request made — the
-  # daemon's half of NET-009, naming the answer it gave.
-  bn_answered="$(grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null \
-    | grep -F -- '"answer":"a"' \
-    | grep -F -- "\"name\":\"$BN_WEB_NAME.min.internal\"" | tail -n1 || true)"
-  case "$bn_answered" in
-    *"$BN_WEB_NAME.min.internal"*) ;;
-    *)
-      echo "::error::the answerer's record does not show the lookup for $BN_WEB_NAME.min.internal it answered"
-      echo "--- zone answerer: this name ---"; printf '%s\n' "$bn_answered"
-      echo "  (the answerer's last lookups, for contrast:)"
-      grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null | tail -n5 || true
-      fail
-      ;;
-  esac
-  echo "daemon log: $bn_answered"
+  # The box-name service answered those lookups, not the daemon. The
+  # daemon's half is its publish of both boxes' names, which the service
+  # acknowledged.
+  bn_published="$(grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null \
+    | grep -F -- 'the answerer acknowledged a publish of the zone table' \
+    | grep -E -- '"rows":([2-9]|[1-9][0-9]+)[,}]' | tail -n1 || true)"
+  if [ -z "$bn_published" ]; then
+    echo "::error::the daemon's log shows no publish of both boxes' names that the box-name service acknowledged"
+    echo "  (the zone answerer's last lines:)"
+    grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null | tail -n5 || true
+    fail
+  fi
+  echo "daemon log: $bn_published"
 
   # ---- NET-019: the proxy still serves, once native DNS supersedes it -----
   # The request that would have been the only way before the zone: through
@@ -9082,24 +9098,22 @@ proof_box_name_resolves_natively_without_proxy() {
   mnl session destroy --force "$bn_api_sid" >/dev/null 2>&1 || true
   bn_name_gone "$BN_API_NAME.min.internal"
   bn_release_record "$BN_API_NAME" "$bn_api_ip"
-  # The daemon's half of the same fact: the lookup that stopped answering
-  # reached the answerer, which answered NXDOMAIN for the withdrawn name —
-  # the poll above is the host's half, and this record is what makes the
-  # name's silence the answerer's verdict and not a broken resolver.
-  bn_nx="$(grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null \
-    | grep -F -- '"answer":"nxdomain"' \
-    | grep -F -- "\"name\":\"$BN_API_NAME.min.internal\"" | tail -n1 || true)"
-  case "$bn_nx" in
-    *"$BN_API_NAME.min.internal"*) ;;
+  # The daemon's half of the same fact: it published the table again with
+  # the destroyed box's name gone, and the box-name service acknowledged
+  # it. That makes the name's silence the service's answer and not a
+  # broken resolver.
+  bn_withdrawn="$(grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null \
+    | grep -F -- 'the answerer acknowledged a publish of the zone table' | tail -n1 || true)"
+  case "$bn_withdrawn" in
+    *'"rows":1,'* | *'"rows":1}'*) ;;
     *)
-      echo "::error::the answerer's record does not show the NXDOMAIN it answered for the destroyed box's name"
-      echo "--- zone answerer: this name ---"; printf '%s\n' "$bn_nx"
-      echo "  (the answerer's last lookups, for contrast:)"
+      echo "::error::the daemon's last acknowledged publish does not carry the one name that is left after the destroy"
+      echo "  (the zone answerer's last lines:)"
       grep -h -- 'zone-answerer' "$(bn_log)" 2>/dev/null | tail -n5 || true
       fail
       ;;
   esac
-  echo "daemon log: $bn_nx"
+  echo "daemon log: $bn_withdrawn"
 
   # The sibling keeps its own address and its own page: its address never
   # changed, and the name still answers it (NET-013's while-a-box-exists).
@@ -9803,9 +9817,10 @@ proof_native_answerer_survives_session_stop() {
     return 0
   fi
   if ! sudo -n true >/dev/null 2>&1; then
-    not_run "$nasr_case" "no passwordless sudo: the advisory's command must run as root"
-    return 0
+    echo "::error::$nasr_case installs the box-name service as root, and sudo asks for a password here"
+    fail
   fi
+  names_step_offered "$nasr_case" || return 0
   mnl finalize-install --show --script >"$WORK/nasr-setup-before.out" 2>/dev/null || true
   if ! setup_script_is_names_alone "$nasr_case" "$WORK/nasr-setup-before.out"; then
     not_run "$nasr_case" "the setup script carries more than the box-name step"
@@ -10136,9 +10151,10 @@ proof_native_names_answer_on_time() {
     return 0
   fi
   if ! sudo -n true >/dev/null 2>&1; then
-    not_run "$nnat_case" "no passwordless sudo: the setup script must run as root"
-    return 0
+    echo "::error::$nnat_case installs the box-name service as root, and sudo asks for a password here"
+    fail
   fi
+  names_step_offered "$nnat_case" || return 0
   mnl finalize-install --show --script >"$WORK/nnat-setup-before.out" 2>/dev/null || true
   if ! setup_script_is_names_alone "$nnat_case" "$WORK/nnat-setup-before.out"; then
     not_run "$nnat_case" "the setup script carries more than the box-name step"
@@ -12059,8 +12075,8 @@ proof_bep_git_credential_helper_sends_header() {
 #   1. `min box spec` on the demo project shows the root CA fingerprint, the
 #      grant `github:user-token` marked `full` with the four GitHub hosts,
 #      and the steering `proxy_env`.
-#   2. The demo box starts headless on a credentialed lane, and its GH_TOKEN
-#      holds a sealed value.
+#   2. The demo box starts headless with a credentialed upstream, and its
+#      GH_TOKEN holds a sealed value.
 #   3. In that box, `gh api user` answers, and git clones the private
 #      repository E2E_BEP_PRIVATE_REPO and pushes a throwaway branch, which
 #      a second push deletes again.
@@ -13506,546 +13522,21 @@ proof_bep_revoke_and_sign_out_end_to_end() {
   echo "::endgroup::"
 }
 
-# DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
-# the gvproxy switch. A box on a credentialed lane with the default `dns`
-# steering and `quic443 = "block"` starts. Where a Box Egress Proxy runs, an A
-# lookup of api.github.com must first get an address. Then the case stops the
-# proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
-# runs and it is down from the start) and, from inside the box:
-#   1. an A lookup of api.github.com, a steered name, must be answered
-#      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
-#   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no
-#      answers (BEP-078, NET-136);
-#   3. a UDP datagram to port 443 must be rejected at once: the switch
-#      answers ICMP port unreachable, so socat reads "Connection refused"
-#      well inside its 5 s wait (BEP-018).
-# All three legs are hard assertions. The relay's DNS gate asks minvmd over
-# the guest report door whether the proxy listens, so leg 1 holds on every
-# host (Networking §5.3).
-# Admission refuses `dns` steering for a box with a broker secret on every
-# host today (no box-zone resolver, BEP-017), so the lane comes from
-# --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
-# (its `auto` blocks only with a credentialed secret).
-# Diagnostics: the pair restarts with the relay's switch and DNS gate records
-# at debug, so on a failure the `min bug` bundle's daemon-log tail carries the
-# SERVFAIL warnings and the rejected datagrams. On a pass, the case prints the
-# same two records out of a bundle it writes itself.
-proof_bep_dns_steering_fails_closed_end_to_end() {
-  echo "::group::DNS steering fails closed while the Box Egress Proxy is down"
-  local ds_case=bep_dns_steering_fails_closed_end_to_end
-  local ds_sid ds_out ds_ns ds_resolv ds_ans ds_rc ds_q ds_quic ds_ms
-  local ds_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
-  local ds_bundle ds_lines
-  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    not_run "$ds_case" "no MINVMD_GVPROXY_BIN: the steered lookups and the UDP 443 rejection run on the VM host's switch, and this target has none"
-    echo "::endgroup::"
-    return 0
-  fi
-
-  # A fresh pair: without MINVMD_BEP_STUB (the stand-in is not the proxy) and
-  # with the switch's debug records, which the UDP 443 rejection writes. The
-  # guest daemon takes its filter from the RUST_LOG minvmd starts with.
-  unset MINVMD_BEP_STUB
-  BEP_LIVE_DAEMON=""
-  mnl stop --force >/dev/null 2>&1 || true
-  minvmd stop >/dev/null 2>&1 || true
-  if ! RUST_LOG="$RUST_LOG,minimald::net::switch=debug,minimald::net::dns_gate=debug" \
-    mnl ls >/dev/null 2>"$WORK/$ds_case.up.err"; then
-    echo "::error::the daemon did not start for $ds_case"
-    cat "$WORK/$ds_case.up.err" 2>/dev/null || true
-    fail
-  fi
-
-  # Not local: ds_cleanup reads it.
-  DS_SID=""
-  ds_cleanup() {
-    [ -n "$DS_SID" ] && mnl session destroy --force "$DS_SID" >/dev/null 2>&1
-    DS_SID=""
-    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
-    GRANT_SEED_DIR=""
-    # The proxy is stopped: the next live case restarts the pair.
-    BEP_LIVE_DAEMON=""
-    return 0
-  }
-  ds_fail() {
-    ds_cleanup
-    fail
-  }
-
-  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlsteer.XXXXXX)"
-  {
-    hook_seed_preamble
-    printf '\n[session.network]\nquic443 = "block"\n'
-  } > "$GRANT_SEED_DIR/minimal.toml"
-  mkdir "$GRANT_SEED_DIR/.git"
-  ds_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-bep-dns-steering --network own_ip --credentialed-upstream \
-    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
-    </dev/null 2>"$WORK/$ds_case.err")" || {
-    echo "::error::'min session activate --network own_ip --credentialed-upstream' failed for the DNS steering box"
-    echo "--- stdout ---"; printf '%s\n' "$ds_out"
-    echo "--- stderr ---"; cat "$WORK/$ds_case.err" 2>/dev/null || true
-    ds_fail
-  }
-  DS_SID="$(printf '%s\n' "$ds_out" | tail -n1 | tr -d '\r')"
-  ds_sid="$DS_SID"
-  mnl session exec "$ds_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
-    echo "::error::the DNS steering box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
-    ds_fail
-  }
-
-  ds_resolv="$(mnl session exec "$ds_sid" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r')" || true
-  ds_ns="$(printf '%s\n' "$ds_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
-  if [ -z "$ds_ns" ]; then
-    echo "::error::the DNS steering box's /etc/resolv.conf names no nameserver"
-    printf '%s\n' "$ds_resolv"
-    ds_fail
-  fi
-
-  # A raw query from inside the box, the way the NET-141 legs send one:
-  # built and parsed host-side with python3, carried as base64. Prints
-  # "rcode ancount" for a reply to the query's own id, or nothing.
-  ds_dns() { # $1 name, $2 qtype number
-    local q b64
-    q="$(python3 -c '
-import base64, struct, sys
-name, qtype = sys.argv[1], int(sys.argv[2])
-wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
-sys.stdout.write(base64.b64encode(
-    struct.pack("!HHHHHH", 0x5e32, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
-).decode())' "$1" "$2")"
-    b64="$(mnl session exec "$ds_sid" \
-      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$ds_ns:53 | /usr/bin/base64 -w0" \
-      2>"$WORK/$ds_case.dns.err" | tr -d '\r\n')" || true
-    python3 -c '
-import base64, sys
-try:
-    r = base64.b64decode(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
-    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
-  }
-
-  # A running proxy must answer before it stops, or leg 1 could not tell a
-  # withdrawn answer from a proxy that never came up.
-  if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
-    for _ in $(seq 1 20); do
-      ds_ans="$(ds_dns api.github.com 1)"
-      case "$ds_ans" in "0 "[1-9]*) break ;; esac
-      sleep 0.5
-    done
-    echo "A api.github.com with the proxy up -> rcode and answers: ${ds_ans:-no reply}"
-    case "$ds_ans" in
-      "0 "[1-9]*) ;;
-      *)
-        echo "::error::the A lookup of the steered name api.github.com got no address while the Box Egress Proxy runs: got '${ds_ans:-no reply}'"
-        cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
-        ds_fail
-        ;;
-    esac
-  fi
-
-  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
-  # proxy stays down for the rest of the case.
-  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
-    for _ in $(seq 1 20); do
-      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
-      sleep 0.5
-    done
-    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
-      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
-      ds_fail
-    fi
-    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
-  else
-    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
-  fi
-
-  # Leg 1: the steered A lookup fails closed. The relay asks minvmd about
-  # the listener every 250 ms and minvmd checks it every 200 ms, so a second
-  # covers both. One lookup, no retry: a stale answer fails the case.
-  sleep 1
-  ds_ans="$(ds_dns api.github.com 1)"
-  echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
-  if [ "${ds_ans%% *}" = 2 ]; then
-    echo "steered A lookup: SERVFAIL while the proxy is down"
-  else
-    echo "::error::the A lookup of the steered name api.github.com was not answered SERVFAIL while the Box Egress Proxy is down: got '${ds_ans:-no reply}'"
-    cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
-    ds_fail
-  fi
-
-  # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
-  for ds_q in AAAA:28 HTTPS:65 SVCB:64; do
-    ds_ans="$(ds_dns api.github.com "${ds_q#*:}")"
-    echo "${ds_q%%:*} api.github.com -> rcode and answers: ${ds_ans:-no reply}"
-    if [ "$ds_ans" != "0 0" ]; then
-      echo "::error::the ${ds_q%%:*} lookup of the steered name api.github.com was not answered NODATA (rcode 0, no answers): got '${ds_ans:-no reply}'"
-      cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
-      ds_fail
-    fi
-  done
-
-  # Leg 3: UDP to port 443 is rejected at once. 192.0.2.1 is TEST-NET-1: the
-  # switch answers before any egress verdict, so nothing leaves the host.
-  # Without the rejection socat waits its full 5 s and exits 0.
-  # shellcheck disable=SC2016
-  ds_quic="$(mnl session exec "$ds_sid" \
-    's=$(date +%s%N); printf q | /usr/bin/socat -t 5 -T 5 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
-    2>&1 | tr -d '\r')" || true
-  ds_rc="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
-  ds_ms="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
-  echo "UDP 192.0.2.1:443 from the blocked box -> exit ${ds_rc:-?} after ${ds_ms:-?} ms"
-  if [ -z "$ds_rc" ] || [ "$ds_rc" = 0 ] || ! printf '%s\n' "$ds_quic" | grep -q 'Connection refused' \
-    || [ -z "$ds_ms" ] || [ "$ds_ms" -ge 2000 ]; then
-    echo "::error::UDP to port 443 from a box with quic443 = \"block\" was not rejected at once (expected 'Connection refused' within 2000 ms)"
-    printf '%s\n' "$ds_quic"
-    ds_fail
-  fi
-
-  # The daemon's records of the run, from the bundle a person attaches to a
-  # report. A note only: the bundle carries a tail of the log.
-  ds_bundle="${WORK:?}/$ds_case.tar.zst"
-  if mnl bug --guest-timeout-secs 30 --output "$ds_bundle" >/dev/null 2>&1; then
-    ds_lines="$(zstd -dc "$ds_bundle" 2>/dev/null | tar -xOf - 2>/dev/null \
-      | grep -a -e 'answered SERVFAIL for a steered name' -e 'rejected UDP to port 443' | tail -n4)"
-    echo "daemon records in the min bug bundle:"
-    printf '%s\n' "${ds_lines:-(none found)}"
-  else
-    echo "(min bug produced no bundle)"
-  fi
-  rm -f "${WORK:?}/${ds_case:?}".*
-
-  ds_cleanup
-  echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
-  echo "::endgroup::"
-}
-
-# DNS steering through the box-zone resolver, end to end (BEP T115). One walk
-# over the slice on a VM host whose gvproxy switch resolves box names, with the
-# Box Egress Proxy running. Each box sets `steering = "dns"`, so it gets no
-# proxy variables, and the switch answers a steered name with the proxy's
-# address. Each leg prints PASS, or NOT RUN with the gate it misses:
-#   store        `min secret set` stores a fresh throwaway value with its rule
-#                for the echo service E2E_BEP_STORE_ECHO_URL (default
-#                https://httpbin.org/headers, as bep_store_reference_end_to_end
-#                uses). A box references it. The upstream's A lookup in the box
-#                answers the proxy's address, and a plain curl with no proxy
-#                variable reaches the upstream with the stored value in the
-#                rule's header (BEP-062, the store-rule authorities of T114).
-#   git          With a GitHub sign-in and E2E_BEP_PRIVATE_REPO, a grant box
-#                resolves github.com to the proxy and clones the private
-#                repository through it (BEP-062, BEP-015).
-#   fail_closed  With the proxy stopped, the A lookup of each steered name a
-#                box above holds is answered SERVFAIL (BEP-062).
-# A lane without the live proxy records the whole case NOT RUN. Any admission
-# refusal of a box here is a hard failure. The stored value is never printed.
-proof_bep_dns_steering_through_the_box_zone_resolver() {
-  echo "::group::DNS steering through the box-zone resolver: store upstream and GitHub through the proxy, SERVFAIL while it is down"
-  local bz_case=bep_dns_steering_through_the_box_zone_resolver
-  local bz_url="${E2E_BEP_STORE_ECHO_URL:-https://httpbin.org/headers}"
-  local bz_repo="${E2E_BEP_PRIVATE_REPO:-}"
-  local bz_proxy_ip=100.64.255.252
-  # This reads the real home, which no earlier subshell export changes.
-  # shellcheck disable=SC2031
-  local bz_control="$HOME/.minimal/bep/control.sock"
-  local bz_header=X-Minimal-E2E-Probe bz_header_lc=x-minimal-e2e-probe
-  local bz_host bz_id bz_value bz_out bz_got bz_want bz_ans bz_try bz_status
-  local bz_summary=""
-  bz_host="${bz_url#https://}"
-  bz_host="${bz_host%%/*}"
-  if [ "$bz_host" = "$bz_url" ] || [ -z "$bz_host" ] || [[ "$bz_host" == *:* ]]; then
-    echo "::error::E2E_BEP_STORE_ECHO_URL is '$bz_url', not an https:// URL on port 443"
-    fail
-  fi
-  if [ -n "$bz_repo" ] && ! [[ "$bz_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-    echo "::error::E2E_BEP_PRIVATE_REPO is '$bz_repo', not <owner>/<name>"
-    fail
-  fi
-  bep_live_gate "$bz_case" no_sign_in || { echo "::endgroup::"; return 0; }
-
-  # Not local: bz_cleanup and bz_fail read them.
-  BZ_STORE_SID="" BZ_GIT_SID="" BZ_ID=""
-  bz_cleanup() {
-    [ -n "$BZ_STORE_SID" ] && mnl session destroy --force "$BZ_STORE_SID" >/dev/null 2>&1
-    [ -n "$BZ_GIT_SID" ] && mnl session destroy --force "$BZ_GIT_SID" >/dev/null 2>&1
-    [ -n "$BZ_ID" ] && mnl secret rm "$BZ_ID" </dev/null >/dev/null 2>&1
-    BZ_STORE_SID="" BZ_GIT_SID="" BZ_ID=""
-    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
-    GRANT_SEED_DIR=""
-    return 0
-  }
-  bz_fail() {
-    echo "--- bep.log (box connections, tail) ---"
-    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
-      | grep -vF -- "${bz_value:-no value}" | tail -20 || true
-    bz_cleanup
-    rm -f "${WORK:?}/${bz_case:?}".*
-    fail
-  }
-  # The leg $1 did not run for the reason $2: a summary line, and the leg
-  # counted NOT RUN in the lane summary.
-  bz_not_run() {
-    not_run "$bz_case/$1" "$2"
-    bz_summary="$bz_summary$1: NOT RUN ($2)"$'\n'
-  }
-  bz_pass() {
-    bz_summary="$bz_summary$1: PASS ($2)"$'\n'
-    echo "$1: PASS"
-  }
-
-  # Activates the box named $2 from GRANT_SEED_DIR with egress to the names
-  # after it, and prints its id. Any refusal fails: after bep_live_gate the
-  # host is minvmd and the box is own_ip, so its switch resolves box names.
-  bz_activate() { # $1 leg, $2 name, $3... egress names
-    local ba_leg="$1" ba_name="$2" ba_out ba_flags=() ba_h
-    shift 2
-    for ba_h in "$@"; do ba_flags+=(--allow-dns-hosts "$ba_h"); done
-    ba_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$ba_name" \
-      --network own_ip --credentialed-upstream "${ba_flags[@]}" \
-      </dev/null 2>"$WORK/$bz_case.$ba_leg.activate.err")" && {
-      printf '%s\n' "$ba_out" | tail -n1 | tr -d '\r'
-      return 0
-    }
-    echo "::error::'min session activate' of the dns-steered box $ba_name failed" >&2
-    echo "--- stdout ---" >&2; printf '%s\n' "$ba_out" >&2
-    echo "--- stderr ---" >&2; grep -vF -- "${bz_value:-no value}" "$WORK/$bz_case.$ba_leg.activate.err" >&2 2>/dev/null || true
-    return 1
-  }
-
-  # A box with dns steering carries no proxy variable (BEP-062: the name,
-  # not the environment, steers its traffic).
-  bz_no_proxy_env() { # $1 box id, $2 leg
-    local pe_vars
-    pe_vars="$(mnl session exec "$1" sh -c 'env' 2>/dev/null | tr -d '\r' \
-      | grep -iE '^(https?|all)_proxy=' | cut -d= -f1)"
-    if [ -n "$pe_vars" ]; then
-      echo "::error::the dns-steered $2 box has proxy variables: $(printf '%s' "$pe_vars" | tr '\n' ' ')"
-      return 1
-    fi
-  }
-
-  # A raw query from inside box $1 to its resolver, built and parsed
-  # host-side with python3 and carried as base64, as the fail-closed case
-  # sends one. Prints "rcode ancount first-A-address" for a reply to the
-  # query's own id, or nothing.
-  bz_dns() { # $1 box id, $2 name, $3 qtype number
-    local dq_ns dq_q dq_b64
-    dq_ns="$(mnl session exec "$1" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r' \
-      | awk '$1 == "nameserver" { print $2; exit }')"
-    [ -n "$dq_ns" ] || return 0
-    dq_q="$(python3 -c '
-import base64, struct, sys
-name, qtype = sys.argv[1], int(sys.argv[2])
-wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
-sys.stdout.write(base64.b64encode(
-    struct.pack("!HHHHHH", 0x5e33, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
-).decode())' "$2" "$3")"
-    dq_b64="$(mnl session exec "$1" \
-      "printf %s '$dq_q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$dq_ns:53 | /usr/bin/base64 -w0" \
-      2>"$WORK/$bz_case.dns.err" | tr -d '\r\n')" || true
-    python3 -c '
-import base64, sys
-try:
-    r = base64.b64decode(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if len(r) < 12 or r[0:2] != b"\x5e\x33" or not r[2] & 0x80:
-    sys.exit(0)
-rcode, an = r[3] & 0x0f, int.from_bytes(r[6:8], "big")
-def skip(i):
-    while i < len(r):
-        n = r[i]
-        if n == 0:
-            return i + 1
-        if n & 0xc0 == 0xc0:
-            return i + 2
-        i += 1 + n
-    return len(r)
-i = skip(12) + 4
-addr = "-"
-for _ in range(an):
-    i = skip(i)
-    if i + 10 > len(r):
-        break
-    t, ln = int.from_bytes(r[i:i+2], "big"), int.from_bytes(r[i+8:i+10], "big")
-    i += 10
-    if t == 1 and ln == 4:
-        addr = ".".join(str(b) for b in r[i:i+4])
-        break
-    i += ln
-print(rcode, an, addr)' "$dq_b64"
-  }
-
-  # The A lookup of $2 in box $1 answers the proxy's address.
-  bz_steered_to_proxy() { # $1 box id, $2 name
-    bz_ans="$(bz_dns "$1" "$2" 1)"
-    echo "A $2 in the dns-steered box -> rcode, answers and address: ${bz_ans:-no reply}"
-    if [ "${bz_ans%% *}" != 0 ] || [ "${bz_ans##* }" != "$bz_proxy_ip" ]; then
-      echo "::error::the A lookup of the steered name $2 did not answer the proxy's address $bz_proxy_ip: got '${bz_ans:-no reply}'"
-      cat "$WORK/$bz_case.dns.err" 2>/dev/null || true
-      return 1
-    fi
-  }
-
-  # --- store: a store reference's upstream resolves to the proxy, and its
-  # request carries the stored value.
-  bz_id="e2e-dns-store-$(date +%s)-$$"
-  bz_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-  BZ_ID="$bz_id"
-  if ! printf '%s' "$bz_value" | mnl secret set "$bz_id" \
-    --upstream "$bz_host" --header "$bz_header" --yes >/dev/null 2>"$WORK/$bz_case.set.err"; then
-    echo "::error::'min secret set $bz_id --upstream $bz_host --header $bz_header' failed"
-    grep -vF -- "$bz_value" "$WORK/$bz_case.set.err" 2>/dev/null || true
-    bz_fail
-  fi
-  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnldnsstore.XXXXXX)"
-  {
-    hook_seed_preamble
-    printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
-    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$bz_id"
-    printf '\n[session.network.bep]\nsteering = "dns"\n'
-  } > "$GRANT_SEED_DIR/minimal.toml"
-  mkdir "$GRANT_SEED_DIR/.git"
-  BZ_STORE_SID="$(bz_activate store e2e-bep-dns-store "$bz_host")"
-  bz_status=$?
-  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  [ "$bz_status" = 0 ] || bz_fail
-  mnl session exec "$BZ_STORE_SID" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
-    echo "::error::the dns-steered store box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
-    bz_fail
-  }
-  bz_no_proxy_env "$BZ_STORE_SID" store || bz_fail
-  bz_steered_to_proxy "$BZ_STORE_SID" "$bz_host" || bz_fail
-  # The box prints one word and the hash of the echoed header, as the
-  # store-reference case does. The echo stays in the pipe.
-  # shellcheck disable=SC2016 # expanded inside the box
-  if ! bz_out="$(mnl session exec "$BZ_STORE_SID" sh -c '
-      command -v curl >/dev/null || { echo "no curl in the box" >&2; exit 9; }
-      r="$(curl -fsS --max-time 60 -H "'"$bz_header"': $E2E_STORE_KEY" "'"$bz_url"'")" || exit 7
-      v="$(printf "%s" "$r" | tr "[:upper:]" "[:lower:]" \
-        | grep -o "\"'"$bz_header_lc"'\": *\"[^\"]*\"" | head -n1 \
-        | sed "s/^[^:]*: *\"//; s/\"\$//")"
-      r=""
-      if [ -z "$v" ]; then w=absent
-      elif [ "$v" = "$(printf "%s" "$E2E_STORE_KEY" | tr "[:upper:]" "[:lower:]")" ]; then w=sealed
-      else w=other; fi
-      printf "%s %s\n" "$w" "$(printf "%s" "$v" | sha256sum | cut -d" " -f1)"
-    ' </dev/null 2>"$WORK/$bz_case.request.err")"; then
-    echo "::error::the request from the dns-steered box to $bz_url, with no proxy variable, failed"
-    grep -vF -- "$bz_value" "$WORK/$bz_case.request.err" 2>/dev/null || true
-    bz_fail
-  fi
-  bz_got="$(printf '%s\n' "$bz_out" | tr -d '\r' | tail -n1)"
-  bz_want="other $(printf '%s' "$bz_value" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
-  if [ "$bz_got" != "$bz_want" ]; then
-    case "$bz_got" in
-      absent*) echo "::error::$bz_host received no $bz_header header from the dns-steered box" ;;
-      sealed*) echo "::error::$bz_host received the box's sealed value in $bz_header, not the stored value: the proxy did not inject it" ;;
-      *) echo "::error::$bz_host received a $bz_header value that is not the stored value (box answered '${bz_got%% *}')" ;;
-    esac
-    bz_fail
-  fi
-  bz_pass store "$bz_host resolved to $bz_proxy_ip and received the stored value in $bz_header, with no proxy variable"
-
-  # --- git: a grant box clones a private repository through the proxy.
-  bz_status="$(mnl auth status </dev/null 2>/dev/null || true)"
-  if [ -z "$bz_repo" ]; then
-    bz_not_run git "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can read"
-  elif [[ "$bz_status" != "Signed in to GitHub"* ]]; then
-    bz_not_run git "no GitHub sign-in on this machine: run 'min auth login' first"
-  else
-    GRANT_SEED_DIR="$(hook_mktemp /tmp/mnldnsgrant.XXXXXX)"
-    {
-      hook_seed_preamble
-      printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
-      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
-      printf '\n[session.network.bep]\nsteering = "dns"\n'
-    } > "$GRANT_SEED_DIR/minimal.toml"
-    mkdir "$GRANT_SEED_DIR/.git"
-    BZ_GIT_SID="$(bz_activate git e2e-bep-dns-git \
-      github.com api.github.com uploads.github.com codeload.github.com)"
-    bz_status=$?
-    rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  fi
-  if [ "$bz_status" = 1 ]; then
-    bz_fail
-  elif [ "$bz_status" = 0 ]; then
-    [ -n "$BZ_GIT_SID" ] || { echo "::error::'min session activate' of the dns-steered grant box printed no box id"; bz_fail; }
-    bz_no_proxy_env "$BZ_GIT_SID" git || bz_fail
-    bz_steered_to_proxy "$BZ_GIT_SID" github.com || bz_fail
-    if ! mnl session exec "$BZ_GIT_SID" sh -c \
-      "rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$bz_repo /tmp/bep-repo" \
-      >"$WORK/$bz_case.clone.out" 2>&1; then
-      echo "::error::'git clone' of the private repository $bz_repo failed in the dns-steered grant box"
-      cat "$WORK/$bz_case.clone.out" 2>/dev/null || true
-      bz_fail
-    fi
-    bz_pass git "github.com resolved to $bz_proxy_ip and git cloned $bz_repo, with no proxy variable"
-  fi
-
-  # --- fail_closed: with the proxy stopped, each steered name is SERVFAIL.
-  # The DNS gate learns that the listener is down from minvmd, so the case
-  # allows it 10 s.
-  if ! r3_proxy_down "$bz_control"; then
-    bz_fail
-  fi
-  echo "stopped the Box Egress Proxy"
-  bz_servfail() { # $1 box id, $2 name
-    for bz_try in $(seq 1 20); do
-      [ "$bz_try" -gt 1 ] && sleep 0.5
-      bz_ans="$(bz_dns "$1" "$2" 1)"
-      [ "${bz_ans%% *}" = 2 ] && break
-    done
-    echo "A $2 with the proxy down -> rcode, answers and address: ${bz_ans:-no reply}"
-    if [ "${bz_ans%% *}" != 2 ]; then
-      echo "::error::the A lookup of the steered name $2 was not answered SERVFAIL 10 s after the proxy stopped: got '${bz_ans:-no reply}'"
-      cat "$WORK/$bz_case.dns.err" 2>/dev/null || true
-      return 1
-    fi
-  }
-  bz_servfail "$BZ_STORE_SID" "$bz_host" || bz_fail
-  if [ -n "$BZ_GIT_SID" ]; then
-    bz_servfail "$BZ_GIT_SID" github.com || bz_fail
-    bz_pass fail_closed "$bz_host and github.com answered SERVFAIL while the proxy was down"
-  else
-    bz_pass fail_closed "$bz_host answered SERVFAIL while the proxy was down. github.com was not checked: the git leg did not run"
-  fi
-
-  bz_cleanup
-  rm -f "${WORK:?}/${bz_case:?}".*
-  echo "::endgroup::"
-  echo "::group::DNS steering through the box-zone resolver: each leg"
-  printf '%s' "$bz_summary"
-  echo "::endgroup::"
-}
-
-# Host-address boxes reach GitHub through the proxy, end to end (BEP T122,
-# BEP-087). Three cases on a VM host with the Box Egress Proxy running. Each
-# prints "<case>: PASS", or NOT RUN with the gate it misses.
+# Host-address boxes reach GitHub through the proxy, end to end. Two cases on
+# a VM host with the Box Egress Proxy running. Each prints "<case>: PASS", or
+# NOT RUN with the gate it misses.
 #   bep_host_ip_git_and_gh_under_dns_steering
 #       A `host_ip` box that declares a GitHub grant and no steering (the
-#       default is dns) carries no proxy variable, resolves github.com to the
-#       proxy's address, and runs git clone, git push and gh api against
-#       E2E_BEP_PRIVATE_REPO. A second `host_ip` box with no grant resolves
-#       github.com to a real address (BEP-086's unwanted half).
+#       default is dns) carries no proxy variable, and runs git clone, git
+#       push and gh api against E2E_BEP_PRIVATE_REPO.
 #   bep_host_ip_git_and_gh_under_proxy_env
 #       The same grant box with `steering = "proxy_env"` carries HTTPS_PROXY,
 #       and runs the same git and gh steps.
-#   bep_host_ip_grant_box_reaches_the_proxy_lane
-#       A GitHub grant box started with `--network host_ip` shows a box id in
-#       `min box show` and connects to the proxy's listener. After it ends, a
-#       `host_ip` box with no grant cannot connect to the proxy's address
-#       (T117, T124).
-# The first two need a GitHub sign-in and E2E_BEP_PRIVATE_REPO, the third a
-# sign-in. A `host_ip` box takes no narrowing allow list, so the boxes here
-# declare no egress flags. On a failure each case prints `min box audit` for
-# each box it started and the proxy's log lines that name the box.
-# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS lane
-# that runs them.
-BEP_HI_PROXY_IP=100.64.255.252
-BEP_HI_PROXY_PORT=8118
+# Both need a GitHub sign-in and E2E_BEP_PRIVATE_REPO. The boxes declare no
+# egress flags, because a `host_ip` box with no egress section reaches every
+# name and the grant's GitHub hosts need no listing. On a failure each case
+# prints `min box audit` for each box it started and the proxy's log lines
+# that name the box.
 BEP_HI_CASE="" BEP_HI_SIDS="" BEP_HI_PUSHED="" BEP_HI_ID=""
 
 # The proxy's debug records name each box connection. A daemon that runs
@@ -14108,17 +13599,15 @@ bep_hi_fail() {
   fail
 }
 
-# Writes a seed project to GRANT_SEED_DIR. $1 is grant or none, $2 the
-# steering line ("" for the default).
+# Writes a GitHub grant seed project to GRANT_SEED_DIR. $1 is the steering
+# ("" for the default).
 bep_hi_seed() {
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlhostip.XXXXXX)"
   {
     hook_seed_preamble
-    if [ "$1" = grant ]; then
-      printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
-      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
-    fi
-    [ -n "$2" ] && printf '\n[session.network.bep]\nsteering = "%s"\n' "$2"
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    [ -n "$1" ] && printf '\n[session.network.bep]\nsteering = "%s"\n' "$1"
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
 }
@@ -14143,56 +13632,6 @@ bep_hi_activate() {
   BEP_HI_SIDS="${BEP_HI_SIDS% "$1"}"; BEP_HI_SIDS="${BEP_HI_SIDS%"$1"}"
   BEP_HI_SIDS="${BEP_HI_SIDS:+$BEP_HI_SIDS }$ha_out"
   BEP_HI_ID="$ha_out"
-}
-
-# A raw A query for $2 from inside box $1 to its own resolver, as the
-# box-zone resolver case sends one. Prints "rcode ancount first-A-address"
-# for a reply to the query's own id, or nothing.
-bep_hi_dns_a() {
-  local dq_ns dq_q dq_b64
-  dq_ns="$(mnl session exec "$1" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r' \
-    | awk '$1 == "nameserver" { print $2; exit }')"
-  [ -n "$dq_ns" ] || return 0
-  dq_q="$(python3 -c '
-import base64, struct, sys
-wire = b"".join(bytes([len(l)]) + l.encode() for l in sys.argv[1].split(".")) + b"\0"
-sys.stdout.write(base64.b64encode(
-    struct.pack("!HHHHHH", 0x5e34, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", 1, 1)
-).decode())' "$2")"
-  dq_b64="$(mnl session exec "$1" \
-    "printf %s '$dq_q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$dq_ns:53 | /usr/bin/base64 -w0" \
-    2>"$WORK/$BEP_HI_CASE.dns.err" | tr -d '\r\n')" || true
-  python3 -c '
-import base64, sys
-try:
-    r = base64.b64decode(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if len(r) < 12 or r[0:2] != b"\x5e\x34" or not r[2] & 0x80:
-    sys.exit(0)
-rcode, an = r[3] & 0x0f, int.from_bytes(r[6:8], "big")
-def skip(i):
-    while i < len(r):
-        n = r[i]
-        if n == 0:
-            return i + 1
-        if n & 0xc0 == 0xc0:
-            return i + 2
-        i += 1 + n
-    return len(r)
-i = skip(12) + 4
-addr = "-"
-for _ in range(an):
-    i = skip(i)
-    if i + 10 > len(r):
-        break
-    t, ln = int.from_bytes(r[i:i+2], "big"), int.from_bytes(r[i+8:i+10], "big")
-    i += 10
-    if t == 1 and ln == 4:
-        addr = ".".join(str(b) for b in r[i:i+4])
-        break
-    i += ln
-print(rcode, an, addr)' "$dq_b64"
 }
 
 # The gates a private-repository case needs: E2E_BEP_PRIVATE_REPO, then the
@@ -14260,62 +13699,37 @@ bep_hi_proxy_vars() {
 }
 
 proof_bep_host_ip_git_and_gh_under_dns_steering() {
-  echo "::group::host_ip grant box under the default dns steering: git clone, git push and gh api against a private repository (BEP-087)"
-  local hd_repo="${E2E_BEP_PRIVATE_REPO:-}" hd_sid hd_plain hd_ans hd_vars
+  echo "::group::host_ip grant box under the default dns steering: git clone, git push and gh api against a private repository"
+  local hd_repo="${E2E_BEP_PRIVATE_REPO:-}" hd_sid hd_vars
   BEP_HI_CASE=bep_host_ip_git_and_gh_under_dns_steering
   bep_hi_repo_gate "$BEP_HI_CASE" "$hd_repo" || { echo "::endgroup::"; return 0; }
 
   # No steering line: the default steering is dns in every mode.
-  bep_hi_seed grant ""
+  bep_hi_seed ""
   bep_hi_activate e2e-bep-hostip-dns || bep_hi_fail
   hd_sid="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  mnl session exec "$hd_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
-    echo "::error::the host_ip grant box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
-    bep_hi_fail
-  }
   hd_vars="$(bep_hi_proxy_vars "$hd_sid")" || bep_hi_fail
   if [ -n "$hd_vars" ]; then
     echo "::error::the host_ip grant box under the default steering has proxy variables: $(printf '%s' "$hd_vars" | tr '\n' ' ')"
     bep_hi_fail
   fi
   echo "proxy variables in the grant box: none"
-  hd_ans="$(bep_hi_dns_a "$hd_sid" github.com)"
-  echo "A github.com in the grant box -> rcode, answers and address: ${hd_ans:-no reply}"
-  if [ "${hd_ans%% *}" != 0 ] || [ "${hd_ans##* }" != "$BEP_HI_PROXY_IP" ]; then
-    echo "::error::github.com in the host_ip grant box did not resolve to the proxy's address $BEP_HI_PROXY_IP: got '${hd_ans:-no reply}'"
-    cat "$WORK/$BEP_HI_CASE.dns.err" 2>/dev/null || true
-    bep_hi_fail
-  fi
   bep_hi_git_and_gh_steps "$hd_sid" dns "$hd_repo" || bep_hi_fail
-
-  # A host_ip box with no grant shares the node's network, and its lookup of
-  # github.com gets the real answer, never the proxy's address.
-  bep_hi_seed none ""
-  bep_hi_activate e2e-bep-hostip-plain || bep_hi_fail
-  hd_plain="$BEP_HI_ID"
-  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  hd_ans="$(bep_hi_dns_a "$hd_plain" github.com)"
-  echo "A github.com in the box with no grant -> rcode, answers and address: ${hd_ans:-no reply}"
-  if [ "${hd_ans%% *}" != 0 ] || [ "${hd_ans##* }" = - ] || [ "${hd_ans##* }" = "$BEP_HI_PROXY_IP" ]; then
-    echo "::error::github.com in the host_ip box with no grant did not resolve to a real address: got '${hd_ans:-no reply}'"
-    cat "$WORK/$BEP_HI_CASE.dns.err" 2>/dev/null || true
-    bep_hi_fail
-  fi
 
   bep_hi_cleanup
   rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
-  echo "$BEP_HI_CASE: PASS (dns steering: github.com resolved to $BEP_HI_PROXY_IP, git and gh reached $hd_repo with no proxy variable, and a box with no grant resolved github.com to ${hd_ans##* })"
+  echo "$BEP_HI_CASE: PASS (dns steering: git and gh reached $hd_repo with no proxy variable)"
   echo "::endgroup::"
 }
 
 proof_bep_host_ip_git_and_gh_under_proxy_env() {
-  echo "::group::host_ip grant box under proxy_env steering: git clone, git push and gh api against a private repository (BEP-087)"
+  echo "::group::host_ip grant box under proxy_env steering: git clone, git push and gh api against a private repository"
   local hp_repo="${E2E_BEP_PRIVATE_REPO:-}" hp_sid hp_vars
   BEP_HI_CASE=bep_host_ip_git_and_gh_under_proxy_env
   bep_hi_repo_gate "$BEP_HI_CASE" "$hp_repo" || { echo "::endgroup::"; return 0; }
 
-  bep_hi_seed grant proxy_env
+  bep_hi_seed proxy_env
   bep_hi_activate e2e-bep-hostip-proxy-env || bep_hi_fail
   hp_sid="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
@@ -14330,79 +13744,6 @@ proof_bep_host_ip_git_and_gh_under_proxy_env() {
   bep_hi_cleanup
   rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
   echo "$BEP_HI_CASE: PASS (proxy_env steering: git and gh reached $hp_repo through HTTPS_PROXY)"
-  echo "::endgroup::"
-}
-
-proof_bep_host_ip_grant_box_reaches_the_proxy_lane() {
-  echo "::group::host_ip grant box: a box id, the proxy's listener, and no reach for a box with no grant after it ends (T117)"
-  local hl_sid hl_id hl_shown hl_plain hl_start hl_ms
-  BEP_HI_CASE=bep_host_ip_grant_box_reaches_the_proxy_lane
-  bep_hi_debug_log
-  bep_live_gate "$BEP_HI_CASE" || { echo "::endgroup::"; return 0; }
-
-  bep_hi_seed grant ""
-  bep_hi_activate e2e-bep-hostip-lane || bep_hi_fail
-  hl_sid="$BEP_HI_ID"
-  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  hl_shown="$(mnl box show e2e-bep-hostip-lane </dev/null 2>&1)" || hl_shown=""
-  hl_id="$(printf '%s\n' "$hl_shown" | sed -n 's/^ID: *//p' | tr -d '\r' | head -n1)"
-  if [ -z "$hl_id" ]; then
-    echo "::error::'min box show e2e-bep-hostip-lane' shows no box id for the host_ip grant box"
-    printf '%s\n' "$hl_shown"
-    bep_hi_fail
-  fi
-  echo "min box show e2e-bep-hostip-lane -> ID: $hl_id"
-  [ "$hl_id" = "$hl_sid" ] || BEP_HI_SIDS="$BEP_HI_SIDS $hl_id"
-  mnl session exec "$hl_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
-    echo "::error::the host_ip grant box has no /usr/bin/socat (a launcher baseline package)"
-    bep_hi_fail
-  }
-  if ! mnl session exec "$hl_sid" \
-    "/usr/bin/socat /dev/null TCP:$BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT,connect-timeout=15" \
-    >/dev/null 2>"$WORK/$BEP_HI_CASE.grant.err"; then
-    echo "::error::the host_ip grant box did not connect to the proxy's listener $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT"
-    cat "$WORK/$BEP_HI_CASE.grant.err" 2>/dev/null || true
-    bep_hi_fail
-  fi
-  echo "the grant box connected to the proxy's listener $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT"
-  if ! mnl session destroy --force "$hl_sid" >/dev/null 2>"$WORK/$BEP_HI_CASE.destroy.err"; then
-    echo "::error::'min session destroy --force $hl_sid' failed"
-    cat "$WORK/$BEP_HI_CASE.destroy.err" 2>/dev/null || true
-    bep_hi_fail
-  fi
-  echo "destroyed the grant box $hl_sid"
-
-  # With no grant box left, nothing admits the proxy's address for a
-  # host_ip box: the connect fails.
-  bep_hi_seed none ""
-  bep_hi_activate e2e-bep-hostip-nogrant || bep_hi_fail
-  hl_plain="$BEP_HI_ID"
-  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  # Probe socat first, so a missing tool or a failed exec does not pass as
-  # a refusal. The connect error must then name a connect failure.
-  mnl session exec "$hl_plain" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
-    echo "::error::the host_ip box with no grant has no /usr/bin/socat (a launcher baseline package)"
-    bep_hi_fail
-  }
-  hl_start="$(now_ms)"
-  if mnl session exec "$hl_plain" \
-    "/usr/bin/socat /dev/null TCP:$BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT,connect-timeout=10" \
-    >/dev/null 2>"$WORK/$BEP_HI_CASE.nogrant.err"; then
-    echo "::error::a host_ip box with no grant connected to the proxy's address $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT after the grant box ended"
-    bep_hi_fail
-  fi
-  hl_ms=$(( $(now_ms) - hl_start ))
-  if ! grep -qiE 'timed out|timeout|Connection refused|No route to host|unreachable|Operation not permitted|Permission denied' \
-    "$WORK/$BEP_HI_CASE.nogrant.err" 2>/dev/null; then
-    echo "::error::the connect from the host_ip box with no grant to $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT failed, but not with a connect failure or a timeout"
-    cat "$WORK/$BEP_HI_CASE.nogrant.err" 2>/dev/null || true
-    bep_hi_fail
-  fi
-  echo "the box with no grant could not connect to $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT (${hl_ms} ms): $(tr -d '\r' <"$WORK/$BEP_HI_CASE.nogrant.err" | tail -n1)"
-
-  bep_hi_cleanup
-  rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
-  echo "$BEP_HI_CASE: PASS (box id $hl_id, the proxy's listener reached, and refused to a box with no grant after the grant box ended)"
   echo "::endgroup::"
 }
 
@@ -14821,10 +14162,6 @@ proof_bep_conditions_closed_end_to_end() {
 # that the third round of the slice's arch conditions held open. Each case
 # is runnable alone, and the walk prints PASS or NOT RUN with its gate for
 # each at its end. A failing case ends the run, as every case does.
-#   * bep_r3_spec_names_jti_and_quarantine: the spec's BEP-039 names the
-#     handle's jti, BEP-041 names the quarantine directory, and BEP-068
-#     refuses a start over an unreadable line and names
-#     `bep serve --quarantine-unreadable`. Runs on every lane.
 #   * bep_r3_minted_id_checked_without_proxy: with no proxy running, a box
 #     creation reads the proxy's audit log for the minted id. An audit
 #     segment with a line that does not parse refuses the creation, and the
@@ -14839,53 +14176,10 @@ proof_bep_conditions_closed_end_to_end() {
 #   * bep_r3_config_dir_rule_reaches_bep_serve: a store rule that only a
 #     `min --config-dir` override holds is one `bep serve` does not read, so
 #     box creation refuses to mint its store handle (BEP-032).
-# The four proxy cases need the live proxy gate (bep_live_gate): macOS, the
-# VM host daemon with gvproxy, and a GitHub sign-in.
-R3_SPEC="docs/specs/24-spec-box-egress-proxy/24-spec-box-egress-proxy.md"
+# Each case needs the live proxy gate (bep_live_gate): macOS, the VM host
+# daemon with gvproxy, and a GitHub sign-in.
 R3_STORE_RULE_ID=e2e-round-three
 R3_STORE_HOST=example.com
-
-# Prints the requirement line of $1 (BEP-039, ...) in the spec, and the
-# lines under it up to the next requirement.
-r3_spec_block() {
-  awk -v id="$1" '
-    index($0, "- **" id "**") == 1 { grab = 1; print; next }
-    grab && /^- \*\*[A-Z]+-[0-9]+\*\*/ { exit }
-    grab && /^#/ { exit }
-    grab { print }
-  ' "$ROOT/$R3_SPEC"
-}
-
-proof_bep_r3_spec_names_jti_and_quarantine() {
-  echo "::group::BEP spec: the audit record names the handle jti, and an unreadable segment moves to quarantine"
-  local sq_039 sq_041 sq_068
-  sq_039="$(r3_spec_block BEP-039 | head -n1)"
-  sq_041="$(r3_spec_block BEP-041 | head -n1)"
-  sq_068="$(r3_spec_block BEP-068)"
-  if [ -z "$sq_039" ] || [ -z "$sq_041" ] || [ -z "$sq_068" ]; then
-    echo "::error::$R3_SPEC lacks one of the BEP-039, BEP-041 and BEP-068 requirements"
-    fail
-  fi
-  if [[ "$sq_039" != *"the handle's \`jti\` or empty"* ]]; then
-    echo "::error::BEP-039 in $R3_SPEC does not name the handle's jti among the audit record's fields"
-    printf '%s\n' "$sq_039"
-    fail
-  fi
-  echo "BEP-039 names the handle's \`jti\` among the audit record's fields"
-  if [[ "$sq_041" != *"into the \`quarantine\` directory"* ]]; then
-    echo "::error::BEP-041 in $R3_SPEC does not name the move of an unreadable segment into the quarantine directory"
-    printf '%s\n' "$sq_041"
-    fail
-  fi
-  echo "BEP-041 names the move of a segment with an unreadable line into the \`quarantine\` directory"
-  # shellcheck disable=SC2016 # the backticks are the spec's own text
-  if [[ "$sq_068" != *'refuse the start and name `bep serve --quarantine-unreadable`'* ]]; then
-    echo "::error::BEP-068 in $R3_SPEC does not say that a start over an unreadable line is refused and names bep serve --quarantine-unreadable"
-    fail
-  fi
-  echo "BEP-068 refuses a start over an unreadable line and names \`bep serve --quarantine-unreadable\`"
-  echo "::endgroup::"
-}
 
 # The pids of this run's `bep serve`, sorted, one per line. minvmd starts it
 # with `--listener` on a socket under this run's $XDG_STATE_HOME, so a proxy
@@ -15227,8 +14521,7 @@ proof_bep_r3_config_dir_rule_reaches_bep_serve() {
 
 proof_bep_round_three_conditions_closed() {
   local r3_case r3_before r3_why r3_ran=0 r3_summary=""
-  for r3_case in bep_r3_spec_names_jti_and_quarantine \
-      bep_r3_minted_id_checked_without_proxy \
+  for r3_case in bep_r3_minted_id_checked_without_proxy \
       bep_r3_stranded_box_frees_client_key \
       bep_r3_widened_store_rule_without_restart \
       bep_r3_config_dir_rule_reaches_bep_serve; do
@@ -15850,12 +15143,13 @@ proof_bep_audit_http_and_messages_closed() {
   fi
 }
 
-# Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
-# is proxy_env starts on an own-address credentialed lane, and its
-# environment points at the Box Egress Proxy. The two cases share one box
-# start. The lane needs a switch, so a target without one records the case
-# as NOT RUN. The box declares no grant, so the case needs no sign-in and no
-# running proxy: it reads the variables, never a connection through them.
+# Proxy-variable proof: a box whose [session.network.bep] steering is
+# proxy_env starts with its own address and a credentialed upstream, and its
+# environment carries the proxy variables. The two cases start the box the
+# same way. An own_ip box needs the VM's network, so a target without gvproxy
+# records the case as NOT RUN. The box declares no grant, so the case needs no
+# sign-in and no running proxy: it reads the variables, never a connection
+# through them.
 # $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
 bep_proxy_env_box_env() {
   local pe_case="$1" pe_sid pe_out
@@ -15895,9 +15189,9 @@ bep_env_value() {
 }
 
 proof_bep_proxy_env_and_no_proxy_are_set() {
-  echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY (BEP-012)"
+  echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: an own_ip box needs the VM's network, and this target has none"
     echo "::endgroup::"
     return 0
   fi
@@ -15907,10 +15201,11 @@ proof_bep_proxy_env_and_no_proxy_are_set() {
   pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
   pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
   pe_no="$(bep_env_value "$pe_env" NO_PROXY)"
-  # The proxy's address is the switch subnet's broadcast - 3, and its
-  # listener port is 8118 (boxes::core::egress::PROXY_LISTENER_PORT).
+  # launch_proxy_env (crates/minimald/src/box_runtime.rs) builds the value
+  # from the subnet's reserved proxy address, broadcast - 3, and
+  # boxes::core::bep::PROXY_LISTENER_PORT.
   if ! [[ "$pe_https" =~ ^http://100\.64\.[0-9]+\.[0-9]+:8118$ ]]; then
-    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the proxy's address on the switch at port 8118"
+    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the subnet's proxy address at port 8118"
     fail
   fi
   if [ "$pe_http" != "$pe_https" ]; then
@@ -15927,9 +15222,9 @@ proof_bep_proxy_env_and_no_proxy_are_set() {
 }
 
 proof_bep_proxy_env_sets_node_use_env_proxy() {
-  echo "::group::proxy_env box: NODE_USE_ENV_PROXY (BEP-012)"
+  echo "::group::proxy_env box: NODE_USE_ENV_PROXY"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: an own_ip box needs the VM's network, and this target has none"
     echo "::endgroup::"
     return 0
   fi
@@ -15988,8 +15283,7 @@ bep_trust_box_files() {
   mkdir "$tb_seed/.git"
   # Only the grant box declares the GitHub hosts its grant needs, and it
   # takes its own IP with a credentialed upstream, as the other grant cases
-  # do. A box with no grant declares no egress rules: a --network host_ip box
-  # on a VM host refuses hostname rules at the start, and that box needs none.
+  # do. The box with no grant needs no egress rules.
   tb_egress=()
   if [ "$tb_kind" = grant ]; then
     tb_egress=(--network own_ip --credentialed-upstream
@@ -25991,11 +25285,8 @@ case "${1:-}" in
     proof_bep_destroy_with_proxy_down_refuses_by_attachment
     proof_bep_logout_refuses_every_reference_at_next_request
     proof_bep_revoke_and_sign_out_end_to_end
-    proof_bep_dns_steering_fails_closed_end_to_end
-    proof_bep_dns_steering_through_the_box_zone_resolver
     proof_bep_host_ip_git_and_gh_under_dns_steering
     proof_bep_host_ip_git_and_gh_under_proxy_env
-    proof_bep_host_ip_grant_box_reaches_the_proxy_lane
     proof_bep_round_two_conditions_closed
     proof_bep_audit_rotation_and_doctor_end_to_end
     proof_bep_audit_http_and_messages_closed
@@ -26052,15 +25343,11 @@ case "${1:-}" in
     | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
     | bep_revoke_and_sign_out_end_to_end \
-    | bep_dns_steering_fails_closed_end_to_end \
-    | bep_dns_steering_through_the_box_zone_resolver \
     | bep_host_ip_git_and_gh_under_dns_steering \
     | bep_host_ip_git_and_gh_under_proxy_env \
-    | bep_host_ip_grant_box_reaches_the_proxy_lane \
     | bep_round_two_conditions_closed \
     | bep_audit_rotation_and_doctor_end_to_end \
     | bep_conditions_closed_end_to_end \
-    | bep_r3_spec_names_jti_and_quarantine \
     | bep_r3_minted_id_checked_without_proxy \
     | bep_r3_stranded_box_frees_client_key \
     | bep_r3_widened_store_rule_without_restart \
@@ -26114,12 +25401,9 @@ case "${1:-}" in
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
     echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
     echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
-    echo "         bep_dns_steering_fails_closed_end_to_end bep_round_two_conditions_closed"
-    echo "         bep_dns_steering_through_the_box_zone_resolver"
+    echo "         bep_round_two_conditions_closed"
     echo "         bep_host_ip_git_and_gh_under_dns_steering bep_host_ip_git_and_gh_under_proxy_env"
-    echo "         bep_host_ip_grant_box_reaches_the_proxy_lane"
     echo "         bep_conditions_closed_end_to_end"
-    echo "         bep_r3_spec_names_jti_and_quarantine"
     echo "         bep_r3_minted_id_checked_without_proxy bep_r3_stranded_box_frees_client_key"
     echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
     echo "         bep_round_three_conditions_closed"
