@@ -1876,8 +1876,7 @@ const LEASE_RECORD_FILE: &str = "loopback-leases.json";
 const LEASE_LOCK_FILE: &str = "loopback-leases.lock";
 
 /// Who a granted address belongs to: the namespace the answerer budgets one
-/// address per (design §7.1 — the budget is per published namespace, a box
-/// or a node, never per daemon).
+/// address per. The budget is per published namespace, never per daemon.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1888,10 +1887,6 @@ pub enum LeaseNamespace {
     /// survives. *Not* the session's name, which a user may reuse for the
     /// next box the moment this one exits.
     Box { session: SessionId },
-    /// The node itself. No daemon asks for one. The variant stays so a
-    /// record on disk that names one still parses: a record that does not
-    /// parse withholds every grant.
-    Node,
 }
 
 /// One line of the answerer's record: a namespace, the address it holds,
@@ -1984,9 +1979,11 @@ pub enum RangeVerdict {
 /// (a crash mid-write leaves the last complete record, never a partial
 /// one), read leniently, and versioned by its field set: an unknown field is
 /// ignored, so a future format can add to it without invalidating a record a
-/// live daemon still reads. A record that cannot be parsed withholds grants
-/// (see [`LoopbackGrant::RecordUnavailable`]); a record that is simply
-/// missing is a host's first boot, and reads as empty.
+/// live daemon still reads. A line that cannot be parsed is dropped with a
+/// warning, and the start sweep writes the record back without it. A record
+/// that is not a list at all withholds grants (see
+/// [`LoopbackGrant::RecordUnavailable`]); a record that is simply missing is
+/// a host's first boot, and reads as empty.
 ///
 /// Within one state root this record *is* the arbitration: every native node
 /// daemon on that root asks it for a lease, and its lock file serializes the
@@ -2239,8 +2236,8 @@ impl LoopbackLeaseBook {
         let Ok(_flock) = lock.write() else {
             return Vec::new();
         };
-        let mut entries = match self.read() {
-            Ok(entries) => entries,
+        let (mut entries, dropped) = match self.read_lines() {
+            Ok(read) => read,
             Err(error) => {
                 tracing::warn!(
                     record = %self.record,
@@ -2250,25 +2247,19 @@ impl LoopbackLeaseBook {
                 return Vec::new();
             }
         };
-        let before = entries.len();
+        // A line the read dropped is gone from the record once this sweep
+        // has written it back.
+        let before = entries.len() + dropped;
+        let dead = |entry: &LeaseEntry| {
+            let LeaseNamespace::Box { session } = entry.namespace;
+            !live.contains(&session) && entry.granted_at < daemon_start
+        };
         let freed: Vec<Ipv4Addr> = entries
             .iter()
-            .filter(|entry| match entry.namespace {
-                // The node's grant is for the node's lifetime, not a
-                // session's: never swept, whatever liveness says.
-                LeaseNamespace::Node => false,
-                LeaseNamespace::Box { session } => {
-                    !live.contains(&session) && entry.granted_at < daemon_start
-                }
-            })
+            .filter(|entry| dead(entry))
             .map(|entry| entry.address)
             .collect();
-        entries.retain(|entry| match entry.namespace {
-            LeaseNamespace::Node => true,
-            LeaseNamespace::Box { session } => {
-                live.contains(&session) || entry.granted_at >= daemon_start
-            }
-        });
+        entries.retain(|entry| !dead(entry));
         if entries.len() == before || self.write(&entries).is_err() {
             // Nothing swept, or the sweep could not be written back: either
             // way the record stands, and the next start sweeps again.
@@ -2339,21 +2330,50 @@ impl LoopbackLeaseBook {
     }
 
     /// Reads the record, or `Err` when it cannot be trusted: a missing file
-    /// is a host's first boot and reads as empty; anything else that cannot
-    /// be parsed withholds.
+    /// is a host's first boot and reads as empty, and a file that is not a
+    /// list withholds.
     fn read(&self) -> std::io::Result<Vec<LeaseEntry>> {
-        match std::fs::read(&self.record) {
-            Ok(bytes) => {
-                // Empty (or whitespace-only, for a file someone touched):
-                // nothing granted, rather than a parse failure.
-                if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
-                    return Ok(Vec::new());
-                }
-                serde_json_lenient::from_slice(&bytes).map_err(std::io::Error::other)
+        self.read_lines().map(|(entries, _)| entries)
+    }
+
+    /// [`Self::read`], with the number of lines it dropped. A line that
+    /// does not parse was written by another version of the daemon, or by
+    /// hand. It names no namespace a daemon of this version can ask for, so
+    /// it holds its address for nobody and is dropped with a warning.
+    fn read_lines(&self) -> std::io::Result<(Vec<LeaseEntry>, usize)> {
+        let bytes = match std::fs::read(&self.record) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
+        };
+        // Empty (or whitespace-only, for a file someone touched): nothing
+        // granted, rather than a parse failure.
+        if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Ok((Vec::new(), 0));
         }
+        let lines: Vec<serde_json_lenient::Value> =
+            serde_json_lenient::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let total = lines.len();
+        let entries: Vec<LeaseEntry> = lines
+            .into_iter()
+            .filter_map(|line| {
+                let shown = line.to_string();
+                serde_json_lenient::from_value(line)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            record = %self.record,
+                            line = %shown,
+                            %error,
+                            "dropping a line of the lease record that does not parse",
+                        );
+                    })
+                    .ok()
+            })
+            .collect();
+        let dropped = total - entries.len();
+        Ok((entries, dropped))
     }
 
     /// Writes the record staged-then-renamed, so a crash mid-write leaves
@@ -4450,10 +4470,12 @@ mod tests {
             }
         }
 
-        // The budget is spent: the node's ask — the next namespace, a
-        // different kind than every box before it — reports the spent pool,
-        // never an address that would break the property.
-        assert_eq!(book.grant(LeaseNamespace::Node), LoopbackGrant::PoolSpent);
+        // The budget is spent: the next namespace's ask reports the spent
+        // pool, never an address that would break the property.
+        let next = LeaseNamespace::Box {
+            session: session_id(u128::from(boxes::core::loopback::POOL_LEN) + 1),
+        };
+        assert_eq!(book.grant(next), LoopbackGrant::PoolSpent);
 
         // Releasing one box makes room for exactly the next ask.
         let released = session_id(1);
@@ -4462,7 +4484,7 @@ mod tests {
                 .is_some(),
             "the box's grant is in the record"
         );
-        match book.grant(LeaseNamespace::Node) {
+        match book.grant(next) {
             LoopbackGrant::Granted(address) => assert!(
                 granted.contains(&address),
                 "{address} is one of the released addresses"
@@ -4517,7 +4539,7 @@ mod tests {
 
     /// The start-time sweep: a box whose session is gone from the store
     /// loses its grant, and a live box — even one another daemon instance
-    /// owns — keeps it. The node's grant is not a box's and is never swept.
+    /// owns — keeps it.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_start_sweep_frees_only_dead_boxes_grants() {
@@ -4536,11 +4558,6 @@ mod tests {
             LoopbackGrant::Granted(address) => address,
             other => panic!("a fresh host grants the box: {other:?}"),
         };
-        let node_address = match book.grant(LeaseNamespace::Node) {
-            LoopbackGrant::Granted(address) => address,
-            other => panic!("the node grants after the boxes: {other:?}"),
-        };
-
         // The store's live set names the live box alone.
         let live_ids = BTreeSet::from([live]);
         let freed = book.release_dead_boxes(&live_ids, a_later_daemon_start());
@@ -4550,8 +4567,8 @@ mod tests {
             "only the destroyed box's grant is swept"
         );
 
-        // The live box keeps its grant; the freed address is grantable
-        // again; the node keeps its own line, un-swept.
+        // The live box keeps its grant, and the freed address is grantable
+        // again.
         assert_eq!(
             book.grant(live_namespace),
             LoopbackGrant::Granted(live_address)
@@ -4563,12 +4580,6 @@ mod tests {
             LoopbackGrant::Granted(dead_address),
             "the swept address is the lowest free"
         );
-        assert_eq!(
-            book.grant(LeaseNamespace::Node),
-            LoopbackGrant::Granted(node_address),
-            "the node's grant is not a box's, and is never swept"
-        );
-
         // An empty store sweeps every box — a host whose sessions were all
         // destroyed while no daemon was running starts with the whole pool.
         let swept: BTreeSet<Ipv4Addr> = book
@@ -4578,7 +4589,72 @@ mod tests {
         assert_eq!(
             swept,
             BTreeSet::from([dead_address, live_address]),
-            "every box's grant goes, the node's stays"
+            "every box's grant goes"
+        );
+    }
+
+    /// A record with lines this daemon cannot parse: a namespace of a kind
+    /// it does not know, a line with no address, and a value that is no
+    /// line at all. The lines are dropped and the start sweep writes the
+    /// record back without them. The lines that parse keep their grants,
+    /// and the next ask is granted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_line_that_does_not_parse_is_dropped_and_the_rest_of_the_record_stands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let kept = session_id(1);
+        let record = tmp.path().join(LEASE_RECORD_FILE);
+        std::fs::write(
+            &record,
+            format!(
+                r#"[{{"namespace":"node","address":"127.0.64.2","granted_at":1}},
+                   {{"namespace":{{"box":{{"session":"{kept}"}}}},"address":"127.0.64.3","granted_at":1}},
+                   {{"namespace":{{"box":{{"session":"{kept}"}}}}}},
+                   7]"#
+            ),
+        )
+        .unwrap();
+        let book = lease_book(&state_root);
+
+        let freed = book.release_dead_boxes(&BTreeSet::from([kept]), a_later_daemon_start());
+        assert!(freed.is_empty(), "no box of the record is dead: {freed:?}");
+        let written = std::fs::read_to_string(&record).unwrap();
+        assert!(!written.contains("node"), "{written}");
+        assert_eq!(book.read_lines().unwrap().1, 0, "{written}");
+
+        let held = Ipv4Addr::new(127, 0, 64, 3);
+        assert_eq!(
+            book.grant(LeaseNamespace::Box { session: kept }),
+            LoopbackGrant::Granted(held)
+        );
+        // The dropped line's address is free again.
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(2)
+            }),
+            LoopbackGrant::Granted(Ipv4Addr::new(127, 0, 64, 2))
+        );
+    }
+
+    /// A record that is no list of lines is not read as an empty one: the
+    /// start sweep frees nothing and grants are withheld.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_that_is_not_a_list_withholds_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        std::fs::write(tmp.path().join(LEASE_RECORD_FILE), "{not a record").unwrap();
+        let book = lease_book(&state_root);
+        assert!(
+            book.release_dead_boxes(&BTreeSet::new(), a_later_daemon_start())
+                .is_empty()
+        );
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(1)
+            }),
+            LoopbackGrant::RecordUnavailable
         );
     }
 
@@ -4690,9 +4766,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
         let book = lease_book(&state_root);
-        let recorded = match book.grant(LeaseNamespace::Node) {
+        let recorded = match book.grant(LeaseNamespace::Box {
+            session: session_id(1),
+        }) {
             LoopbackGrant::Granted(address) => address,
-            other => panic!("a fresh host grants the node: {other:?}"),
+            other => panic!("a fresh host grants the box: {other:?}"),
         };
 
         // One publish at the recorded address, one at an address no line of
@@ -4794,7 +4872,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
         let book = LoopbackLeaseBook::open(&state_root, RangeVerdict::Absent).unwrap();
-        assert_eq!(book.grant(LeaseNamespace::Node), LoopbackGrant::RangeAbsent);
         assert_eq!(
             book.grant(LeaseNamespace::Box {
                 session: session_id(1)
