@@ -499,9 +499,10 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 /// path — with `SocketUser` the operator and `SocketMode 0600` for the
 /// channel (the connect is what every daemon of the operator needs; the
 /// answerer's uid gate decides who may publish, defence in depth rather
-/// than the only check), and the channel's directory the unit's own
-/// `RuntimeDirectory` (`/run/minimal`, root's, made when the sockets are
-/// bound and removed with them). `WantedBy=sockets.target` is what makes
+/// than the only check). systemd makes the channel's directory when it
+/// binds the socket. The unit does not own that directory: the network
+/// policy loader's socket is in it too, and a `RuntimeDirectory` would
+/// remove both when this unit stops. `WantedBy=sockets.target` is what makes
 /// `enable` hold the sockets at every boot after the step runs.
 ///
 /// The script writes the body under a quoted heredoc, so nothing in it
@@ -516,7 +517,7 @@ ListenDatagram=127.0.0.1:7656
 ListenStream=__CHANNEL__
 SocketUser=__OPERATOR__
 SocketMode=0600
-__RUNTIME_DIRECTORY__Service=minzoned.service
+Service=minzoned.service
 
 [Install]
 WantedBy=sockets.target
@@ -3298,19 +3299,9 @@ fn answerer_unit_plist(install: &AnswererInstall) -> String {
 /// program is a constant path on this platform too).
 #[cfg(any(test, not(target_os = "macos")))]
 fn answerer_socket_unit(install: &AnswererInstall) -> String {
-    // The channel's directory is the unit's `RuntimeDirectory` when it sits
-    // directly under `/run` — the machine-global path always does; a test
-    // build's overridden path elsewhere carries none.
-    let runtime = std::path::Path::new(&install.channel_dir)
-        .strip_prefix("/run")
-        .ok()
-        .filter(|name| name.components().count() == 1)
-        .map(|name| format!("RuntimeDirectory={}\n", name.display()))
-        .unwrap_or_default();
     ANSWERER_SOCKET_TEMPLATE
         .replace("__CHANNEL__", &install.channel)
         .replace("__OPERATOR__", &install.operator)
-        .replace("__RUNTIME_DIRECTORY__", &runtime)
 }
 
 /// The answerer's systemd service unit, rendered from
@@ -9730,8 +9721,7 @@ resolvectl domain minzone0 '~min.internal'
         assert!(sh_parses(&mac), "the macOS command parses: {mac}");
 
         // Linux: the copy, root's, and a system socket+service pair naming
-        // it, run as the operator, the channel's directory the socket
-        // unit's RuntimeDirectory.
+        // it, run as the operator.
         let linux = linux_command(15353, Some(&install));
         let copy = format!(
             "install -m 0755 -o root -g root \"{}\" \"$t\"",
@@ -9774,9 +9764,9 @@ resolvectl domain minzone0 '~min.internal'
             !socket.contains("0666"),
             "the channel socket is never world-connectable: {socket}"
         );
-        if install.channel == "/run/minimal/answerer.sock" {
-            assert!(socket.contains("RuntimeDirectory=minimal\n"), "{socket}");
-        }
+        // The policy loader's socket shares the channel's directory, so
+        // this unit must not remove the directory when it stops.
+        assert!(!socket.contains("RuntimeDirectory"), "{socket}");
         assert_eq!(
             service_exec_start(&service),
             Some(LINUX_ANSWERER_PROGRAM_PATH),

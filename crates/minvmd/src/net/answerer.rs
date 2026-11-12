@@ -201,7 +201,7 @@ const HOLDER_CHANNEL_WAIT: Duration = Duration::from_secs(3);
 
 /// The machine-global channel socket the installed answerer service's unit
 /// holds (NET-122's host service): one per host, whatever any node's state
-/// dir — on Linux under the socket unit's own `RuntimeDirectory`, on macOS
+/// dir — on Linux in `/run/minimal`, which systemd makes for the socket, on macOS
 /// under the root-owned `Application Support` dir the privileged step
 /// makes (it survives a reboot, which `/var/run` does not).
 #[cfg(target_os = "macos")]
