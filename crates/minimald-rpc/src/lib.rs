@@ -1617,6 +1617,10 @@ pub enum StreamRefusal {
 /// for each box.
 pub const MAX_HOST_PORT_STREAMS: usize = 512;
 
+/// The streams one box holds to the credential proxy at once. The VM
+/// host's stream door and the node's relay both stop there.
+pub const MAX_CREDENTIAL_PROXY_STREAMS: usize = 16;
+
 /// The vsock port of the guest door: the in-VM daemon dials
 /// `VMADDR_CID_HOST` on it, and the VM host daemon answers each request
 /// line. Defined here because both ends depend on this crate. Not 7351:

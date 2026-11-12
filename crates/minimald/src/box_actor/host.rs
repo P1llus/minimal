@@ -642,6 +642,24 @@ impl BoxActor {
         Ok(Some(cgroup))
     }
 
+    /// Where the box reaches the credential proxy as its HTTP proxy, for a
+    /// box whose launch sets the proxy variables. The endpoint exists once
+    /// the box's policy is in the engine, so this makes the box's cgroup.
+    /// A box whose cgroup cannot be made has no endpoint, and the launch
+    /// that follows says why.
+    async fn credential_proxy_endpoint(
+        &mut self,
+        record: &boxes::Record,
+    ) -> Option<std::net::SocketAddrV4> {
+        if !box_runtime::sets_proxy_env(record.policy.credentialed_upstream.as_ref()) {
+            return None;
+        }
+        self.ensure_cgroup().await.ok()?;
+        crate::net::engine::Engine::current()
+            .installed(record.id)?
+            .credential_proxy()
+    }
+
     /// Ends the box's cgroup: kills what is left in it, waits for it to
     /// empty, removes it, and takes the box out of the policy engine. The
     /// engine's entry goes also when processes outlived the kill, which
@@ -793,6 +811,14 @@ impl BoxActor {
         // sealed values join this layer here, so the shell's launch
         // environment holds them before its entrypoint runs.
         let mut attach_env = attach_env;
+        let proxy_endpoint = self.credential_proxy_endpoint(&record).await;
+        box_runtime::place_launch_proxy_env(
+            &mut attach_env,
+            &box_runtime::launch_proxy_env(
+                record.policy.credentialed_upstream.as_ref(),
+                proxy_endpoint,
+            ),
+        );
         let connection_env = box_runtime::place_launch_deliveries(
             &mut attach_env,
             record.id,

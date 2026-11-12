@@ -41,6 +41,7 @@ pub(crate) mod nl;
 pub(crate) mod relay;
 pub(crate) mod resolver;
 pub(crate) mod spec;
+pub(crate) mod steer;
 
 use std::collections::VecDeque;
 use std::io;

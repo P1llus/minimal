@@ -18,7 +18,7 @@ use std::{
 };
 
 use boxbpf::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
-use boxes::{BoxPolicy, NetworkMode, SessionId};
+use boxes::{BoxPolicy, NetworkMode, SessionId, core::bep::Steering};
 use netpol::{
     Compiled, Protocol, Verdict,
     base::{NodeKind, PortOf, Services},
@@ -92,6 +92,9 @@ pub(crate) enum Unenforceable {
     NoNetwork(&'static str),
     /// A setting nothing applies yet.
     Setting(&'static str),
+    /// The box sends connections to the credential proxy, and this node
+    /// has no way to one.
+    NoCredentialProxy,
     NoEngine(Absent),
     Spec(SpecError),
     Compile(netpol::CompileError),
@@ -110,6 +113,11 @@ impl std::fmt::Display for Unenforceable {
                 f,
                 "its network policy sets `{setting}`, which this version of Minimal cannot \
                  apply. Remove the setting."
+            ),
+            Self::NoCredentialProxy => f.write_str(
+                "it declares a credentialed upstream, and this node has no credential proxy \
+                 to send its connections to. The proxy runs on the host of a VM, for the \
+                 boxes in that VM.",
             ),
             Self::NoEngine(why) => {
                 write!(
@@ -217,6 +225,28 @@ impl Installed {
         self.host_alias
     }
 
+    /// Where the box reaches the credential proxy as its HTTP proxy.
+    pub(crate) fn credential_proxy(&self) -> Option<std::net::SocketAddrV4> {
+        let block = self.block.filter(|_| self.wants.credential_proxy)?;
+        block.endpoint(Service::CredentialProxy).v4
+    }
+
+    /// Whether `at` is the box's own credential proxy endpoint.
+    pub(crate) fn is_credential_proxy(&self, at: SocketAddr) -> bool {
+        let Some(block) = self.block.filter(|_| self.wants.credential_proxy) else {
+            return false;
+        };
+        let endpoint = block.endpoint(Service::CredentialProxy);
+        match netpol::eval::canonical(at.ip()) {
+            IpAddr::V4(ip) => endpoint
+                .v4
+                .is_some_and(|e| *e.ip() == ip && e.port() == at.port()),
+            IpAddr::V6(ip) => endpoint
+                .v6
+                .is_some_and(|e| *e.ip() == ip && e.port() == at.port()),
+        }
+    }
+
     /// The count of the streams the box holds through its endpoints.
     pub(crate) fn streams(&self) -> Arc<super::relay::Held> {
         Arc::clone(&self.streams)
@@ -284,6 +314,10 @@ pub(crate) struct Serving {
     pub(crate) hostname_proxy: Arc<dyn BoxProxy>,
     /// Opens the host's end of a connection a box made to the host alias.
     pub(crate) host_relay: Arc<dyn super::relay::Dial>,
+    /// Opens the far end of a connection at a box's credential proxy
+    /// endpoint. `None` on a node that has no way to a credential proxy,
+    /// where no box has that endpoint.
+    pub(crate) credential_proxy: Option<Arc<dyn super::relay::Dial>>,
 }
 
 /// The hostname proxy, as the engine starts it for a box.
@@ -835,16 +869,29 @@ impl Engine {
         }
     }
 
+    /// Whether the box gets a credential proxy endpoint: it declares a
+    /// credentialed upstream, has a network, and its steering is not `off`.
+    fn credential_proxy(mode: NetworkMode, policy: &BoxPolicy) -> bool {
+        mode != NetworkMode::NoNet
+            && policy
+                .credentialed_upstream
+                .as_ref()
+                .is_some_and(|upstream| upstream.bep.resolved_steering() != Steering::Off)
+    }
+
     /// The first setting of `policy` that nothing applies to a box with a
     /// network.
     fn unapplied_setting(mode: NetworkMode, policy: &BoxPolicy) -> Option<&'static str> {
-        if mode == NetworkMode::NoNet {
-            return None;
-        }
-        if policy.credentialed_upstream.is_some() {
-            return Some("secrets");
-        }
-        None
+        let redirects = policy
+            .credentialed_upstream
+            .as_ref()
+            .is_some_and(|upstream| {
+                matches!(
+                    upstream.bep.resolved_steering(),
+                    Steering::Dns | Steering::Both
+                )
+            });
+        (mode != NetworkMode::NoNet && redirects).then_some("network.bep.steering = \"dns\"")
     }
 
     /// Whether a box in `mode` with `policy` can run here with every rule
@@ -860,6 +907,11 @@ impl Engine {
         {
             return Err(Unenforceable::NoNetwork(why));
         }
+        // No box of a native node reaches a credential proxy: that is what
+        // the node is, and no state of it.
+        if self.node == NodeKind::Native && Self::credential_proxy(mode, policy) {
+            return Err(Unenforceable::NoCredentialProxy);
+        }
         if let Some(setting) = Self::unapplied_setting(mode, policy) {
             return Err(Unenforceable::Setting(setting));
         }
@@ -871,7 +923,7 @@ impl Engine {
                 // Endpoint addresses do not change whether a policy
                 // compiles, so any block stands in for the box's own.
                 let block = Block::sample();
-                Self::spec_of(&node, mode, own, Some(block))
+                Self::spec_of(&node, mode, policy, own, Some(block))
                     .compile()
                     .map(drop)
                     .map_err(Unenforceable::Compile)
@@ -902,10 +954,13 @@ impl Engine {
         }
     }
 
-    fn wants(node: &Node, mode: NetworkMode, own: &netpol::BoxPolicy) -> Wants {
+    /// The endpoints of a box in `mode` that declares `policy`, which
+    /// reads as `own` for the engine.
+    fn wants(node: &Node, mode: NetworkMode, policy: &BoxPolicy, own: &netpol::BoxPolicy) -> Wants {
         Wants {
             resolver: spec::needs_resolver(node, mode, own),
             hostname_proxy: mode != NetworkMode::NoNet,
+            credential_proxy: Self::credential_proxy(mode, policy),
             host_relay: mode != NetworkMode::NoNet,
         }
     }
@@ -913,13 +968,16 @@ impl Engine {
     fn spec_of(
         node: &Node,
         mode: NetworkMode,
+        policy: &BoxPolicy,
         own: netpol::BoxPolicy,
         block: Option<Block>,
     ) -> Spec {
-        let wants = Self::wants(node, mode, &own);
+        let wants = Self::wants(node, mode, policy, &own);
         let services = block.map_or_else(Services::default, |block| Services {
             resolver: wants.resolver.then(|| block.endpoint(Service::Resolver)),
-            credential_proxy: None,
+            credential_proxy: wants
+                .credential_proxy
+                .then(|| block.endpoint(Service::CredentialProxy)),
             hostname_proxy: wants
                 .hostname_proxy
                 .then(|| block.endpoint(Service::HostnameProxy)),
@@ -962,7 +1020,7 @@ impl Engine {
         )
         .map_err(Unenforceable::Spec)?;
         let node = attached.node.read().expect("engine lock").clone();
-        let wants = Self::wants(&node, facts.mode, &own);
+        let wants = Self::wants(&node, facts.mode, &facts.policy, &own);
         let own_namespace = facts.mode == NetworkMode::OwnIp;
         let (block, sockets) = if own_namespace {
             // Bound inside the namespace, once it exists.
@@ -978,7 +1036,7 @@ impl Engine {
             (None, Sockets::default())
         };
         let id = BoxId(cgroup.id());
-        let spec = Self::spec_of(&node, facts.mode, own, block);
+        let spec = Self::spec_of(&node, facts.mode, &facts.policy, own, block);
         let on_virtual_network = spec.deployment.network.is_some();
         let host_alias = match spec.deployment.host_alias {
             Some(IpAddr::V4(alias)) => Some(alias),
@@ -1161,6 +1219,34 @@ impl Engine {
                 Err(error) => tracing::error!(%error, "a host relay endpoint cannot be served"),
             }
         }
+        for listener in sockets.credential_proxy {
+            let Some(peers) = peers() else { continue };
+            let Some(dial) = &serving.credential_proxy else {
+                tracing::error!(
+                    box_id = %of.session,
+                    "the box has a credential proxy endpoint on a node with no way to one"
+                );
+                continue;
+            };
+            match listen(listener) {
+                Ok(listener) => tasks.push(
+                    serving
+                        .runtime
+                        .spawn(super::relay::serve(
+                            listener,
+                            self,
+                            Arc::clone(of),
+                            peers,
+                            &super::relay::CREDENTIAL_PROXY,
+                            Arc::clone(dial),
+                        ))
+                        .abort_handle(),
+                ),
+                Err(error) => {
+                    tracing::error!(%error, "a credential proxy endpoint cannot be served");
+                }
+            }
+        }
         tasks
     }
 
@@ -1178,7 +1264,7 @@ impl Engine {
         )
         .map_err(Unenforceable::Spec)?;
         let node = attached.node.read().expect("engine lock").clone();
-        let mut spec = Self::spec_of(&node, facts.mode, own, of.block);
+        let mut spec = Self::spec_of(&node, facts.mode, &facts.policy, own, of.block);
         let mut entry = of.entry.lock().expect("box entry lock");
         if entry.removed {
             return Ok(());
@@ -1335,6 +1421,7 @@ impl Engine {
         let entry = of.entry.lock().expect("box entry lock");
         entry.facts.mode == facts.mode
             && entry.facts.policy.egress == facts.policy.egress
+            && entry.facts.policy.credentialed_upstream == facts.policy.credentialed_upstream
             && entry.facts.deny_all_opt_out == facts.deny_all_opt_out
     }
 
@@ -1758,22 +1845,87 @@ mod tests {
         assert_eq!(engine.resolver_address(7), None);
     }
 
+    fn steered(steering: Steering) -> BoxPolicy {
+        let mut policy = BoxPolicy::new(None, None);
+        policy.credentialed_upstream = Some(boxes::CredentialedUpstream {
+            bep: boxes::core::bep::BepSettings {
+                steering: Some(steering),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        policy
+    }
+
+    /// A native node has no way to a credential proxy, so it runs no box
+    /// that would send connections to one. In a VM the box needs the
+    /// engine like any box there.
     #[test]
-    fn settings_nothing_applies_to_a_host_address_box_are_refused_by_name() {
-        let engine = Engine::absent(Absent::NotStarted);
-        let mut blocked = BoxPolicy::new(None, None);
-        blocked.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+    fn a_native_node_refuses_a_box_that_needs_the_credential_proxy() {
+        let native = Engine::absent(Absent::NotStarted);
+        let guest = Engine {
+            state: State::Absent(Absent::NotStarted),
+            node: NodeKind::Guest,
+        };
+        for steering in [Steering::ProxyEnv, Steering::Dns, Steering::Both] {
+            let policy = steered(steering);
+            for mode in [NetworkMode::HostNet, NetworkMode::OwnIp] {
+                let refusal = native
+                    .can_enforce(mode, &policy, false)
+                    .expect_err("no credential proxy");
+                assert_eq!(refusal, Unenforceable::NoCredentialProxy, "{steering:?}");
+                assert!(
+                    refusal
+                        .to_string()
+                        .contains("this node has no credential proxy"),
+                    "{refusal}"
+                );
+                assert_ne!(
+                    guest.can_enforce(mode, &policy, false),
+                    Err(Unenforceable::NoCredentialProxy)
+                );
+            }
+            // A box with no network sends nothing anywhere.
+            assert_eq!(
+                native.can_enforce(NetworkMode::NoNet, &policy, false),
+                Ok(())
+            );
+        }
+        // With steering off the box has no endpoint and asks for no proxy.
         assert_eq!(
-            engine.can_enforce(NetworkMode::HostNet, &blocked, false),
-            Err(Unenforceable::Setting("secrets"))
-        );
-        assert_eq!(
-            engine.can_enforce(NetworkMode::OwnIp, &blocked, false),
-            Err(Unenforceable::Setting("secrets"))
-        );
-        assert_eq!(
-            engine.can_enforce(NetworkMode::NoNet, &blocked, false),
+            native.can_enforce(NetworkMode::HostNet, &steered(Steering::Off), false),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_box_gets_a_credential_proxy_endpoint_when_it_declares_one_and_steers() {
+        let guest = Node::guest(switch::DEFAULT_SUBNET);
+        let own = netpol::BoxPolicy::default();
+        let wants = |mode, policy: &BoxPolicy| Engine::wants(&guest, mode, policy, &own);
+        let plain = BoxPolicy::new(None, None);
+        assert!(!wants(NetworkMode::HostNet, &plain).credential_proxy);
+        for mode in [NetworkMode::HostNet, NetworkMode::OwnIp] {
+            assert!(wants(mode, &steered(Steering::ProxyEnv)).credential_proxy);
+            assert!(!wants(mode, &steered(Steering::Off)).credential_proxy);
+        }
+        assert!(!wants(NetworkMode::NoNet, &steered(Steering::ProxyEnv)).credential_proxy);
+
+        // The endpoint is in the box's policy, in its own place in the block.
+        let spec = Engine::spec_of(
+            &guest,
+            NetworkMode::HostNet,
+            &steered(Steering::ProxyEnv),
+            own.clone(),
+            Some(Block::sample()),
+        );
+        assert_eq!(
+            spec.deployment.services.credential_proxy,
+            Some(Block::sample().endpoint(Service::CredentialProxy))
+        );
+        assert_ne!(
+            spec.deployment.services.credential_proxy,
+            spec.deployment.services.hostname_proxy
         );
     }
 

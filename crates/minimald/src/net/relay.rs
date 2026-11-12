@@ -96,6 +96,22 @@ pub(crate) static HOST_RELAY: Kind = Kind {
     },
 };
 
+/// The endpoint a box's connections for the credential proxy arrive at:
+/// those the engine redirects there, and those the box dials as its HTTP
+/// proxy.
+pub(crate) static CREDENTIAL_PROXY: Kind = Kind {
+    service: Service::CredentialProxy,
+    source: Source::CredentialProxy,
+    most: minimald_rpc::MAX_CREDENTIAL_PROXY_STREAMS,
+    reason: |refused| match refused {
+        // No rule either, but nothing else tells the user why every
+        // request with a secret fails.
+        Refused::Door(StreamRefusal::ProxyDown) => Some("credential_proxy_down"),
+        Refused::Door(StreamRefusal::NoCredentialedGrant) => Some("no_credentialed_grant"),
+        Refused::NotExposed | Refused::Unreachable(_) | Refused::Door(_) => None,
+    },
+};
+
 /// The streams one box holds, for each kind of endpoint.
 #[derive(Debug, Default)]
 pub(crate) struct Held(std::sync::Mutex<Vec<(Service, usize)>>);
@@ -187,13 +203,16 @@ impl std::fmt::Display for Refused {
 /// Where a relayed stream goes, decided at the moment it is dialled.
 pub(crate) trait Dial: Send + Sync {
     /// Opens the far end of a connection that box `from` made to
-    /// `original` from its port `peer_port`.
-    fn dial(
-        &self,
+    /// `original` from its port `peer_port`. A dialler that decides by how
+    /// the connection starts reads that from `client`, and sends what it
+    /// read to the far end before it returns.
+    fn dial<'a>(
+        &'a self,
         from: BoxId,
         original: SocketAddr,
         peer_port: u16,
-    ) -> BoxFuture<'_, Result<Dialled, Refused>>;
+        client: &'a mut TcpStream,
+    ) -> BoxFuture<'a, Result<Dialled, Refused>>;
 }
 
 /// The ports of the host's loopback that this daemon's own listeners hold:
@@ -301,12 +320,13 @@ async fn dial_loopback(port: u16) -> io::Result<TcpStream> {
 }
 
 impl Dial for NativeHostPorts {
-    fn dial(
-        &self,
+    fn dial<'a>(
+        &'a self,
         _from: BoxId,
         original: SocketAddr,
         _peer_port: u16,
-    ) -> BoxFuture<'_, Result<Dialled, Refused>> {
+        _client: &'a mut TcpStream,
+    ) -> BoxFuture<'a, Result<Dialled, Refused>> {
         Box::pin(async move {
             let port = original.port();
             // Subscribed before the read, so no change after it is missed.
@@ -352,12 +372,13 @@ impl<C: Connect> Dial for DoorHostPorts<C>
 where
     C::Stream: Stream,
 {
-    fn dial(
-        &self,
+    fn dial<'a>(
+        &'a self,
         from: BoxId,
         original: SocketAddr,
         _peer_port: u16,
-    ) -> BoxFuture<'_, Result<Dialled, Refused>> {
+        _client: &'a mut TcpStream,
+    ) -> BoxFuture<'a, Result<Dialled, Refused>> {
         Box::pin(async move {
             let open = StreamOpen {
                 box_id: from,
@@ -546,7 +567,10 @@ async fn carry(
     report: Arc<Report>,
 ) {
     let _slot = slot;
-    let revoked = match dial.dial(from, original, peer.port()).await {
+    let Some(client) = ends.client.as_mut() else {
+        return;
+    };
+    let revoked = match dial.dial(from, original, peer.port(), client).await {
         Ok(Dialled { stream, revoked }) => {
             ends.far = Some(stream);
             revoked
@@ -928,12 +952,13 @@ mod tests {
     async fn a_peer_that_is_not_the_box_gets_nothing() {
         struct Never;
         impl Dial for Never {
-            fn dial(
-                &self,
+            fn dial<'a>(
+                &'a self,
                 _: BoxId,
                 _: SocketAddr,
                 _: u16,
-            ) -> BoxFuture<'_, Result<Dialled, Refused>> {
+                _: &'a mut TcpStream,
+            ) -> BoxFuture<'a, Result<Dialled, Refused>> {
                 panic!("an outsider's connection was dialled");
             }
         }
@@ -1042,7 +1067,13 @@ mod tests {
     }
 
     impl Dial for Breaks {
-        fn dial(&self, _: BoxId, _: SocketAddr, _: u16) -> BoxFuture<'_, Result<Dialled, Refused>> {
+        fn dial<'a>(
+            &'a self,
+            _: BoxId,
+            _: SocketAddr,
+            _: u16,
+            _: &'a mut TcpStream,
+        ) -> BoxFuture<'a, Result<Dialled, Refused>> {
             Box::pin(async {
                 Ok(Dialled {
                     stream: Box::new(Self { said: false }),

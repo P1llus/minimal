@@ -70,7 +70,7 @@ const IDLE_TICK: Duration = Duration::from_millis(200);
 const MAX_STREAMS: usize = minimald_rpc::MAX_HOST_PORT_STREAMS;
 
 /// The credential proxy streams one box holds at once.
-const MAX_PROXY_STREAMS_PER_BOX: usize = 16;
+const MAX_PROXY_STREAMS_PER_BOX: usize = minimald_rpc::MAX_CREDENTIAL_PROXY_STREAMS;
 
 /// How the door reaches the credential proxy.
 #[derive(Clone)]

@@ -36,6 +36,7 @@ const BLOCKS: u16 = (LAST_PORT - FIRST_PORT + 1) / BLOCK;
 pub(crate) enum Service {
     Resolver,
     HostnameProxy,
+    CredentialProxy,
     HostRelay,
 }
 
@@ -44,6 +45,7 @@ impl Service {
         match self {
             Self::Resolver => 0,
             Self::HostnameProxy => 1,
+            Self::CredentialProxy => 2,
             Self::HostRelay => 3,
         }
     }
@@ -53,6 +55,7 @@ impl Service {
         match self {
             Self::Resolver => netpol::base::RESOLVER,
             Self::HostnameProxy => netpol::base::HOSTNAME_PROXY,
+            Self::CredentialProxy => netpol::base::CREDENTIAL_PROXY,
             Self::HostRelay => netpol::base::HOST_RELAY,
         }
     }
@@ -116,12 +119,13 @@ impl Block {
 pub(crate) struct Wants {
     pub(crate) resolver: bool,
     pub(crate) hostname_proxy: bool,
+    pub(crate) credential_proxy: bool,
     pub(crate) host_relay: bool,
 }
 
 impl Wants {
     pub(crate) const fn any(self) -> bool {
-        self.resolver || self.hostname_proxy || self.host_relay
+        self.resolver || self.hostname_proxy || self.credential_proxy || self.host_relay
     }
 }
 
@@ -131,6 +135,7 @@ pub(crate) struct Sockets {
     pub(crate) resolver_udp: Vec<UdpSocket>,
     pub(crate) resolver_tcp: Vec<TcpListener>,
     pub(crate) hostname_proxy: Vec<TcpListener>,
+    pub(crate) credential_proxy: Vec<TcpListener>,
     pub(crate) host_relay: Vec<TcpListener>,
 }
 
@@ -176,6 +181,11 @@ pub(crate) fn bind_with(block: Block, wants: Wants, unbound: Unbound<'_>) -> io:
         }
         if wants.hostname_proxy {
             sockets.hostname_proxy.push(stream(Service::HostnameProxy)?);
+        }
+        if wants.credential_proxy {
+            sockets
+                .credential_proxy
+                .push(stream(Service::CredentialProxy)?);
         }
         if wants.host_relay {
             sockets.host_relay.push(stream(Service::HostRelay)?);
@@ -223,6 +233,10 @@ impl Allocator {
             if wants.hostname_proxy {
                 let at = SocketAddr::new(addr, block.port(Service::HostnameProxy));
                 sockets.hostname_proxy.push(TcpListener::bind(at)?);
+            }
+            if wants.credential_proxy {
+                let at = SocketAddr::new(addr, block.port(Service::CredentialProxy));
+                sockets.credential_proxy.push(TcpListener::bind(at)?);
             }
             if wants.host_relay {
                 let at = SocketAddr::new(addr, block.port(Service::HostRelay));
@@ -289,6 +303,7 @@ mod tests {
             for service in [
                 Service::Resolver,
                 Service::HostnameProxy,
+                Service::CredentialProxy,
                 Service::HostRelay,
             ] {
                 let endpoint = block.endpoint(service);
@@ -315,6 +330,7 @@ mod tests {
         let wants = Wants {
             resolver: true,
             hostname_proxy: true,
+            credential_proxy: true,
             host_relay: true,
         };
         let (first, sockets) = allocator.take(wants).expect("a block");

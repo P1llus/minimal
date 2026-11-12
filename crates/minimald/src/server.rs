@@ -1657,11 +1657,19 @@ async fn start_policy_engine_tasks(state: &ServerStateHandle, in_microvm: bool) 
             ),
         ))
     };
+    // The credential proxy runs on the host of a VM. A native node has no
+    // way to one, and refuses the boxes that would need it.
+    let credential_proxy: Option<Arc<dyn crate::net::relay::Dial>> = in_microvm.then(|| {
+        let door =
+            crate::net::steer::DoorProxy::new(Arc::new(crate::net::door::VmHost::of_this_guest()));
+        Arc::new(crate::net::steer::CredentialProxy::new(engine, door)) as Arc<_>
+    });
     engine.start_tasks(Serving {
         runtime: tokio::runtime::Handle::current(),
         resolver: Arc::new(resolver),
         hostname_proxy: Arc::new(BoxEndpoints::new(router, engine)),
         host_relay,
+        credential_proxy,
     });
 }
 

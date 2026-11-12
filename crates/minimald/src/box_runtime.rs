@@ -376,6 +376,70 @@ pub(crate) fn place_sealed_deliveries(
     }
 }
 
+/// The `NO_PROXY` entries of every box whose environment names the
+/// credential proxy, ahead of the box's own `[network.bep] no_proxy`
+/// entries: the box zone and loopback, which never go through the proxy.
+const NO_PROXY_DEFAULTS: [&str; 4] = [
+    ".min.internal",
+    "host.min.internal",
+    "localhost",
+    "127.0.0.1",
+];
+
+/// Whether a launch of the box sets the proxy variables: the box declares
+/// a credentialed upstream, and its steering is `proxy_env` or `both`, or
+/// its `[network.bep] proxy_env` is true.
+pub(crate) fn sets_proxy_env(declared: Option<&boxes::CredentialedUpstream>) -> bool {
+    use boxes::core::bep::Steering;
+    declared.is_some_and(|upstream| {
+        let bep = &upstream.bep;
+        matches!(bep.resolved_steering(), Steering::ProxyEnv | Steering::Both) || bep.proxy_env
+    })
+}
+
+/// The proxy variables a launch of the box sets, in a fixed order:
+/// `HTTPS_PROXY` and `HTTP_PROXY` at `endpoint`, the box's own credential
+/// proxy endpoint, then `NO_PROXY`, then `NODE_USE_ENV_PROXY=1`, which
+/// Node's built-in `fetch` needs before it reads the other three.
+///
+/// Empty for a box that [`sets_proxy_env`] says sets none, and for a box
+/// with no endpoint: variables that name nothing would send all of its HTTP
+/// traffic nowhere.
+pub(crate) fn launch_proxy_env(
+    declared: Option<&boxes::CredentialedUpstream>,
+    endpoint: Option<std::net::SocketAddrV4>,
+) -> Vec<(String, String)> {
+    let (Some(upstream), Some(endpoint)) =
+        (declared.filter(|_| sets_proxy_env(declared)), endpoint)
+    else {
+        return Vec::new();
+    };
+    let proxy = format!("http://{endpoint}");
+    let no_proxy = NO_PROXY_DEFAULTS
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .chain(upstream.bep.no_proxy.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        ("HTTPS_PROXY".to_string(), proxy.clone()),
+        ("HTTP_PROXY".to_string(), proxy),
+        ("NO_PROXY".to_string(), no_proxy),
+        ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
+    ]
+}
+
+/// Places the proxy variables in a launch's connection layer, over any
+/// value the layer held there, so the shell's launch environment and
+/// everything the host runs in the box carry them. Call it before
+/// [`place_launch_deliveries`], which keeps the layer it reads.
+pub(crate) fn place_launch_proxy_env(attach_env: &mut AttachEnv, vars: &[(String, String)]) {
+    for (name, value) in vars {
+        attach_env.connection.retain(|(k, _)| k != name);
+        attach_env.connection.push((name.clone(), value.clone()));
+    }
+}
+
 /// Where a box with the proxy's root (BEP-011) finds its CA bundle: the
 /// box's own copy of the system roots with the root appended. The bundle a
 /// package ships can be the package store's own file, so the launch writes
@@ -1843,3 +1907,101 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proxy_env_tests {
+    use super::*;
+    use boxes::core::bep::{BepSettings, Steering};
+
+    fn declared(bep: BepSettings) -> boxes::CredentialedUpstream {
+        boxes::CredentialedUpstream {
+            bep,
+            ..Default::default()
+        }
+    }
+
+    fn steering(steering: Steering) -> BepSettings {
+        BepSettings {
+            steering: Some(steering),
+            ..BepSettings::default()
+        }
+    }
+
+    #[test]
+    fn proxy_variables_point_at_the_box_s_own_endpoint() {
+        let endpoint: std::net::SocketAddrV4 = "127.0.80.1:20486".parse().unwrap();
+        let mut bep = steering(Steering::ProxyEnv);
+        bep.no_proxy = vec!["direct.example".into(), "10.0.0.0/8".into()];
+        let vars = launch_proxy_env(Some(&declared(bep)), Some(endpoint));
+        assert_eq!(
+            vars,
+            [
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://127.0.80.1:20486".to_string()
+                ),
+                (
+                    "HTTP_PROXY".to_string(),
+                    "http://127.0.80.1:20486".to_string()
+                ),
+                (
+                    "NO_PROXY".to_string(),
+                    ".min.internal,host.min.internal,localhost,127.0.0.1,direct.example,10.0.0.0/8"
+                        .to_string()
+                ),
+                ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_box_that_steers_through_its_environment_gets_the_variables() {
+        let endpoint: std::net::SocketAddrV4 = "127.0.80.1:20482".parse().unwrap();
+        let set =
+            |bep: BepSettings| !launch_proxy_env(Some(&declared(bep)), Some(endpoint)).is_empty();
+        assert!(set(steering(Steering::ProxyEnv)));
+        assert!(set(steering(Steering::Both)));
+        assert!(!set(steering(Steering::Dns)));
+        assert!(!set(steering(Steering::Off)));
+        // `proxy_env = true` adds them to a box whose steering redirects.
+        assert!(set(BepSettings {
+            proxy_env: true,
+            ..steering(Steering::Dns)
+        }));
+        // A box that declares no credentialed upstream gets none, and
+        // neither does a box that has no endpoint.
+        assert!(launch_proxy_env(None, Some(endpoint)).is_empty());
+        assert!(launch_proxy_env(Some(&declared(steering(Steering::ProxyEnv))), None).is_empty());
+    }
+
+    #[test]
+    fn the_variables_replace_what_the_connection_set() {
+        let mut attach_env = AttachEnv {
+            connection: vec![
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://elsewhere:3128".to_string(),
+                ),
+                ("TERM".to_string(), "xterm".to_string()),
+            ],
+            ..AttachEnv::default()
+        };
+        place_launch_proxy_env(
+            &mut attach_env,
+            &[(
+                "HTTPS_PROXY".to_string(),
+                "http://127.0.80.1:20482".to_string(),
+            )],
+        );
+        assert_eq!(
+            attach_env.connection,
+            [
+                ("TERM".to_string(), "xterm".to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://127.0.80.1:20482".to_string()
+                ),
+            ]
+        );
+    }
+}

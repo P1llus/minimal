@@ -42,6 +42,7 @@ pub(crate) enum Source {
     Resolver,
     HostnameProxy,
     HostRelay,
+    CredentialProxy,
 }
 
 impl Source {
@@ -51,6 +52,7 @@ impl Source {
             Self::Resolver => "resolver",
             Self::HostnameProxy => "hostname_proxy",
             Self::HostRelay => "host_relay",
+            Self::CredentialProxy => "credential_proxy",
         }
     }
 }
