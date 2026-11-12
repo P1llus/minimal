@@ -1117,7 +1117,6 @@ mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
-            quic443: None,
         };
 
         // The successful shape, driven the way the activation drives it:
@@ -1306,7 +1305,6 @@ mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
-            quic443: None,
         };
         let dir = tempfile::TempDir::new().unwrap();
         let host_dir = dir.path().join("providers").join("local-minvmd0");
@@ -1373,7 +1371,6 @@ mod tests {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
-                quic443: None,
             },
             status: boxes::BoxState::default(),
             reason: None,
@@ -1443,7 +1440,6 @@ mod tests {
                 dynamic_ingress: Some(boxes::DynamicIngress::Ask),
             }),
             credentialed_upstream: None,
-            quic443: None,
         };
         let ungranted = boxes::BoxPolicy {
             egress: None,
@@ -1453,7 +1449,6 @@ mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
-            quic443: None,
         };
 
         for (policy, name) in [(granted, "granted"), (ungranted, "ungranted")] {
@@ -1513,7 +1508,6 @@ mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
 
         // The real host table and the real control server the daemon boots
@@ -1706,7 +1700,6 @@ mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         let dir = tempfile::TempDir::new().unwrap();
         let host_dir = dir.path().join("providers").join("local-minvmd0");
@@ -1761,7 +1754,6 @@ mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         let dir = tempfile::TempDir::new().unwrap();
         let host_dir = dir.path().join("providers").join("local-minvmd0");
@@ -2222,7 +2214,6 @@ mod tests {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
-                quic443: None,
             },
             status: boxes::BoxState::default(),
             reason: None,

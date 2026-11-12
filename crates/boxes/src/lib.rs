@@ -321,10 +321,8 @@ impl IngressPolicy {
 /// whatever the box's egress rules say.
 ///
 /// The declaration carries the Box Egress Proxy settings: the
-/// `[network.bep]` table and the `[secrets]` grants ([`core::bep`]). The
-/// declared `quic443` stance is not here: it is a setting of every box, so it
-/// rides [`BoxPolicy::quic443`]. Both default to empty and are skipped when
-/// empty, so a declaration with no settings serializes as `{}`, exactly as
+/// `[network.bep]` table and the `[secrets]` grants ([`core::bep`]). Both
+/// default to empty and are skipped when empty, so a declaration with no settings serializes as `{}`, exactly as
 /// it did before the settings existed, and an old `{}` reads as no settings.
 /// A policy that carries `Some` declaration puts its box on a credentialed
 /// lane; one that carries `None` declares nothing.
@@ -434,13 +432,6 @@ pub struct BoxPolicy {
     /// record and every reading client already holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
-    /// The `[session.network] quic443` stance, `None` when the project
-    /// declares none. `None` reads as `auto`. `block` and `allow` override
-    /// the `auto` resolution on the lane's grants and steering (BEP-018).
-    /// It is a setting of every box, lane or not. Skipped when `None`, so
-    /// a policy that declares none serializes as it did before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quic443: Option<core::bep::Quic443>,
 }
 
 impl BoxPolicy {
@@ -453,7 +444,6 @@ impl BoxPolicy {
             egress,
             ingress,
             credentialed_upstream: None,
-            quic443: None,
         }
     }
 }

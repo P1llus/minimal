@@ -608,7 +608,6 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
-            quic443: None,
         }
     }
 
@@ -640,7 +639,6 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
-            quic443: None,
         }
     }
 

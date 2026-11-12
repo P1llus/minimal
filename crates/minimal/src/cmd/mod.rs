@@ -1724,7 +1724,6 @@ mod tests {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
-                quic443: None,
             },
             status: boxes::BoxState::default(),
             reason: None,

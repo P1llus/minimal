@@ -1646,7 +1646,6 @@ mod tests {
                     dynamic_ingress: Some(stance),
                 }),
                 credentialed_upstream: None,
-                quic443: None,
             };
             register_box_for_activation(
                 paths::HostKind::Minvmd,

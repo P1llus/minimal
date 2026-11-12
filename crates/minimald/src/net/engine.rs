@@ -818,9 +818,6 @@ impl Engine {
         if policy.credentialed_upstream.is_some() {
             return Some("secrets");
         }
-        if policy.quic443 == Some(boxes::core::bep::Quic443::Block) {
-            return Some("quic443");
-        }
         None
     }
 
@@ -1722,14 +1719,14 @@ mod tests {
     fn settings_nothing_applies_to_a_host_address_box_are_refused_by_name() {
         let engine = Engine::absent(Absent::NotStarted);
         let mut blocked = BoxPolicy::new(None, None);
-        blocked.quic443 = Some(boxes::core::bep::Quic443::Block);
+        blocked.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
         assert_eq!(
             engine.can_enforce(NetworkMode::HostNet, &blocked, false),
-            Err(Unenforceable::Setting("quic443"))
+            Err(Unenforceable::Setting("secrets"))
         );
         assert_eq!(
             engine.can_enforce(NetworkMode::OwnIp, &blocked, false),
-            Err(Unenforceable::Setting("quic443"))
+            Err(Unenforceable::Setting("secrets"))
         );
         assert_eq!(
             engine.can_enforce(NetworkMode::NoNet, &blocked, false),

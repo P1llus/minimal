@@ -1,8 +1,7 @@
 //! `min box spec`: what a project's box gets from the local Box Egress
 //! Proxy (BEP-038). It prints the proxy's root CA fingerprint, each broker
 //! grant with its upstream hosts and the `full` marker, each store
-//! reference, the resolved steering mode, and the `quic443` stance when it
-//! lets HTTP/3 past the proxy.
+//! reference, and the resolved steering mode.
 //!
 //! The rows come from [`render`], which is pure. [`cmd_box_spec`] gathers
 //! its inputs: the project's `minimal.toml`, the proxy's published identity
@@ -13,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
+    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, SecretGrant,
+    SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
@@ -26,8 +25,6 @@ pub(crate) struct SpecInputs<'a> {
     pub root_fingerprint: Option<&'a str>,
     /// `[session.network.bep]`.
     pub bep: &'a BepSettings,
-    /// `[session.network] quic443`, `None` when not declared.
-    pub quic443: Option<Quic443>,
     /// `[session.secrets]`.
     pub secrets: &'a SecretGrants,
     /// Whether the client configuration sets the full-breadth
@@ -180,9 +177,6 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
             )?;
         }
     }
-    if !inputs.quic443.unwrap_or_default().blocks(true, steering) {
-        writeln!(out, "quic443  allowed (HTTP/3 bypasses the proxy)")?;
-    }
     Ok(())
 }
 
@@ -224,13 +218,9 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             return Err(crate::ProjectFileInvalid { error }.into());
         }
     };
-    let (bep, quic443, secrets) = session.map_or_else(Default::default, |session| {
-        let network = session.network.unwrap_or_default();
-        (
-            network.bep.unwrap_or_default(),
-            network.quic443,
-            session.secrets,
-        )
+    let (bep, secrets) = session.map_or_else(Default::default, |session| {
+        let bep = session.network.and_then(|network| network.bep);
+        (bep.unwrap_or_default(), session.secrets)
     });
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
     let store_rules = if boxes::core::bep::store_references(&secrets)
@@ -258,7 +248,6 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
         &SpecInputs {
             root_fingerprint: root.as_deref(),
             bep: &bep,
-            quic443,
             secrets: &secrets,
             acknowledged,
             network,
@@ -326,7 +315,6 @@ mod tests {
     fn rendered(
         secrets: &SecretGrants,
         bep: &BepSettings,
-        quic443: Option<Quic443>,
         acknowledged: bool,
     ) -> anyhow::Result<String> {
         let mut out = Vec::new();
@@ -334,7 +322,6 @@ mod tests {
             &SpecInputs {
                 root_fingerprint: Some("abc123"),
                 bep,
-                quic443,
                 secrets,
                 acknowledged,
                 // An own-address box on the VM host, whose switch resolves
@@ -372,7 +359,6 @@ mod tests {
                 &SpecInputs {
                     root_fingerprint: Some("abc123"),
                     bep: &proxy_env(),
-                    quic443: None,
                     secrets: &secrets,
                     acknowledged: false,
                     network: boxes::NetworkMode::OwnIp,
@@ -435,7 +421,6 @@ mod tests {
             &SpecInputs {
                 root_fingerprint: Some("abc123"),
                 bep: &proxy_env(),
-                quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
@@ -463,7 +448,6 @@ mod tests {
             &SpecInputs {
                 root_fingerprint: Some("abc123"),
                 bep: &proxy_env(),
-                quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
@@ -495,15 +479,14 @@ mod tests {
             ("GH_TOKEN".to_string(), grant(&["github:user-token"])),
             ("NPM_TOKEN".to_string(), store_grant("keychain", "npm")),
         ]);
-        let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
+        let text = rendered(&secrets, &proxy_env(), false).expect("renders");
         assert_eq!(
             text,
             "root CA  certificate SHA256:abc123\n\
              grant  github:user-token  full  GH_TOKEN  hosts github.com, api.github.com, \
              uploads.github.com, codeload.github.com\n\
              store  npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
-             steering  proxy_env\n\
-             quic443  allowed (HTTP/3 bypasses the proxy)\n"
+             steering  proxy_env\n"
         );
 
         // No published root says so, and a project with no broker secret
@@ -514,7 +497,6 @@ mod tests {
             &SpecInputs {
                 root_fingerprint: None,
                 bep: &bep,
-                quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
@@ -530,7 +512,7 @@ mod tests {
                 .unwrap()
                 .starts_with("root CA  not published yet.")
         );
-        let none = rendered(&SecretGrants::new(), &proxy_env(), None, false).unwrap();
+        let none = rendered(&SecretGrants::new(), &proxy_env(), false).unwrap();
         assert_eq!(
             none,
             "This project declares no broker secret, so its box does not use the proxy.\n"
@@ -542,7 +524,7 @@ mod tests {
             steering: Some(Steering::Off),
             ..BepSettings::default()
         };
-        let text = rendered(&secrets, &off, None, false).expect("renders with a warning");
+        let text = rendered(&secrets, &off, false).expect("renders with a warning");
         let warning = BepWarning::SteeringOffWithGrant {
             grants: vec!["GH_TOKEN".into()],
         };
@@ -552,7 +534,7 @@ mod tests {
         );
         assert_eq!(text.matches("warning  ").count(), 1, "{text}");
         // `proxy_env` writes no warning.
-        let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
+        let text = rendered(&secrets, &proxy_env(), false).expect("renders");
         assert!(!text.contains("warning  "), "{text}");
     }
 
@@ -580,7 +562,6 @@ mod tests {
             &SpecInputs {
                 root_fingerprint: Some(&fingerprint),
                 bep: &bep,
-                quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
@@ -617,7 +598,7 @@ mod tests {
     fn box_spec_marks_full_breadth_member() {
         for scope in ["github:user-token", "github:repo:full"] {
             let secrets = SecretGrants::from([("GH_TOKEN".to_string(), grant(&[scope]))]);
-            let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
+            let text = rendered(&secrets, &proxy_env(), false).expect("renders");
             assert!(
                 text.contains(&format!("grant  {scope}  full  GH_TOKEN")),
                 "{text}"
@@ -626,30 +607,6 @@ mod tests {
                 !text.contains("acknowledge_full_breadth_unenrolled"),
                 "{text}"
             );
-        }
-    }
-
-    /// BEP-038: the allowed stance is flagged whether `allow` was declared
-    /// or `auto` resolved to it, and a blocked stance prints no row.
-    #[test]
-    fn box_spec_flags_allowed_quic_stance_on_grant_box() {
-        let secrets = SecretGrants::from([("GH_TOKEN".to_string(), grant(&["github:user-token"]))]);
-        let flag = "quic443  allowed (HTTP/3 bypasses the proxy)";
-        let both = BepSettings {
-            steering: Some(Steering::Both),
-            ..BepSettings::default()
-        };
-        let cases = [
-            (proxy_env(), None, true),
-            (proxy_env(), Some(Quic443::Auto), true),
-            (both.clone(), Some(Quic443::Allow), true),
-            (both.clone(), None, false),
-            (both, Some(Quic443::Auto), false),
-            (proxy_env(), Some(Quic443::Block), false),
-        ];
-        for (bep, quic443, flagged) in cases {
-            let text = rendered(&secrets, &bep, quic443, false).expect("renders");
-            assert_eq!(text.contains(flag), flagged, "{bep:?} {quic443:?}\n{text}");
         }
     }
 
@@ -672,7 +629,7 @@ mod tests {
         assert!(!crate::config::acknowledged_in(&[organization]).expect("reads"));
 
         let secrets = SecretGrants::from([("GH_TOKEN".to_string(), grant(&["github:repo:read"]))]);
-        let text = rendered(&secrets, &proxy_env(), None, acknowledged).expect("renders");
+        let text = rendered(&secrets, &proxy_env(), acknowledged).expect("renders");
         assert!(
             text.contains("grant  github:repo:read  full  GH_TOKEN  hosts github.com"),
             "{text}"
@@ -685,7 +642,7 @@ mod tests {
             "{text}"
         );
 
-        let err = rendered(&secrets, &proxy_env(), None, false).expect_err("refused");
+        let err = rendered(&secrets, &proxy_env(), false).expect_err("refused");
         let refused = err
             .downcast_ref::<ActivationRefused>()
             .expect("an activation refusal");

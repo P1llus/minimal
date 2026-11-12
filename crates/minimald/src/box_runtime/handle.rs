@@ -260,9 +260,8 @@ impl HostHandle {
     /// send from here on finds the channel closed.
     ///
     /// Awaiting an aborted loop task is not always enough for that: the
-    /// task a caller holds can be a watcher that stands in for the loop
-    /// (`box_actor`'s `watch_quic443_exit`), and aborting the watcher only
-    /// asks the loop to abort.
+    /// task a caller holds can be a watcher that stands in for the loop,
+    /// and aborting the watcher only asks the loop to abort.
     pub(crate) async fn closed(&self) {
         self.sender.closed().await;
     }

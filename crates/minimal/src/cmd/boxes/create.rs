@@ -1111,8 +1111,8 @@ impl std::fmt::Display for GrantNotDelivered {
 impl std::error::Error for GrantNotDelivered {}
 
 /// The project's `[session.network.bep]` settings, `[session.secrets]`
-/// grants, the box spec's own variable names and the `[session.network]
-/// quic443` stance. Only a missing project file reads as empty. A file that
+/// grants and the box spec's own variable names. Only a missing project
+/// file reads as empty. A file that
 /// exists but does not load refuses the activation, so a broken file can
 /// never skip the grant checks (BEP-008).
 fn project_bep_and_grants(
@@ -1122,7 +1122,6 @@ fn project_bep_and_grants(
         boxes::core::bep::BepSettings,
         boxes::core::bep::SecretGrants,
         Vec<String>,
-        Option<boxes::core::bep::Quic443>,
     ),
     ProjectFileInvalid,
 > {
@@ -1153,10 +1152,8 @@ fn project_bep_and_grants(
                     .map(|entry| entry.name().as_ref().to_string()),
             )
             .collect();
-        let (bep, quic443) = session
-            .network
-            .map_or_else(Default::default, |n| (n.bep.unwrap_or_default(), n.quic443));
-        (bep, session.secrets, spec_env, quic443)
+        let bep = session.network.and_then(|n| n.bep).unwrap_or_default();
+        (bep, session.secrets, spec_env)
     }))
 }
 
@@ -1664,8 +1661,7 @@ pub(crate) fn effective_egress(
 /// flag, or a `[session.secrets]` grant whose source is the broker or a
 /// store (NET-134, BEP-016, BEP-032). The set is derived from those grants. A `[session.network.bep]`
 /// setting or a `client_env` grant alone declares nothing. The settings
-/// ride the declaration. The declared `quic443` stance does not: it rides
-/// the policy of every box (BEP-018).
+/// ride the declaration.
 fn credentialed_upstream_for(
     flag: bool,
     bep: &boxes::core::bep::BepSettings,
@@ -3106,7 +3102,7 @@ pub(crate) async fn activate_box(
         .await?;
     let (policy, github_grants, store_grants) = ActivationStep::CheckProject
         .run(async {
-            let (project_bep, project_secrets, project_env, project_quic443) =
+            let (project_bep, project_secrets, project_env) =
                 project_bep_and_grants(&utf8_path)?;
             // NET-060: the project's egress, with each field a flag names
             // replaced by the flag.
@@ -3139,10 +3135,6 @@ pub(crate) async fn activate_box(
                     &project_bep,
                     &project_secrets,
                 ),
-                // BEP-018: the declared stance is a setting of every box, lane
-                // or not, so a declared `block` reaches the gate of a box with
-                // no credentialed upstream.
-                quic443: project_quic443,
                 ..network_override_policy(&args, port_mappings, egress.policy)
             };
 
@@ -5271,7 +5263,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
         // The egress here is unset, so both runs refuse for that too. Only
         // the narrow-scope refusal depends on the acknowledgement.
         let narrow = |acknowledged: bool| {
@@ -5317,7 +5309,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
             let egress = boxes::EgressPolicy {
                 allow_dns_hosts: Some(
                     bep::module::GITHUB
@@ -5364,7 +5356,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         refuse_unhonourable_grants(
@@ -5929,7 +5921,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
             assert!(credentialed_upstream_for(false, &bep, &secrets).is_some());
             assert_eq!(bep.resolved_steering().word(), word);
             assert_eq!(bep.resolved_steering() == Steering::Both, word == "both");
@@ -5965,7 +5957,6 @@ mod tests {
                     &crate::cmd::box_spec::SpecInputs {
                         root_fingerprint: None,
                         bep: &bep,
-                        quic443: None,
                         secrets: &secrets,
                         acknowledged: false,
                         network,
@@ -6040,7 +6031,6 @@ mod tests {
                         &crate::cmd::box_spec::SpecInputs {
                             root_fingerprint: None,
                             bep: &bep,
-                            quic443: None,
                             secrets: &secrets,
                             acknowledged: false,
                             network: spec_network,

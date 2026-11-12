@@ -2,9 +2,8 @@
 //! pass before a box with a credential grant is created.
 //!
 //! The settings are the `[network.bep]` table (`steering`, `proxy_env`,
-//! `no_proxy`) and the `[secrets]` grants. The UDP 443 stance, [`Quic443`],
-//! is a `[network]` setting, not a `[network.bep]` one. A project declares
-//! them under its `[session]` table as `[session.network.bep]` and
+//! `no_proxy`) and the `[secrets]` grants. A project declares them under
+//! its `[session]` table as `[session.network.bep]` and
 //! `[session.secrets.<VAR>]`. They ride the box's policy inside
 //! [`crate::CredentialedUpstream`].
 //!
@@ -80,35 +79,6 @@ impl Steering {
     #[must_use]
     pub fn needs_resolver(self) -> bool {
         matches!(self, Steering::Dns | Steering::Both)
-    }
-}
-
-/// The box's stance on UDP to port 443.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Quic443 {
-    /// Blocked when the box has a credentialed upstream under `dns` or
-    /// `both` steering, and allowed otherwise.
-    #[default]
-    Auto,
-    /// Always blocked.
-    Block,
-    /// Always allowed.
-    Allow,
-}
-
-impl Quic443 {
-    /// Whether the stance in effect blocks UDP to port 443. `block` always
-    /// blocks and `allow` never does. `auto` blocks exactly when the box
-    /// has a credentialed upstream and `steering` is `dns` or `both`
-    /// (BEP-018).
-    #[must_use]
-    pub fn blocks(self, credentialed_upstream: bool, steering: Steering) -> bool {
-        match self {
-            Quic443::Block => true,
-            Quic443::Allow => false,
-            Quic443::Auto => credentialed_upstream && steering.needs_resolver(),
-        }
     }
 }
 
@@ -1737,58 +1707,6 @@ mod tests {
             toml::from_str("[GH_TOKEN]\nsource = \"broker\"\n").expect("parses");
         assert!(!quiet.acknowledgement_ignored);
         assert!(toml::from_str::<ProjectSecrets>("[GH_TOKEN]\nsource = \"vault\"\n").is_err());
-    }
-
-    /// The resolved `quic443` stance (BEP-018).
-    #[test]
-    fn quic443_auto_blocks_only_on_credentialed_resolver_steering() {
-        assert!(Quic443::Block.blocks(false, Steering::Off));
-        assert!(!Quic443::Allow.blocks(true, Steering::Dns));
-        assert!(Quic443::Auto.blocks(true, Steering::Dns));
-        assert!(Quic443::Auto.blocks(true, Steering::Both));
-        assert!(!Quic443::Auto.blocks(true, Steering::ProxyEnv));
-        assert!(!Quic443::Auto.blocks(false, Steering::Dns));
-    }
-
-    fn any_quic443() -> impl Strategy<Value = Option<Quic443>> {
-        prop_oneof![
-            Just(None),
-            Just(Some(Quic443::Auto)),
-            Just(Some(Quic443::Block)),
-            Just(Some(Quic443::Allow)),
-        ]
-    }
-
-    proptest! {
-        /// BEP-018: for every `quic443` value, grant set and steering
-        /// mode, the resolved stance is blocked iff the value is `block`,
-        /// or it is `auto` (declared or absent), the spec declares a
-        /// credentialed upstream and the steering resolves to `dns` or
-        /// `both`.
-        #[test]
-        fn prop_quic443_auto_resolves_on_grants_and_steering(
-            quic443 in any_quic443(),
-            network in any_network(),
-            egress in any_egress(),
-            bep in any_bep(),
-            secrets in any_grants(),
-        ) {
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
-            let credentialed = secrets.values().any(SecretGrant::is_credentialed);
-            prop_assert_eq!(spec.has_credentialed_upstream(), credentialed);
-            let resolved = bep.steering.unwrap_or(Steering::Dns);
-            let expected = match quic443.unwrap_or(Quic443::Auto) {
-                Quic443::Block => true,
-                Quic443::Allow => false,
-                Quic443::Auto => {
-                    credentialed && matches!(resolved, Steering::Dns | Steering::Both)
-                }
-            };
-            let blocked = quic443
-                .unwrap_or_default()
-                .blocks(spec.has_credentialed_upstream(), bep.resolved_steering());
-            prop_assert_eq!(blocked, expected);
-        }
     }
 
     /// The diagnostic text the task fixes for BEP-008.

@@ -166,9 +166,6 @@ pub(crate) fn effective_session_policy(
         // registration fills — so it is carried verbatim, like the ingress:
         // the effective policy keeps the lane the box declared beside it.
         credentialed_upstream: policy.credentialed_upstream.clone(),
-        // BEP-018: the declared `quic443` stance resolves nothing here
-        // either, so it is carried verbatim.
-        quic443: policy.quic443,
     }
 }
 

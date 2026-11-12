@@ -3748,7 +3748,6 @@ mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
-            quic443: None,
         };
 
         // The registry, as the session actor and the attach path fill it: the

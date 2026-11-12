@@ -6643,7 +6643,6 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         egress: None,
         ingress: None,
         credentialed_upstream: None,
-        quic443: None,
     };
     let dir = tempfile::TempDir::new().unwrap();
     let host_dir = dir.path().join("providers").join("local-minvmd0");
@@ -6815,7 +6814,6 @@ async fn colliding_box_id_refuses_creation() {
         egress: None,
         ingress: None,
         credentialed_upstream: None,
-        quic443: None,
     };
     let dir = tempfile::TempDir::new().unwrap();
     let host_dir = dir.path().join("providers").join("local-minvmd0");

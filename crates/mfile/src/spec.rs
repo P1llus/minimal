@@ -148,7 +148,7 @@ fn until_complete() -> Lifetime {
 
 /// The network half of a [`BoxSpec`]. It serializes as the `[network]`
 /// table: `mode`, then the policy's `egress` and `ingress` tables, and its
-/// `credentialed_upstream` and `quic443` when it sets them.
+/// `credentialed_upstream` when it sets one.
 ///
 /// This is a v0 exception to `box.toml`, which #2410 ends. `ingress` keeps
 /// the [`boxes::IngressPolicy`] shape (`port_mappings`,
@@ -363,8 +363,8 @@ struct DocInstall {
 }
 
 /// The `[network]` table. The policy's own keys are `egress`, `ingress`,
-/// and `credentialed_upstream` and `quic443` when it sets them, so it is
-/// flattened in beside `mode`. The policy refuses an unknown key.
+/// and `credentialed_upstream` when it sets one, so it is flattened in
+/// beside `mode`. The policy refuses an unknown key.
 ///
 /// The flatten puts every [`boxes::BoxPolicy`] key beside `mode`. This is
 /// the same v0 exception as on [`SpecNetwork`]: `ingress` keeps the
@@ -612,7 +612,6 @@ const NETWORK_KEYS: &[SectionKey] = &[
     ("egress_deny_subnets", ANY),
     ("ingress", ANY),
     ("mode", ANY),
-    ("quic443", KeyShape::Str),
     ("vpn_network_names", KeyShape::StrList),
 ];
 
@@ -1127,7 +1126,6 @@ mod tests {
 
             [sessions.dev.network]
             mode = "own_ip"
-            quic443 = "auto"
             vpn_network_names = ["corp"]
             ingress = [{ proto = "tcp", port = 8080 }]
             dynamic_ingress = "allow"
@@ -1275,9 +1273,9 @@ mod tests {
                  which is not a box setting. Remove the key or correct its name.",
             ),
             (
-                "[sessions.dev.network]\nquic443 = true\n",
-                "`[sessions.dev]` in minimal.toml sets `network.quic443` to a true \
-                 or false value, but `network.quic443` takes a string. Fix the value.",
+                "[sessions.dev.network]\ndynamic_ingress = true\n",
+                "`[sessions.dev]` in minimal.toml sets `network.dynamic_ingress` to a true \
+                 or false value, but `network.dynamic_ingress` takes a string. Fix the value.",
             ),
             (
                 "[sessions.dev.install]\npackages = [\"git\", 3]\n",

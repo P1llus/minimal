@@ -1675,7 +1675,6 @@ async fn effective_policy_response_round_trips() {
         egress: None,
         ingress: None,
         credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
-        quic443: None,
     };
     let laned_id = own_ip_session(&mut client, "laned-egress", laned_policy.clone()).await;
 

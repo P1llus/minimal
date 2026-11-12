@@ -3696,7 +3696,6 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                 ..Default::default()
             }),
             credentialed_upstream: None,
-            quic443: None,
         },
     )
 }

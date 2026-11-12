@@ -221,8 +221,8 @@ pub(super) fn timeout_of(spec: &mfile::spec::BoxSpec) -> Option<u64> {
 /// box because it is idle or because its clients went away. A client that
 /// detaches or drops leaves the entrypoint running, and the loop with it.
 ///
-/// The handle it returns stands in for `task`, as [`watch_quic443_exit`]'s
-/// does: it yields the loop's result, and an abort of it aborts the loop.
+/// The handle it returns stands in for `task`: it yields the loop's result,
+/// and an abort of it aborts the loop.
 ///
 /// `entry` names the task a launch runs as its entrypoint (see
 /// [`entry_run_as_entrypoint`]). When that entrypoint returns on its own,
