@@ -784,6 +784,21 @@ impl ServerStateHandle {
         self.0.lock().await.proxy_unavailable.clone()
     }
 
+    /// Why this daemon cannot give a box an address of its own, when it
+    /// cannot: it runs gvproxy for those boxes itself and has no gvproxy
+    /// program. In a VM the VM host runs gvproxy.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn no_virtual_network(&self) -> Option<String> {
+        let (in_microvm, binary) = {
+            let state = self.0.lock().await;
+            (state.config.in_microvm, state.config.gvproxy_bin_path())
+        };
+        if in_microvm {
+            return None;
+        }
+        crate::net::gvproxy_missing(&binary)
+    }
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077): the fact [`crate::rpc::serve_get_effective_session_policy`]
     /// resolves a session's effective egress against, so the answer a client

@@ -704,6 +704,58 @@ impl BoxActor {
         phase: LaunchPhase,
         for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
+        let launched = self
+            .start_host(
+                session_hnd,
+                conn_username,
+                sz,
+                attach_env,
+                progress,
+                phase,
+                for_hooks,
+            )
+            .await;
+        if launched.is_err() {
+            self.release_failed_launch().await;
+        }
+        launched
+    }
+
+    /// Takes back what a launch that failed made for the box: its cgroup,
+    /// and with it the box's entry in the policy engine and its endpoints.
+    /// The launch's own guards have released the rest (the address on the
+    /// virtual network, the forwards). A host that still runs keeps
+    /// everything: the failed launch was to replace it, and the cgroup is
+    /// the one its processes are in.
+    async fn release_failed_launch(&mut self) {
+        let host_alive = matches!(
+            &self.inner,
+            BoxInner::Active { host: Some((host, _)), .. } if host.is_alive()
+        );
+        if host_alive || self.cgroup.is_none() {
+            return;
+        }
+        tracing::info!(
+            box_id = %self.record.id(),
+            "the box did not start; removing its cgroup and its network policy"
+        );
+        self.destroy_cgroup().await;
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments of `launch_host`, passed on"
+    )]
+    async fn start_host(
+        &mut self,
+        session_hnd: BoxHandle,
+        conn_username: String,
+        sz: WinSize,
+        attach_env: box_runtime::AttachEnv,
+        progress: Option<ChannelProgress>,
+        phase: LaunchPhase,
+        for_hooks: bool,
+    ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         // BOX-013: a stop ended the box's processes and could not set its
         // record to `stopped`. The record still says running, so no launch
         // starts new processes in the box before the retried stop.

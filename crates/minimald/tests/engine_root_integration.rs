@@ -276,6 +276,19 @@ struct Daemon {
 
 impl Daemon {
     fn start(dir: &Path, loader_socket: &Path, upstream: Option<SocketAddr>) -> Self {
+        let gvproxy = std::env::var_os("GVPROXY_BIN").map(PathBuf::from);
+        Self::start_with(dir, loader_socket, upstream, gvproxy.as_deref(), &[])
+    }
+
+    /// Starts a daemon that runs `gvproxy` as its virtual network, with
+    /// `env` added to its environment.
+    fn start_with(
+        dir: &Path,
+        loader_socket: &Path,
+        upstream: Option<SocketAddr>,
+        gvproxy: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Self {
         let state = dir.join("state");
         let project = dir.join("project");
         std::fs::create_dir_all(&state).expect("state dir");
@@ -303,9 +316,10 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("log file"))
             .stderr(log);
-        if let Some(gvproxy) = std::env::var_os("GVPROXY_BIN") {
+        if let Some(gvproxy) = gvproxy {
             command.arg("--gvproxy-bin").arg(gvproxy);
         }
+        command.envs(env.iter().copied());
         if let Some(upstream) = upstream {
             command.env("MINIMALD_UPSTREAM_DNS", upstream.to_string());
         }
@@ -465,6 +479,55 @@ impl Daemon {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.state.with_file_name("minimald.log")).unwrap_or_default()
+    }
+
+    /// Whether `min ls` lists a box named `name`.
+    fn lists(&self, name: &str) -> bool {
+        self.min(&["ls"])
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(name))
+    }
+
+    /// The box cgroups that exist below the daemon's root.
+    fn box_cgroups(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(self.cgroup_root().join("boxes"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    /// The pids in the daemon's cgroup for helper programs, gvproxy among
+    /// them.
+    fn helpers(&self) -> Vec<String> {
+        std::fs::read_to_string(self.cgroup_root().join("helpers/cgroup.procs"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The socket and the subnet of the gvproxy this daemon runs.
+    fn switch(&self) -> (PathBuf, switch::SwitchSubnet) {
+        let dir = std::fs::read_dir(self.state.join("gvproxy"))
+            .expect("the daemon's gvproxy directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|dir| dir.join("gvproxy-api.sock").exists())
+            .expect("a running gvproxy");
+        let config = std::fs::read_to_string(dir.join("gvproxy.yaml")).expect("gvproxy's config");
+        let subnet = config
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("subnet: "))
+            .map(|value| value.trim_matches('"'))
+            .and_then(|value| value.split_once('/'))
+            .and_then(|(base, prefix)| {
+                switch::SwitchSubnet::new(base.parse().ok()?, prefix.parse().ok()?).ok()
+            })
+            .unwrap_or_else(|| panic!("no subnet in {config}"));
+        (dir.join("gvproxy-api.sock"), subnet)
     }
 
     /// The port the daemon's hostname proxy listens on: its default, or
@@ -1087,22 +1150,197 @@ fn without_a_loader_only_boxes_that_need_no_enforcement_start() {
     }
     let dir = tempfile::tempdir().expect("temp dir");
     let port = target(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    let daemon = Daemon::start(dir.path(), &dir.path().join("no-loader.sock"), None);
+    let gvproxy = std::env::var_os("GVPROXY_BIN").map(PathBuf::from);
+    // With the opt-out a box with its own address and no egress section
+    // allows everything.
+    let daemon = Daemon::start_with(
+        dir.path(),
+        &dir.path().join("no-loader.sock"),
+        None,
+        gvproxy.as_deref(),
+        &[("MINIMALD_EGRESS_DENY_ALL_OPT_OUT", "1")],
+    );
     let log = daemon.log();
     assert!(log.contains("no network policy engine"), "{log}");
     assert!(log.contains("min finalize-install"), "{log}");
 
     daemon.activate("open", &["--network", "host_ip"]);
     assert_eq!(daemon.connect("open", "127.0.0.1", port).trim(), "ok");
+    daemon.activate("alone", &["--network", "none"]);
+    assert_eq!(daemon.exec("alone", "echo runs").trim(), "runs");
 
-    let activation = daemon.activate(
-        "sub",
-        &["--network", "host_ip", "--allow-subnets", "127.0.0.1/32"],
+    // Refused when it is activated, with the step to take, and nothing
+    // of it stays: a box that shares the host's address and has a rule,
+    // and every box with an address of its own, also one that allows
+    // everything.
+    let before = daemon.box_cgroups().len();
+    for (name, flags) in [
+        (
+            "sub",
+            &["--network", "host_ip", "--allow-subnets", "127.0.0.1/32"][..],
+        ),
+        ("own", &["--network", "own_ip"][..]),
+        (
+            "own-open",
+            &["--network", "own_ip", "--allow-subnets", "0.0.0.0/0"][..],
+        ),
+    ] {
+        let activation = daemon.activate(name, flags);
+        assert!(
+            activation.contains("no network policy engine")
+                && activation.contains("min finalize-install"),
+            "{name}: {activation}"
+        );
+        assert!(!daemon.lists(name), "{name} is listed: {activation}");
+    }
+    assert_eq!(daemon.box_cgroups().len(), before);
+    assert!(daemon.helpers().is_empty(), "no gvproxy was started");
+    assert!(!dir.path().join("state/gvproxy").exists());
+}
+
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_box_that_cannot_start_is_refused_or_leaves_nothing() {
+    if !gated("a_box_that_cannot_start_is_refused_or_leaves_nothing") {
+        return;
+    }
+    // No gvproxy program at all: known when the box is activated.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let missing = dir.path().join("no-gvproxy");
+    let daemon = Daemon::start_with(dir.path(), &loader.socket, None, Some(&missing), &[]);
+    let activation = daemon.activate("own", &["--network", "own_ip"]);
+    assert!(
+        activation.contains("gvproxy") && activation.contains("no-gvproxy"),
+        "{activation}"
     );
-    let exec = daemon.connect("sub", "127.0.0.1", port);
-    let said = format!("{activation}{exec}");
-    assert_ne!(exec.trim(), "ok", "{said}");
-    assert!(said.contains("min finalize-install"), "{said}");
+    assert!(!daemon.lists("own"), "{activation}");
+    assert!(daemon.box_cgroups().is_empty());
+    drop(daemon);
+
+    // A gvproxy that dies when it is started: known at the box's first
+    // start, after its cgroup, its policy and its address were made.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let daemon = Daemon::start_with(
+        dir.path(),
+        &loader.socket,
+        None,
+        Some(Path::new("/bin/false")),
+        &[],
+    );
+    daemon.activate("open", &["--network", "host_ip"]);
+    assert_eq!(daemon.exec("open", "echo runs").trim(), "runs");
+    let held = daemon.box_cgroups();
+    assert_eq!(held.len(), 1, "{held:?}");
+
+    daemon.activate("own", &["--network", "own_ip"]);
+    let id = daemon.box_id("own");
+    for attempt in 0..2 {
+        let start = daemon.exec("own", "echo runs");
+        assert!(
+            start.contains("gvproxy exited") && !start.contains("runs\n"),
+            "attempt {attempt}: {start}"
+        );
+        assert_eq!(daemon.box_cgroups(), held, "attempt {attempt}");
+        assert!(daemon.helpers().is_empty(), "attempt {attempt}");
+    }
+    // The engine's entry went with the cgroup. Its counters are logged
+    // when it goes.
+    let log = daemon.log();
+    let removed = log
+        .lines()
+        .filter(|line| line.contains("removed the box's network policy") && line.contains(&id))
+        .count();
+    assert_eq!(removed, 2, "{log}");
+    // Each attempt gave its address on the virtual network back.
+    let config = std::fs::read_dir(dir.path().join("state/gvproxy"))
+        .expect("gvproxy directory")
+        .flatten()
+        .map(|entry| entry.path().join("gvproxy.yaml"))
+        .find(|file| file.exists())
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .expect("gvproxy's config");
+    assert_eq!(config.matches("52:54:00").count(), 1, "{config}");
+    // The box that runs is untouched.
+    assert_eq!(daemon.exec("open", "echo still").trim(), "still");
+}
+
+/// What a guest with no manners gets from the daemon's gvproxy: frames
+/// written straight to the switch, for the host alias and for the
+/// addresses that mean this host.
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn nothing_on_the_native_switch_reaches_the_host_s_loopback() {
+    use std::net::SocketAddrV4;
+    use switch::fake_guest::{FakeGuest, Seen, TCP_SYN_ACK};
+
+    if !gated("nothing_on_the_native_switch_reaches_the_host_s_loopback") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    // gvproxy runs while a box with its own address does.
+    daemon.activate("own", &["--network", "own_ip"]);
+    assert_eq!(daemon.exec("own", "echo runs").trim(), "runs");
+    let (socket, subnet) = daemon.switch();
+    let alias = subnet.host_alias();
+
+    // Services on the host's loopback that nothing exposes.
+    let tcp = TcpListener::bind("127.0.0.1:0").expect("bind");
+    tcp.set_nonblocking(true).expect("nonblocking");
+    let tcp_port = tcp.local_addr().expect("address").port();
+    let udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    udp.set_nonblocking(true).expect("nonblocking");
+    let udp_port = udp.local_addr().expect("address").port();
+
+    let address = Ipv4Addr::from(u32::from(subnet.broadcast()) - 9);
+    let mut guest = FakeGuest::attach(&socket, address, subnet.gateway()).expect("attach");
+    guest.arp_request(alias).expect("send");
+    let this_host = [alias, Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED];
+    for to in this_host {
+        guest
+            .tcp_syn(SocketAddrV4::new(to, tcp_port))
+            .expect("send");
+        guest
+            .udp(SocketAddrV4::new(to, udp_port), b"ping")
+            .expect("send");
+    }
+    let seen = guest.listen(Duration::from_secs(3)).expect("listen");
+    println!("frames from the switch: {seen:?}");
+    for frame in &seen {
+        let answered = match frame {
+            Seen::ArpReply { owner } => *owner == alias,
+            Seen::Tcp { from, flags, .. } => this_host.contains(from.ip()) && *flags == TCP_SYN_ACK,
+            Seen::Udp { from, .. } => this_host.contains(from.ip()),
+            Seen::Icmp { .. } => false,
+        };
+        assert!(!answered, "the switch answered for this host: {frame:?}");
+    }
+    assert!(
+        tcp.accept().is_err(),
+        "a connection arrived on the host's loopback"
+    );
+    assert!(
+        udp.recv_from(&mut [0u8; 16]).is_err(),
+        "a datagram arrived on the host's loopback"
+    );
+
+    // The gateway does answer this guest, and its API asks for a token.
+    let api = SocketAddrV4::new(subnet.gateway(), 80);
+    let reply = guest
+        .tcp_request(
+            api,
+            b"GET /services/forwarder/all HTTP/1.0\r\n\r\n",
+            Duration::from_secs(5),
+        )
+        .expect("request");
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(
+        reply.starts_with("HTTP/1.0 401") || reply.starts_with("HTTP/1.1 401"),
+        "the gateway's API answered: {reply:?}"
+    );
 }
 
 #[test]

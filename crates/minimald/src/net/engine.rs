@@ -21,7 +21,7 @@ use boxbpf::{BoxId, Flows, Handles, LiveBox, OriginalDestination};
 use boxes::{BoxPolicy, NetworkMode, SessionId};
 use netpol::{
     Compiled, Protocol, Verdict,
-    base::{PortOf, Services},
+    base::{NodeKind, PortOf, Services},
     compile::Spec,
 };
 use sandbox::cgroup::{BoxCgroup, Root};
@@ -473,11 +473,14 @@ enum State {
 /// The engine, or the reason there is none.
 pub(crate) struct Engine {
     state: State,
+    /// What the node is. Without programs it decides which boxes run.
+    node: NodeKind,
 }
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 static NOT_STARTED: Engine = Engine {
     state: State::Absent(Absent::NotStarted),
+    node: NodeKind::Native,
 };
 
 /// How often expired name pins are deleted from the maps.
@@ -605,14 +608,19 @@ impl Engine {
     fn acquire(root: Option<Root>, node: Node, socket: &Path) -> (Self, Option<Root>) {
         use std::os::fd::AsFd as _;
 
+        let kind = node.kind;
+        let absent = |why| Self {
+            state: State::Absent(why),
+            node: kind,
+        };
         let Some(root) = root else {
-            return (Self::absent(Absent::NoCgroupRoot), None);
+            return (absent(Absent::NoCgroupRoot), None);
         };
         let boxes = match std::fs::File::open(root.dir().join(sandbox::cgroup::BOXES)) {
             Ok(dir) => std::os::fd::OwnedFd::from(dir),
             Err(error) => {
                 let why = Absent::Failed(format!("opening the boxes cgroup: {error}"));
-                return (Self::absent(why), Some(root));
+                return (absent(why), Some(root));
             }
         };
         let taken = if nix::unistd::geteuid().is_root() {
@@ -629,20 +637,21 @@ impl Engine {
             Ok(attached) => (
                 Self {
                     state: State::Attached(Box::new(attached)),
+                    node: kind,
                 },
                 Some(root),
             ),
             Err(NotTaken {
                 why,
                 may_be_attached: false,
-            }) => (Self::absent(why), Some(root)),
+            }) => (absent(why), Some(root)),
             Err(NotTaken { why, .. }) => {
                 // Below programs whose maps nobody writes a box has no
                 // network at all. A new `boxes` cgroup has no programs.
                 let dir = root.dir().to_owned();
                 drop(root);
                 match Root::open(&dir) {
-                    Ok(root) => (Self::absent(why), Some(root)),
+                    Ok(root) => (absent(why), Some(root)),
                     Err(error) => {
                         tracing::error!(
                             root = %dir.display(),
@@ -651,16 +660,19 @@ impl Engine {
                              engine failed to start; boxes run without a cgroup, and a box \
                              that needs one is refused"
                         );
-                        (Self::absent(why), None)
+                        (absent(why), None)
                     }
                 }
             }
         }
     }
 
+    /// A native node without an engine.
+    #[cfg(test)]
     const fn absent(why: Absent) -> Self {
         Self {
             state: State::Absent(why),
+            node: NodeKind::Native,
         }
     }
 
@@ -854,20 +866,26 @@ impl Engine {
                     .map_err(Unenforceable::Compile)
             }
             State::Absent(why) => {
-                // Without the programs a box runs unjudged. That is what a
-                // box with no network or with nothing to enforce asks for.
-                // A box with its own address is closed unless it says
-                // otherwise, so only one that opens everything runs.
-                let unjudged = match mode {
-                    NetworkMode::OwnIp => Verdict::Deny,
-                    _ => Verdict::Allow,
+                // Without the programs a box runs unjudged.
+                let runs = match mode {
+                    NetworkMode::NoNet => true,
+                    // The box shares the host's network. A policy that
+                    // allows everything withholds nothing from it.
+                    NetworkMode::HostNet => {
+                        self.node == NodeKind::Native
+                            && own.rules().is_empty()
+                            && own.egress_default(Verdict::Allow) == Verdict::Allow
+                    }
+                    // On a virtual network the base policy keeps the
+                    // gateway's services, the other boxes and the host
+                    // alias from the box, whatever its own rules allow.
+                    // Only the programs apply it.
+                    _ => false,
                 };
-                let nothing_to_enforce =
-                    own.rules().is_empty() && own.egress_default(unjudged) == Verdict::Allow;
-                match mode {
-                    NetworkMode::NoNet => Ok(()),
-                    _ if nothing_to_enforce => Ok(()),
-                    _ => Err(Unenforceable::NoEngine(why.clone())),
+                if runs {
+                    Ok(())
+                } else {
+                    Err(Unenforceable::NoEngine(why.clone()))
                 }
             }
         }
@@ -1748,15 +1766,63 @@ mod tests {
                 .can_enforce(NetworkMode::OwnIp, &silent, false)
                 .is_err()
         );
-        // Under the daemon's opt-out the same box allows everything.
-        assert_eq!(
-            engine.can_enforce(NetworkMode::OwnIp, &silent, true),
-            Ok(())
-        );
         assert_eq!(
             engine.can_enforce(NetworkMode::HostNet, &silent, false),
             Ok(())
         );
+    }
+
+    /// A box on a virtual network never runs unjudged, whatever it allows:
+    /// its base policy keeps the gateway, the other boxes and the host
+    /// alias from it, and only the programs apply that.
+    #[test]
+    fn without_an_engine_no_box_on_a_virtual_network_runs() {
+        let why = Absent::NoLoader {
+            socket: PathBuf::from("/run/minimal/policy-loader.sock"),
+        };
+        let refused = Err(Unenforceable::NoEngine(why.clone()));
+        let open = [
+            BoxPolicy::new(None, None),
+            egress(|_| {}),
+            egress(|e| e.allow_subnets = list(&["0.0.0.0/0", "::/0"])),
+        ];
+        let native = Engine::absent(why.clone());
+        let guest = Engine {
+            state: State::Absent(why),
+            node: NodeKind::Guest,
+        };
+        for policy in &open {
+            for opt_out in [false, true] {
+                assert_eq!(
+                    native.can_enforce(NetworkMode::OwnIp, policy, opt_out),
+                    refused,
+                    "{policy:?}"
+                );
+                assert_eq!(
+                    guest.can_enforce(NetworkMode::OwnIp, policy, opt_out),
+                    refused,
+                    "{policy:?}"
+                );
+                // A guest's node is on the virtual network itself.
+                assert_eq!(
+                    guest.can_enforce(NetworkMode::HostNet, policy, opt_out),
+                    refused,
+                    "{policy:?}"
+                );
+                assert_eq!(
+                    guest.can_enforce(NetworkMode::NoNet, policy, opt_out),
+                    Ok(())
+                );
+            }
+        }
+        // A native box that shares the host's network and allows
+        // everything has nothing withheld from it.
+        for policy in &open[..2] {
+            assert_eq!(
+                native.can_enforce(NetworkMode::HostNet, policy, false),
+                Ok(())
+            );
+        }
     }
 
     #[test]
