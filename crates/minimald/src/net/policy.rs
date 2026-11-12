@@ -538,32 +538,6 @@ impl PortForwarder {
             }
         }
     }
-
-    /// Unbinds the forward a move of the box's publish left at the old
-    /// address (#2748). The gate keeps admitting the port, since the forward
-    /// bound at the new address serves it now. The forwarder is marked
-    /// revoked once the unbind stands, so the attach's teardown, which holds
-    /// a clone, asks nothing more of it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the I/O error from the failing `unexpose` call.
-    pub async fn unbind_moved(&self, control: &ControlChannel) -> io::Result<()> {
-        if self.is_revoked() {
-            return Ok(());
-        }
-        let closed = unexpose_mapping(control, &self.mapping).await?;
-        self.mark_unbound();
-        let (host, port) = self.mapping.host_port().unwrap_or(("", 0));
-        tracing::info!(
-            host,
-            port,
-            protocol = %self.mapping.protocol,
-            closed_connections = %closed,
-            "unbound the forward a move of the box's publish left at the old address"
-        );
-        Ok(())
-    }
 }
 
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
@@ -1518,7 +1492,7 @@ pub(crate) async fn post_json_reply_within<T: Serialize>(
         // A refusal that says the listener is already held, by another host
         // process (the OS's bind text) or by a forward this forwarder already
         // runs, carries `AddrInUse`: the address exists, and a caller that
-        // reads the kind (the range walk) can tell it from a missing one.
+        // reads the kind can tell it from a missing one.
         let kind = if status == 500
             && (said.contains(ADDRESS_IN_USE_BODY) || said.contains(ALREADY_RUNNING_BODY))
         {

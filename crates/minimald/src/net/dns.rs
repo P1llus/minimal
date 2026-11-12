@@ -239,8 +239,7 @@ enum Target {
     /// on a VM node `address` is the node's address on the *host* loopback,
     /// where the host's forwarder mirrors the guest's listeners (NET-129).
     /// The proxy runs in the guest beside those listeners, so it dials them
-    /// at the guest's own `127.0.0.1` wherever the node's address moves
-    /// (#2748). `None` dials `address`.
+    /// at the guest's own `127.0.0.1`. `None` dials `address`.
     Loopback {
         address: Ipv4Addr,
         dial: Option<Ipv4Addr>,
@@ -486,31 +485,11 @@ struct OwnPublished {
     ports: BTreeSet<u16>,
 }
 
-/// A box's publish moved to a new address (#2748): the present landing moved
-/// it off the `127.0.0.1` interim ([`HostnameRegistry::hand_over_moved_publish`]).
-/// Sent as data so the receiver can bind the box's declared ports at the new
-/// address and move the forwards its runtime `min net expose` bound at the
-/// old one, while the box runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishMove {
-    /// The session whose box moved.
-    pub holder: SessionId,
-    /// The address the box published at before the move.
-    pub from: Ipv4Addr,
-    /// The address the box publishes at now.
-    pub to: Ipv4Addr,
-    /// The declared ports the box holds at `to`, one hand-over each: a port
-    /// another box holds there is left out, since the box yields it.
-    pub hand_overs: Vec<PortHandOver>,
-}
-
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
 /// the box created earliest among the running boxes still publishing it
-/// there took it — or among the stopped ones, when none is running. The
-/// present landing makes one too, for a box it moved off the `127.0.0.1`
-/// interim, and sends it inside the move ([`PublishMove`]). Returned as data
-/// so the caller can bind the new holder's forward.
+/// there took it — or among the stopped ones, when none is running.
+/// Returned as data so the caller can bind the new holder's forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortHandOver {
     /// The session whose box holds the port now.
@@ -630,12 +609,6 @@ pub struct HostnameRegistry {
     /// box runs ([`Self::notify_hand_overs`]). `None` leaves a hand-over a
     /// change of record alone, bound at the new holder's next attach.
     hand_overs: Option<tokio::sync::mpsc::UnboundedSender<(PortHandOver, crate::traced::Caller)>>,
-    /// Where each move of a box's publish is sent
-    /// ([`Self::hand_over_moved_publish`]), for the sessions manager to move
-    /// the forwards the box's `min net expose` bound while its box runs
-    /// ([`Self::notify_publish_moves`]). `None` leaves those forwards where
-    /// they are until the box's spawn ends.
-    publish_moves: Option<tokio::sync::mpsc::UnboundedSender<(PublishMove, crate::traced::Caller)>>,
     /// Sessions whose box has stopped (NET-128): its name stays *held* —
     /// answered, not absent, so a stopped box is never mistaken for one that
     /// never existed — but a name it shares with the node answers NODATA, so
@@ -818,7 +791,6 @@ impl HostnameRegistry {
             own_holders: HashMap::new(),
             own_bound: HashMap::new(),
             hand_overs: None,
-            publish_moves: None,
             stopped: HashSet::new(),
             host_launches: HashMap::new(),
             last_host_launch: 0,
@@ -855,24 +827,10 @@ impl HostnameRegistry {
         self.hand_overs = Some(sender);
     }
 
-    /// Sends every move of a box's publish from here on to `sender`
-    /// (#2748): the receiver moves the forwards the box's runtime
-    /// `min net expose` bound at the old address, if its box is running.
-    /// The send never waits, so the registry's lock is held no longer for
-    /// it. Each move carries the trace context of the work that made it, as
-    /// a hand-over does ([`Self::notify_hand_overs`]).
-    pub fn notify_publish_moves(
-        &mut self,
-        sender: tokio::sync::mpsc::UnboundedSender<(PublishMove, crate::traced::Caller)>,
-    ) {
-        self.publish_moves = Some(sender);
-    }
-
     /// The box holding `port` at `address` of record (NET-129), declared or
     /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
-    /// also asks for a declared publish, cannot see a dynamic holder, and
-    /// what the listen watcher reads before it moves a port to a new
-    /// address (#2748).
+    /// also asks for a declared publish, cannot see a dynamic holder.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn shared_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<SessionId> {
         self.own_holders.get(&(address, port)).copied()
@@ -889,57 +847,6 @@ impl HostnameRegistry {
                 .own_published
                 .get(&session_id)
                 .is_some_and(|own| own.address == address && own.ports.contains(&port))
-    }
-
-    /// Sends the move of the box `session_id`'s publish from `from` to the
-    /// address it publishes at now (NET-123 §7.1, #2748), with one hand-over
-    /// per declared port it holds there, and returns the hand-overs. The
-    /// present landing calls it for each box it moves off the `127.0.0.1`
-    /// interim: a box that runs has its forwards bound at the interim, so
-    /// the name would answer at an address no forward listens on. A port
-    /// another box holds at the address is left out: the box yields it.
-    ///
-    /// The move goes to [`Self::notify_publish_moves`]'s receiver, never to
-    /// [`Self::notify_hand_overs`]'s. The receiver passes it on only to a
-    /// box whose actor runs, which binds each declared port at the new
-    /// address and moves the forwards its `min net expose` bound at `from`.
-    /// A box with no actor gets nothing and binds at the new address at its
-    /// next attach. The listen watcher reads the box's published address
-    /// here on every poll, and moves the ports it published itself.
-    pub fn hand_over_moved_publish(
-        &self,
-        session_id: SessionId,
-        from: Ipv4Addr,
-    ) -> Vec<PortHandOver> {
-        let Some(own) = self.own_published.get(&session_id) else {
-            return Vec::new();
-        };
-        let hand_overs: Vec<PortHandOver> = own
-            .ports
-            .iter()
-            .filter(|&&port| self.holds_shared_port(session_id, own.address, port))
-            .map(|&port| PortHandOver {
-                holder: session_id,
-                address: own.address,
-                port,
-            })
-            .collect();
-        if own.address != from
-            && let Some(sender) = &self.publish_moves
-        {
-            // A receiver that is gone moves nothing: the box binds its
-            // declared ports at the new address at its next attach, and its
-            // runtime forwards come down with its spawn.
-            let moved = PublishMove {
-                holder: session_id,
-                from,
-                to: own.address,
-                hand_overs: hand_overs.clone(),
-            };
-            let caller = crate::traced::caller_context();
-            drop(sender.send((moved, caller)));
-        }
-        hand_overs
     }
 
     /// Returns the node's host loopback address as the registry currently
@@ -999,7 +906,7 @@ impl HostnameRegistry {
     /// On a VM node (`on_switch`) the name answers at the node's host-side
     /// address, where the host mirrors the guest's listeners, and the proxy,
     /// which runs in the guest, dials those listeners at the guest's own
-    /// `127.0.0.1` (#2748).
+    /// `127.0.0.1`.
     pub fn register_host_net(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
         self.host_net.insert(session_id);
         let mut route = Route::loopback(session_name, self.node, None);
@@ -2016,16 +1923,9 @@ pub enum LeaseNamespace {
     /// survives. *Not* the session's name, which a user may reuse for the
     /// next box the moment this one exits.
     Box { session: SessionId },
-    /// The node itself: the one address its host-address boxes answer at and
-    /// publish on (NET-129). A native node already owns the host loopback and
-    /// asks for nothing; a VM node holds one for its lifetime — granted at its
-    /// first daemon's start and re-answered to every daemon the node restarts,
-    /// because the node's identity on the host does not change with its
-    /// daemon, so its grant is never swept. The state root the node's daemon
-    /// runs from is the node for keying it: a guest's root is the guest's own,
-    /// so two co-resident VMs hold two grants in two records — the host-side
-    /// channel across them is the minvmd answerer's to carry, not this
-    /// record's.
+    /// The node itself. No daemon asks for one. The variant stays so a
+    /// record on disk that names one still parses: a record that does not
+    /// parse withholds every grant.
     Node,
 }
 
@@ -3267,7 +3167,7 @@ mod tests {
         // A VM node: the node holds one allocated address of its own, and its
         // host-address boxes answer at it. The host's forwarder mirrors the
         // guest's listeners there, and the proxy, in the guest beside them,
-        // dials them at the guest's own loopback (#2748).
+        // dials them at the guest's own loopback.
         let node = Ipv4Addr::new(127, 0, 64, 200);
         let mut vm = HostnameRegistry::new("dev", true).with_node_address(node);
         vm.register_host_net(id("2"), "web");
@@ -3680,8 +3580,7 @@ mod tests {
     }
 
     /// The other half of the same rule: a holder that *moves* to an address
-    /// of its own — the present landing's sweep off the `127.0.0.1`
-    /// interim — takes the yields it was recorded with it, exactly as a
+    /// of its own takes the yields it was recorded with it, exactly as a
     /// destroy does. The box left at the shared address holds the port of
     /// record again, so the next box to publish it there collides with it
     /// and yields, instead of a stale yield masking the collision.
@@ -3707,8 +3606,8 @@ mod tests {
         );
         reg.register_own_ip(second, "second", port.clone());
 
-        // The holder moves to an address of its own — the sweep's re-publish
-        // at the hand, a destroy's equal for everything left behind.
+        // The holder moves to an address of its own, a destroy's equal for
+        // everything left behind.
         assert!(
             reg.publish_own_address(first, "first", Ipv4Addr::new(127, 0, 64, 9), port.clone())
                 .is_empty(),

@@ -5343,7 +5343,7 @@ async fn show_reports_disk_a_reap_frees() {
 const CLIENT_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 
 /// An `rpc` span that adopted a client's `TRACEPARENT`, as the RPC handler's
-/// does: the request a test makes a hand-over or a publish move from.
+/// does: the request a test makes a hand-over from.
 #[cfg(target_os = "linux")]
 fn request_span() -> tracing::Span {
     let request = tracing::info_span!(
@@ -5413,7 +5413,7 @@ fn hand_over_8080(
 /// the work the daemon does by itself joins the root's trace: the boot
 /// resume, sent from no span as `Server::run` sends it, and a hand-over no
 /// request made. Each was a root of its own, a stray trace in every
-/// telemetry-on lab run (`sessions.hand_overs`, `sessions.publish_moves`,
+/// telemetry-on lab run (`sessions.hand_overs`,
 /// `sessions.manager.message` ResumeActive; lab job 01958).
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -5430,11 +5430,9 @@ async fn the_managers_own_work_runs_in_its_root_trace() {
     );
     let root_trace = root.field("trace_id").expect("the root's ids");
     let root_span = root.field("span_id").expect("the root's ids");
-    for name in ["sessions.hand_overs", "sessions.publish_moves"] {
-        let found = only(&log, name);
-        let parent = log.parent_of(&found).expect("a loop's parent");
-        assert_eq!(parent.name, "sessions.manager", "{name}");
-    }
+    let hand_overs = only(&log, "sessions.hand_overs");
+    let parent = log.parent_of(&hand_overs).expect("the loop's parent");
+    assert_eq!(parent.name, "sessions.manager");
 
     assert_eq!(mngr.resume_active_sessions().await.unwrap(), 0);
     let resume = log.one("sessions.manager.message", "kind", "ResumeActive");
@@ -5448,8 +5446,8 @@ async fn the_managers_own_work_runs_in_its_root_trace() {
     assert_eq!(hand_over.field("parent_span_id"), Some(root_span));
 }
 
-/// TEL-030: the manager's root closes when its mainloop ends, and so do
-/// the hand-over and publish-move loops under it. A loop that outlived the
+/// TEL-030: the manager's root closes when its mainloop ends, and so does
+/// the hand-over loop under it. A loop that outlived the
 /// mainloop held the root open until the runtime's drop, so a daemon whose
 /// drop came after its last flush never exported the root, and the boot
 /// work in its trace read as orphans instead of joined spans.
@@ -5465,11 +5463,7 @@ async fn the_managers_root_closes_when_its_mainloop_ends() {
 
     // The last handle gone, the mainloop's receiver ends.
     drop(mngr);
-    let names = [
-        "sessions.manager",
-        "sessions.hand_overs",
-        "sessions.publish_moves",
-    ];
+    let names = ["sessions.manager", "sessions.hand_overs"];
     let turn = std::time::Duration::from_millis(10);
     for _ in 0..500 {
         if names.iter().all(|name| only(&log, name).closed) {
@@ -5483,13 +5477,13 @@ async fn the_managers_root_closes_when_its_mainloop_ends() {
     }
 }
 
-/// TEL-022: a hand-over and a publish move are handled in the trace of the
-/// request that made them, as children of its span, and the manager
-/// messages their handling sends are children of theirs: not in the
-/// manager's lifetime trace, and not in a trace of their own.
+/// TEL-022: a hand-over is handled in the trace of the request that made
+/// it, as a child of its span, and the manager message its handling sends
+/// is a child of the hand-over's span: not in the manager's lifetime trace,
+/// and not in a trace of its own.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_hand_over_and_a_publish_move_join_the_requests_trace() {
+async fn a_hand_over_joins_the_requests_trace() {
     use tracing_subscriber::layer::SubscriberExt as _;
     let log = crate::test_harness::SpanLog::default();
     let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
@@ -5510,21 +5504,4 @@ async fn a_hand_over_and_a_publish_move_join_the_requests_trace() {
     let lookup = logged(&log, "sessions.manager.message", "kind", "GetSession").await;
     assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
     assert_eq!(lookup.field("parent_span_id"), hand_over.field("span_id"));
-
-    let mover = SessionId::mint();
-    let to = std::net::Ipv4Addr::new(127, 0, 64, 201);
-    let from = std::net::Ipv4Addr::LOCALHOST;
-    {
-        let registry = mngr.hostnames();
-        let mut registry = registry.write().expect("registry lock");
-        let ports = std::collections::BTreeSet::from([7070u16]);
-        registry.publish_own_address(mover, "mover", to, ports);
-        let moved = request.in_scope(|| registry.hand_over_moved_publish(mover, from));
-        assert_eq!(moved.len(), 1, "{moved:?}");
-    }
-    let moved = logged(&log, "sessions.publish_move", "trace_id", CLIENT_TRACE).await;
-    assert_eq!(moved.field("parent_span_id"), rpc.field("span_id"));
-    let lookup = logged(&log, "sessions.manager.message", "kind", "GetRunning").await;
-    assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
-    assert_eq!(lookup.field("parent_span_id"), moved.field("span_id"));
 }

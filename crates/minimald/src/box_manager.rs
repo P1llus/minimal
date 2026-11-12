@@ -1141,13 +1141,6 @@ enum ManagerMessage {
         Responder<Option<(boxes::Record, boxes::store::DiskBox)>>,
     ),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
-    /// The handle of the session's live actor, if it has one. Read-only
-    /// against the `running` map: unlike [`GetSession`](Self::GetSession)
-    /// it never starts an actor, so a stopped box stays without one. Linux
-    /// only, like the publish-move receiver that asks it: on macOS minimald
-    /// runs inside the Linux guest.
-    #[cfg(target_os = "linux")]
-    GetRunning(SessionId, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
     /// [`GetSession`](Self::GetSession) it never starts an actor, and a
@@ -1226,8 +1219,6 @@ impl ManagerMessage {
             Self::EventsSource(..) => "EventsSource",
             Self::EndedSource(..) => "EndedSource",
             Self::GetSession(..) => "GetSession",
-            #[cfg(target_os = "linux")]
-            Self::GetRunning(..) => "GetRunning",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
             #[cfg(test)]
@@ -1381,14 +1372,14 @@ impl BoxManager {
         let (sender, receiver) = crate::traced::channel(8);
         // The manager's root (TEL-030): it serves every request for the
         // daemon's life, so it never pins whatever span its creator ran in,
-        // and the hand-over and publish-move loops below run under it too,
-        // as its children: they live exactly as long, and a lifetime loop
-        // that is a root of its own reads as a stray trace in the export.
+        // and the hand-over loop below runs under it too, as its child: it
+        // lives exactly as long, and a lifetime loop that is a root of its
+        // own reads as a stray trace in the export.
         // Its ids are noted (`adopt_trace` with no caller), so the work no
         // request asks for (the boot resume) joins this trace instead of
         // starting one.
         //
-        // The root closes when the mainloop ends: the loops end with the
+        // The root closes when the mainloop ends: the loop ends with the
         // mainloop (`mainloop_done`), not at the runtime's drop, so a root
         // that never closed (and never exported) cannot hide the boot work
         // as orphans.
@@ -1551,60 +1542,6 @@ impl BoxManager {
                 }
             };
             let lifelong = tracing::info_span!(parent: &root, "sessions.hand_overs");
-            let serve = tracing::Instrument::instrument(serve, lifelong);
-            root.in_scope(|| crate::traced::spawn(serve));
-        }
-        // #2748: each move of a box's publish is passed to that box's
-        // session, which binds its declared ports at the new address and
-        // moves the forwards its `min net expose` bound at the old one, if
-        // the box is running. Off the registry's lock, like the hand-overs
-        // above. Only a live actor is asked: the landing moves stopped boxes
-        // too, and a box with no actor has no forward to move, so none is
-        // started for it. Its next attach binds at the new address.
-        #[cfg(target_os = "linux")]
-        {
-            let (sender, mut moves) = tokio::sync::mpsc::unbounded_channel();
-            hostnames
-                .write()
-                .expect("hostname registry lock poisoned")
-                .notify_publish_moves(sender);
-            let manager = weak_self.clone();
-            // Under the manager's root, each move in its sender's trace, as
-            // the hand-overs above.
-            let done = mainloop_done.clone();
-            let serve = async move {
-                loop {
-                    let next = tokio::select! {
-                        biased;
-                        () = done.cancelled() => None,
-                        next = moves.recv() => next,
-                    };
-                    let Some((moved, caller)) = next else {
-                        return;
-                    };
-                    let Some(manager) = manager.upgrade() else {
-                        return;
-                    };
-                    let span = tracing::info_span!(
-                        parent: None,
-                        "sessions.publish_move",
-                        trace_id = tracing::field::Empty,
-                        span_id = tracing::field::Empty,
-                        parent_span_id = tracing::field::Empty,
-                    );
-                    crate::exec::adopt_trace(&span, caller.or(lifetime));
-                    let rebind = async {
-                        if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
-                            let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
-                            holder
-                                .publish_moved(moved.from, moved.to, ports.collect())
-                                .await;
-                        }
-                    };
-                    tracing::Instrument::instrument(rebind, span).await;
-                }
-            };
-            let lifelong = tracing::info_span!(parent: &root, "sessions.publish_moves");
             let serve = tracing::Instrument::instrument(serve, lifelong);
             root.in_scope(|| crate::traced::spawn(serve));
         }
@@ -3366,12 +3303,6 @@ impl BoxManager {
             // if the session is known but not running.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(self.resolve_session(pred)).await;
-            }
-            #[cfg(target_os = "linux")]
-            ManagerMessage::GetRunning(id, r) => {
-                let running = self.running.get(&id).cloned();
-                r.handle(async move { Ok::<_, BoxManagerError>(running) })
-                    .await;
             }
             // Snapshot a running session's screen without starting its
             // actor. A name resolves through the store to its id, then the

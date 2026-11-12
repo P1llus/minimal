@@ -417,11 +417,6 @@ async fn finish_own_ip_attach(
 
     let runtime_ingress =
         own_address.map(crate::net::provider::OwnAddressReporter::runtime_ingress);
-    // The box's actor unbinds a declared forward a move of its publish left
-    // at the old address (#2748), so it holds clones of the attach's.
-    if let Some(runtime_ingress) = &runtime_ingress {
-        runtime_ingress.record_attached(&exposed);
-    }
     Ok(OwnIpGuard {
         attach: Some(OwnIpAttach {
             wired,
