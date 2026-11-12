@@ -452,10 +452,7 @@ impl Network for HostIpAddressNetwork {
             let (vm_host, subnet) = {
                 let s = self.switch.lock().await;
                 (
-                    matches!(
-                        s.transport(),
-                        crate::net::SwitchTransport::HostShuttle { .. }
-                    ),
+                    matches!(s.transport(), crate::net::SwitchTransport::VmHost),
                     s.subnet(),
                 )
             };
@@ -589,7 +586,7 @@ impl OwnIpNetwork {
         let (lease, control, subnet) = {
             let mut s = self.switch.lock().await;
             let subnet = s.subnet();
-            let attach = match (self.box_addresses.as_ref(), self.task_slots.as_deref()) {
+            let lease = match (self.box_addresses.as_ref(), self.task_slots.as_deref()) {
                 (Some(handed), _) => s
                     .attach_handed(handed.switch_address)
                     .await
@@ -606,7 +603,7 @@ impl OwnIpNetwork {
                 .as_ref()
                 .map(OwnAddressReporter::session_id)
                 .or_else(|| self.engine_box.as_ref().map(|judged| judged.of.session()));
-            (attach.lease, ControlChannel::of(&s, box_id), subnet)
+            (lease, ControlChannel::of(&s, box_id), subnet)
         };
 
         *self.reserved.lock().unwrap() = Some(Reserved {
@@ -669,7 +666,7 @@ impl OwnIpNetwork {
 mod tests {
     use super::*;
 
-    /// A switch whose attach/detach are pure bookkeeping: `HostShuttle` leaves
+    /// A switch whose attach/detach are pure bookkeeping: `VmHost` leaves
     /// the gvproxy process to `minvmd`, so only the count moves.
     ///
     /// It lets the daemon draw, which a VM host's switch never does in
@@ -678,10 +675,7 @@ mod tests {
     fn counting_switch() -> Arc<Mutex<SwitchClient>> {
         Arc::new(Mutex::new(
             SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-                .with_transport(crate::net::SwitchTransport::HostShuttle {
-                    cid: crate::net::VSOCK_HOST_CID,
-                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                })
+                .with_transport(crate::net::SwitchTransport::VmHost)
                 .allowing_self_allocation(),
         ))
     }
@@ -713,10 +707,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!host.isolates_netns());
-        // The fixture's switch is a `HostShuttle` — a VM host — so the
-        // host-address box resolves through the node's DNS layer, not the
-        // host's own resolver (NET-003; the native case is
-        // `host_min_internal_resolves_to_host_reach_address_per_mode`).
+        // The fixture's switch is the VM host's, so the host-address box
+        // resolves through the node's DNS layer, not the host's own
+        // resolver.
         assert_eq!(
             host.resolver(),
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])

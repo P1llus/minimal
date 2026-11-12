@@ -23,8 +23,6 @@ struct Open {
     listening: BTreeSet<u16>,
     /// Ports `min net expose` opened.
     exposed: BTreeSet<u16>,
-    /// Declared ports whose forward was taken away while the box runs.
-    revoked: BTreeSet<u16>,
 }
 
 /// The engine's part of a published port.
@@ -56,8 +54,7 @@ impl Admission for EngineAdmission {
 /// The ingress side of one box at one address.
 pub struct IngressGate {
     rules: IngressRules,
-    /// The TCP ports the box declares. Each is open while the gate lives,
-    /// unless it is revoked.
+    /// The TCP ports the box declares. Each is open while the gate lives.
     declared: BTreeSet<u16>,
     open: Mutex<Open>,
     admission: Arc<dyn Admission>,
@@ -165,16 +162,8 @@ impl IngressGate {
         });
     }
 
-    /// Closes a declared port for the rest of the gate's life, unless
-    /// something else keeps it open.
-    pub(crate) fn revoke_port(&self, port: u16) {
-        self.change(port, |open| {
-            open.revoked.insert(port);
-        });
-    }
-
     fn admits(&self, open: &Open, port: u16) -> bool {
-        (self.declared.contains(&port) && !open.revoked.contains(&port))
+        self.declared.contains(&port)
             || open.listening.contains(&port)
             || open.exposed.contains(&port)
     }
@@ -356,19 +345,6 @@ mod tests {
         assert!(take(&journal).is_empty());
         drop(gate);
         assert_eq!(take(&journal), ["refuse 8080", "refuse udp 53"]);
-    }
-
-    #[test]
-    fn a_revoked_declared_port_closes_unless_something_else_holds_it_open() {
-        let (gate, journal) = gate();
-        take(&journal);
-        gate.admit_exposed(8080);
-        gate.revoke_port(8080);
-        assert!(gate.admits_tcp(8080));
-        assert!(take(&journal).is_empty());
-        gate.withdraw_exposed(8080);
-        assert!(!gate.admits_tcp(8080));
-        assert_eq!(take(&journal), ["refuse 8080"]);
     }
 
     #[test]

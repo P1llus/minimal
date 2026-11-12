@@ -1753,41 +1753,12 @@ pub enum ZoneAnswererStatus {
         /// The machine's answerer port, held by a process with no channel.
         port: u16,
     },
-    /// The hostname proxy this VM host daemon reserved for its VM is not
-    /// serving, and this is the host-side cause (T93): the port the
-    /// supervisor drew or was pinned and what kept it from publishing. It
-    /// rides the answerer's read because that read is already the one
-    /// host-side fact the CLI asks this daemon for — the proxy's publish
-    /// outcome is a host fact the same way the answerer's state is, never
-    /// something the guest could vouch for, and it is the CLI's only way to
-    /// say *why* the proxy is down rather than that it merely is.
-    ProxyNotServing {
-        /// The port the supervisor reserved and could not publish.
-        port: u16,
-        /// What kept the proxy from serving on that port.
-        cause: ProxyDownCause,
-    },
 }
 
-/// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
-/// the publish outcomes the supervisor itself reached — the port it
-/// reserved is held by another process on the host, or the draws to find a
-/// free one ran out. A host that merely has no switch to publish through
-/// says nothing here: that boot's proxy never attempted a publish, and its
-/// story stays the daemon log's, not a cause this status could name.
+/// Why a VM host daemon says its VM's hostname proxy is not serving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyDownCause {
-    /// Another process on the host holds the published port — for a port
-    /// the operator pinned this fails the start outright; for a drawn one
-    /// it is what every redraw skipped.
-    PortHeld,
-    /// The drawn port's publish tries ran out: every port the reservation
-    /// drew was already taken.
-    RedrawsRanOut,
-    /// A publish the host cannot vouch for. This VM host daemon never
-    /// sends it. A client still decodes it from an older one.
-    PublishUnconfirmed,
     /// The supervisor could not bind the proxy's port on the host. The VM
     /// stays up with no hostname proxy, so this is not a start failure.
     /// Names the holder as the host saw it (`pid <pid> (<exe>)`), or `None`
@@ -1818,18 +1789,13 @@ pub struct ProxyDown {
 /// hostname proxy's publish outcome — when the supervisor reached a cause
 /// that names one — riding beside it as [`Self::proxy_down`] rather than
 /// in place of it. The proxy-down cause is a fact about the proxy, never
-/// a state of the answerer: substituting it for the answerer's state
-/// dropped the zone-answerer facts entirely, leaving the CLI unable to
-/// name who answers the zone or to probe for native DNS while the proxy
-/// was down or its publish unconfirmed.
+/// a state of the answerer, so the CLI can still name who answers the zone
+/// and probe for native DNS while the proxy is down.
 ///
 /// The wire shape is the status's own flat document — `state` at the top
 /// level — with `proxy_down` an optional sibling key: a client that
 /// predates the field ignores it (unknown fields are not refused), and a
-/// client that knows it reads `None` from a daemon that predates it. The
-/// older substituting shape — `state: "proxy_not_serving"` naming no
-/// answerer fact — stays a variant a new client still parses, for the
-/// daemons that still send it.
+/// client that knows it reads `None` from a daemon that predates it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AnswererStatusReply {
     /// The machine's zone-answerer state, flattened so `state` stays at

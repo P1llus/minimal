@@ -370,7 +370,6 @@ impl BoxActor {
                             switch_address,
                             port,
                             boxes::IpProto::Tcp,
-                            None,
                         )
                         .await,
                     );
@@ -1016,7 +1015,6 @@ impl BoxActor {
                     switch_address,
                     port,
                     boxes::IpProto::Tcp,
-                    None,
                 )
                 .await
             }
@@ -1161,7 +1159,6 @@ impl BoxActor {
             return;
         };
         let control = self.switch_control().await;
-        let gate = crate::net::ingress_gate::live_gate(switch_address);
         let mut bound_any = false;
         let mut refused_any = false;
         for mapping in &mappings {
@@ -1169,14 +1166,9 @@ impl BoxActor {
             if self.live_ingress.holds_handed(address, mapping) {
                 continue;
             }
-            let bind = crate::net::policy::bind_handed_port(
-                &control,
-                address,
-                switch_address,
-                mapping,
-                gate.as_ref(),
-            )
-            .await;
+            let bind =
+                crate::net::policy::bind_handed_port(&control, address, switch_address, mapping)
+                    .await;
             let forwarder = match bind {
                 Ok(forwarder) => forwarder,
                 Err(error) => {

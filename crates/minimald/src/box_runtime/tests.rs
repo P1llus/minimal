@@ -3369,7 +3369,7 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
 
     assert!(
         gate.admits_tcp(3000),
-        "the port the human allowed is admitted at the box's relay gate"
+        "the port the human allowed is admitted at the box's ingress gate"
     );
     assert!(
         !gate.admits_tcp(3001),
@@ -3531,11 +3531,11 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     sampler.await.unwrap();
     assert!(
         !ever_admitted.load(std::sync::atomic::Ordering::SeqCst),
-        "an allow whose record the log refused is never admitted at the relay gate"
+        "an allow whose record the log refused is never admitted at the ingress gate"
     );
     assert!(
         !gate.admits_tcp(3000),
-        "the unaudited allow is not admitted at the relay gate"
+        "the unaudited allow is not admitted at the ingress gate"
     );
     assert!(
         web_handle
@@ -3572,7 +3572,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         .expect("an auditable allow publishes again");
     assert!(
         gate.admits_tcp(3000),
-        "the republished allow is admitted at the box's relay gate"
+        "the republished allow is admitted at the box's ingress gate"
     );
     forwarder.abort();
 
@@ -4906,7 +4906,7 @@ fn host_ip_box_on_vm_host_gets_the_proxy_variables() {
     }
     // The launch reads the host kind from the switch's transport.
     assert_eq!(
-        host_kind_of(crate::net::SwitchTransport::HostShuttle { cid: 2, port: 1024 }),
+        host_kind_of(crate::net::SwitchTransport::VmHost),
         paths::HostKind::Minvmd
     );
     assert_eq!(

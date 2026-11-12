@@ -1,12 +1,9 @@
-//! gvproxy-switch primitives: subnet arithmetic, MAC derivation, the vsock wire
-//! constants, gvproxy `-config` rendering, the default address plan an
-//! un-enrolled host self-allocates from, and the one refusal shape every leg
-//! that refuses a connection answers with ([`refusal`]).
+//! gvproxy-switch primitives: subnet arithmetic, MAC derivation, gvproxy
+//! `-config` rendering, the frame pump, and the default address plan an
+//! un-enrolled host self-allocates from.
 //!
-//! Shared by `minimald` (the in-guest / native switch client + IP allocator) and
-//! `minvmd` (the host switch supervisor). A standalone crate — these are network
-//! primitives, not part of the `minimald-rpc` wire contract — so both sides have
-//! one definition rather than drifting copies.
+//! `minimald` and `minvmd` both link this crate, so the two daemons share one
+//! definition of each.
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -15,7 +12,6 @@ use std::path::{Path, PathBuf};
 pub mod loopback;
 #[cfg(feature = "pump")]
 pub mod pump;
-pub mod refusal;
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
@@ -65,12 +61,6 @@ const _: () = assert!(
     SWITCH_ADDRESS_REUSE_QUARANTINE.as_millis() > BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
     "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
 );
-
-/// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
-/// `VMADDR_CID_HOST == 2`.
-pub const VSOCK_HOST_CID: u32 = 2;
-
-pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
 
 /// Default gvproxy switch subnet: the RFC 6598 (CGNAT) `100.64.0.0/16` block.
 ///
@@ -333,26 +323,6 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
     }
 
-    /// The documented host literal this switch also maps to the host's
-    /// loopback (NET-004): the default subnet's host alias, `100.64.255.254`,
-    /// when this subnet is a block carved out of [`DEFAULT_SUBNET`] that does
-    /// not hold that address itself. A box on a carved `/24` reaches the host
-    /// at its own subnet's alias, so the old literal needs its own `nat` and
-    /// virtual-IP entry to keep reaching what `host.min.internal` reaches.
-    /// `None` for the default subnet, whose own alias is the literal, and for
-    /// a subnet outside the default block, which the literal never named.
-    #[must_use]
-    pub fn documented_host_literal(self) -> Option<Ipv4Addr> {
-        let literal = DEFAULT_SUBNET.host_alias();
-        let holds = |subnet: Self, addr: Ipv4Addr| {
-            u32::from(addr) & subnet.mask() == u32::from(subnet.network())
-        };
-        (self.prefix > DEFAULT_SUBNET.prefix
-            && holds(DEFAULT_SUBNET, self.network())
-            && !holds(self, literal))
-        .then_some(literal)
-    }
-
     /// The Box Egress Proxy address (the address below [`Self::daemon_ip`],
     /// `broadcast - 3`): a second infrastructure address above the PTask lease
     /// pool that the host-side stack peer owns directly. Reserved, never
@@ -415,20 +385,6 @@ impl LoopbackSlice {
     pub fn last(self) -> Ipv4Addr {
         self.last
     }
-
-    /// Whether `addr` falls inside the slice.
-    #[must_use]
-    pub fn contains(self, addr: Ipv4Addr) -> bool {
-        self.first <= addr && addr <= self.last
-    }
-
-    /// Whether the two slices share at least one address. Slices the same
-    /// [`AddressPlan`] minted never do — the property that keeps two gvproxies
-    /// on one host from publishing boxes at the same loopback address.
-    #[must_use]
-    pub fn overlaps(self, other: Self) -> bool {
-        self.first <= other.last && other.first <= self.last
-    }
 }
 
 impl fmt::Display for LoopbackSlice {
@@ -437,58 +393,14 @@ impl fmt::Display for LoopbackSlice {
     }
 }
 
-/// One switch the plan serves: the subnet its boxes lease addresses on, and
-/// the slice of the reserved local range its published boxes come from.
+/// The address plan a host without a control plane takes: the switch subnet
+/// boxes lease addresses on ([`DEFAULT_SUBNET`], out of which a native daemon
+/// carves a `/24`), and the [`RESERVED_LOCAL_RANGE`] their published addresses
+/// come from, cut into one [`SWITCH_SLICE_PREFIX`] slice per switch.
 ///
-/// The pairing is the point (NET-102): a switch's loopback slice is a function
-/// of the switch itself, so two switches one host holds never publish from
-/// the same addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SwitchSlice {
-    subnet: SwitchSubnet,
-    loopback: LoopbackSlice,
-}
-
-impl SwitchSlice {
-    /// The subnet this switch serves box addresses on.
-    #[must_use]
-    pub fn subnet(self) -> SwitchSubnet {
-        self.subnet
-    }
-
-    /// The disjoint slice of the reserved local range this switch publishes at.
-    #[must_use]
-    pub fn loopback(self) -> LoopbackSlice {
-        self.loopback
-    }
-}
-
-/// The default address plan an **un-enrolled host self-allocates from**
-/// (NET-102): the built-in block every box host draws on when no control plane
-/// has handed it one.
-///
-/// Two paired halves:
-///
-/// * the [`switch subnet`](Self::switch_subnet) boxes lease addresses on —
-///   the CGNAT [`DEFAULT_SUBNET`], which the host's switches carve `/24`s out
-///   of;
-/// * the [`RESERVED_LOCAL_RANGE`] those boxes' published addresses come from
-///   on the host's loopback, carved one [`SWITCH_SLICE_PREFIX`] slice per
-///   switch.
-///
-/// The pairing between the two is what makes published addresses safe to hand
-/// out per switch: switch *i* holds slice *i*, so two gvproxies on one host
-/// never hold the same loopback slice — whatever they are (the host switch a
-/// `minvmd` owns beside a native daemon's own, two native daemons, ...). The
-/// plan serves exactly [`switch_capacity`](Self::switch_capacity) switches —
-/// eight on the default plan; a host needing more switches needs the
-/// host-global arbitration NET-010 is the layer for, not a ninth slice of the
-/// same block.
-///
-/// The plan pairs switches with loopback slices; it does **not** arbitrate the
-/// box leases two switches' subnets could contend for — the `/24` a second
-/// daemon carves sits inside the host switch's default subnet, and keeping
-/// those leases distinct is exactly the host-global layer NET-010's.
+/// Switch *i* holds slice *i*, so two gvproxies on one host never publish
+/// from the same loopback addresses. The plan serves as many switches as the
+/// range has slices, eight by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddressPlan {
     switch_subnet: SwitchSubnet,
@@ -510,58 +422,16 @@ impl Default for AddressPlan {
 }
 
 impl AddressPlan {
-    /// The subnet a host's switches serve box addresses on: the CGNAT /16 the
-    /// default switch runs on and later switches carve `/24`s out of.
-    #[must_use]
-    pub fn switch_subnet(self) -> SwitchSubnet {
-        self.switch_subnet
-    }
-
-    /// The reserved local range published box addresses come from, as
-    /// `(network, prefix)`.
-    #[must_use]
-    pub fn reserved_local_range(self) -> (Ipv4Addr, u8) {
-        self.reserved_local_range
-    }
-
     /// How many switches this plan serves on one host: the reserved local range
     /// holds exactly one slice per switch, so the capacity *is* the slice
     /// count — eight on the default plan.
-    ///
-    /// `const` so a caller can size its own state from it at compile time —
-    /// `minimald`'s per-daemon slice arithmetic derives its wrap-around from
-    /// this rather than restating the prefix.
-    #[must_use]
-    pub const fn switch_capacity(self) -> usize {
+    const fn switch_capacity(self) -> usize {
         1usize << (self.slice_prefix - self.reserved_local_range.1)
     }
 
-    /// The switch a host self-allocates at `index`: the subnet it serves and
-    /// the loopback slice it publishes at.
-    ///
-    /// Index `0` is the host's own switch — the plan's default subnet itself,
-    /// the one a `minvmd`-owned gvproxy serves every VM's boxes on — and each
-    /// later index is the next `/24` carved out of the plan's subnet, paired
-    /// with the next slice of the reserved local range. `None` once the plan's
-    /// switches are used up: a host that needs more switches is the
-    /// host-global arbitration NET-010 is the layer for, and inventing a ninth
-    /// slice of the same /24 would hand two gvproxies the same addresses.
-    #[must_use]
-    pub fn switch_slice(self, index: usize) -> Option<SwitchSlice> {
-        let loopback = self.slice_at(index)?;
-        let subnet = if index == 0 {
-            self.switch_subnet
-        } else {
-            let [a, b, _, _] = self.switch_subnet.network().octets();
-            SwitchSubnet::new(Ipv4Addr::new(a, b, index as u8, 0), 24).ok()?
-        };
-        Some(SwitchSlice { subnet, loopback })
-    }
-
-    /// The slice a switch already running on `subnet` publishes its boxes at —
-    /// the same pairing [`switch_slice`](Self::switch_slice) mints, derived
-    /// back from the switch's own subnet: the plan's default subnet is slice
-    /// `0`, and the `/24` it carved at octet *o* is slice *o*.
+    /// The slice a switch running on `subnet` publishes its boxes at: the
+    /// plan's default subnet is slice `0`, and the `/24` it carved at octet
+    /// *o* is slice *o*.
     ///
     /// `None` for a switch this plan does not serve — a subnet outside its
     /// own, or a `/24` past its capacity: no slice exists to publish from, and
@@ -860,7 +730,7 @@ mod tests {
 
     // The resolver tests below create real temp dirs; Miri's default isolation
     // has no `mkdir`, so exclude them there. The miri lane still covers the pure
-    // subnet/MAC/vsock primitives above, which is what it was added to check.
+    // subnet and MAC primitives above, which is what it was added to check.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn installed_gvproxy_prefers_existing_user_local_install() {
@@ -982,89 +852,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unenrolled_self_allocates_default_plan() {
-        // NET-102: no control plane hands this host a plan, so it
-        // self-allocates the default one — the CGNAT /16 for box leases, the
-        // reserved local /24 for published addresses.
-        let plan = AddressPlan::default();
-        assert_eq!(plan, DEFAULT_ADDRESS_PLAN);
-        assert_eq!(plan.switch_subnet(), SwitchSubnet::default());
-        assert_eq!(
-            plan.reserved_local_range(),
-            (Ipv4Addr::new(127, 0, 64, 0), 24)
-        );
-        // Box addresses self-allocated from the plan come from its switch
-        // subnet, starting at the first allocatable host address — the same
-        // address minimald's IpAllocator hands out.
-        assert_eq!(
-            Ipv4Addr::from(plan.switch_subnet().first_ptask()),
-            Ipv4Addr::new(100, 64, 0, 2)
-        );
-        // The first switch an un-enrolled host takes is the plan's default
-        // subnet — the host switch every VM's boxes ride on.
-        let host = plan.switch_slice(0).unwrap();
-        assert_eq!(host.subnet(), SwitchSubnet::default());
-        assert_eq!(host.loopback().first(), Ipv4Addr::new(127, 0, 64, 0));
-        assert_eq!(host.loopback().last(), Ipv4Addr::new(127, 0, 64, 31));
-        assert!(host.loopback().contains(Ipv4Addr::new(127, 0, 64, 16)));
-        assert_eq!(host.loopback().to_string(), "127.0.64.0-127.0.64.31");
-        // A second daemon on the same host self-allocates the next switch: a
-        // /24 carved from the plan's subnet, with its own slice to publish at.
-        let second = plan.switch_slice(1).unwrap();
-        assert_eq!(second.subnet().to_string(), "100.64.1.0/24");
-        assert_eq!(second.loopback().first(), Ipv4Addr::new(127, 0, 64, 32));
-        // The plan runs out of switches exactly when it runs out of slices.
-        assert!(plan.switch_slice(plan.switch_capacity()).is_none());
+    /// The `/24` a daemon carves at `octet` of the default subnet.
+    fn carved(octet: u8) -> SwitchSubnet {
+        SwitchSubnet::new(Ipv4Addr::new(100, 64, octet, 0), 24).unwrap()
     }
 
     #[test]
-    fn loopback_slices_disjoint_per_switch() {
+    fn each_switch_of_the_plan_publishes_from_its_own_slice() {
         let plan = AddressPlan::default();
-        let n = plan.switch_capacity();
-        assert_eq!(n, 8, "a /24 carved at /27 holds eight slices");
-        // Every pair of switches the plan serves publishes from disjoint
-        // slices: two gvproxies on one host never hold the same loopback
-        // addresses, whatever they are.
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let a = plan.switch_slice(i).unwrap().loopback();
-                let b = plan.switch_slice(j).unwrap().loopback();
-                assert!(
-                    !a.overlaps(b),
-                    "slices {a} and {b} overlap: switches {i} and {j}"
-                );
-            }
-        }
-        // The slices tile the whole reserved range: no address is double-held
-        // and none is unassigned.
-        let (net, prefix) = plan.reserved_local_range();
-        let expected: Vec<u32> =
-            (u32::from(net)..u32::from(net) + (1u32 << (32 - prefix))).collect();
-        let mut held: Vec<u32> = Vec::with_capacity(expected.len());
-        for i in 0..n {
-            let slice = plan.switch_slice(i).unwrap().loopback();
+        assert_eq!(plan, DEFAULT_ADDRESS_PLAN);
+        let capacity = plan.switch_capacity();
+        assert_eq!(capacity, 8, "a /24 carved at /27 holds eight slices");
+        // The default subnet is slice 0.
+        let host = plan.loopback_slice_for_switch(DEFAULT_SUBNET).unwrap();
+        assert_eq!(host.first(), Ipv4Addr::new(127, 0, 64, 0));
+        assert_eq!(host.last(), Ipv4Addr::new(127, 0, 64, 31));
+        assert_eq!(host.to_string(), "127.0.64.0-127.0.64.31");
+        // The /24 carved at octet `o` is slice `o`. In order the slices tile
+        // the reserved range, so no two switches hold one address and no
+        // address is left out.
+        let mut held: Vec<u32> = (u32::from(host.first())..=u32::from(host.last())).collect();
+        for octet in 1..capacity as u8 {
+            let slice = plan.loopback_slice_for_switch(carved(octet)).unwrap();
             held.extend(u32::from(slice.first())..=u32::from(slice.last()));
         }
+        let (net, prefix) = RESERVED_LOCAL_RANGE;
+        let expected: Vec<u32> =
+            (u32::from(net)..u32::from(net) + (1u32 << (32 - prefix))).collect();
         assert_eq!(held, expected);
-        // A switch derives its own slice back from its subnet — including the
-        // host switch, whose subnet (the plan's default) is slice 0.
-        for i in 0..n {
-            let switch = plan.switch_slice(i).unwrap();
-            assert_eq!(
-                plan.loopback_slice_for_switch(switch.subnet()),
-                Some(switch.loopback())
-            );
-        }
-        // A /24 past the plan's capacity has no slice: refusing beats the
-        // wrap-around collision a `mod`-count derivation would hand out.
-        let beyond = SwitchSubnet::new(Ipv4Addr::new(100, 64, n as u8, 0), 24).unwrap();
+    }
+
+    #[test]
+    fn a_switch_the_plan_does_not_serve_has_no_slice() {
+        let plan = AddressPlan::default();
+        // A /24 past the plan's capacity: a wrap-around would hand two
+        // switches the same addresses.
+        let beyond = carved(plan.switch_capacity() as u8);
         assert_eq!(plan.loopback_slice_for_switch(beyond), None);
-        // A /24 at octet 0 would share box addresses with the host switch's
-        // own subnet, so the plan serves it no slice either.
-        let inside_host = SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 24).unwrap();
-        assert_eq!(plan.loopback_slice_for_switch(inside_host), None);
-        // Neither does a switch outside the plan's subnet.
+        // A /24 at octet 0 would share box addresses with the default
+        // subnet's own switch.
+        assert_eq!(plan.loopback_slice_for_switch(carved(0)), None);
+        // A switch outside the plan's subnet.
         let foreign = SwitchSubnet::new(Ipv4Addr::new(10, 0, 1, 0), 24).unwrap();
         assert_eq!(plan.loopback_slice_for_switch(foreign), None);
     }

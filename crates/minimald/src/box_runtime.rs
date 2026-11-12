@@ -532,7 +532,7 @@ pub(crate) fn place_launch_proxy_env(
 /// other transport is a native host.
 pub(crate) fn host_kind_of(transport: crate::net::SwitchTransport) -> paths::HostKind {
     match transport {
-        crate::net::SwitchTransport::HostShuttle { .. } => paths::HostKind::Minvmd,
+        crate::net::SwitchTransport::VmHost => paths::HostKind::Minvmd,
         crate::net::SwitchTransport::LocalSpawn => paths::HostKind::Minimald,
     }
 }

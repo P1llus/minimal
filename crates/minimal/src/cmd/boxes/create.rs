@@ -3774,10 +3774,9 @@ pub(crate) async fn activate_box(
             // minvmd took is otherwise discoverable only from `min ls`. The
             // pre-acquisition state prints nothing: nothing is held yet to name.
             // The reply's two facts are two lines: the answerer's state renders
-            // from the answerer field — even while the proxy is down or its
-            // publish unconfirmed, because the sibling cause no longer displaces
-            // the state — and the proxy's publish outcome, when the reply carries
-            // one, names itself once below, with the surface verdict.
+            // from the answerer field, even while the proxy is down, and the
+            // proxy's publish outcome, when the reply carries one, names
+            // itself once below, with the surface verdict.
             if let Some(reply) = &vm_answerer
                 && let Some(line) = vm_host_answerer_start_line(reply.answerer.clone())
             {

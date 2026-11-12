@@ -27,9 +27,8 @@ use std::time::Duration;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
 use tracing::Instrument as _;
-// gvproxy-switch primitives live in the shared `switch` crate. Re-exported so
-// `minvmd::net::{SwitchSubnet, MacAddr, …}` keeps working.
-pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
+// The switch primitives live in the `switch` crate, which `minimald` links too.
+pub use switch::{MacAddr, SwitchSubnet, render_gvproxy_config};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
@@ -143,8 +142,8 @@ pub struct GvproxyConfig {
 impl GvproxyConfig {
     /// Construct a config for the gvproxy `binary` listening on `switch_socket`.
     ///
-    /// The `-config` YAML defaults to `gvproxy.yaml` alongside `switch_socket`;
-    /// override it with [`with_config_path`](Self::with_config_path).
+    /// The `-config` YAML is written to `gvproxy.yaml` alongside
+    /// `switch_socket`.
     #[must_use]
     pub fn new(binary: PathBuf, switch_socket: PathBuf) -> Self {
         let dir = switch_socket.parent().unwrap_or_else(|| Path::new("."));
@@ -161,24 +160,10 @@ impl GvproxyConfig {
         }
     }
 
-    /// Override the path the gvproxy `-config` YAML is written to.
-    #[must_use]
-    pub fn with_config_path(mut self, config_path: PathBuf) -> Self {
-        self.config_path = config_path;
-        self
-    }
-
     /// Override the switch subnet (default `100.64.0.0/16`).
     #[must_use]
     pub fn with_subnet(mut self, subnet: SwitchSubnet) -> Self {
         self.subnet = subnet;
-        self
-    }
-
-    /// Override the SIGTERM grace period (default [`DEFAULT_TERM_TIMEOUT`]).
-    #[must_use]
-    pub fn with_term_timeout(mut self, term_timeout: Duration) -> Self {
-        self.term_timeout = term_timeout;
         self
     }
 
@@ -190,12 +175,6 @@ impl GvproxyConfig {
     pub fn with_datapath_check_interval(mut self, datapath_check_interval: Duration) -> Self {
         self.datapath_check_interval = datapath_check_interval;
         self
-    }
-
-    /// The path the `-config` YAML is written to.
-    #[must_use]
-    pub fn config_path(&self) -> &Path {
-        &self.config_path
     }
 
     /// The argument vector passed to the gvproxy binary: it reads the subnet +
@@ -1037,7 +1016,7 @@ mod tests {
                 "/run/minvmd/gvproxy-api.token".to_string(),
             ]
         );
-        assert_eq!(cfg.config_path(), Path::new("/run/minvmd/gvproxy.yaml"));
+        assert_eq!(cfg.config_path, Path::new("/run/minvmd/gvproxy.yaml"));
     }
 
     #[test]
@@ -1188,7 +1167,7 @@ mod tests {
         let ip = Ipv4Addr::new(100, 64, 0, 2);
         cfg.write_config(&[(ip, MacAddr::for_switch_ip(ip))])
             .expect("write config");
-        let body = std::fs::read_to_string(cfg.config_path()).expect("read config");
+        let body = std::fs::read_to_string(&cfg.config_path).expect("read config");
         assert!(body.contains("100.64.0.0/16"));
         // The file the host switch reads carries the raised outbound TCP
         // bounds, so a burst of connections from a box is not held to the

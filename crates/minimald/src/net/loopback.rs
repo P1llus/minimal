@@ -1,31 +1,16 @@
-//! The session-start loopback probe (NET-123): bind-probe the reserved local
-//! range before publishing, and report the `127.0.0.1` interim when it is
-//! absent — the verdict the `CreateSession` reply carries and the one the
-//! client re-surfaces the naming advisory on (NET-122).
+//! The session-start loopback probe. It binds every address of the reserved
+//! local range on this daemon's own loopback. The `CreateSession` reply
+//! carries the verdict as `interim_loopback`, and the handler logs it once
+//! per session.
 //!
-//! The probe itself — the walk over the range, the verdict, its summary —
-//! is `switch::loopback`, next to the range constant it probes and shared
-//! with the CLI's `min bug` record, so the daemon's verdict and the bundle's
-//! cannot differ for one host. This module holds what is the daemon's: the
-//! test stand-in the `CreateSession` handler reads.
+//! The probe is `switch::loopback`, which the CLI and the VM host daemon run
+//! too. This daemon is a Linux process, and Linux carries all of `127/8` on
+//! `lo`, so its probe reads the range present. A macOS host's `lo0` can lack
+//! the range, and there the VM host daemon probes its own loopback before it
+//! hands a box an address in the range.
 //!
-//! Whose loopback the probe measures: the daemon's own host, and only that
-//! host. This daemon is a Linux process — running natively, or as the guest
-//! of a libkrun microVM — and on Linux the whole `127/8` is local to `lo`, so
-//! its probe always reads the range present. The absent verdict is a fact
-//! about a *macOS* host's `lo0`, the aliases the privileged step installs,
-//! and the probe that can see them belongs to the microVM host (`minvmd`);
-//! until that lands, a VM-backed daemon's flag stays the guest's verdict.
-//!
-//! What the verdict carries in this change: the reply flag and the one
-//! session-start log line, no more. It does not switch the addresses a
-//! session's boxes publish — those still follow the node (a native node's
-//! boxes already mirror `127.0.0.1`; a VM node's publish their switch
-//! leases), so NET-123's "publish the box at `127.0.0.1`" is the change this
-//! verdict feeds rather than one the flag makes: the per-box allocation over
-//! the range is what has a range address to fall back *from*, and it
-//! consumes this verdict when it lands. `rpc.rs`'s create handler is where
-//! the verdict is read.
+//! This module adds the stand-in a test installs so the handler sees an
+//! absent range.
 
 pub use ::switch::loopback::{RangeProbe, probe};
 

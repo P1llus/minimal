@@ -297,7 +297,6 @@ async fn finish_own_ip_attach(
     ingress: Option<&boxes::IngressPolicy>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
-    let gate = wired.gate.as_ref();
     let lease_ip = lease.ip;
     // The host loopback address this box's declaration publishes on (NET-010):
     // the address a creator handed it, read back from the registry rather than
@@ -327,8 +326,8 @@ async fn finish_own_ip_attach(
                 }
                 None => minimald_rpc::PortHolder::Host,
             };
-            match crate::net::policy::apply_ingress_naming_holders(
-                &control, published, lease_ip, ingress, gate, &yielded, &holder_of,
+            match crate::net::policy::apply_ingress(
+                &control, published, lease_ip, ingress, &yielded, &holder_of,
             )
             .await
             {
@@ -464,7 +463,7 @@ mod tests {
         (200, String::new())
     }
 
-    /// A switch whose attach/detach are pure bookkeeping: `HostShuttle`
+    /// A switch whose attach/detach are pure bookkeeping: `VmHost`
     /// leaves the gvproxy process to `minvmd`, so only the count moves —
     /// the shape a VM-backed host's daemon carries. Carries the same
     /// instance host id the NET-121 proofs build their registry with
@@ -474,10 +473,7 @@ mod tests {
         Arc::new(Mutex::new(
             SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
                 .with_host_id("aaaa1")
-                .with_transport(SwitchTransport::HostShuttle {
-                    cid: crate::net::VSOCK_HOST_CID,
-                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                }),
+                .with_transport(SwitchTransport::VmHost),
         ))
     }
 
@@ -1218,7 +1214,7 @@ mod tests {
             &switch,
             no_link(),
             ControlChannel::Unix(scenario.control_path.clone()),
-            attached.lease,
+            attached,
             crate::net::gvproxy_network::AttachInputs {
                 session_name: "web",
                 policy: None,
@@ -1252,7 +1248,7 @@ mod tests {
             .attach_task_slot(&slots)
             .await
             .expect("the dropped run's slot is free again");
-        assert_eq!(again.lease.ip, slots[0]);
+        assert_eq!(again.ip, slots[0]);
         fake.abort();
     }
 
@@ -1429,7 +1425,6 @@ mod tests {
             FIRST_LEASE,
             3000,
             boxes::IpProto::Tcp,
-            None,
         )
         .await
         .expect("the runtime publish binds");

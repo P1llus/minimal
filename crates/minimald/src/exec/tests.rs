@@ -284,12 +284,8 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
 #[tokio::test]
 async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
     let switch = tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        ),
+        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+            .with_transport(crate::net::SwitchTransport::VmHost),
     );
     let unregistered = record_with(boxes::NetworkMode::OwnIp);
     super::ensure_task_rows_stand(&unregistered, &switch)
@@ -321,19 +317,15 @@ async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
 
 /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
 /// is the case that matters, as it used to arrive as `HostNet`. The switch
-/// is `HostShuttle`, so an own-IP plan is pure bookkeeping.
+/// is `VmHost`, so an own-IP plan is pure bookkeeping.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_task_takes_the_network_of_its_session() {
     use std::sync::Arc;
 
     let switch = Arc::new(tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        ),
+        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+            .with_transport(crate::net::SwitchTransport::VmHost),
     ));
 
     let host = super::task_network(
@@ -404,12 +396,8 @@ async fn a_task_takes_the_network_of_its_session() {
 #[cfg(target_os = "linux")]
 fn vm_host_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
     std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        ),
+        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+            .with_transport(crate::net::SwitchTransport::VmHost),
     ))
 }
 
@@ -496,12 +484,8 @@ async fn a_task_gate_follows_the_egress_default() {
     use std::sync::Arc;
 
     let switch = Arc::new(tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        ),
+        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+            .with_transport(crate::net::SwitchTransport::VmHost),
     ));
     // A bare own-address box: no egress declaration, so its egress is
     // whatever the default resolves for an absent one.

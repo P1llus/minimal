@@ -175,13 +175,8 @@ impl BoxLauncher for MockLauncher {
         // The child is not a job-control one, because the mock's shell is
         // not interactive, so it reads no tty and touches no foreground
         // rights.
-        let leader_child = if self.listen_plan.is_some() {
-            "sleep 60 & "
-        } else {
-            ""
-        };
         let script = format!(
-            r#"{leader_child}while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
         );
         // The shell entrypoint is the echo loop every runtime test drives.
         // An argv entrypoint runs as the spec names it, host-side.

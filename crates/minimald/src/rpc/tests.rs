@@ -1419,8 +1419,6 @@ async fn absent_range_publishes_interim_and_readvises() {
     );
 }
 
-#[allow(clippy::await_holding_lock)]
-#[cfg(target_os = "linux")]
 /// NET-018: once the answerer is serving beside the proxy, the replies
 /// report the one fact that is the daemon's to know — its answerer
 /// bound — and the one log line, emitted the moment the answerer binds,

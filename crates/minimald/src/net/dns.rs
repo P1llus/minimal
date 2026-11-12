@@ -102,14 +102,6 @@ pub const DEFAULT_HOST_ID: &str = "local";
 /// published addresses are the one definition and cannot drift.
 pub use ::switch::RESERVED_LOCAL_RANGE;
 
-/// The TTL every box-zone answer carries, and the ceiling on it (NET-126):
-/// 15 s, short enough that a box published a moment ago is found without
-/// reloading the host resolver. Also the `minimum` the zone's SOA reports for
-/// negatives, so the host resolver caches them at all (NET-124): an
-/// uncacheable negative stalls every lookup on a macOS host, not only the
-/// zone's.
-pub const ANSWER_TTL_SECS: u32 = 15;
-
 /// Whether `addr` is one an A answer in the box zone may carry when the lookup
 /// originates on the host OS (NET-127): an address from the reserved local
 /// range, `127.0.0.1` itself, or one of the node's own addresses.
@@ -630,8 +622,6 @@ pub struct HostnameRegistry {
     /// ([`Self::register_host_net`]). On a VM node the host answers their
     /// names, so this registry's zone holds no address for them.
     host_net: HashSet<SessionId>,
-    /// The session holding each reported lease.
-    by_lease: HashMap<Ipv4Addr, SessionId>,
     /// The zone table's change count and the installed answerer's
     /// acknowledgement of it (NET-011, NET-012): what lets a registration
     /// return only once the name answers there.
@@ -787,7 +777,6 @@ impl HostnameRegistry {
             by_session: HashMap::new(),
             own: HashMap::new(),
             host_net: HashSet::new(),
-            by_lease: HashMap::new(),
             zone_track: ZoneTrack::default(),
         }
     }
@@ -1011,17 +1000,10 @@ impl HostnameRegistry {
         lease: Ipv4Addr,
         ports: BTreeMap<u16, u16>,
     ) -> Option<Hostname> {
-        // Retire the session's previous lease from the lease map, if it had
-        // one: a re-attach takes a new lease and the old one must not name a
-        // session that no longer holds it.
-        if let Some(old) = self.own.get(&session_id) {
-            self.by_lease.remove(&old.lease);
-        }
         let own = OwnAddress {
             lease,
             ports: ports.clone(),
         };
-        self.by_lease.insert(lease, session_id);
         // Recorded before the route is derived from it, so the route this
         // registration installs already targets the lease it is reporting:
         // [`Self::own_route`] reads the box's lease from this map, and a box
@@ -1043,9 +1025,7 @@ impl HostnameRegistry {
     /// Not called by `deregister` itself: a rename withdraws and re-registers
     /// against the same lease.
     pub fn forget_own_address(&mut self, session_id: SessionId) {
-        if let Some(own) = self.own.remove(&session_id) {
-            self.by_lease.remove(&own.lease);
-        }
+        self.own.remove(&session_id);
         self.host_net.remove(&session_id);
         self.host_launches.remove(&session_id);
         self.stopped.remove(&session_id);

@@ -2174,7 +2174,7 @@ async fn answerer_starts_and_serves_the_zone_on_loopback() {
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{RData, RecordType};
 
-    use crate::net::answerer::{AnswerScope, ZoneAnswerer, encode_query};
+    use crate::net::answerer::{ZoneAnswerer, encode_query};
 
     // A free port, handed to the driver the way startup hands it a fixed
     // one: bound and dropped, uncontended in a test binary.
@@ -2200,7 +2200,7 @@ async fn answerer_starts_and_serves_the_zone_on_loopback() {
         .register_host_net(SessionId::nil(), "web");
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
+    let answerer = ZoneAnswerer::new(hostnames);
     crate::traced::spawn(drive_answerer_until_serving(
         state.clone(),
         answerer,
@@ -2271,7 +2271,7 @@ async fn answerer_starts_and_serves_the_zone_on_loopback() {
 async fn answerer_relocates_when_its_default_port_is_busy() {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::net::answerer::{AnswerScope, ZoneAnswerer};
+    use crate::net::answerer::ZoneAnswerer;
 
     // Hold the "default" for the whole test: an OS-picked port this
     // process owns, not the documented one. The `Server::run` tests
@@ -2294,7 +2294,7 @@ async fn answerer_relocates_when_its_default_port_is_busy() {
         .await
         .unwrap();
     let hostnames = state.sessions_manager().await.hostnames();
-    let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
+    let answerer = ZoneAnswerer::new(hostnames);
     crate::traced::spawn(drive_answerer_until_serving(
         state.clone(),
         answerer,

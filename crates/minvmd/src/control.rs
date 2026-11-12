@@ -198,17 +198,13 @@ const MAX_REQUEST_LINE: usize = 64 * 1024;
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) const PUBLISH_TRIES: usize = 3;
 
-/// The hostname proxy's publish state for this VM (T93) — the host fact the
-/// CLI's `min ls` row and session-start message read to *name why* the proxy
-/// is not serving, in the same read that already carries the answerer's
-/// state. Held by the supervisor, written when a start fails on the publish
-/// — a supervisor about to stop, whose fact outlives it exactly as long as
-/// the socket does — or when the VM came up with its publish unconfirmed,
-/// the one entry a later report clears ([`Self::confirm`]).
+/// The hostname proxy's publish state for this VM: why the proxy is not
+/// serving, which `min ls` and the session start read beside the answerer's
+/// state. The supervisor writes the cause when a publish finds the port
+/// held, and the held-port watcher clears it when it publishes the port.
 ///
-/// Shaped like [`AnswererStatus`] — a cloneable cell behind one mutex,
-/// read on the serving thread — because that is the pattern the status
-/// read already serves under.
+/// Shaped like [`AnswererStatus`]: a cloneable cell behind one mutex, read
+/// on the serving thread.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 ///
 /// The second cell is the host ports the proxy serves on (NET-154): the
@@ -274,9 +270,8 @@ impl ProxyPublishStatus {
     /// Every host port the proxy serves on, the preferred first: the
     /// answer to [`BoxControlRequest::ProxyPorts`]. Empty before the start
     /// recorded a port, and for a start that never brought the proxy up.
-    /// Empty too while a down cause is recorded ([`Self::down`]): an
-    /// unconfirmed publish or a port held after the start serves nothing
-    /// the host can vouch for.
+    /// Empty too while a down cause is recorded ([`Self::down`]): a held
+    /// port serves nothing.
     pub(crate) fn serving_ports(&self) -> Vec<u16> {
         if self.down().is_some() {
             return Vec::new();
@@ -913,9 +908,8 @@ fn oversized_listen_notice(line: &str) -> Option<GuestDoorReply> {
 /// own services, read from this daemon's own configuration and never from
 /// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
 /// bridge, the boot marker, the timekeep bridge, the report door and the
-/// telemetry port), the zone answerer's port, the range probe's port, and
-/// the node row's admitted ports, which hold the hostname proxy's port the
-/// host assigned before boot.
+/// telemetry port), the zone answerer's port, and the node row's admitted
+/// ports, which hold the hostname proxy's port the host assigned before boot.
 pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
     let vsock = [
         crate::sock::VSOCK_BRIDGE_PORT,
@@ -929,7 +923,6 @@ pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collection
         .filter_map(|port| u16::try_from(port).ok())
         .collect();
     ports.insert(crate::net::answerer::DEFAULT_ANSWERER_PORT);
-    ports.insert(switch::loopback::RANGE_PROBE_PORT);
     if let Some(node) = boxes.table().by_source(boxes.subnet().daemon_ip().octets()) {
         ports.extend(node.admitted_ports().iter().copied());
     }

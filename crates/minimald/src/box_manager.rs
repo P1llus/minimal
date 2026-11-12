@@ -1432,10 +1432,7 @@ impl BoxManager {
             // dead by a snapshot that predates them.
             let daemon_start = crate::net::dns::unix_now_secs();
             let switch = net_switch.lock().await;
-            let on_switch = matches!(
-                switch.transport(),
-                crate::net::SwitchTransport::HostShuttle { .. }
-            );
+            let on_switch = matches!(switch.transport(), crate::net::SwitchTransport::VmHost);
             // The answerer's record for this host, under the state root every
             // daemon instance on it shares. Unreadable records withhold
             // grants (never guess an address another namespace may hold);

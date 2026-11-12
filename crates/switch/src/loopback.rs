@@ -98,13 +98,6 @@ impl RangeProbe {
     }
 }
 
-/// The host port reserved for probing the reserved local range: fixed and
-/// deliberately obscure, so no box's declaration is likely to name it.
-pub const RANGE_PROBE_PORT: u16 = 21064;
-
-/// A placeholder `remote` for a forward that accepts no connection.
-pub const RANGE_PROBE_REMOTE: &str = "127.0.0.1:1";
-
 /// Every usable address in the reserved local range: host part 1..=254. The
 /// `.0` and `.255` spellings of a /24 are the network and broadcast forms,
 /// and the step that installs the range installs exactly these 254 aliases —

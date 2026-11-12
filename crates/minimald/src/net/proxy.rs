@@ -30,7 +30,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,12 +50,6 @@ use super::policy::Direction;
 /// (NET-025). The one routing listener the daemon opens: the mTLS reverse
 /// proxy that once took the next port up is retired (NET-109).
 pub const DEFAULT_EGRESS_PROXY_PORT: u16 = 7654;
-
-/// The address a pinned deployment's clients are told to point
-/// `HTTP(S)_PROXY` at: loopback, where every `*.min.internal` name is
-/// reachable, on [`DEFAULT_EGRESS_PROXY_PORT`].
-pub const DEFAULT_PROXY_ADDR: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_EGRESS_PROXY_PORT);
 
 /// Upstream port used when a routed authority carries no explicit `:port`.
 const DEFAULT_UPSTREAM_PORT: u16 = 80;
@@ -108,6 +102,10 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
         }
     }
 }
+
+/// The rule the `network policy violation` line names for a request to a
+/// port the box has not published.
+const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
 
 /// The rule a loopback-only refusal names in its `network policy violation`
 /// line (NET-071).
@@ -165,8 +163,9 @@ impl<T: HostRoute> Router<T> {
     /// (including per-PTask loopback port restriction) to a follow-up. Where
     /// mutually-untrusted PTasks share loopback, this is a loopback-SSRF
     /// surface that the follow-up must close.
+    #[cfg(test)]
     #[must_use]
-    pub fn route(&self, authority: &str) -> Option<SocketAddr> {
+    pub(crate) fn route(&self, authority: &str) -> Option<SocketAddr> {
         let (host, port) = split_authority(authority);
         self.resolve(host)?
             .upstream(port.unwrap_or(DEFAULT_UPSTREAM_PORT))
@@ -275,24 +274,16 @@ impl BindFailure {
 /// netns, where the two never meet, and the host port that forwards to it is
 /// minvmd's bind.
 ///
+/// `bound` runs between taking the address and accepting on it, and gets
+/// the address the socket has. Nothing can connect before it returns, so
+/// whatever must hold for the first connection is put in place there.
+///
 /// # Errors
 ///
 /// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
 /// carried inside the failure's reason, and its kind beside it
 /// ([`BindFailure::kind`]).
-pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure> {
-    bind_listener_after(addr, |_| {}).await
-}
-
-/// [`bind_listener`], with a step between taking the address and
-/// accepting on it. `bound` gets the address the socket has. Nothing can
-/// connect before it returns, so whatever must hold for the first
-/// connection is put in place there.
-///
-/// # Errors
-///
-/// As [`bind_listener`].
-pub async fn bind_listener_after(
+pub async fn bind_listener(
     addr: SocketAddr,
     bound: impl FnOnce(SocketAddr),
 ) -> Result<TcpListener, BindFailure> {
@@ -576,7 +567,7 @@ where
             direction = %Direction::Ingress,
             proto = "tcp",
             dst_port = port,
-            rule_matched = ::switch::refusal::NO_INGRESS_MAPPING_RULE,
+            rule_matched = NO_INGRESS_MAPPING_RULE,
             reason,
             status = "403 Forbidden",
             "network policy violation"
@@ -1617,7 +1608,9 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
 /// proxy (NET-019's daemon-side proof).
 #[cfg(test)]
 pub(crate) async fn spawn_backend() -> u16 {
-    let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+    let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .unwrap();
     let port = backend.local_addr().unwrap().port();
     crate::traced::spawn(async move {
         while let Ok((mut sock, _)) = backend.accept().await {
@@ -1650,13 +1643,14 @@ pub(crate) async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     /// The step between bind and listen sees the address the socket has,
     /// and nothing connects before it returns.
     #[tokio::test]
     async fn nothing_connects_to_a_listener_before_its_bound_step_returns() {
         let mut seen = None;
-        let listener = bind_listener_after("127.0.0.1:0".parse().unwrap(), |addr| {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), |addr| {
             let refused = std::net::TcpStream::connect(addr).is_err();
             seen = Some((addr, refused));
         })
@@ -1673,7 +1667,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, RwLock};
 
-    use ::switch::refusal::NO_INGRESS_MAPPING_RULE;
     use boxes::{BoxPolicy, IngressPolicy, IpProto, PortMapping, SessionId};
     use tokio::net::TcpSocket;
 
@@ -2235,7 +2228,7 @@ mod tests {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
-        let listener = bind_listener(addr).await;
+        let listener = bind_listener(addr, |_| {}).await;
         drop(guard);
 
         let failure = listener.expect_err("a bind to a held address must fail");
@@ -2295,7 +2288,7 @@ mod tests {
         // kernel answered with, beside the text.
         let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = held.local_addr().unwrap();
-        let failure = bind_listener(addr)
+        let failure = bind_listener(addr, |_| {})
             .await
             .expect_err("a bind to a held address must fail");
         drop(held);
@@ -2325,7 +2318,7 @@ mod tests {
         // host loopback and listening, before this daemon's bind runs.
         let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = held.local_addr().unwrap();
-        let failure = bind_listener(addr)
+        let failure = bind_listener(addr, |_| {})
             .await
             .expect_err("a held port must be refused, not shared");
         assert_eq!(
@@ -2346,7 +2339,7 @@ mod tests {
         // default the bind keeps on purpose, so it is not pinned here;
         // `SO_REUSEPORT` is never asked for anywhere in the bind, and reading
         // it is the defence against a default that ever changes.
-        let listener = bind_listener((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into())
+        let listener = bind_listener((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into(), |_| {})
             .await
             .expect("a free loopback port binds");
         let value = socket_option(listener.as_raw_fd(), libc::SO_REUSEPORT);
@@ -2416,7 +2409,7 @@ mod tests {
         // restart keeps the documented port its recipes point at, and the
         // socket carries the `SO_REUSEADDR` that made that possible.
         use std::os::fd::AsRawFd as _;
-        let rebound = bind_listener(addr)
+        let rebound = bind_listener(addr, |_| {})
             .await
             .expect("a restart must rebind over the TIME_WAIT sockets its previous run left");
         let value = socket_option(rebound.as_raw_fd(), libc::SO_REUSEADDR);
@@ -2615,7 +2608,9 @@ mod tests {
     #[tokio::test]
     async fn forward_proxy_rewrites_absolute_form_target_to_origin_form() {
         // A backend that records the request head it received, then answers 200.
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
@@ -2668,7 +2663,9 @@ mod tests {
     /// URI authority, and the upstream receives the origin-form request line.
     #[tokio::test]
     async fn absolute_form_uri_authority_overrides_host_header() {
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
@@ -3091,7 +3088,9 @@ mod tests {
     /// rather than the client getting an empty, reset connection.
     #[tokio::test]
     async fn bare_lf_response_is_passed_through_when_the_upstream_closes() {
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
@@ -3122,7 +3121,9 @@ mod tests {
     #[tokio::test]
     async fn proxy_adds_connection_close_when_upstream_omits_it() {
         // A backend that answers without a `Connection` header.
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
@@ -3168,7 +3169,9 @@ mod tests {
     async fn proxy_passes_websocket_upgrade_through() {
         // A backend that answers a websocket upgrade with `101` and then
         // echoes back whatever the client sends after the upgrade.
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
@@ -3258,7 +3261,9 @@ mod tests {
         answer_on: &'static [u8],
         interim: bool,
     ) -> (u16, Arc<Mutex<Vec<u8>>>) {
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
@@ -3964,7 +3969,9 @@ mod tests {
     /// and answers each connection with `200 OK`, returning the port it
     /// listens on and the shared buffer the heads land in.
     async fn spawn_recording_backend() -> (u16, Arc<Mutex<Vec<u8>>>) {
-        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let backend = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);

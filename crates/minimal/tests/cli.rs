@@ -3927,7 +3927,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
 /// T93's sibling, as the list renders it: a reply that carries the
 /// answerer's own state *and* the hostname proxy's publish outcome keeps
 /// both — the DNS SERVICE row prints from the answerer field while the
-/// proxy is down or its publish unconfirmed, and the cause names itself
+/// proxy is down, and the cause names itself
 /// on a `HOSTNAME PROXY` row of its own, never in place of the answerer's
 /// and never claiming to be the live surface. The cause row carries the
 /// blank-line bookkeeping on its own, so it separates the header from the
@@ -3960,7 +3960,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
             answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
             proxy_down: Some(minimald_rpc::ProxyDown {
                 port: 19_911,
-                cause: minimald_rpc::ProxyDownCause::PortHeld,
+                cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder: None },
             }),
         }),
     )
@@ -3990,9 +3990,9 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         "the two rows carry the blank line before the body: {held_ls}"
     );
 
-    // The unconfirmed publish, beside a pre-acquisition answerer: the
-    // answerer row keeps its silence, and the cause row — the only thing
-    // that printed — carries the blank line on its own.
+    // A down proxy beside a pre-acquisition answerer: the answerer row
+    // keeps its silence, and the cause row, the only row that printed,
+    // carries the blank line on its own.
     let mut out = Vec::new();
     format_ls(
         &mut out,
@@ -4006,23 +4006,23 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
             answerer: minimald_rpc::ZoneAnswererStatus::Starting,
             proxy_down: Some(minimald_rpc::ProxyDown {
                 port: 19_917,
-                cause: minimald_rpc::ProxyDownCause::PublishUnconfirmed,
+                cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder: None },
             }),
         }),
     )
     .unwrap();
-    let unconfirmed_ls = String::from_utf8(out).unwrap();
+    let starting_ls = String::from_utf8(out).unwrap();
     assert!(
-        !unconfirmed_ls.contains("DNS SERVICE:"),
-        "the pre-acquisition state still prints no answerer row: {unconfirmed_ls}"
+        !starting_ls.contains("DNS SERVICE:"),
+        "the pre-acquisition state still prints no answerer row: {starting_ls}"
     );
     assert!(
-        unconfirmed_ls.starts_with("HOSTNAME PROXY:  the hostname proxy is not confirmed yet"),
-        "the unconfirmed publish is the row that prints: {unconfirmed_ls}"
+        starting_ls.starts_with("HOSTNAME PROXY:  the hostname proxy is not serving"),
+        "the cause row is the row that prints: {starting_ls}"
     );
     assert!(
-        unconfirmed_ls.contains("\n\nNo active sessions."),
-        "a cause row on its own still separates the header from the body: {unconfirmed_ls}"
+        starting_ls.contains("\n\nNo active sessions."),
+        "a cause row on its own still separates the header from the body: {starting_ls}"
     );
 
     // A reply with no cause prints no proxy row at all — a serving or a
@@ -4060,7 +4060,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
         proxy_down: Some(minimald_rpc::ProxyDown {
             port: 19_911,
-            cause: minimald_rpc::ProxyDownCause::PortHeld,
+            cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder: None },
         }),
     };
     for surface in [resolver::LiveSurface::Native, resolver::LiveSurface::Proxy] {
@@ -4139,7 +4139,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
             answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
             proxy_down: Some(minimald_rpc::ProxyDown {
                 port: 19_911,
-                cause: minimald_rpc::ProxyDownCause::PortHeld,
+                cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder: None },
             }),
         }),
         Some(minimald_rpc::AnswererStatusReply {

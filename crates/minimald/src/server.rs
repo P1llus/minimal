@@ -468,10 +468,7 @@ impl ServerState {
         // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
         // (owned by `minvmd`). DM2 (native Linux): spawn + own gvproxy locally.
         let transport = if config.in_microvm {
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            }
+            crate::net::SwitchTransport::VmHost
         } else {
             crate::net::SwitchTransport::LocalSpawn
         };
@@ -1599,7 +1596,6 @@ async fn reap_if_unfinalized(
     }
 }
 
-#[cfg(target_os = "linux")]
 /// Gives the policy engine what serves a box's endpoints (the resolver
 /// and the hostname proxy) and starts its event and sweep tasks.
 #[cfg(target_os = "linux")]
@@ -2052,12 +2048,9 @@ pub async fn retry_zone_answerer_until_serving(
     addr: SocketAddr,
     retry: RetryBackoff,
 ) {
-    use crate::net::answerer::{AnswerScope, ZoneAnswerer};
+    use crate::net::answerer::ZoneAnswerer;
 
-    let answerer = ZoneAnswerer::new(
-        state.sessions_manager().await.hostnames(),
-        AnswerScope::Native,
-    );
+    let answerer = ZoneAnswerer::new(state.sessions_manager().await.hostnames());
     drive_answerer_until_serving(
         state,
         answerer,
@@ -2109,7 +2102,7 @@ pub(crate) async fn drive_proxy_until_serving(
         let redirect_boxes = |bound: std::net::SocketAddr| {
             crate::net::engine::Engine::current().set_node_hostname_proxy(vec![bound]);
         };
-        match crate::net::proxy::bind_listener_after(addr, redirect_boxes).await {
+        match crate::net::proxy::bind_listener(addr, redirect_boxes).await {
             Ok(listener) => {
                 match listener.local_addr() {
                     Ok(local) => {

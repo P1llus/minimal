@@ -1603,8 +1603,7 @@ impl WatchState {
     /// NET-017: one published listening port closed — or the box stopped,
     /// which closes all of them at once. The gate refuses the port first,
     /// so no new connection crosses the gap between a listener already gone
-    /// and a forward still bound; the forward comes down after. The order a
-    /// revoked declared forwarder's own `revoke` holds (NET-121).
+    /// and a forward still bound; the forward comes down after.
     ///
     /// `reason` names what ended the publication: the listener closing under
     /// the box's own life, the box's stop taking every publication with it,
@@ -1627,10 +1626,7 @@ impl WatchState {
         // the point: between the two, the listener is already gone and the
         // forward still bound, so a connection arriving in that gap would be
         // accepted by the box's own address and delivered to nothing. With
-        // the gate first, that connection is refused at the address instead
-        // — the same order a revoked declared forwarder's `revoke` holds
-        // (NET-121), so both ingress surfaces end a publication the same
-        // way.
+        // the gate first, that connection is refused at the address instead.
         self.plan.gate.withdraw_published(port);
         match unexpose_mapping(&self.plan.control, &mapping).await {
             Ok(closed) => {

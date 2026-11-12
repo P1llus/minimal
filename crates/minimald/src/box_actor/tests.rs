@@ -7224,7 +7224,7 @@ async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
         .expect("the allowed port publishes");
     assert!(
         gate.admits_tcp(3000),
-        "the published port is admitted at the box's relay gate"
+        "the published port is admitted at the box's ingress gate"
     );
     assert!(
         !gate.admits_tcp(3001),
@@ -11081,12 +11081,8 @@ fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -
 /// A switch on a VM host, which a test never reaches.
 fn build_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
     std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        ),
+        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+            .with_transport(crate::net::SwitchTransport::VmHost),
     ))
 }
 

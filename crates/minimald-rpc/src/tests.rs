@@ -1605,8 +1605,7 @@ fn box_control_pending_ask_offer_round_trip() {
         serde_json_lenient::from_str::<BoxControlReply>(&wire)
             .expect("an offered ask decodes as its own reply"),
         offer,
-        "the offer is placed before the recorded-port reply its fields \
-         are a superset of"
+        "an offer decodes as the offer and as no other reply"
     );
 
     // The dismissal: the marker keeps it distinct, both directions.
@@ -1803,14 +1802,14 @@ fn box_control_answerer_status_reply_round_trip() {
         answerer: ZoneAnswererStatus::Holder { port: 7_656 },
         proxy_down: Some(ProxyDown {
             port: 19_911,
-            cause: ProxyDownCause::PortHeld,
+            cause: ProxyDownCause::PortHeldAfterStart { holder: None },
         }),
     });
     let wire = serde_json_lenient::to_string(&with_cause).expect("serialize");
     for field in [
         r#""state":"holder""#,
         r#""port":7656"#,
-        r#""proxy_down":{"port":19911,"cause":"port_held"}"#,
+        r#""proxy_down":{"port":19911,"cause":{"port_held_after_start":{"holder":null}}}"#,
     ] {
         assert!(wire.contains(field), "the reply spells {field}: {wire}");
     }
@@ -1821,22 +1820,6 @@ fn box_control_answerer_status_reply_round_trip() {
     let older_client: ZoneAnswererStatus =
         serde_json_lenient::from_str(&wire).expect("an older client still decodes the reply");
     assert_eq!(older_client, ZoneAnswererStatus::Holder { port: 7_656 });
-
-    // The unconfirmed publish rides the sibling the same way, beside
-    // whatever state the answerer itself is in.
-    let unconfirmed = BoxControlReply::Status(AnswererStatusReply {
-        answerer: ZoneAnswererStatus::Starting,
-        proxy_down: Some(ProxyDown {
-            port: 19_916,
-            cause: ProxyDownCause::PublishUnconfirmed,
-        }),
-    });
-    let wire = serde_json_lenient::to_string(&unconfirmed).expect("serialize");
-    assert!(
-        wire.contains(r#""state":"starting""#) && wire.contains(r#""cause":"publish_unconfirmed""#),
-        "the unconfirmed publish is a sibling of the answerer's state: {wire}"
-    );
-    assert_eq!(round_trip(&unconfirmed), unconfirmed);
 
     // A daemon that predates the sibling — its reply names only the
     // state — decodes with the cause `None` an absent fact is.
@@ -1850,25 +1833,6 @@ fn box_control_answerer_status_reply_round_trip() {
             proxy_down: None,
         }),
         "a reply that says nothing about the proxy reads as no proxy fact"
-    );
-
-    // The old substituting shape still parses: a daemon that answers
-    // the proxy failure in the state's own place is read as exactly
-    // that, claiming no answerer facts the reply does not carry.
-    let substituting: BoxControlReply = serde_json_lenient::from_str(
-        r#"{"state":"proxy_not_serving","port":19911,"cause":"redraws_ran_out"}"#,
-    )
-    .expect("the substituting shape still decodes");
-    assert_eq!(
-        substituting,
-        BoxControlReply::Status(AnswererStatusReply {
-            answerer: ZoneAnswererStatus::ProxyNotServing {
-                port: 19_911,
-                cause: ProxyDownCause::RedrawsRanOut,
-            },
-            proxy_down: None,
-        }),
-        "the state the older daemon answered is the state the read returns"
     );
 
     // A newer daemon's cause this client does not know still yields

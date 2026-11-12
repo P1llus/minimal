@@ -120,12 +120,6 @@ const COMPONENT: &str = "zone-answerer";
 /// answerer port — which the guest now binds nothing on — still is).
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 
-/// The interim answerer channel socket's file name inside a state dir's
-/// host dir. Deliberately beside [`crate::control`]'s
-/// `control.sock` rather than in the `paths` crate: this name only means
-/// something where two VM host daemons share a machine.
-pub const CHANNEL_SOCK_FILE: &str = "answerer.sock";
-
 /// Largest datagram the answerer reads: a DNS query fits far below this
 /// (queries are tens of bytes), and a larger datagram is dropped rather than
 /// buffered unbounded.
@@ -4247,6 +4241,9 @@ mod tests {
     use crate::box_registry::BoxRegistration;
 
     use super::*;
+
+    /// The file name of a channel socket a test binds in its own directory.
+    const CHANNEL_SOCK_FILE: &str = "answerer.sock";
 
     /// The answerer's own row is the sessions zone's host row, byte for byte:
     /// the CLI's liveness query reads [`HOST_NAME`], so a spelling that drifts

@@ -58,11 +58,11 @@ enum Command {
         /// Print status as a JSON object.
         #[arg(long)]
         json: bool,
-        /// Print the read-only row verb's reply for this box's row
-        /// (NET-138) instead of the lifecycle report: the row's switch
-        /// address, egress allow-list and declared and runtime-admitted
-        /// ports while a live box holds the name, the no-row marker once
-        /// none does. Exit 0 when a row answered, 1 on the no-row marker.
+        /// Print the row of the box with this name instead of the
+        /// lifecycle report: its box id, switch address and declared and
+        /// runtime-admitted ports while a live box holds the name, the
+        /// no-row marker once none does. Exit 0 when a row answered, 1 on
+        /// the no-row marker.
         #[arg(long, value_name = "NAME")]
         row: Option<String>,
     },

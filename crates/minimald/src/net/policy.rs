@@ -8,13 +8,11 @@
 //! forward, and the daemon asks it through the guest door
 //! ([`ControlChannel`]).
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -66,7 +64,7 @@ impl ControlChannel {
     pub fn of(switch: &crate::net::SwitchClient, box_id: Option<boxes::BoxId>) -> Self {
         match switch.transport() {
             crate::net::SwitchTransport::LocalSpawn => Self::Unix(switch.control_socket()),
-            crate::net::SwitchTransport::HostShuttle { .. } => Self::VmHost {
+            crate::net::SwitchTransport::VmHost => Self::VmHost {
                 door: super::door::of_this_guest(),
                 box_id,
             },
@@ -356,25 +354,12 @@ impl ExposedMapping {
     }
 }
 
-/// A declared port's forwarder, owned by the daemon: the mapping the switch
-/// bound for it, the internal port it forwards to, and the box's ingress
-/// gate when it has one. [`revoke`](Self::revoke) closes the port at the
-/// gate and then unexposes. The patched switch's unexpose closes the
-/// forward's listener and then the connections that forward accepted, so the
-/// host-side ends of a revoked port's connections close with it, while a
-/// sibling forward to the same internal port keeps its own (NET-017).
+/// A port's forward, owned by the daemon: the mapping the switch bound for
+/// it and the internal port it forwards to.
 #[derive(Clone)]
 pub struct PortForwarder {
     mapping: ExposedMapping,
     internal_port: u16,
-    gate: Option<Arc<super::ingress_gate::IngressGate>>,
-    /// Whether this forwarder's ingress was revoked already — set by
-    /// [`Self::revoke`] once its unbind has *succeeded*, so a revocation that
-    /// failed at the switch stays unrevoked and both a retry and the
-    /// teardown's unexpose still have work to do. `Arc`-shared because the
-    /// forwarder is cloned onto the guard's list and every clone must agree
-    /// on whether the forward stands.
-    revoked: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for PortForwarder {
@@ -388,22 +373,11 @@ impl fmt::Debug for PortForwarder {
 
 impl PortForwarder {
     /// The forwarder of a forward the switch bound at `mapping`.
-    fn bound(
-        mapping: ExposedMapping,
-        internal_port: u16,
-        gate: Option<Arc<super::ingress_gate::IngressGate>>,
-    ) -> Self {
+    fn bound(mapping: ExposedMapping, internal_port: u16) -> Self {
         Self {
             mapping,
             internal_port,
-            gate,
-            revoked: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Marks the forward unbound: the switch dropped it.
-    fn mark_unbound(&self) {
-        self.revoked.store(true, Ordering::Release);
     }
 
     /// The `host:port` the forward is bound on, as [`ExposedMapping`] reads
@@ -428,93 +402,10 @@ impl PortForwarder {
             && self.mapping.local == format!("{published}:{}", mapping.external_port)
     }
 
-    /// The internal port the forward delivers to — the port a revocation
-    /// refuses at the box's ingress gate.
+    /// The internal port the forward delivers to.
     #[must_use]
     pub fn internal_port(&self) -> u16 {
         self.internal_port
-    }
-
-    /// Whether this forwarder's ingress was revoked already: its unbind ran
-    /// and succeeded, so no forward stands at its `local` any more, and
-    /// neither a second revocation nor the teardown's unexpose has anything
-    /// left to ask of the switch.
-    #[must_use]
-    pub fn is_revoked(&self) -> bool {
-        self.revoked.load(Ordering::Acquire)
-    }
-
-    /// Unbinds the forwarder: the gate closes its port, and the switch
-    /// unexposes the forward.
-    ///
-    /// `keep_admitted` names the internal ports that must stay admitted
-    /// because another *live* forwarder still forwards to them — the shape
-    /// two mappings make when both publish the same in-box port. The gate
-    /// closes a port by internal port alone, so a revocation whose internal
-    /// port is in the set leaves the gate as it is. The unbind still
-    /// ends this forward's own connections: the switch tracks what each
-    /// forward accepted, so its unexpose closes this forward's connections
-    /// and leaves the sibling's open (NET-017).
-    ///
-    /// # Errors
-    ///
-    /// The unexpose error, after the gate has closed the port: the caller
-    /// decides whether a failed unbind stops its path.
-    pub async fn revoke(
-        &self,
-        control: &ControlChannel,
-        keep_admitted: &HashSet<u16>,
-    ) -> io::Result<()> {
-        let (host, external_port) = self.host_port().unwrap_or(("", 0));
-        if let Some(gate) = &self.gate {
-            if keep_admitted.contains(&self.internal_port) {
-                // A live sibling forwarder still maps another external port
-                // to this internal port, and closing the port at the gate
-                // would refuse the sibling's new connections too.
-                tracing::info!(
-                    host,
-                    port = external_port,
-                    internal_port = self.internal_port(),
-                    reason = "internal port still served by another forwarder",
-                    "unbinding ingress forwarder"
-                );
-            } else {
-                gate.revoke_port(self.internal_port());
-                tracing::info!(
-                    host,
-                    port = external_port,
-                    internal_port = self.internal_port(),
-                    reason = "ingress revoked",
-                    "unbinding ingress forwarder"
-                );
-            }
-        }
-        match close_forward(control, &self.mapping).await {
-            Ok(closed) => {
-                tracing::info!(
-                    host,
-                    port = external_port,
-                    closed_connections = %closed,
-                    reason = "ingress revoked",
-                    "unbound ingress forwarder"
-                );
-                // Marked only now, when the switch has really dropped the
-                // forward: an unbind that failed leaves the forward standing,
-                // so a retry — and the teardown's unexpose — still have work.
-                self.mark_unbound();
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!(
-                    host,
-                    port = external_port,
-                    error = %e,
-                    reason = "ingress revoked",
-                    "unbinding ingress forwarder failed"
-                );
-                Err(e)
-            }
-        }
     }
 }
 
@@ -523,10 +414,6 @@ impl PortForwarder {
 /// to `ptask_ip`, returning one daemon-owned [`PortForwarder`] per bound
 /// forward (R2.3, R2.4-static, NET-121). The dynamic range, if any, is not
 /// applied here — dynamic port-mapping is split to #553.
-///
-/// `gate` is the box's ingress gate, carried into every forwarder so a later
-/// revocation can close the port there. With `None` a forwarder has no gate
-/// to revoke through.
 ///
 /// `yielded` is the ports the box yields at a shared address (NET-129,
 /// first-come): another box holds each one, so its forward is known state,
@@ -538,8 +425,10 @@ impl PortForwarder {
 /// the name. Only the returned error differs. It carries a
 /// [`minimald_rpc::PortInUseRefusal`] in place of the forwarder's raw
 /// refusal, and its kind is [`io::ErrorKind::AddrInUse`]. The refusal names
-/// the port and its holder (NET-144). Here the holder is always the host.
-/// [`apply_ingress_naming_holders`] reads it from the hostname registry.
+/// the port and its holder. `holder_of` says what holds a taken port. The
+/// attach path passes [`port_holder`] over the hostname registry,
+/// so the refusal names the box whose publish stands at that address and
+/// port, or the host when none does.
 ///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
@@ -555,42 +444,10 @@ pub async fn apply_ingress(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
-    yielded: &[super::dns::SharedPortCollision],
-) -> io::Result<Vec<PortForwarder>> {
-    apply_ingress_naming_holders(
-        control,
-        published,
-        ptask_ip,
-        ingress,
-        gate,
-        yielded,
-        &|_| minimald_rpc::PortHolder::Host,
-    )
-    .await
-}
-
-/// [`apply_ingress`], with `holder_of` to name what holds a taken port
-/// (NET-144). The attach path passes [`port_holder`] over the hostname
-/// registry, so the refusal names the box whose publish stands at that
-/// address and port, or the host when none does.
-///
-/// # Errors
-///
-/// As [`apply_ingress`].
-pub async fn apply_ingress_naming_holders(
-    control: &ControlChannel,
-    published: Ipv4Addr,
-    ptask_ip: Ipv4Addr,
-    ingress: &IngressPolicy,
-    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
-    apply_declared(
-        control, published, ptask_ip, ingress, gate, yielded, holder_of,
-    )
-    .await
+    apply_declared(control, published, ptask_ip, ingress, yielded, holder_of).await
 }
 
 /// Binds the declared forwards of a box on a VM-backed host when finalize
@@ -623,7 +480,6 @@ pub async fn bind_declared_at_publish(
         published,
         switch_address,
         ingress,
-        None,
         yielded,
         holder_of,
     )
@@ -636,7 +492,6 @@ async fn apply_declared(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
@@ -665,11 +520,7 @@ async fn apply_declared(
         )
         .await;
         match opened {
-            Ok(exposed) => bound.push(PortForwarder::bound(
-                exposed,
-                mapping.internal_port,
-                gate.cloned(),
-            )),
+            Ok(exposed) => bound.push(PortForwarder::bound(exposed, mapping.internal_port)),
             Err(e) => {
                 // The failed bind is the failure's own fact, said where it
                 // happened: the declared port, the address it tried to bind
@@ -852,7 +703,6 @@ pub async fn bind_handed_port(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     mapping: &PortMapping,
-    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
 ) -> io::Result<PortForwarder> {
     let exposed = open_forward(
         control,
@@ -862,11 +712,7 @@ pub async fn bind_handed_port(
         minimald_rpc::PublishOrigin::Declared,
     )
     .await?;
-    Ok(PortForwarder::bound(
-        exposed,
-        mapping.internal_port,
-        gate.cloned(),
-    ))
+    Ok(PortForwarder::bound(exposed, mapping.internal_port))
 }
 
 /// Removes every forward in `bound` from the switch's `control_sock` (R2.3
@@ -874,15 +720,9 @@ pub async fn bind_handed_port(
 /// rest still attempted, since teardown runs on the session-end path where there
 /// is no caller left to propagate to. A bound forward that comes down says one
 /// info line (NET-121), naming the port it unbound — the unbind half of the
-/// per-forwarder bind/unbind pair the daemon log carries. A forward a
-/// revocation already unbound is skipped: the switch holds no forward at its
-/// `local` any more, and asking again would read as a teardown failure that
-/// is none.
+/// per-forwarder bind/unbind pair the daemon log carries.
 pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
     for forwarder in bound {
-        if forwarder.is_revoked() {
-            continue;
-        }
         let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
         match close_forward(control, &forwarder.mapping).await {
             Ok(closed) => {
@@ -907,15 +747,11 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
 
 /// Unbinds one forward and says whether the switch let it go: the fallible
 /// twin of [`remove_ingress`], for a caller that keeps tracking a forward the
-/// switch still holds so a later teardown can retry it. A forward already
-/// revoked is already down.
+/// switch still holds so a later teardown can retry it.
 pub async fn unexpose_forwarder(
     control: &ControlChannel,
     forwarder: &PortForwarder,
 ) -> io::Result<()> {
-    if forwarder.is_revoked() {
-        return Ok(());
-    }
     let closed = unexpose_mapping(control, &forwarder.mapping).await?;
     // The caller says why in its own line. This line carries the switch's
     // count, and claims no withdrawal.
@@ -937,7 +773,7 @@ pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortFor
         remove_ingress(control, bound).await;
         return;
     }
-    for forwarder in bound.iter().filter(|forwarder| !forwarder.is_revoked()) {
+    for forwarder in bound {
         let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
         tracing::info!(
             host,
@@ -1354,7 +1190,6 @@ pub async fn expose_dynamic(
     ptask_ip: Ipv4Addr,
     port: u16,
     proto: IpProto,
-    gate: Option<&Arc<super::ingress_gate::IngressGate>>,
 ) -> io::Result<PortForwarder> {
     let mapping = PortMapping {
         external_port: port,
@@ -1370,7 +1205,7 @@ pub async fn expose_dynamic(
     )
     .await;
     match opened {
-        Ok(exposed) => Ok(PortForwarder::bound(exposed, port, gate.cloned())),
+        Ok(exposed) => Ok(PortForwarder::bound(exposed, port)),
         Err(e) => {
             tracing::warn!(
                 port,
@@ -1579,11 +1414,6 @@ pub(crate) const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// streams without closing inside the [`GVPROXY_CONTROL_TIMEOUT`] window.
 const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 
-/// Minimum gap between emitted policy-violation warnings: one minute, matching
-/// R2.2's "first drop per PTask per rule per minute" rate-limit window, so a
-/// flood of dropped frames cannot spam the log.
-const WARN_MIN_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Which direction a policy violation occurred in, for R2.7's `direction`
 /// structured field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1600,188 +1430,6 @@ impl fmt::Display for Direction {
             Self::Egress => "egress",
             Self::Ingress => "ingress",
         })
-    }
-}
-
-/// The transport a policy-violating frame is logged under, for R2.7's `proto`
-/// structured field.
-///
-/// Wider than [`IpProto`] because a dropped frame is not always an IP packet
-/// whose protocol number is one of the three a policy can name: IPv6 is
-/// dropped as a whole family (NET-082) with no single L4 protocol to name, a
-/// truncated or non-IP frame has no header to read one from, and a policy can
-/// be violated by a protocol Minimal does not model (any other IPv4 number).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Proto {
-    /// `IpProto::Tcp` — IPv4 protocol 6.
-    Tcp,
-    /// `IpProto::Udp` — IPv4 protocol 17.
-    Udp,
-    /// `IpProto::Icmp` — IPv4 protocol 1.
-    Icmp,
-    /// Any other IPv4 protocol number, logged as `ip-<number>`.
-    Other(u8),
-    /// An IPv6 frame, dropped as a family (NET-082) before any L4 protocol is
-    /// read.
-    Ipv6,
-    /// Nothing to name: a frame with no IPv4 header to read a protocol from
-    /// (a truncated or non-IP frame), or a protocol Minimal does not model
-    /// under a name.
-    None,
-}
-
-impl Proto {
-    /// The transport Minimal's policies name, for a frame whose protocol is
-    /// one of the three declared ones. `IpProto` is `#[non_exhaustive]`, so a
-    /// variant a later sessions adds has no rendering here yet and logs as
-    /// `none` — the drop still names its rule.
-    #[must_use]
-    pub fn from_ipproto(proto: IpProto) -> Self {
-        match proto {
-            IpProto::Tcp => Self::Tcp,
-            IpProto::Udp => Self::Udp,
-            IpProto::Icmp => Self::Icmp,
-            _ => Self::None,
-        }
-    }
-
-    /// The transport of an IPv4 frame carrying protocol number `number`: the
-    /// three declared protocols by name, any other number by number.
-    #[must_use]
-    pub fn from_ipv4_number(number: u8) -> Self {
-        match number {
-            6 => Self::Tcp,
-            17 => Self::Udp,
-            1 => Self::Icmp,
-            other => Self::Other(other),
-        }
-    }
-}
-
-impl fmt::Display for Proto {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tcp => f.write_str("tcp"),
-            Self::Udp => f.write_str("udp"),
-            Self::Icmp => f.write_str("icmp"),
-            Self::Other(n) => write!(f, "ip-{n}"),
-            Self::Ipv6 => f.write_str("ipv6"),
-            Self::None => f.write_str("none"),
-        }
-    }
-}
-
-/// Rate-limited emitter plumbing for policy-violation warnings (R2.7).
-///
-/// The rate limit is keyed by **box and rule** (NET-062: "first drop per
-/// PTask per rule per minute"): one box's flood never silences another box's
-/// single drop, and a box hitting several rules in the same minute is still
-/// heard once per rule. A DNS refusal adds the refused name to its key
-/// ([`warn_dns_refusal`](Self::warn_dns_refusal)), because its requirement
-/// is the name and the answer per refusal.
-#[derive(Debug, Default)]
-pub struct PolicyWarnLimiter {
-    last: Mutex<HashMap<String, HashMap<String, Instant>>>,
-}
-
-impl PolicyWarnLimiter {
-    /// A fresh limiter that has never emitted for any box or rule.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether enough time has elapsed since the last emission for `session_id`
-    /// under `rule` to warn again at `now`, recording `now` as that pair's last
-    /// emission when it returns `true`.
-    ///
-    /// Split from [`warn`](Self::warn) so the rate-limit decision is testable
-    /// without a real clock or a `tracing` subscriber.
-    #[must_use]
-    pub fn should_warn_at(&self, session_id: &str, rule: &str, now: Instant) -> bool {
-        let mut last = self.last.lock().expect("PolicyWarnLimiter mutex poisoned");
-        let Some(emit) = last.get_mut(session_id) else {
-            last.entry(session_id.to_string())
-                .or_default()
-                .insert(rule.to_string(), now);
-            return true;
-        };
-        match emit.get(rule) {
-            Some(prev) if now.duration_since(*prev) < WARN_MIN_INTERVAL => false,
-            _ => {
-                emit.insert(rule.to_string(), now);
-                true
-            }
-        }
-    }
-
-    /// Emits a rate-limited `tracing::warn!` for a policy violation, carrying
-    /// R2.7's required structured fields: the `session_id`, the `direction` of
-    /// the offending traffic, the `remote_addr` it was to/from (rendered as
-    /// `none` when the frame had no IP destination to read, as for an IPv6 or
-    /// truncated drop), its `proto`, the `dst_port` the traffic targeted
-    /// (`None` when the drop is not about a port), and the `rule_matched`.
-    /// The port is a structured field only, never part of `rule_matched`: it
-    /// must not fragment the per-rule rate-limit key. Returns whether a warning
-    /// was emitted (vs. suppressed by the rate limit).
-    pub fn warn(
-        &self,
-        session_id: &str,
-        direction: Direction,
-        remote_addr: Option<SocketAddr>,
-        proto: Proto,
-        dst_port: Option<u16>,
-        rule_matched: &str,
-    ) -> bool {
-        if self.should_warn_at(session_id, rule_matched, Instant::now()) {
-            let remote_addr = remote_addr.map_or_else(|| "none".to_string(), |a| a.to_string());
-            tracing::warn!(
-                session_id,
-                %direction,
-                %remote_addr,
-                %proto,
-                dst_port,
-                rule_matched,
-                "network policy violation"
-            );
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Emits a rate-limited `tracing::warn!` for a DNS answer the rebinding
-    /// intersection refused (NET-067): an address a name the box's policy
-    /// allowed resolved into the box's `deny_subnets` or the infrastructure
-    /// deny set, and so is never admitted — the name and the answer, the two
-    /// things the spec requires the refusal to carry.
-    ///
-    /// Rate-limited per **box, name and rule**, not per box and rule like
-    /// [`warn`](Self::warn): the requirement is the name and the answer per
-    /// refusal, so a second refused name inside the interval is its own line
-    /// rather than silenced by the first's, while a burst of the *same*
-    /// name's refusals stays one line per rule. The limiter's key is built
-    /// from both, and the `rule_matched` field it logs is the rule alone.
-    pub fn warn_dns_refusal(
-        &self,
-        session_id: &str,
-        name: &str,
-        answer: Ipv4Addr,
-        rule_matched: &str,
-    ) -> bool {
-        let key = format!("{rule_matched}:{name}");
-        if self.should_warn_at(session_id, &key, Instant::now()) {
-            tracing::warn!(
-                session_id,
-                name,
-                %answer,
-                rule_matched,
-                "an allowed name resolved into a refused range"
-            );
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -2191,78 +1839,10 @@ mod tests {
     }
 
     #[test]
-    fn warn_limiter_suppresses_within_the_interval() {
-        let limiter = PolicyWarnLimiter::new();
-        let t0 = Instant::now();
-        // First emission at t0 is allowed; a second within the interval is not.
-        assert!(limiter.should_warn_at("box", "egress-undeclared-subnet", t0));
-        assert!(!limiter.should_warn_at(
-            "box",
-            "egress-undeclared-subnet",
-            t0 + Duration::from_millis(10)
-        ));
-        // Once the interval has elapsed it warns again.
-        assert!(limiter.should_warn_at("box", "egress-undeclared-subnet", t0 + WARN_MIN_INTERVAL));
-    }
-
-    #[test]
-    fn warn_limiter_keys_by_box_and_rule() {
-        // NET-062 rate-limits "per PTask per rule": one box's flood never
-        // silences another box's single drop, and a box hitting several rules in
-        // the same minute is still heard once per rule.
-        let limiter = PolicyWarnLimiter::new();
-        let t0 = Instant::now();
-        assert!(limiter.should_warn_at("box-a", "rule-1", t0));
-        // A different box under the same rule is not silenced by box-a's drop…
-        assert!(limiter.should_warn_at("box-b", "rule-1", t0));
-        // …and neither is the same box under a different rule.
-        assert!(limiter.should_warn_at("box-a", "rule-2", t0));
-        // But the same pair within the interval still is.
-        assert!(!limiter.should_warn_at("box-a", "rule-1", t0 + Duration::from_secs(1)));
-        assert!(!limiter.should_warn_at("box-b", "rule-1", t0 + Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn warn_limiter_keys_ingress_drops_by_rule_not_port() {
-        // The destination port is a structured field, not part of the rule
-        // key: a port scan against one box is one rule hit per minute, not one
-        // emission per probed port.
-        let limiter = PolicyWarnLimiter::new();
-        let src = Some(SocketAddr::from(([100, 64, 0, 9], 40000)));
-        let emitted = [80u16, 8080]
-            .into_iter()
-            .filter(|&dst_port| {
-                limiter.warn(
-                    "box",
-                    Direction::Ingress,
-                    src,
-                    Proto::from_ipproto(IpProto::Tcp),
-                    Some(dst_port),
-                    "no ingress mapping",
-                )
-            })
-            .count();
-        assert_eq!(emitted, 1);
-    }
-
-    #[test]
     fn direction_renders_the_r2_7_field_values() {
         // R2.7 spells the `direction` structured field `egress`/`ingress`.
         assert_eq!(Direction::Egress.to_string(), "egress");
         assert_eq!(Direction::Ingress.to_string(), "ingress");
-    }
-
-    #[test]
-    fn proto_renders_the_r2_7_field_values() {
-        // R2.7 names the three declared protocols `tcp`/`udp`/`icmp`; anything
-        // else a box can send is rendered as its IPv4 protocol number, and the
-        // family/truncation drops (which carry no L4 protocol) as `ipv6`/`none`.
-        assert_eq!(Proto::from_ipproto(IpProto::Tcp).to_string(), "tcp");
-        assert_eq!(Proto::from_ipproto(IpProto::Udp).to_string(), "udp");
-        assert_eq!(Proto::from_ipproto(IpProto::Icmp).to_string(), "icmp");
-        assert_eq!(Proto::from_ipv4_number(47).to_string(), "ip-47");
-        assert_eq!(Proto::Ipv6.to_string(), "ipv6");
-        assert_eq!(Proto::None.to_string(), "none");
     }
 
     #[test]
@@ -2315,6 +1895,7 @@ mod tests {
     mod closed_on_retract {
         use super::forwarder_probe::read_request;
         use super::*;
+        use std::sync::Mutex;
         use tokio::net::UnixListener;
         use tokio::sync::mpsc;
         use tracing::Instrument as _;
@@ -2652,15 +2233,10 @@ mod tests {
             let sock = dir.path().join("gvproxy.sock");
             let forwarder = forwarder_answering_once(sock.clone(), 200, "");
 
-            let tracked = bind_handed_port(
-                &ControlChannel::Unix(sock),
-                PUBLISHED,
-                LEASE,
-                &mapping(),
-                None,
-            )
-            .await
-            .expect("the switch bound the forward");
+            let tracked =
+                bind_handed_port(&ControlChannel::Unix(sock), PUBLISHED, LEASE, &mapping())
+                    .await
+                    .expect("the switch bound the forward");
 
             let request = forwarder.await.expect("the fake forwarder ran");
             assert!(
@@ -2686,8 +2262,6 @@ mod tests {
 
     // ---- who unbinds a declared forward when its box stops (NET-121) ------
     mod declared_release {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
         use std::time::Duration;
 
         use super::super::{
@@ -2704,8 +2278,6 @@ mod tests {
                     protocol: "tcp".to_string(),
                 },
                 internal_port: 80,
-                gate: None,
-                revoked: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2823,8 +2395,8 @@ mod tests {
                 PUBLISHED,
                 LEASE,
                 &ingress(&[18080, 18999]),
-                None,
                 &[],
+                &|_| minimald_rpc::PortHolder::Host,
             )
             .await
             {
@@ -2928,8 +2500,8 @@ mod tests {
                 PUBLISHED,
                 LEASE,
                 &ingress(&[18080, 18181]),
-                None,
                 &[],
+                &|_| minimald_rpc::PortHolder::Host,
             )
             .await
             {

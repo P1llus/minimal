@@ -43,7 +43,7 @@
 //! [`super::dns::HostnameRegistry::zone_table`] for the state-dump half).
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,8 +58,8 @@ use tokio_util::sync::CancellationToken;
 
 use boxes::core::zone_answer;
 
-use super::SwitchSubnet;
 use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry, ZoneEntry};
+#[cfg(any(test, feature = "test-support"))]
 use super::proxy::BindFailure;
 
 /// Port the box-zone answerer listens on, above the hostname proxy on
@@ -125,53 +125,14 @@ impl Zone for std::sync::RwLock<HostnameRegistry> {
     }
 }
 
-/// Which datagram sources the answerer serves (NET-006): the zone leaves the
-/// machine with no answer, not even a refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnswerScope {
-    /// A native host (DM2): the listener binds host loopback, so only
-    /// loopback peers reach it at all. The source is still checked per
-    /// datagram, so a misbound socket can never serve the zone to the
-    /// network.
-    Native,
-    /// Inside a microVM (DM1/3/4): loopback and the host-local switch's own
-    /// subnet are both on-machine — the guest's only fabric is the switch —
-    /// and anything outside them is off-host and gets nothing.
-    ///
-    /// Since the VM host daemon took over the zone for a VM-backed host, no
-    /// production daemon serves under this scope: `start_host_proxies` starts
-    /// the answerer only on a native host, and the in-VM daemon answers
-    /// nothing (`minvmd`'s host answerer answers the zone from the host's
-    /// table instead). The variant stays the scope's complete answer — the
-    /// on-machine rule it states is the one the shared decision's origin
-    /// input carries, and the tests below still prove it.
-    Microvm { subnet: SwitchSubnet },
-}
-
-impl AnswerScope {
-    /// Whether a datagram from `peer` originated on this machine (NET-006).
-    fn allows(&self, peer: SocketAddr) -> bool {
-        match peer.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() => true,
-            IpAddr::V4(ip) => match self {
-                Self::Native => false,
-                Self::Microvm { subnet } => (u32::from(subnet.network())
-                    ..=u32::from(subnet.broadcast()))
-                    .contains(&u32::from(ip)),
-            },
-            IpAddr::V6(ip) => ip.is_loopback(),
-        }
-    }
-
-    /// The shared decision's origin for a datagram from `peer`: on this
-    /// machine, or off it (NET-006) — the one input the decision is gated on
-    /// that does not come off the query itself.
-    fn origin_for(&self, peer: SocketAddr) -> zone_answer::Origin {
-        if self.allows(peer) {
-            zone_answer::Origin::OnMachine
-        } else {
-            zone_answer::Origin::OffMachine
-        }
+/// Where a datagram from `peer` came from. Only a loopback peer is on this
+/// machine: the socket binds host loopback, and the source is still checked
+/// per datagram, so a misbound socket never serves the zone to the network.
+fn origin_of(peer: SocketAddr) -> zone_answer::Origin {
+    if peer.ip().is_loopback() {
+        zone_answer::Origin::OnMachine
+    } else {
+        zone_answer::Origin::OffMachine
     }
 }
 
@@ -181,8 +142,6 @@ impl AnswerScope {
 pub struct ZoneAnswerer<T: Zone = HostnameRegistry> {
     /// The shared registry the sessions manager registers boxes into.
     zone: Arc<T>,
-    /// Which datagram sources this answerer serves (NET-006).
-    scope: AnswerScope,
     /// The zone's SOA, carried by every negative (NET-124), built once.
     soa: Record,
 }
@@ -194,20 +153,17 @@ impl<T: Zone> Clone for ZoneAnswerer<T> {
     fn clone(&self) -> Self {
         Self {
             zone: Arc::clone(&self.zone),
-            scope: self.scope.clone(),
             soa: self.soa.clone(),
         }
     }
 }
 
 impl<T: Zone> ZoneAnswerer<T> {
-    /// Builds an answerer over the shared `zone` table, serving the sources
-    /// `scope` allows.
+    /// Builds an answerer over the shared `zone` table.
     #[must_use]
-    pub fn new(zone: Arc<T>, scope: AnswerScope) -> Self {
+    pub fn new(zone: Arc<T>) -> Self {
         Self {
             zone,
-            scope,
             soa: zone_soa(),
         }
     }
@@ -257,7 +213,7 @@ impl<T: Zone> ZoneAnswerer<T> {
             } else {
                 zone_answer::RecordType::Other
             },
-            origin: self.scope.origin_for(peer),
+            origin: origin_of(peer),
         };
         let view = self.zone_view(asked);
         match zone_answer::decide(&lookup, &view) {
@@ -475,6 +431,7 @@ pub(crate) fn zone_soa() -> Record {
 /// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
 /// carried inside the failure's reason, and its kind beside it
 /// ([`BindFailure::kind`]).
+#[cfg(any(test, feature = "test-support"))]
 pub async fn bind_answerer(addr: SocketAddr) -> Result<UdpSocket, BindFailure> {
     match UdpSocket::bind(addr).await {
         Ok(socket) => {
@@ -1830,7 +1787,7 @@ async fn host_the_interim(
         // frees the port. Its exit is reported rather than polled, so the
         // wait below hears a serve loop that ends on its own (its receive
         // returned an error) as readily as one a release stopped.
-        let answerer = ZoneAnswerer::new(Arc::clone(registry), AnswerScope::Native);
+        let answerer = ZoneAnswerer::new(Arc::clone(registry));
         serve_stop = CancellationToken::new();
         let stop = serve_stop.clone();
         let serve_done = Arc::new(Notify::new());
@@ -2179,13 +2136,13 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
 mod tests {
     use std::collections::BTreeMap;
     use std::io;
+    use std::net::IpAddr;
     use std::sync::{Arc, Mutex};
 
     use tracing_subscriber::fmt::MakeWriter;
 
     use boxes::SessionId;
 
-    use super::super::DEFAULT_SUBNET;
     use super::super::dns::{DEFAULT_HOST_ID, is_host_answerable};
     use super::*;
 
@@ -2246,11 +2203,8 @@ mod tests {
 
     /// The answerer over a fresh registry, sharing it the way the daemon does
     /// (behind the same `RwLock` the sessions manager hands out).
-    fn answerer(
-        reg: HostnameRegistry,
-        scope: AnswerScope,
-    ) -> ZoneAnswerer<std::sync::RwLock<HostnameRegistry>> {
-        ZoneAnswerer::new(Arc::new(std::sync::RwLock::new(reg)), scope)
+    fn answerer(reg: HostnameRegistry) -> ZoneAnswerer<std::sync::RwLock<HostnameRegistry>> {
+        ZoneAnswerer::new(Arc::new(std::sync::RwLock::new(reg)))
     }
 
     /// A source on this machine: a host resolver's datagram, from loopback.
@@ -2262,12 +2216,6 @@ mod tests {
     /// interface.
     fn off_host() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 5353)
-    }
-
-    /// A source inside a microVM's switch fabric: an `OwnIp` box's lease, one
-    /// more L2 client on the host-local switch.
-    fn on_fabric() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7)), 5353)
     }
 
     /// Sends `datagram` to `answerer` as if from `peer` and decodes the reply
@@ -2284,11 +2232,8 @@ mod tests {
     /// NET-006: the zone answers only lookups that originate on this machine.
     /// A datagram from another host gets nothing at all — not even a REFUSED,
     /// which would tell a scanner a DNS server is here — and one warn line per
-    /// refusal names the source and the name it asked for. Natively the
-    /// listener binds loopback, so the per-datagram check is defense in depth;
-    /// inside a microVM the listener binds in-guest and the host-local switch
-    /// fabric is the fabric the gvproxy forwarder rides, so a fabric peer is
-    /// on-machine while an off-fabric one still gets nothing.
+    /// refusal names the source and the name it asked for. The listener
+    /// binds loopback, so the per-datagram check is defense in depth.
     #[test]
     fn min_internal_zone_not_served_off_host() {
         let buf = CaptureWriter::default();
@@ -2298,7 +2243,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let native = answerer(registry(false), AnswerScope::Native);
+        let native = answerer(registry(false));
         let lookup = encode_query("web.min.internal.", RecordType::A);
 
         // A lookup from this machine is answered.
@@ -2330,24 +2275,6 @@ mod tests {
             log.contains("off-host"),
             "the refusal must say why, got: {log}"
         );
-
-        // In a microVM the listener binds in-guest: the host-local switch
-        // fabric is on-machine (the gvproxy forwarder rides it), and a source
-        // off that fabric is off-host all the same.
-        let vm = answerer(
-            registry(true),
-            AnswerScope::Microvm {
-                subnet: DEFAULT_SUBNET,
-            },
-        );
-        assert!(
-            exchange(&vm, on_fabric(), &lookup).is_some(),
-            "a fabric peer is on this machine"
-        );
-        assert!(
-            exchange(&vm, off_host(), &lookup).is_none(),
-            "a source off the fabric is off-host"
-        );
     }
 
     /// NET-007: no certificate and no audit record names a `*.min.internal`
@@ -2365,7 +2292,7 @@ mod tests {
     /// log for the answerer to reach for.
     #[test]
     fn min_internal_absent_from_certs_and_audit() {
-        let answ = answerer(registry(false), AnswerScope::Native);
+        let answ = answerer(registry(false));
         for rtype in [
             RecordType::AAAA,
             RecordType::CERT,
@@ -2424,7 +2351,7 @@ mod tests {
     /// zone's SOA in every negative.
     #[test]
     fn non_a_in_zone_query_is_nodata() {
-        let native = answerer(registry(false), AnswerScope::Native);
+        let native = answerer(registry(false));
         for rtype in [
             RecordType::AAAA,
             RecordType::HTTPS,
@@ -2456,12 +2383,7 @@ mod tests {
 
         // A name held at a switch lease (an `OwnIp` box on a VM host): even an
         // A lookup is NODATA, not NXDOMAIN — held-without-A is not absent.
-        let vm = answerer(
-            registry(true),
-            AnswerScope::Microvm {
-                subnet: DEFAULT_SUBNET,
-            },
-        );
+        let vm = answerer(registry(true));
         let reply = exchange(
             &vm,
             on_host(),
@@ -2500,7 +2422,7 @@ mod tests {
             Ipv4Addr::new(127, 0, 0, 9),
             std::collections::BTreeSet::new(),
         );
-        let native = answerer(reg, AnswerScope::Native);
+        let native = answerer(reg);
         for name in ["host.min.internal.", "HOST.Min.Internal."] {
             let reply = exchange(&native, on_host(), &encode_query(name, RecordType::A))
                 .expect("the host row is answered");
@@ -2544,7 +2466,7 @@ mod tests {
     /// lookup on a macOS host, not only the zone's.
     #[test]
     fn negative_answers_carry_zone_authority() {
-        let native = answerer(registry(false), AnswerScope::Native);
+        let native = answerer(registry(false));
         let negatives = [
             ("web.min.internal.", RecordType::AAAA), // NODATA: non-A on a held name
             ("min.internal.", RecordType::A),        // NODATA: the apex
@@ -2574,12 +2496,7 @@ mod tests {
 
         // Held-without-A (an `OwnIp` box on a VM host) is a negative the same
         // way: its NODATA carries the SOA too.
-        let vm = answerer(
-            registry(true),
-            AnswerScope::Microvm {
-                subnet: DEFAULT_SUBNET,
-            },
-        );
+        let vm = answerer(registry(true));
         let reply = exchange(
             &vm,
             on_host(),
@@ -2597,7 +2514,7 @@ mod tests {
     /// answerer fabricating an NXDOMAIN for someone else's namespace.
     #[test]
     fn unknown_in_zone_name_is_nxdomain() {
-        let native = answerer(registry(false), AnswerScope::Native);
+        let native = answerer(registry(false));
 
         let reply = exchange(
             &native,
@@ -2629,7 +2546,7 @@ mod tests {
         // A withdrawn name is unknown again once its session ends.
         let shared = Arc::new(std::sync::RwLock::new(registry(false)));
         shared.write().unwrap().deregister("web");
-        let answ = ZoneAnswerer::new(Arc::clone(&shared), AnswerScope::Native);
+        let answ = ZoneAnswerer::new(Arc::clone(&shared));
         let reply = exchange(
             &answ,
             on_host(),
@@ -2663,7 +2580,7 @@ mod tests {
     /// answer outlives the registry's next change.
     #[test]
     fn zone_answers_carry_short_ttl() {
-        let native = answerer(registry(false), AnswerScope::Native);
+        let native = answerer(registry(false));
         for (name, rtype) in [
             ("web.min.internal.", RecordType::A),     // a positive A answer
             ("web.min.internal.", RecordType::HTTPS), // NODATA
@@ -2727,7 +2644,7 @@ mod tests {
         );
 
         // Through the answerer: a `HostNet` box answers the host loopback...
-        let native = answerer(registry(false), AnswerScope::Native);
+        let native = answerer(registry(false));
         let reply = exchange(
             &native,
             on_host(),
@@ -2759,12 +2676,7 @@ mod tests {
         // The same `OwnIp` box on a VM host routes at its lease inside the
         // fabric; the host is told nothing — no A answer, and the zone table
         // reports the name held without an address, not absent.
-        let vm = answerer(
-            registry(true),
-            AnswerScope::Microvm {
-                subnet: DEFAULT_SUBNET,
-            },
-        );
+        let vm = answerer(registry(true));
         let reply = exchange(
             &vm,
             on_host(),

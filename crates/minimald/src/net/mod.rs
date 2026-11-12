@@ -50,38 +50,20 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
 
-// The gvproxy-switch primitives (subnet arithmetic, MAC derivation, wire
-// constants, `-config` rendering) live in the shared `switch` crate.
-// Re-exported here so `minimald::net::{SwitchSubnet, MacAddr, …}` keeps working.
-pub use ::switch::{
-    DEFAULT_MTU, DEFAULT_SUBNET, InvalidPrefix, MacAddr, SwitchSubnet, VSOCK_GVPROXY_SHUTTLE_PORT,
-    VSOCK_HOST_CID, render_gvproxy_config,
-};
-// The default address plan itself (NET-102) is imported un-re-exported: the
-// plan is a definition the allocation below draws from, not part of the
-// `minimald::net::*` vocabulary callers consume.
-use ::switch::AddressPlan;
+// The switch primitives live in the `switch` crate, which `minvmd` links too.
+pub use ::switch::{DEFAULT_SUBNET, MacAddr, SwitchSubnet, render_gvproxy_config};
 
-/// How the per-host gvproxy switch is reached, selected by deployment model.
-///
-/// On DM2 (native Linux) `minimald` owns gvproxy: it is spawned locally and
-/// PTask taps attach over its `-listen` UNIX socket. On DM1/3/4 (a libkrun VM)
-/// `minvmd` owns the host gvproxy and the in-guest `minimald` does **not**
-/// spawn one. Keeping the two as an enum (rather than an `Option<sock>` plus
-/// a bool) makes the illegal "spawn locally *and* use the host's" state
-/// unrepresentable.
+/// Whose gvproxy this daemon's switch is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SwitchTransport {
-    /// DM2: `minimald` spawns + owns gvproxy locally; taps attach over its UNIX
-    /// control socket.
+    /// A native node: the daemon spawns gvproxy and draws its own addresses.
     #[default]
     LocalSpawn,
-    /// DM1/3/4: gvproxy runs on the host (owned by `minvmd`). `minimald`
-    /// never spawns gvproxy here.
-    HostShuttle { cid: u32, port: u32 },
+    /// A VM guest: the VM host runs gvproxy, hands every address and holds
+    /// the forwards. The daemon spawns nothing.
+    VmHost,
 }
 
 /// How long to wait for gvproxy's control socket to appear after spawn.
@@ -200,14 +182,6 @@ pub struct PtaskLease {
     pub epoch: u64,
 }
 
-/// Returned by [`SwitchClient::attach`].
-pub struct AttachResult {
-    /// The allocated IP/MAC for this PTask's tap device.
-    pub lease: PtaskLease,
-    /// Fires (`true`) when gvproxy exits unexpectedly.
-    pub exit_signal: watch::Receiver<bool>,
-}
-
 /// The sub-run of `subnet`'s PTask run this daemon **self-allocates** from:
 /// the run's lower half, `[first_ptask, midpoint]`, as an inclusive
 /// `(first, last)` pair — the hand-out run above it keeps one address
@@ -222,7 +196,7 @@ pub struct AttachResult {
 /// change both together — each side's tests pin the default plan's split
 /// literally.
 ///
-/// A daemon whose switch is the VM host's ([`SwitchTransport::HostShuttle`])
+/// A daemon whose switch is the VM host's ([`SwitchTransport::VmHost`])
 /// draws nothing from it (NET-138): every own-address box arrives handed,
 /// and every task run attaches at a task address registered with its box
 /// ([`SwitchClient::attach_task_slot`]). [`SwitchClient::attach`] refuses
@@ -331,16 +305,6 @@ impl IpAllocator {
             epoch: 0,
             leases: Vec::new(),
         }
-    }
-
-    /// Creates an allocator over the switch crate's default address plan
-    /// (NET-102): the block an un-enrolled host self-allocates box addresses
-    /// from, because no control plane has handed it one. The plan's switch
-    /// subnet is where the leases come from; its reserved local range is where
-    /// their published addresses will.
-    #[must_use]
-    pub fn for_default_plan() -> Self {
-        Self::new(AddressPlan::default().switch_subnet())
     }
 
     /// The subnet this allocator draws from.
@@ -495,15 +459,6 @@ impl IpAllocator {
     }
 }
 
-impl Default for IpAllocator {
-    /// The plan an un-enrolled host self-allocates from (NET-102): an
-    /// allocator with no subnet named draws from the switch crate's default
-    /// plan rather than an implicit constant of its own.
-    fn default() -> Self {
-        Self::for_default_plan()
-    }
-}
-
 ///
 /// The switch is reference-counted against the set of attached `OwnIp` PTasks:
 /// it is spawned lazily on the first attach and torn down after the last
@@ -520,11 +475,8 @@ pub struct SwitchClient {
     /// Number of attached PTasks; the switch runs while this is non-zero.
     attached: usize,
     /// The running gvproxy child, if started. Always `None` in
-    /// [`SwitchTransport::HostShuttle`] mode (the host owns gvproxy).
+    /// [`SwitchTransport::VmHost`] mode (the host owns gvproxy).
     child: Option<Child>,
-    /// Signals attached PTasks when gvproxy exits unexpectedly. Replaced
-    /// on each unexpected exit so new attachers get a fresh receiver.
-    exit_tx: watch::Sender<bool>,
     /// Whose gvproxy the switch is: spawned here (DM2) or the VM host's
     /// (DM1/3/4).
     transport: SwitchTransport,
@@ -532,39 +484,36 @@ pub struct SwitchClient {
     /// the daemon's own id, which its hostname registry answers under.
     /// Defaults to the single-daemon id `local`.
     host_id: String,
-    /// Whether [`Self::attach`] may draw on a [`SwitchTransport::HostShuttle`]
+    /// Whether [`Self::attach`] may draw on a [`SwitchTransport::VmHost`]
     /// switch: never in production (NET-138), and only for a test that
-    /// drives the draw path over a shuttle switch without a host to hand it
+    /// drives the draw path over a VM-host switch without a host to hand it
     /// addresses ([`Self::allowing_self_allocation`]).
     #[cfg(test)]
     allow_self_allocation: bool,
 }
 
 impl SwitchClient {
-    /// Builds a switch supervisor. Does not spawn anything; the first
-    /// [`attach`](Self::attach) starts gvproxy. The allocator draws from the
-    /// switch crate's default address plan (NET-102) — the block an un-enrolled
-    /// host self-allocates from.
+    /// A switch supervisor over the default subnet, for a test.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(binary: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
-        Self::with_subnet(binary, state_dir, AddressPlan::default().switch_subnet())
+    pub(crate) fn new(binary: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
+        Self::with_subnet(binary, state_dir, DEFAULT_SUBNET)
     }
 
-    /// Builds a switch supervisor over a non-default subnet.
+    /// Builds a switch supervisor over `subnet`. Does not spawn anything;
+    /// the first [`attach`](Self::attach) starts gvproxy.
     #[must_use]
     pub fn with_subnet(
         binary: impl Into<PathBuf>,
         state_dir: impl Into<PathBuf>,
         subnet: SwitchSubnet,
     ) -> Self {
-        let (exit_tx, _) = watch::channel(false);
         Self {
             binary: binary.into(),
             state_dir: state_dir.into(),
             allocator: IpAllocator::new(subnet),
             attached: 0,
             child: None,
-            exit_tx,
             transport: SwitchTransport::default(),
             host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
             #[cfg(test)]
@@ -589,7 +538,7 @@ impl SwitchClient {
 
     /// Sets whose gvproxy the switch is. The DM2 default is
     /// [`SwitchTransport::LocalSpawn`]; in a libkrun VM (DM1/3/4) the caller sets
-    /// [`SwitchTransport::HostShuttle`] so this `minimald` uses the host-owned
+    /// [`SwitchTransport::VmHost`] so this `minimald` uses the host-owned
     /// gvproxy instead of spawning one in-guest.
     #[must_use]
     pub fn with_transport(mut self, transport: SwitchTransport) -> Self {
@@ -597,7 +546,7 @@ impl SwitchClient {
         self
     }
 
-    /// Lets [`Self::attach`] draw on a [`SwitchTransport::HostShuttle`]
+    /// Lets [`Self::attach`] draw on a [`SwitchTransport::VmHost`]
     /// switch, for a test of the draw path that has no host to hand it
     /// addresses. Production has no such switch (NET-138).
     #[cfg(test)]
@@ -625,8 +574,9 @@ impl SwitchClient {
     }
 
     /// How many `OwnIp` PTasks are attached; the switch runs while non-zero.
+    #[cfg(test)]
     #[must_use]
-    pub fn attached(&self) -> usize {
+    pub(crate) fn attached(&self) -> usize {
         self.attached
     }
 
@@ -665,8 +615,7 @@ impl SwitchClient {
     /// Allocates an address for a new PTask, (re)writes the config, ensures
     /// gvproxy is running, and bumps the attach count.
     ///
-    /// Returns an [`AttachResult`] with the allocated lease and a receiver that
-    /// fires `true` when gvproxy exits unexpectedly.
+    /// Returns the allocated lease.
     ///
     /// Only a native switch draws ([`SwitchTransport::LocalSpawn`],
     /// NET-102). On a switch the VM host owns, every address is the host's
@@ -676,14 +625,14 @@ impl SwitchClient {
     /// # Errors
     ///
     /// [`NetError::SelfAllocationRetired`] on a
-    /// [`SwitchTransport::HostShuttle`] switch; propagates config-write,
+    /// [`SwitchTransport::VmHost`] switch; propagates config-write,
     /// spawn, and socket-readiness failures.
-    pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
+    pub async fn attach(&mut self) -> Result<PtaskLease, NetError> {
         if !self.self_allocates() {
             return Err(NetError::SelfAllocationRetired);
         }
         let lease = self.allocator.allocate()?;
-        // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
+        // DM2 spawns + configures gvproxy locally; DM1/3/4 (VmHost) leaves
         // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
         // only track the attach count.
         if matches!(self.transport, SwitchTransport::LocalSpawn) {
@@ -698,31 +647,16 @@ impl SwitchClient {
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch"
         );
-        let exit_signal = self.exit_tx.subscribe();
-        Ok(AttachResult { lease, exit_signal })
+        Ok(lease)
     }
 
-    /// Attaches a PTask with the switch address the host handed it (T66)
-    /// instead of drawing one: the box was registered on the host-side table
-    /// keyed by this address, so the daemon reuses it and mints nothing.
-    ///
-    /// The handed address is recorded like an allocated one — it joins the
-    /// static-lease table the switch is configured from
-    /// ([`IpAllocator::hand`]) — and leaves with the attach: [`Self::detach`]
-    /// withdraws it, so the same box's re-attach re-hands it. That re-handed
-    /// address comes from the host's persisted row — the registration
-    /// allocated it into the host-side table — and detach never touches that
-    /// row: the daemon-side lease ends with the attach, the host-side row
-    /// does not. What this daemon cannot yet check is that the address it
-    /// is handed is still the row's for this box: the host-row
-    /// check by box id — the same address for the same box, a refusal on
-    /// mismatch — lands with the box id in the registration (T44, #1660,
-    /// NET-133), which names it as the gap; until then this daemon attaches
-    /// with whatever the create request carries. A drawn lease, by
-    /// contrast, is reused only under a new epoch and after the reuse
-    /// quarantine ([`IpAllocator::allocate`]). Everything else matches
-    /// [`Self::attach`], including the DM2 config/spawn steps and the
-    /// attach count.
+    /// Attaches a PTask at the switch address the VM host handed its box,
+    /// and draws nothing. The lease joins the static-lease table
+    /// ([`IpAllocator::hand`]) and leaves with the attach
+    /// ([`Self::detach`]), so the same box re-attaches at the same address.
+    /// The address is the one the create request carries. This daemon does
+    /// not check it against the host's row. The spawn steps and the attach
+    /// count are those of [`Self::attach`].
     ///
     /// # Errors
     ///
@@ -733,9 +667,9 @@ impl SwitchClient {
     /// [`NetError::HandedAddressCollision`] when an attach still holds the
     /// handed address; propagates config-write, spawn, and socket-readiness
     /// failures as [`Self::attach`] does.
-    pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<AttachResult, NetError> {
+    pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<PtaskLease, NetError> {
         let lease = self.allocator.hand(handed)?;
-        // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
+        // DM2 spawns + configures gvproxy locally; DM1/3/4 (VmHost) leaves
         // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
         // only track the attach count — same shape as [`Self::attach`].
         if matches!(self.transport, SwitchTransport::LocalSpawn) {
@@ -750,8 +684,7 @@ impl SwitchClient {
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch at its handed address"
         );
-        let exit_signal = self.exit_tx.subscribe();
-        Ok(AttachResult { lease, exit_signal })
+        Ok(lease)
     }
 
     /// Attaches a task run at one of the task addresses the host registered
@@ -771,7 +704,7 @@ impl SwitchClient {
     /// [`NetError::TaskSlotsBusy`] when every slot is held,
     /// [`NetError::NoTaskAddresses`] as above; otherwise what
     /// [`Self::attach_handed`] or [`Self::attach`] returns.
-    pub async fn attach_task_slot(&mut self, slots: &[Ipv4Addr]) -> Result<AttachResult, NetError> {
+    pub async fn attach_task_slot(&mut self, slots: &[Ipv4Addr]) -> Result<PtaskLease, NetError> {
         if slots.is_empty() {
             if !self.self_allocates() {
                 return Err(NetError::NoTaskAddresses {
@@ -849,22 +782,10 @@ impl SwitchClient {
             // not connect to a dead socket (R1.4 unexpected-exit handling).
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    tracing::error!(
-                        ?status,
-                        "gvproxy exited unexpectedly; signalling attached PTasks"
-                    );
-                    // Replace the channel so future attachers get a fresh receiver
-                    // while all current receivers fire and know to tear down.
-                    let (new_tx, _) = watch::channel(false);
-                    let old_tx = std::mem::replace(&mut self.exit_tx, new_tx);
-                    let _ = old_tx.send(true);
+                    tracing::error!(?status, "gvproxy exited unexpectedly; starting it again");
                     self.child = None;
-                    // Do NOT reset self.attached: old PTasks will call detach()
-                    // as they observe the exit signal, decrementing the counter
-                    // naturally. Resetting here races with new-generation
-                    // attachers and can cause a stale detach() to saturating_sub
-                    // the new generation's count to 0, triggering a spurious
-                    // stop() on a live switch.
+                    // `attached` stays: the PTasks attached before the exit
+                    // still detach, and each detach counts down once.
                 }
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(NetError::Io(e)),
@@ -1017,46 +938,6 @@ mod tests {
         assert_eq!(second.ip, Ipv4Addr::new(100, 64, 0, 3));
         assert_ne!(first.ip, second.ip);
         assert_eq!(a.leases().len(), 2);
-    }
-
-    #[test]
-    fn allocator_uses_default_plan() {
-        // NET-102: an un-enrolled host self-allocates box addresses from the
-        // switch crate's default plan, so an allocator with no subnet named
-        // draws from that plan rather than a constant of minimald's own.
-        let plan = AddressPlan::default();
-        let mut a = IpAllocator::for_default_plan();
-        assert_eq!(a.subnet(), plan.switch_subnet());
-        // The first lease is the plan's first allocatable box address...
-        let lease = a.allocate().unwrap();
-        assert_eq!(lease.ip, Ipv4Addr::from(plan.switch_subnet().first_ptask()));
-        assert_eq!(lease.ip, Ipv4Addr::new(100, 64, 0, 2));
-        // ...and the default allocator is the same one.
-        assert_eq!(
-            IpAllocator::default().allocate().unwrap().ip,
-            Ipv4Addr::new(100, 64, 0, 2)
-        );
-        // The plan's reserved local range — where those boxes' published
-        // addresses come from on the host's loopback — is the same block the
-        // zone's published names answer at (NET-127). One definition now: the
-        // answerer re-exports the switch crate's constant, so this asserts the
-        // plan is built from the range it serves rather than bridging two
-        // constants that could drift.
-        assert_eq!(
-            plan.reserved_local_range(),
-            crate::net::dns::RESERVED_LOCAL_RANGE
-        );
-        // Every loopback slice the plan pairs with one of its switches stays
-        // inside that range, so a published box answers on the host's
-        // loopback, at an address no other switch on the host holds.
-        let (range_net, range_prefix) = plan.reserved_local_range();
-        let range_first = u32::from(range_net);
-        let range_len = 1u32 << (32 - range_prefix);
-        for index in 0..plan.switch_capacity() {
-            let slice = plan.switch_slice(index).unwrap().loopback();
-            assert!(u32::from(slice.first()) >= range_first);
-            assert!(u32::from(slice.last()) < range_first + range_len);
-        }
     }
 
     #[test]
@@ -1281,24 +1162,6 @@ mod tests {
     }
 
     #[test]
-    fn subnet_rejects_overly_narrow_prefix() {
-        assert!(matches!(
-            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30),
-            Err(InvalidPrefix(30))
-        ));
-    }
-
-    #[test]
-    fn subnet_rejects_overly_wide_prefix() {
-        // A prefix wider than /8 lets the high octet vary, which the derived MAC
-        // does not cover, so the constructor rejects it to keep MACs unique.
-        assert!(matches!(
-            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 7),
-            Err(InvalidPrefix(7))
-        ));
-    }
-
-    #[test]
     fn config_contains_subnet_gateway_and_leases() {
         let mut a = IpAllocator::new(SwitchSubnet::default());
         let lease = a.allocate().unwrap();
@@ -1329,65 +1192,51 @@ mod tests {
     }
 
     #[test]
-    fn with_transport_selects_host_shuttle() {
-        let switch = SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            SwitchTransport::HostShuttle {
-                cid: VSOCK_HOST_CID,
-                port: VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        );
-        assert_eq!(
-            switch.transport(),
-            SwitchTransport::HostShuttle { cid: 2, port: 1024 }
-        );
+    fn with_transport_selects_vm_host() {
+        let switch = SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+            .with_transport(SwitchTransport::VmHost);
+        assert_eq!(switch.transport(), SwitchTransport::VmHost);
     }
 
     /// A switch the VM host owns, pointed at a gvproxy binary that does not
-    /// exist: `minvmd` owns gvproxy in HostShuttle mode, so nothing here may
+    /// exist: `minvmd` owns gvproxy in VmHost mode, so nothing here may
     /// try to spawn it.
-    fn host_shuttle_switch(dir: &std::path::Path) -> SwitchClient {
-        SwitchClient::new("/nonexistent/gvproxy-binary", dir.join("gvproxy")).with_transport(
-            SwitchTransport::HostShuttle {
-                cid: VSOCK_HOST_CID,
-                port: VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        )
+    fn vm_host_switch(dir: &std::path::Path) -> SwitchClient {
+        SwitchClient::new("/nonexistent/gvproxy-binary", dir.join("gvproxy"))
+            .with_transport(SwitchTransport::VmHost)
     }
 
     /// The first `n` addresses of the default plan's hand-out run: the
     /// upper half the VM host hands boxes and task addresses from.
     fn handed_addresses(n: u32) -> Vec<Ipv4Addr> {
-        let (_, reserve_last) = self_allocation_run(AddressPlan::default().switch_subnet());
+        let (_, reserve_last) = self_allocation_run(DEFAULT_SUBNET);
         (1..=n).map(|k| Ipv4Addr::from(reserve_last + k)).collect()
     }
 
     #[tokio::test]
-    async fn host_shuttle_attach_handed_without_spawning_gvproxy() {
-        // In HostShuttle mode `minvmd` owns gvproxy, so a handed attach must
+    async fn vm_host_attach_handed_without_spawning_gvproxy() {
+        // In VmHost mode `minvmd` owns gvproxy, so a handed attach must
         // not try to spawn the (here nonexistent) binary: it records the
         // lease and only tracks the attach count. A LocalSpawn switch
         // pointed at the same missing binary would instead fail in
         // `ensure_running`.
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut switch = host_shuttle_switch(dir.path());
+        let mut switch = vm_host_switch(dir.path());
         let handed = handed_addresses(1)[0];
-        let result = switch
-            .attach_handed(handed)
-            .await
-            .expect("host-shuttle attach");
-        assert_eq!(result.lease.ip, handed);
+        let lease = switch.attach_handed(handed).await.expect("VM-host attach");
+        assert_eq!(lease.ip, handed);
         // No gvproxy child was spawned; detach decrements the count and
         // withdraws the lease with the attach.
-        switch.detach(result.lease).await.expect("detach");
+        switch.detach(lease).await.expect("detach");
     }
 
     /// NET-138's hard guarantee: on a switch the VM host owns, the daemon
     /// draws nothing — a draw is refused, telling the user to re-activate,
     /// and leaves no lease and no attach behind.
     #[tokio::test]
-    async fn host_shuttle_switch_refuses_self_allocation() {
+    async fn vm_host_switch_refuses_self_allocation() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut switch = host_shuttle_switch(dir.path());
+        let mut switch = vm_host_switch(dir.path());
         let Err(err) = switch.attach().await else {
             panic!("a switch the VM host owns draws nothing");
         };
@@ -1447,15 +1296,15 @@ mod tests {
     #[tokio::test]
     async fn own_ip_task_attaches_at_a_handed_task_address() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut switch = host_shuttle_switch(dir.path());
+        let mut switch = vm_host_switch(dir.path());
         let slots = handed_addresses(2);
         let first = switch.attach_task_slot(&slots).await.expect("a free slot");
-        assert_eq!(first.lease.ip, slots[0]);
+        assert_eq!(first.ip, slots[0]);
         let second = switch.attach_task_slot(&slots).await.expect("a free slot");
-        assert_eq!(second.lease.ip, slots[1], "a held slot is skipped");
-        switch.detach(first.lease).await.expect("detach");
+        assert_eq!(second.ip, slots[1], "a held slot is skipped");
+        switch.detach(first).await.expect("detach");
         let again = switch.attach_task_slot(&slots).await.expect("a freed slot");
-        assert_eq!(again.lease.ip, slots[0], "the freed slot is taken again");
+        assert_eq!(again.ip, slots[0], "the freed slot is taken again");
     }
 
     /// Every task address held: the run is refused with how many are in
@@ -1463,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn own_ip_task_refused_when_no_task_address_free() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut switch = host_shuttle_switch(dir.path());
+        let mut switch = vm_host_switch(dir.path());
         let slots = handed_addresses(2);
         for _ in &slots {
             switch.attach_task_slot(&slots).await.expect("a free slot");
