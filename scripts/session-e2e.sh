@@ -198,9 +198,10 @@
 #                                    Allow publishes, whose deny records
 #                                    nothing — a later expose asks again —
 #                                    nobody attached is refused), the deny
-#                                    box refuses with nothing recorded on
-#                                    the host, every decision is a line in
-#                                    the host audit, and with two named
+#                                    box refuses and asks the host for
+#                                    nothing, every publish the host is
+#                                    asked for is a line in the host
+#                                    audit, and with two named
 #                                    VMs an expose inside a box on the
 #                                    non-default VM publishes there, found
 #                                    by the flagless attach through the
@@ -3184,9 +3185,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     fail
   fi
-  # The guard's withdrawal request is the only writer of this row's end — no
-  # sandbox exists yet, so no shuttle connection has ever opened and the gate's
-  # attachment-end drainer has nothing to report — but `box_row_end_record`
+  # The guard's withdrawal request is the only writer of this row's end,
+  # because no sandbox exists yet, but `box_row_end_record`
   # still takes either shape, for the row that ends before the request lands
   # (a respawned daemon, say).
   for _ in $(seq 1 40); do
@@ -7154,10 +7154,13 @@ answerer_service_teardown() {
     sudo -n rm -rf "/Library/PrivilegedHelperTools/Minimal.app" \
       "/Library/PrivilegedHelperTools/Minimal.app.old" >/dev/null 2>&1 || true
   else
-    # The same script installs the unit that re-creates the resolver link
-    # at boot. The link itself is reverted by the case that made it.
     sudo -n systemctl disable --now minzoned.socket \
-      minzoned.service minzone0-link.service >/dev/null 2>&1 || true
+      minzoned.service >/dev/null 2>&1 || true
+    # The same script installs the unit that re-creates the resolver link
+    # at boot. The link itself is reverted by the case that made it. A call
+    # of its own, because one unit that is gone already fails the whole
+    # command and would leave the service running.
+    sudo -n systemctl disable --now minzone0-link.service >/dev/null 2>&1 || true
     sudo -n rm -f /etc/systemd/system/minzoned.socket \
       /etc/systemd/system/minzoned.service \
       /etc/systemd/system/minzone0-link.service \
@@ -7165,12 +7168,12 @@ answerer_service_teardown() {
     sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
     sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
     sudo -n systemctl reset-failed minzoned.socket \
-      minzoned.service minzone0-link.service >/dev/null 2>&1 || true
+      minzoned.service >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed minzone0-link.service >/dev/null 2>&1 || true
   fi
   sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
-  # And the directory it sat in, when the command made it and it is now
-  # empty (systemd's RuntimeDirectory= removes /run/minimal on stop itself;
-  # the macOS run dir is the command's mkdir). rmdir never removes a
+  # And the directory it sat in, when it is now empty. On Linux the policy
+  # loader's socket is in /run/minimal too, and rmdir never removes a
   # directory something else still uses.
   sudo -n rmdir "$(dirname -- "$ANSWERER_SERVICE_CHANNEL")" >/dev/null 2>&1 || true
   ANSWERER_SERVICE_CHANNEL=""
@@ -15148,6 +15151,16 @@ proof_bep_audit_http_and_messages_closed() {
   fi
 }
 
+# Whether the exec error in $2 is the daemon's own refusal to start a box
+# with a credentialed upstream. It starts none while it cannot deliver the
+# box's flows to the proxy, and says which setting it cannot apply. Records
+# case $1 as a KNOWN GAP then.
+credentialed_box_gap() {
+  # shellcheck disable=SC2016 # the backticks are the daemon's text
+  grep -qF -- 'sets `secrets`, which this version of Minimal cannot apply' "$2" 2>/dev/null || return 1
+  known_gap "$1" "the daemon starts no box with a credentialed upstream: its network policy sets \`secrets\`, which this version of Minimal cannot apply"
+}
+
 # Proxy-variable proof: a box whose [session.network.bep] steering is
 # proxy_env starts with its own address and a credentialed upstream, and its
 # environment carries the proxy variables. The two cases start the box the
@@ -15155,7 +15168,9 @@ proof_bep_audit_http_and_messages_closed() {
 # records the case as NOT RUN. The box declares no grant, so the case needs no
 # sign-in and no running proxy: it reads the variables, never a connection
 # through them.
-# $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
+# $1: the case name. Leaves the box's `env` output in $WORK/$1.env. Returns
+# 1 after recording the case as a KNOWN GAP when the daemon starts no box
+# with a credentialed upstream.
 bep_proxy_env_box_env() {
   local pe_case="$1" pe_sid pe_out
   PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlpenv.XXXXXX)"
@@ -15177,10 +15192,11 @@ bep_proxy_env_box_env() {
   pe_sid="$(printf '%s\n' "$pe_out" | tail -n1 | tr -d '\r')"
   if ! mnl session exec "$pe_sid" sh -c 'env' \
     >"$WORK/$pe_case.env" 2>"$WORK/$pe_case.exec.err"; then
-    echo "::error::'min session exec' in the proxy_env box failed"
-    cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
     mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
     rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    credentialed_box_gap "$pe_case" "$WORK/$pe_case.exec.err" && return 1
+    echo "::error::'min session exec' in the proxy_env box failed"
+    cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
     fail
   fi
   tr -d '\r' <"$WORK/$pe_case.env" >"$WORK/$pe_case.env.tmp" && mv "$WORK/$pe_case.env.tmp" "$WORK/$pe_case.env"
@@ -15201,7 +15217,7 @@ proof_bep_proxy_env_and_no_proxy_are_set() {
     return 0
   fi
   local pe_env pe_https pe_http pe_no
-  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set
+  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set || { echo "::endgroup::"; return 0; }
   pe_env="$WORK/bep_proxy_env_and_no_proxy_are_set.env"
   pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
   pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
@@ -15234,7 +15250,7 @@ proof_bep_proxy_env_sets_node_use_env_proxy() {
     return 0
   fi
   local pe_env pe_node
-  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy
+  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy || { echo "::endgroup::"; return 0; }
   pe_env="$WORK/bep_proxy_env_sets_node_use_env_proxy.env"
   pe_node="$(bep_env_value "$pe_env" NODE_USE_ENV_PROXY)"
   if [ "$pe_node" != "1" ]; then
@@ -16056,10 +16072,9 @@ PY
 # published is refused within 5 s, never timed out. The github-only case
 # above holds the connect-time conjunction's shape — its unpublished-port
 # zone leg included — on every lane that has a switch; THIS case is the VM
-# host's own half of the same requirement, driven where the fabric it
-# describes exists: boxes the VM host daemon registered, the in-guest relay
-# that answers their SYNs, and the host gate that fronts it. Three legs,
-# one transcript line each:
+# host's own half of the same requirement, driven where its parts exist:
+# boxes the VM host daemon registered, and the forwards it binds for their
+# published ports. Three legs, one transcript line each:
 #
 #   * the peer leg — a peer box connects to the target's UNPUBLISHED port by
 #     name and must be refused with the kernel's own connection-refused
@@ -16108,9 +16123,8 @@ PY
 #     `<name>.min.internal` to the target's published port, every proxy
 #     variable stripped from curl's environment, and the marker answers.
 #     Where that holds, the host's own connect through the same name to the
-#     UNPUBLISHED port must get the same refusal — the leg that shows the
-#     host gate passing a host-originated SYN through to the relay that
-#     resets it. Where it does not (no lane points this host's own resolver
+#     UNPUBLISHED port must get the same refusal: the name is the published
+#     address, where no forward is bound at that port. Where it does not (no lane points this host's own resolver
 #     at the answerer, so no box name resolves from the host's curl), the
 #     leg prints the observed fact and asserts nothing: the WHERE clause is
 #     the requirement's own, and a skip that says what it could not assert
@@ -16145,13 +16159,12 @@ proof_unpublished_port_refused_on_vm_host() {
   local upr_marker="UNPUB_TARGET_OK"
   echo "::group::an unpublished port is refused on a VM-backed host (NET-014)"
 
-  # This case is the VM lanes': the in-guest relay it drives and the host
-  # gate that fronts it exist only where the CLI is VM-backed. A native host's
-  # own relay refuses the same SYN — the github-only case's zone legs carry
-  # that half on a native lane — so a native run skips rather than prove the
-  # native path twice.
+  # This case is the VM lanes': the VM host daemon whose forwards it reads
+  # exists only where the CLI is VM-backed. The github-only case's zone legs
+  # carry the refusal on a native lane, so a native run skips rather than
+  # prove the native path twice.
   if [ -z "$E2E_VM" ]; then
-    echo "unpublished-port refusal on a VM host SKIPPED (native target: the in-guest relay this case drives and the host gate that fronts it exist only where the CLI is VM-backed; a native relay's own refusal is the github-only case's half on that lane)"
+    echo "unpublished-port refusal on a VM host SKIPPED (native target: the VM host daemon whose forwards this case reads exists only where the CLI is VM-backed; the github-only case carries the refusal on that lane)"
     echo "::endgroup::"
     return 0
   fi
@@ -16429,7 +16442,7 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_ans_port=""
   for _ in $(seq 1 40); do
     upr_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE:.*on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$upr_ans_port" ] && break
     sleep 0.25
@@ -16557,7 +16570,7 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_hctl_body="$(cat "$WORK/upr-hctl.body" 2>/dev/null || true)"
   if [ "$upr_hctl_rc" -eq 6 ]; then
     upr_name_leg="skipped (the name $upr_t_name.min.internal did not resolve from the host, curl exit 6)"
-    echo "name leg: SKIPPED (no published name reaches the box from this host — $upr_t_name.min.internal did not resolve from the host with no proxy settings, curl exit 6: this host's resolver is not pointed at the box zone's answerer. Where one is, the host's own connect through the name to the unpublished port must get the same refusal — the host gate passing that SYN through to the relay that resets it)"
+    echo "name leg: SKIPPED (no published name reaches the box from this host — $upr_t_name.min.internal did not resolve from the host with no proxy settings, curl exit 6: this host's resolver is not pointed at the box zone's answerer. Where one is, the host's own connect through the name to the unpublished port must get the same refusal, because no forward is bound at that port)"
   elif [ "$upr_hctl_rc" -ne 0 ] || [ "${upr_hctl_status:-}" != "HTTP:200" ] \
      || [[ "$upr_hctl_body" != *"$upr_marker"* ]]; then
     upr_name_leg="skipped (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>})"
@@ -16596,8 +16609,8 @@ proof_unpublished_port_refused_on_vm_host() {
       cat "$WORK/upr-href.err" 2>/dev/null || true
       fail
     fi
-    upr_name_leg="refused in ${upr_href_ms} ms (curl exit $upr_href_rc, the host gate passing this SYN through to the relay that reset it)"
-    echo "name leg: the host's connect through $upr_t_name.min.internal:$upr_closed_port (the published name, the unpublished port) -> the same refusal, in ${upr_href_ms} ms (curl exit $upr_href_rc), the host gate passing this SYN through to the relay that reset it; curl: ${upr_href_err:-<none>}"
+    upr_name_leg="refused in ${upr_href_ms} ms (curl exit $upr_href_rc, no forward being bound at that port)"
+    echo "name leg: the host's connect through $upr_t_name.min.internal:$upr_closed_port (the published name, the unpublished port) -> the same refusal, in ${upr_href_ms} ms (curl exit $upr_href_rc), no forward being bound at that port; curl: ${upr_href_err:-<none>}"
     upr_print_net_since "$upr_before" 'no ingress mapping'
   fi
 
@@ -17564,12 +17577,16 @@ proof_own_ip_deny_all_box_answers_published_port() {
   fi
 
   # The request origin: a host-address box, sharing its host's loopback —
-  # which is how it reaches the proxy at all, on every lane.
+  # which is how it reaches the proxy at all, on every lane. It lists the
+  # two boxes it asks the proxy for: in a guest a box reaches a peer only
+  # by a name it lists, and the proxy judges the request by the same rules.
   DA_ORIGIN_SEED_DIR="$(hook_mktemp /tmp/mnldo.XXXXXX)"
   hook_seed_preamble > "$DA_ORIGIN_SEED_DIR/minimal.toml"
   mkdir "$DA_ORIGIN_SEED_DIR/.git"
   da_origin_sid="$(cd "$DA_ORIGIN_SEED_DIR" && mnl session activate . --no-prompt \
-    --name "$DA_ORIGIN_NAME" 2>"$WORK/da-origin-activate.err")" || {
+    --name "$DA_ORIGIN_NAME" \
+    --allow-dns-hosts "$DA_TARGET_NAME.min.internal" \
+    --allow-dns-hosts "$DA_SIBLING_NAME.min.internal" 2>"$WORK/da-origin-activate.err")" || {
     echo "::error::'min session activate' for the deny-all answer proof's origin box failed"
     echo "--- stderr ---"; cat "$WORK/da-origin-activate.err" 2>/dev/null || true
     fail
@@ -18843,8 +18860,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 #
 # The case runs whole on every lane, never by a skip. The allow box's
 # publish rides the lane the box is on: on a VM lane the in-VM daemon
-# reports it over the bridged guest report door and the VM host daemon
-# admits it against the host-held grant the create registered (T94) —
+# asks the VM host daemon for it over the guest door, and the VM host
+# admits it against the host-held grant the create registered —
 # the same publish, the same reply, the same listing, decided by a host
 # gate instead of the stance alone. The deny box declares the same range
 # on every lane, so its listing carries a declared stance and range with no
@@ -19197,9 +19214,9 @@ PY
 # transcript names which ran.
 #
 # The case runs whole on every lane, never by a skip. The target holds an
-# allow stance everywhere now (T94): on a VM lane the watcher's publish of
-# the in-range listen rides the bridged guest report door to the VM host
-# daemon, which admits it against the host-held grant the create
+# allow stance everywhere: on a VM lane the watcher asks the VM host
+# daemon over the guest door to publish the in-range listen, and the VM
+# host admits it against the host-held grant the create
 # registered — the same publish, the same live row, the same reach and
 # withdrawal legs a native lane runs. What runs on every target is the
 # case's refusal half, and that half carries its own
@@ -19569,9 +19586,9 @@ proof_listen_published_port_reaches_peer_and_host() {
   # it records a publication only once the switch said yes — so the live row
   # in `min session policy` is the observed word for whether the listen
   # published. On every lane the stance is allow: the row must appear within
-  # sixteen of the watcher's own polls (on a VM lane the publish also has to
-  # ride the guest report door and come back admitted by the VM host
-  # daemon's grant — the row is the proof it did), and the arm runs whole
+  # sixteen of the watcher's own polls (on a VM lane the publish is also
+  # asked of the VM host daemon over the guest door and admitted by its
+  # grant — the row is the proof it was), and the arm runs whole
   # below, peer and host.
   mnl session exec "$lp_sid" \
     "nohup /usr/bin/socat TCP-LISTEN:$lp_listen_port,reuseaddr,fork SYSTEM:\"cat /home/lp-http200\" >/dev/null 2>&1 & echo \$! > /home/lp.pid" \
@@ -19647,8 +19664,8 @@ proof_listen_published_port_reaches_peer_and_host() {
   # ---- the bridge: the host-held grant admitted the listen (T94) ---------
   # The peer leg never leaves the VM, so on a VM lane the host half of the
   # listen is read off the VM host daemon's own row for the box: the in-VM
-  # daemon's report crossed the bridge and the host gate admitted the port
-  # into the row's runtime set, at the box's own switch address. This case
+  # daemon asked the VM host for the publish, and the VM host admitted the
+  # port into the row's runtime set, at the box's own switch address. This case
   # declares no expose, so a runtime port in the row is the listen's report.
   lp_bridge_switch=""
   if [ -n "${E2E_VM:-}" ]; then
@@ -19669,7 +19686,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     done
     echo "minvmd status --row $lp_target_name -> '${lp_bridge_row:-<no answer>}'"
     if ! lp_row_holds "$lp_bridge_row"; then
-      echo "::error::the VM host daemon's row for box '$lp_target_name' at $lp_bridge_switch holds no runtime port $lp_listen_port — the listen's report never crossed the bridge to the host gate (T94)"
+      echo "::error::the VM host daemon's row for box '$lp_target_name' at $lp_bridge_switch holds no runtime port $lp_listen_port — the VM host was not asked for the listen's publish, or did not admit it"
       fail
     fi
     echo "bridge: the host-held grant admitted the listen — the row at $lp_bridge_switch holds runtime port $lp_listen_port"
@@ -20056,8 +20073,7 @@ eib_vm_ask_legs() {
 # the running box succeeds, and the host's read of the row afterwards is the same row as before the exit — the same
 # box id, switch address and allow-list — with the box itself holding that
 # switch address (read from /proc/net/fib_trie: a session rootfs has no
-# iproute2) and its frames decided by the row again: the same zone lookup
-# resolves, where the gate would drop a rowless source's. The attach runs
+# iproute2) and the same zone lookup resolving again. The attach runs
 # through the real pty driver, as a person at a terminal attaches.
 # $1 = box name. Echoes the session it created on fd 3, for the caller's
 # teardown.
@@ -20209,7 +20225,7 @@ exit" \
     cat "$WORK/eib-vm-kept-zone.err" 2>/dev/null || true
     return 1
   fi
-  echo "an exec into the kept box resumed its row: the same box id, switch address $switch and allow-list, held by the box, and its frames pass the gate again (NET-138)"
+  echo "an exec into the kept box resumed its row: the same box id, switch address $switch and allow-list, held by the box (NET-138)"
 }
 
 # ---------------------------------------------------------------------------
@@ -20255,22 +20271,22 @@ exit" \
 #
 # The lane split: on a VM lane the whole case runs against the VM host
 # daemon, whose records replace the guest daemon's. The allow stance's
-# publish crosses the report door T94 opened (`report_admitted_port`): the
+# publish is asked of the VM host over the guest door: the
 # host-held row admits the runtime port at the switch address the box's
 # registration named (`minvmd status --row`), and the admission's own copy
 # lands in the VM host daemon's owner-only host audit (T84) — printed,
 # like every record this case asserts. The deny stance is decided inside
 # the box, so nothing is admitted on the host: no live row and an empty
-# runtime set. The decision still crosses the report door (NET-046), so the
-# host audit holds exactly one deny line for it. The host's own probe at the published address must reach the
+# runtime set. The box asks the VM host for nothing, so the host audit
+# holds no publish line for it. The host's own probe at the published address must reach the
 # in-box server and get its response (NET-044). The ask legs
 # (`eib_vm_ask_legs` above) are the host-attached human's. And the expose half of T61 lands on this lane: a
 # box created on the non-default VM (`min --vm alpha session activate`,
 # autospawning the VM) publishes an in-box expose THERE, driven through
 # the flagless `min session attach` that finds the VM from the box name —
 # the one verb that resolves a box name across the machine's VMs — with
-# alpha's own row and alpha's own audit carrying the admission while the
-# default VM answers `no row` and holds no line for the box.
+# alpha's own audit carrying the admission while the default VM answers
+# `no row` and holds no line for the box.
 proof_expose_from_inside_box() {
   echo "::group::min net expose from inside the box: allow publishes, ask asks the attached human, deny and nobody-attached refuse, and every decision is audited (NET-043, NET-045, NET-046, NET-047)"
 
@@ -20304,12 +20320,12 @@ proof_expose_from_inside_box() {
   # ---- a VM lane: the whole case runs against the VM host daemon ----------
   # The records this lane's legs read are the VM host daemon's own (T84): its
   # host-held row table (`minvmd status --row <name>`) and its owner-only
-  # host audit (audit/box-admissions.log). The allow stance's publish crosses
-  # the report door T94 opened: the guest daemon reports it, the host admits
+  # host audit (audit/box-admissions.log). The guest daemon asks the VM host
+  # for the allow stance's publish over the guest door, the host admits
   # the runtime port into the row, and the admission's own copy lands in the
   # host audit. The ask stays with `eib_vm_ask_legs` — the human attached on
-  # the host answers. The deny is decided inside the box, so nothing is
-  # admitted on the host, and its one audit line is reported there. The two-VM leg at the end is the
+  # the host answers. The deny is decided inside the box, so the host is
+  # asked for nothing and its audit holds no line. The two-VM leg at the end is the
   # expose half of T61: a box on the non-default VM publishes there.
   if [ -n "${E2E_VM:-}" ]; then
     local eib_vm_sids=""
@@ -20317,7 +20333,7 @@ proof_expose_from_inside_box() {
     local eib_vm_audit="$eib_vm_root/audit/box-admissions.log"
     local eib_vm_reg="" eib_vm_switch="" eib_vm_row="" eib_vm_line=""
     local eib_two_name="e2e-inside-alpha" eib_two_vm="alpha"
-    local eib_two_sid="" eib_two_reg="" eib_two_switch="" eib_two_row=""
+    local eib_two_sid="" eib_two_reg="" eib_two_switch=""
     local eib_two_line="" eib_two_attach="" eib_two_skip=""
     local eib_two_audit="" eib_two_drc=0 eib_two_drow=""
     local eib_two_stopped="" eib_vm_ok="" EIB_TWO_SEED_DIR=""
@@ -20553,10 +20569,9 @@ proof_expose_from_inside_box() {
       *) echo "::error::the deny box's refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; fail ;;
     esac
     echo "deny box: refused with the deny the stance spells (NET-043)"
-    # The guest decided deny, so nothing is admitted on the host: no live row
-    # in the box's own listing and an empty runtime set in the host-held row.
-    # The decision itself still crosses the report door (NET-046), so the host
-    # audit holds exactly one expose_decision line for it.
+    # The guest decided deny and asked the VM host for nothing: no live row
+    # in the box's own listing, an empty runtime set in the host-held row,
+    # and no publish line for the box in the host audit.
     eib_policy="$(mnl session policy "$eib_deny_sid" 2>"$WORK/eib-vm-deny-policy.err")" \
       || { echo "::error::'min session policy' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
     case "$eib_policy" in
@@ -20582,31 +20597,18 @@ proof_expose_from_inside_box() {
         fail
         ;;
     esac
-    # The VM host refuses the publish and writes the refusal to its audit.
-    eib_deny_lines=""
-    eib_deny_count=0
-    for _ in $(seq 1 20); do
-      eib_deny_lines="$(grep -F '"event":"publish"' "$eib_vm_audit" 2>/dev/null \
-        | grep -F "\"box\":\"$eib_deny_name\"" || true)"
-      eib_deny_count="$(printf '%s' "$eib_deny_lines" | grep -c . || true)"
-      [ "$eib_deny_count" -ge 1 ] && break
-      sleep 0.25
-    done
-    if [ "$eib_deny_count" -ne 1 ]; then
-      echo "::error::the VM host daemon's host audit carries $eib_deny_count publish lines for $eib_deny_name: the refused expose must be exactly one line"
-      grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null | sed 's/^/  /' || true
+    # A publish the VM host was asked for is in its audit within a moment
+    # (the allow box's line above was), so a short wait is enough to see
+    # that none arrives.
+    sleep 2
+    eib_deny_lines="$(grep -F '"event":"publish"' "$eib_vm_audit" 2>/dev/null \
+      | grep -F "\"box\":\"$eib_deny_name\"" || true)"
+    if [ -n "$eib_deny_lines" ]; then
+      echo "::error::the VM host daemon's host audit carries a publish line for $eib_deny_name, and the deny box must ask it for nothing"
+      printf '%s\n' "$eib_deny_lines" | sed 's/^/  /'
       fail
     fi
-    case "$eib_deny_lines" in
-      *'"origin":"expose"'*'"outcome":"refused'*) ;;
-      *)
-        echo "::error::the host audit's publish line for $eib_deny_name is not a refused expose"
-        echo "  $eib_deny_lines"
-        fail
-        ;;
-    esac
-    echo "host audit: $eib_deny_lines"
-    echo "the deny admitted nothing: no live row and an empty runtime set in the host row, and the host audit holds the one refusal"
+    echo "the deny admitted nothing: no live row, an empty runtime set in the host row, and no publish line in the host audit"
 
     while IFS= read -r eib_vm_sid; do
       [ -n "$eib_vm_sid" ] && { mnl session destroy --force "$eib_vm_sid" >/dev/null 2>&1 || true; }
@@ -20624,8 +20626,7 @@ proof_expose_from_inside_box() {
     # activate` creates the box on alpha (autospawning and booting it), the
     # expose runs inside a FLAGLESS `min session attach` by the box's name —
     # the one verb that resolves a box name across the machine's VMs — and
-    # the records land in alpha's own row and alpha's own audit, never the
-    # default VM's. Gated the way the two-named-VMs case gates itself: a
+    # the record lands in alpha's own audit, never the default VM's. Gated the way the two-named-VMs case gates itself: a
     # daemon that is not minvmd hosts no named VM, a host without the guest
     # images cannot boot one, and on Linux the hypervisor is /dev/kvm.
     eib_two_skip=""
@@ -20737,24 +20738,10 @@ exit" \
         fail
       fi
 
-      # The publish's records live on alpha (NET-055): alpha's own row holds
-      # the runtime port at alpha's registration address, and alpha's own
-      # audit carries the admission line — while the default VM answers
-      # `no row` for the box and its audit holds no line at all.
-      eib_two_row=""
-      for _ in $(seq 1 40); do
-        eib_two_row="$(minvmd --vm "$eib_two_vm" status --row "$eib_two_name" 2>/dev/null || true)"
-        if eib_vm_row_holds "$eib_two_row" "$eib_two_switch" "$eib_two_port"; then break; fi
-        eib_two_row=""
-        sleep 0.25
-      done
-      if [ -z "$eib_two_row" ]; then
-        echo "::error::alpha's own row never admitted the runtime port $eib_two_port at switch address $eib_two_switch — the expose inside its box published nowhere (T94, NET-055)"
-        echo "minvmd --vm $eib_two_vm status --row $eib_two_name -> '$(minvmd --vm "$eib_two_vm" status --row "$eib_two_name" 2>&1 || true)'"
-        rm -rf "$EIB_TWO_SEED_DIR"
-        fail
-      fi
-      echo "alpha's row: $eib_two_row (the publish is admitted in the named VM's own table, T94, NET-055)"
+      # The publish's record lives on alpha (NET-055): alpha's own audit
+      # carries the admission line, while the default VM answers `no row`
+      # for the box and its audit holds no line at all. The box has ended,
+      # and its row on alpha went with it, so the row is not read here.
       eib_two_audit="$eib_vm_root/$eib_two_vm/audit/box-admissions.log"
       eib_two_line=""
       for _ in $(seq 1 20); do
@@ -20816,7 +20803,7 @@ exit" \
       echo "two named VMs: the expose inside the box on $eib_two_vm published on $eib_two_vm, and the named VM is stopped again (NET-055, NET-058)"
     fi
 
-    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing admitted on the host and its deny recorded in the host audit, and every decision is a line in the VM host daemon's own audit"
+    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing admitted on the host and no line in the host audit, and every publish the VM host was asked for is a line in its own audit"
     if [ -n "$eib_two_skip" ]; then
       echo "$eib_vm_ok; the two named VMs leg SKIPPED: $eib_two_skip)"
     else
@@ -21517,8 +21504,16 @@ proof_proxy_refuses_like_direct() {
   PAR_SEED_DIR="$(hook_mktemp /tmp/mnlpd.XXXXXX)"
   hook_seed_preamble > "$PAR_SEED_DIR/minimal.toml"
   mkdir "$PAR_SEED_DIR/.git"
+  # In a guest a box reaches a peer only by a name it lists, so on a VM
+  # lane the origin lists the target of the between-box halves. The open
+  # subnet keeps every other destination as reachable as it is with no
+  # rules at all.
+  local par_peer_args=()
+  if [ -n "$E2E_VM" ]; then
+    par_peer_args=(--allow-subnets 0.0.0.0/0 --allow-dns-hosts "$PAR_OWN_NAME.min.internal")
+  fi
   par_sid="$(cd "$PAR_SEED_DIR" && mnl session activate . --no-prompt \
-    --name "$PAR_NAME" 2>"$WORK/par-activate.err")" || {
+    --name "$PAR_NAME" ${par_peer_args[@]+"${par_peer_args[@]}"} 2>"$WORK/par-activate.err")" || {
     echo "::error::'min session activate' for the parity proof's origin box failed"
     echo "--- stderr ---"; cat "$WORK/par-activate.err" 2>/dev/null || true
     fail
@@ -24532,6 +24527,7 @@ proof_names_survive_restart_and_second_vm() {
     not_run "$nc" "no passwordless sudo: the names step runs as root"
     return 0
   fi
+  names_step_offered "$nc" || return 0
 
   echo "::group::box names survive a restart and a second VM; a withdrawn port closes its connections (T121)"
 
