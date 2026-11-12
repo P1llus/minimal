@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use minimald_rpc::{ForwardState, IpProto, PublishOrigin, PublishPortRequest, PublishRefusal};
 
-use crate::bep_attach::{BoxId, BoxIdText};
+use crate::box_id::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxRegistry, PortReportRefusal, RowWithdrawal};
 use crate::net::gvproxy_api::{ExposeError, SwitchApi, UnexposeError};
 

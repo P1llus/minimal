@@ -6649,9 +6649,7 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
     let host_dir = dir.path().join("providers").join("local-minvmd0");
     std::fs::create_dir_all(&host_dir).unwrap();
     let sock_path = host_dir.join("control.sock");
-    let attachments = minvmd::bep_attach::Attachments::new();
-    let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
-        .feeding_proxy_attachments(attachments.clone());
+    let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
     let _server = minvmd::control::spawn(
         sock_path.clone(),
         registry.clone(),
@@ -6692,8 +6690,8 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
             .expect("the reply returns the id the host minted for this creation");
         let bytes = id.to_bytes();
 
-        // The host minted it: the row and the attachment that the
-        // registration published hold the id that the reply returned.
+        // The host minted it: the row the registration published holds
+        // the id the reply returned.
         let row = registry
             .table()
             .by_source(registered.addresses.switch_address.octets())
@@ -6702,14 +6700,6 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
             row.box_id(),
             bytes,
             "creation {creation}: the CLI holds the id the host's row holds"
-        );
-        let attachment = attachments
-            .by_source(registered.addresses.switch_address.octets())
-            .expect("the registration issued the box's attachment");
-        assert_eq!(
-            attachment.box_id(),
-            bytes,
-            "creation {creation}: the CLI holds the id the host's attachment holds"
         );
 
         // A UUIDv7: version 7 and the RFC 9562 variant.
@@ -6746,8 +6736,8 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         )
         .await;
         assert!(
-            !attachments.holds_id(bytes),
-            "creation {creation}: the destroyed box's id is held by no attachment"
+            registry.row_by_box_id(bytes).is_none(),
+            "creation {creation}: the destroyed box's id names no row"
         );
     }
 
@@ -6834,7 +6824,7 @@ async fn colliding_box_id_refuses_creation() {
 
     // The id a retained record already holds, and the refusal the host's
     // control server replies with when a mint lands on it.
-    let held = minvmd::bep_attach::mint_box_id();
+    let held = minvmd::box_id::mint_box_id();
     let refusal = minvmd::box_registry::AllocationError::CollidingBoxId { id: held }.to_string();
     let held_text = minimald_rpc::BoxId::from_bytes(held).to_string();
     assert!(

@@ -4860,9 +4860,7 @@ mod tests {
         let host_dir = dir.path().join("providers").join("local-minvmd0");
         std::fs::create_dir_all(&host_dir).unwrap();
         let sock_path = host_dir.join("control.sock");
-        let attachments = minvmd::bep_attach::Attachments::new();
-        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
-            .feeding_proxy_attachments(attachments.clone());
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
         let _server = minvmd::control::spawn(
             sock_path.clone(),
             registry.clone(),
@@ -4923,8 +4921,8 @@ mod tests {
             "the failed mint withdrew the row registered under the entry's name"
         );
         assert!(
-            !attachments.holds_id(id.to_bytes()),
-            "the withdrawn box's id is held by no attachment"
+            registry.row_by_box_id(id.to_bytes()).is_none(),
+            "the withdrawn box's id names no row"
         );
     }
 

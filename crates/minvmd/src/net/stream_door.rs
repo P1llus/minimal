@@ -34,7 +34,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tracing::Instrument as _;
 
-use crate::bep_attach::{BoxId, BoxIdText};
+use crate::box_id::{BoxId, BoxIdText};
 use crate::box_registry::BoxRegistry;
 use crate::control::BepListening;
 use crate::net::host_exposures::{Holder, HostExposures};
@@ -49,6 +49,10 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The shortest wait between two looks at the exposure table for an open
 /// stream.
 const SHORTEST_EXPOSURE_CHECK: Duration = Duration::from_millis(10);
+
+/// How often an open credential proxy stream looks whether its box is
+/// still registered.
+const BOX_CHECK: Duration = Duration::from_millis(100);
 
 /// How long the connect on the host side may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -217,9 +221,17 @@ pub(crate) fn spawn(sock_path: PathBuf, config: Config) -> io::Result<StreamDoor
 }
 
 /// Where a stream was let through to.
-enum Target {
-    Proxy(UnixStream),
+enum Target<'a> {
+    Proxy(UnixStream, ProxySlot<'a>, Standing),
     Host(TcpStream),
+}
+
+/// The registration a stream was admitted on.
+enum Standing {
+    /// The box's row, as it was then.
+    Row(Arc<crate::box_registry::BoxRecord>),
+    /// A box that shares the node's address and has no row.
+    HostIp(BoxId),
 }
 
 impl Door {
@@ -252,7 +264,7 @@ impl Door {
             }
         };
         let id = open.box_id.to_bytes();
-        let (target, _proxy_slot) = match self.admit(&open).await {
+        let target = match self.admit(&open).await {
             Ok(admitted) => admitted,
             Err(reason) => {
                 tracing::warn!(
@@ -270,7 +282,20 @@ impl Door {
         }
         tracing::debug!(box_id = %BoxIdText(&id), purpose = ?open.purpose, "opened a stream");
         let ended = match target {
-            Target::Proxy(proxy) => splice(guest, proxy).await,
+            Target::Proxy(proxy, _slot, standing) => {
+                tokio::select! {
+                    ended = splice(guest, proxy) => ended,
+                    // The guest is not relied on to close the streams of a
+                    // box that is gone.
+                    () = self.box_gone(&standing) => {
+                        tracing::info!(
+                            box_id = %BoxIdText(&id),
+                            "ended a credential proxy stream of a box that is no longer registered"
+                        );
+                        Ok(())
+                    }
+                }
+            }
             Target::Host(host) => {
                 let StreamPurpose::HostPort { port } = open.purpose else {
                     return;
@@ -321,22 +346,42 @@ impl Door {
         }
     }
 
+    /// Whether the box is still registered as it was when its stream was
+    /// admitted: the same row, or still resident with its grant.
+    fn stands(&self, standing: &Standing) -> bool {
+        let boxes = &self.config.boxes;
+        match standing {
+            Standing::Row(row) => boxes.row_stands(row),
+            Standing::HostIp(id) => boxes.resident_host_ip_box(*id) == Some(true),
+        }
+    }
+
+    /// Resolves when the registration a stream was admitted on has ended.
+    async fn box_gone(&self, standing: &Standing) {
+        loop {
+            tokio::time::sleep(BOX_CHECK).await;
+            if !self.stands(standing) {
+                return;
+            }
+        }
+    }
+
     /// Decides one stream and connects its host side.
-    async fn admit(
-        &self,
-        open: &StreamOpen,
-    ) -> Result<(Target, Option<ProxySlot<'_>>), StreamRefusal> {
+    async fn admit(&self, open: &StreamOpen) -> Result<Target<'_>, StreamRefusal> {
         let id = open.box_id.to_bytes();
         let boxes = &self.config.boxes;
         // A box is a row, or a resident host_ip box, which has no row.
-        let credentialed = match boxes.row_by_box_id(id) {
+        let (credentialed, standing) = match boxes.row_by_box_id(id) {
             Some(row) => {
                 row.mark_used();
-                row.declares_credentialed_upstream()
+                (row.declares_credentialed_upstream(), Standing::Row(row))
             }
-            None => boxes
-                .resident_host_ip_box(id)
-                .ok_or(StreamRefusal::UnknownBox)?,
+            None => (
+                boxes
+                    .resident_host_ip_box(id)
+                    .ok_or(StreamRefusal::UnknownBox)?,
+                Standing::HostIp(id),
+            ),
         };
         match open.purpose {
             StreamPurpose::CredentialProxy { entry } => {
@@ -364,7 +409,7 @@ impl Door {
                 let stream = deliver(proxy, &delivery)
                     .await
                     .map_err(|_| StreamRefusal::ConnectFailed)?;
-                Ok((Target::Proxy(stream), Some(slot)))
+                Ok(Target::Proxy(stream, slot, standing))
             }
             StreamPurpose::HostPort { port } => {
                 if !self.exposed(port) {
@@ -373,7 +418,7 @@ impl Door {
                 // Always the host's own loopback. The header names a port
                 // and nothing else.
                 match dial_loopback(port).await {
-                    Ok(stream) => Ok((Target::Host(stream), None)),
+                    Ok(stream) => Ok(Target::Host(stream)),
                     Err(_) => Err(StreamRefusal::ConnectFailed),
                 }
             }
@@ -1057,10 +1102,10 @@ mod tests {
         let _ = &bed.dir;
     }
 
-    #[test]
-    fn a_box_holds_a_bounded_number_of_proxy_streams() {
+    /// An acceptor at a proxy socket that takes connections and holds them
+    /// open, with a door in front of it.
+    fn holding_bed() -> (tempfile::TempDir, BoxRegistry, StreamDoor) {
         let dir = tempfile::tempdir().unwrap();
-        // An acceptor that takes connections and holds them open.
         let proxy_sock = dir.path().join("hold.sock");
         let acceptor = std::os::unix::net::UnixListener::bind(&proxy_sock).unwrap();
         std::thread::spawn(move || {
@@ -1086,6 +1131,67 @@ mod tests {
             },
         )
         .unwrap();
+        (dir, boxes, door)
+    }
+
+    /// Whether the door has closed the guest's end of a stream. A stream
+    /// that is still open has nothing to read.
+    fn closed(guest: &mut Guest, within: Duration) -> bool {
+        guest
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(within))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        matches!(guest.reader.read(&mut byte), Ok(0))
+    }
+
+    /// The door does not wait for the guest to close the streams of a box
+    /// that is gone: a guest that keeps one open holds a way to the proxy
+    /// under an id the host no longer vouches for.
+    #[test]
+    fn a_proxy_stream_ends_when_its_box_is_no_longer_registered() {
+        let (_dir, boxes, door) = holding_bed();
+        let web = boxes.register_client_box(spec("web", true)).unwrap();
+        let other = boxes.register_client_box(spec("other", true)).unwrap();
+        let shared = boxes.register_host_ip_box("shared").unwrap();
+        boxes.admit_host_ip_box(boxes::SessionId::from_bytes(shared), true);
+        let open = |id| {
+            let (guest, reply) = Guest::open(&door, &proxy(id));
+            assert_eq!(reply, StreamReply::Open);
+            guest
+        };
+        let (mut of_web, mut of_other, mut of_shared) =
+            (open(web.box_id()), open(other.box_id()), open(shared));
+        let short = Duration::from_millis(300);
+        assert!(!closed(&mut of_web, short) && !closed(&mut of_shared, short));
+
+        boxes.withdraw(web.switch_addr());
+        assert!(
+            closed(&mut of_web, WAIT),
+            "the row is gone and its stream is still open"
+        );
+        boxes.end_host_ip_box(shared);
+        assert!(
+            closed(&mut of_shared, WAIT),
+            "the box ended and its stream is still open"
+        );
+        // A box that is still registered keeps its stream.
+        assert!(!closed(&mut of_other, short));
+
+        // The same name registered again is another box: the old stream
+        // does not come back, and a new one is admitted for the new id.
+        let again = boxes.register_client_box(spec("web", true)).unwrap();
+        assert_ne!(again.box_id(), web.box_id());
+        let (_guest, reply) = Guest::open(&door, &proxy(web.box_id()));
+        assert_eq!(reply, refused(StreamRefusal::UnknownBox));
+        let mut of_again = open(again.box_id());
+        assert!(!closed(&mut of_again, short));
+    }
+
+    #[test]
+    fn a_box_holds_a_bounded_number_of_proxy_streams() {
+        let (_dir, boxes, door) = holding_bed();
         let web = boxes.register_client_box(spec("web", true)).unwrap();
         let other = boxes.register_client_box(spec("other", true)).unwrap();
         let mut held = Vec::new();

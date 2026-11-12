@@ -28,11 +28,8 @@ use bep::listener::{DELIVERY_HEADER_LEN, Delivery, Entry, TOKEN_LEN};
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The start-up facts the supervisor hands the stand-in over the channel it
-/// receives at [`spawn`]: the per-boot token minted for this boot — the same
-/// bytes wired into the peer — the host daemon's pid, the process the
-/// pool's deliveries are supposed to come from, and the proxy's attachment
-/// table, the stand-in's own facts about which boxes are attached
-/// (NET-133).
+/// receives at [`spawn`]: the token minted for this boot, and the host
+/// daemon's pid, the process deliveries come from.
 pub struct StubStart {
     /// The token every delivered connection presents first.
     pub token: [u8; TOKEN_LEN],
@@ -147,8 +144,6 @@ struct Shared {
     /// The daemon's own uid: the peer's uid is checked against it before
     /// anything is read.
     daemon_uid: u32,
-    /// The host's attachment table: what a delivered connection is
-    /// attributed by (NET-133), looked up through and never written.
     /// The answer lines sent, one per accepted connection.
     presented: Arc<Mutex<Vec<String>>>,
     /// The refusal reasons audited, one per refused connection.
@@ -315,7 +310,7 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
     };
     let line = format!(
         "box_id={} entry={entry}\n",
-        crate::bep_attach::BoxIdText(&delivery.box_id),
+        crate::box_id::BoxIdText(&delivery.box_id),
     );
     if stream.write_all(line.as_bytes()).is_err() {
         return;
@@ -401,13 +396,13 @@ mod tests {
     fn a_delivery_with_the_token_is_presented_under_the_id_it_names() {
         let dir = tempfile::tempdir().unwrap();
         let (sock, stub) = stub(&dir, std::process::id());
-        let id = crate::bep_attach::mint_box_id();
+        let id = crate::box_id::mint_box_id();
         let answer = present(&sock, &TOKEN, &delivery(id).emit());
         assert_eq!(
             answer,
             format!(
                 "box_id={} entry=redirected destination=140.82.112.3:443\n",
-                crate::bep_attach::BoxIdText(&id)
+                crate::box_id::BoxIdText(&id)
             )
         );
         assert_eq!(stub.presented(), vec![answer]);
@@ -418,7 +413,7 @@ mod tests {
     fn a_wrong_token_a_bad_header_and_a_zero_id_are_refused_without_an_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (sock, stub) = stub(&dir, std::process::id());
-        let id = crate::bep_attach::mint_box_id();
+        let id = crate::box_id::mint_box_id();
 
         assert_eq!(present(&sock, &[0u8; TOKEN_LEN], &delivery(id).emit()), "");
         let mut wrong_version = delivery(id).emit();
@@ -440,7 +435,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The stub expects deliveries from a pid that is not this test's.
         let (sock, stub) = stub(&dir, std::process::id().wrapping_add(1));
-        let id = crate::bep_attach::mint_box_id();
+        let id = crate::box_id::mint_box_id();
         assert_eq!(present(&sock, &TOKEN, &delivery(id).emit()), "");
         assert_eq!(until_refusals(&stub, 1), vec!["pid"]);
     }
