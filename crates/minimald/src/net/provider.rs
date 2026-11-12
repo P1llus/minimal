@@ -309,52 +309,74 @@ impl OwnAddressReporter {
     }
 }
 
-/// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`
-/// is the sandbox layer's plan, decided here against the switch (on a VM host
-/// the resolver must be the node's DNS layer, not the host's) and against the
-/// box's own declaration — a native deny-all box resolves through the box
-/// zone's answerer, from the policy below; `OwnIp` needs a
-/// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
-/// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
+/// What a launch puts on its box's network.
+pub(crate) enum Launch {
+    /// The box's own processes. An `OwnIp` box attaches at the address the
+    /// VM host handed it, or draws one on a native node, and opens the
+    /// ports `policy` declares.
+    Session {
+        policy: Option<Box<boxes::BoxPolicy>>,
+        /// Reports the lease to the hostname registry once attached.
+        own_address: Option<OwnAddressReporter>,
+        box_addresses: Option<boxes::BoxAddresses>,
+    },
+    /// A task of the box. In `OwnIp` it gets a namespace beside the box's,
+    /// at one of `addresses` when the VM host filed any with the box. It
+    /// opens no ports and owns no name.
+    Task { addresses: Vec<Ipv4Addr> },
+}
+
+/// The network of one launch in a box of `mode`. Every launch of a box goes
+/// through here, so a session and a task of the same box read the same
+/// resolver file and reach the host at the same address.
 ///
-/// `policy` is the launch's whole session policy. The own-IP attach builds
-/// the box's ingress gate from it, and `None` attaches without one. The
-/// session launcher passes the box's policy. A task launch passes `None`,
-/// because a task carries none of its session's ingress, the session's own
-/// PTask being attached at the same time.
-/// `own_address` carries the registry handle an own-address launch reports its
-/// lease through once the box attaches (NET-001); a task launch passes `None`
-/// for that too. `box_addresses` carries the switch and loopback addresses
-/// the VM host daemon handed the box's registration (T66): its switch
-/// address is what this `OwnIp` PTask attaches with instead of drawing one,
-/// because the host-side table's row is keyed by it. A task launch goes
-/// through [`task_network_for`] instead — the task's sandbox is not the box
-/// the registration named.
+/// `engine_box` is the box's entry in the policy engine, `None` for a box
+/// no engine judges. An unknown mode gets the empty namespace.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<boxes::BoxPolicy>,
-    own_address: Option<OwnAddressReporter>,
-    box_addresses: Option<boxes::BoxAddresses>,
+    launch: Launch,
     engine_box: Option<crate::net::gvproxy_network::EngineBox>,
 ) -> Arc<dyn Network> {
-    match mode {
+    let resolver = engine_box
+        .as_ref()
+        .and_then(|judged| judged.of.resolver_address());
+    let network: Arc<dyn Network> = match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
             switch: Arc::clone(switch),
             host_alias: engine_box.and_then(|judged| judged.of.host_alias()),
         }),
-        NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
-            switch: Arc::clone(switch),
-            identity: identity.to_string(),
-            policy,
-            own_address,
-            box_addresses,
-            task_slots: None,
-            engine_box,
-            reserved: std::sync::Mutex::new(None),
-        }),
+        NetworkMode::OwnIp => {
+            let (policy, own_address, box_addresses, task_slots) = match launch {
+                Launch::Session {
+                    policy,
+                    own_address,
+                    box_addresses,
+                } => (
+                    policy.map(|policy| *policy),
+                    own_address,
+                    box_addresses,
+                    None,
+                ),
+                Launch::Task { addresses } => (None, None, None, Some(addresses)),
+            };
+            Arc::new(OwnIpNetwork {
+                switch: Arc::clone(switch),
+                identity: identity.to_string(),
+                policy,
+                own_address,
+                box_addresses,
+                task_slots,
+                engine_box,
+                reserved: std::sync::Mutex::new(None),
+            })
+        }
         _ => Arc::new(sandbox::NoNet),
+    };
+    match resolver {
+        Some(resolver) => with_box_resolver(network, resolver),
+        None => network,
     }
 }
 
@@ -363,10 +385,7 @@ pub(crate) fn network_for(
 /// DNS there whatever server it asks, so the file only has to name a server
 /// that can be redirected. A copy of the host's file may name one that
 /// cannot: an IPv6 link-local server with a scope.
-pub(crate) fn with_box_resolver(
-    network: Arc<dyn Network>,
-    resolver: std::net::Ipv4Addr,
-) -> Arc<dyn Network> {
+fn with_box_resolver(network: Arc<dyn Network>, resolver: Ipv4Addr) -> Arc<dyn Network> {
     Arc::new(BoxResolver {
         inner: network,
         resolver,
@@ -376,7 +395,7 @@ pub(crate) fn with_box_resolver(
 #[derive(Debug)]
 struct BoxResolver {
     inner: Arc<dyn Network>,
-    resolver: std::net::Ipv4Addr,
+    resolver: Ipv4Addr,
 }
 
 impl Network for BoxResolver {
@@ -393,37 +412,6 @@ impl Network for BoxResolver {
 
     fn abandon(&self) -> sandbox::AbandonFuture<'_> {
         self.inner.abandon()
-    }
-}
-
-/// [`network_for`] for a task run (NET-138): an `OwnIp` task attaches at
-/// one of the task addresses the VM host registered with its session's box
-/// (`task_addresses`, off the session record) — each a host-side row
-/// carrying the box's id and egress — never at the box's own address and
-/// never at one it draws. No task addresses is the plain draw, which only a
-/// native switch makes ([`SwitchClient::attach_task_slot`]). Every other
-/// mode is [`network_for`]'s, with no reporter and no handed box addresses:
-/// a task owns no proxy route.
-pub(crate) fn task_network_for(
-    mode: NetworkMode,
-    switch: &Arc<Mutex<SwitchClient>>,
-    identity: &str,
-    policy: Option<boxes::BoxPolicy>,
-    task_addresses: Vec<std::net::Ipv4Addr>,
-    engine_box: Option<crate::net::gvproxy_network::EngineBox>,
-) -> Arc<dyn Network> {
-    match mode {
-        NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
-            switch: Arc::clone(switch),
-            identity: identity.to_string(),
-            policy,
-            own_address: None,
-            box_addresses: None,
-            task_slots: Some(task_addresses),
-            engine_box,
-            reserved: std::sync::Mutex::new(None),
-        }),
-        _ => network_for(mode, switch, identity, policy, None, None, None),
     }
 }
 
@@ -509,9 +497,9 @@ struct OwnIpNetwork {
     /// the activating client did not register, which draws on a native
     /// switch and is refused on one the VM host owns (NET-138).
     box_addresses: Option<boxes::BoxAddresses>,
-    /// For a task launch ([`task_network_for`]), the task addresses the VM
-    /// host registered with the session's box (NET-138): the PTask attaches
-    /// at the first one no task run holds. `None` for a box's own launch.
+    /// For a task launch, the task addresses the VM host registered with
+    /// the session's box: the task attaches at the first one no task run
+    /// holds. `None` for a box's own launch.
     task_slots: Option<Vec<std::net::Ipv4Addr>>,
     /// The box's entry in the engine, which judges what the box sends and
     /// takes. `None` for a box that runs unjudged.
@@ -682,6 +670,15 @@ mod tests {
         ))
     }
 
+    /// A box's own launch that declares nothing.
+    fn session() -> Launch {
+        Launch::Session {
+            policy: None,
+            own_address: None,
+            box_addresses: None,
+        }
+    }
+
     /// The launch reads the box's address on the virtual network from the
     /// reporter once the attach has reported it.
     #[test]
@@ -701,7 +698,7 @@ mod tests {
         let switch = counting_switch();
         let endpoint = crate::net::endpoints::V4;
         let plan = with_box_resolver(
-            network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None),
+            network_for(NetworkMode::HostNet, &switch, "s", session(), None),
             endpoint,
         )
         .plan()
@@ -718,7 +715,7 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", session(), None)
             .plan()
             .await
             .unwrap();
@@ -731,14 +728,14 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None, None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", session(), None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && !no_net.wired());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", session(), None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -765,7 +762,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", session(), None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -799,9 +796,7 @@ mod tests {
                     NetworkMode::OwnIp,
                     &switch,
                     &format!("p{i}"),
-                    None,
-                    None,
-                    None,
+                    session(),
                     None,
                 )
             })
@@ -834,7 +829,7 @@ mod tests {
             "/usr/bin/gvproxy",
             "/run/minimal/gvproxy",
         )));
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &native, "s", session(), None)
             .plan()
             .await
             .unwrap();
@@ -850,7 +845,7 @@ mod tests {
 
         // VM-host host-address: the node's DNS layer answers the same name.
         let vm = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &vm, "s", session(), None)
             .plan()
             .await
             .unwrap();

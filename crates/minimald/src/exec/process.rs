@@ -141,19 +141,15 @@ pub(crate) fn engine_box(
         .map(|of| crate::net::gvproxy_network::EngineBox { engine, of })
 }
 
-/// The network a task gets: the provider for its session's mode (017-005),
-/// carrying the session's *effective* egress (NET-074) and none of
-/// its ingress. Shared by the two ways a
-/// task starts — over an exec channel here, and from inside the session
-/// (`env::BoxChannel::run_task`).
+/// The network of a task of the box `record` describes: the box's mode,
+/// resolver file and host alias, as a session of the box gets them. Both
+/// ways a task starts use it, over an exec channel and from inside the
+/// session.
 ///
-/// The mode, not the identity: an own-IP task is a second PTask beside the
-/// session's, on the same switch at the same time, so it registers under its
-/// own name and carries none of the session's ingress — forwards a task
-/// applied would come down again at its teardown. It carries no registry
-/// handle either: a task owns no proxy route of its own, so no lease is ever
-/// reported for it. The engine holds the task to its box's policy through
-/// `engine_box`.
+/// An own-address task is a second namespace beside the session's, so it
+/// registers under a name of its own and opens none of the box's ports,
+/// which would close again when the task ends. The engine holds it to the
+/// box's policy through `engine_box`.
 pub(crate) fn task_network(
     record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -161,22 +157,16 @@ pub(crate) fn task_network(
 ) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    crate::net::provider::task_network_for(
+    crate::net::provider::network_for(
         record.network,
         switch,
         &format!("{session}-task"),
-        // A task declares no ingress, so its namespace has no ports to open.
-        None,
-        // Never the record's handed box addresses (T66): the task's sandbox
-        // is not the box the registration named, and the session's box
-        // holds that address.
-        // A task attaches at one of the task addresses the same
-        // registration filed with the box (NET-138), each a host-side row
-        // carrying the box's id and egress, so no daemon-side draw happens
-        // once a control socket exists. A native daemon, whose record holds
-        // none, draws from its reserve (`crate::net::self_allocation_run`);
-        // an in-VM one refuses the draw (`SwitchClient::attach`).
-        record.task_addresses.clone(),
+        // The task addresses the VM host filed with the box, never the
+        // box's own address, which the session holds. A native record has
+        // none and the daemon draws one.
+        crate::net::provider::Launch::Task {
+            addresses: record.task_addresses.clone(),
+        },
         engine_box,
     )
 }

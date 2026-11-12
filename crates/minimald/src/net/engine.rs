@@ -236,6 +236,12 @@ impl Installed {
         self.host_alias
     }
 
+    /// The address to write into the box's resolver file, when the box's
+    /// DNS goes to an endpoint of its own.
+    pub(crate) fn resolver_address(&self) -> Option<Ipv4Addr> {
+        self.wants.resolver.then_some(endpoints::V4)
+    }
+
     /// Where the box reaches the credential proxy as its HTTP proxy.
     pub(crate) fn credential_proxy(&self) -> Option<std::net::SocketAddrV4> {
         let block = self.block.filter(|_| self.wants.credential_proxy)?;
@@ -1529,15 +1535,6 @@ impl Engine {
         }
     }
 
-    /// The address to write into the resolver file of the box whose cgroup
-    /// has the id `cgroup`, when the box's DNS goes to an endpoint of its
-    /// own.
-    pub(crate) fn resolver_address(&self, cgroup: u64) -> Option<std::net::Ipv4Addr> {
-        self.by_cgroup(BoxId(cgroup))
-            .filter(|of| of.wants.resolver)
-            .map(|_| endpoints::V4)
-    }
-
     /// The box whose cgroup has the id `cgroup`, when the engine judges it.
     pub(crate) fn of_cgroup(&self, cgroup: u64) -> Option<Arc<Installed>> {
         self.by_cgroup(BoxId(cgroup))
@@ -1877,13 +1874,13 @@ mod tests {
         assert!(refused.contains("the peer runs in /x") && !refused.ends_with(' '));
     }
 
-    /// Without an engine no box is judged, and no box's DNS is sent to an
-    /// endpoint: a launch then leaves the box's resolver file alone.
+    /// Without an engine no box is judged, so a launch finds no entry to
+    /// take a resolver endpoint from and leaves the box's resolver file
+    /// alone.
     #[test]
     fn a_daemon_without_an_engine_judges_no_box() {
         let engine = Engine::absent(Absent::NotStarted);
         assert!(engine.of_cgroup(7).is_none());
-        assert_eq!(engine.resolver_address(7), None);
     }
 
     fn steered(steering: Steering) -> BoxPolicy {

@@ -931,9 +931,11 @@ impl BoxLauncher for SandboxLauncher {
             network_mode,
             &net_switch,
             &session_name,
-            Some(policy),
-            own_address.clone(),
-            box_addresses,
+            crate::net::provider::Launch::Session {
+                policy: Some(Box::new(policy)),
+                own_address: own_address.clone(),
+                box_addresses,
+            },
             ctx.box_cgroup().and_then(|cgroup| {
                 let engine = crate::net::engine::Engine::current();
                 engine
@@ -941,13 +943,6 @@ impl BoxLauncher for SandboxLauncher {
                     .map(|of| crate::net::gvproxy_network::EngineBox { engine, of })
             }),
         );
-        let network = match ctx
-            .box_cgroup()
-            .and_then(|cgroup| crate::net::engine::Engine::current().resolver_address(cgroup.id()))
-        {
-            Some(resolver) => crate::net::provider::with_box_resolver(network, resolver),
-            None => network,
-        };
         let planned = sandbox::PlannedLaunch::begin(network)
             .await
             .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;

@@ -1153,6 +1153,78 @@ fn a_task_of_a_box_with_its_own_address_is_under_the_box_s_policy() {
 
 #[test]
 #[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
+fn a_task_resolves_and_reaches_the_host_as_a_session_of_its_box_does() {
+    if !gated("a_task_resolves_and_reaches_the_host_as_a_session_of_its_box_does") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let loader = Loader::start(dir.path());
+    let port = target(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let daemon = Daemon::start(dir.path(), &loader.socket, None);
+    daemon.expose_host_port(port);
+    let tasks = format!(
+        "\n[tasks.files]\npackages = [\"base\"]\n\
+         bash = \"cat /etc/resolv.conf; getent hosts host.min.internal\"\n\
+         \n[tasks.host]\npackages = [\"base\"]\n\
+         bash = \"exec 3<>/dev/tcp/host.min.internal/{port} && read -t 5 line <&3 && echo $line\"\n\
+         \n[tasks.loopback]\npackages = [\"base\"]\n\
+         bash = \"exec 3<>/dev/tcp/127.0.0.1/{port} && echo reached\"\n"
+    );
+    let file = daemon.project.join("minimal.toml");
+    let mut project = std::fs::read_to_string(&file).expect("project file");
+    project.push_str(&tasks);
+    std::fs::write(&file, project).expect("project file");
+    let greeted = |out: &str| out.lines().any(|line| line == "hello");
+    // What a session of a box with a resolver endpoint reads: the endpoint
+    // in its resolver file, and the host's name at the alias.
+    let sees_its_box_s_files = |out: &str| {
+        out.contains("nameserver 127.0.80.1")
+            && out
+                .lines()
+                .any(|line| line.starts_with("100.64.") && line.contains(".254 "))
+    };
+
+    // A box that allows everything fills the package cache.
+    daemon.activate("open", &["--network", "host_ip"]);
+    let filled = daemon.min(&["session", "run", "open", "loopback"]);
+    assert!(reached(&filled), "{filled}");
+
+    // A box that shares the host's address and denies by default: its own
+    // dial of the host's loopback is refused, and the alias leads to the
+    // exposed port.
+    let shut = ["--network", "host_ip", "--deny-all-egress"];
+    let out = daemon.activate("shut", &shut);
+    let session = daemon.exec(
+        "shut",
+        "cat /etc/resolv.conf; getent hosts host.min.internal",
+    );
+    assert!(sees_its_box_s_files(&session), "{out}{session}");
+    let files = daemon.min(&["session", "run", "shut", "files"]);
+    assert!(sees_its_box_s_files(&files), "{files}");
+    let direct = daemon.min(&["session", "run", "shut", "loopback"]);
+    assert!(direct.contains(REFUSED) && !reached(&direct), "{direct}");
+    let host = daemon.min(&["session", "run", "shut", "host"]);
+    assert!(greeted(&host), "{host}");
+
+    // The same for a task run that makes its own box.
+    let mut run = vec!["task", "run"];
+    run.extend_from_slice(&shut);
+    let files = daemon.min(&[&run[..], &["files"]].concat());
+    assert!(sees_its_box_s_files(&files), "{files}");
+    let host = daemon.min(&[&run[..], &["host"]].concat());
+    assert!(greeted(&host), "{host}");
+
+    // And for a task of a box with its own address, in the namespace the
+    // task gets beside the box's.
+    let out = daemon.activate("web", &["--network", "own_ip"]);
+    let files = daemon.min(&["session", "run", "web", "files"]);
+    assert!(sees_its_box_s_files(&files), "{out}{files}");
+    let host = daemon.min(&["session", "run", "web", "host"]);
+    assert!(greeted(&host), "{host}");
+}
+
+#[test]
+#[ignore = "needs MINIMALD_NETNS_TEST=1, sudo -n and systemd (just test-root-integration)"]
 fn without_a_loader_only_boxes_that_need_no_enforcement_start() {
     if !gated("without_a_loader_only_boxes_that_need_no_enforcement_start") {
         return;
