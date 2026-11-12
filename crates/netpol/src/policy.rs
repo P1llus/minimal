@@ -2,8 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{
-    Action, Direction, NamePattern, Origin, PortRange, Prefix, Protocols, Rule, Target, Verdict,
+use crate::{
+    base::{self, Mode},
+    model::{
+        Action, Direction, NamePattern, Origin, PortRange, Prefix, Protocol, Protocols, Rule,
+        Target, Verdict,
+    },
 };
 
 /// The action of a rule a box writes. A box cannot redirect.
@@ -110,6 +114,28 @@ impl BoxPolicy {
         );
         out
     }
+
+    /// Whether a box of `mode` with these entries lets TCP to `port` out to
+    /// a destination it knows only as `name`.
+    ///
+    /// An entry by prefix judges an address, and the name has none until
+    /// the box looks it up. So only the entries by name, the entries for
+    /// every address and the default decide here.
+    #[must_use]
+    pub fn admits_tcp_by_name(&self, mode: Mode, name: &str, port: u16) -> bool {
+        let decides = |rule: &Rule| {
+            rule.matches_l4(Protocol::Tcp, port)
+                && match &rule.target {
+                    Target::Any => true,
+                    Target::Names(pattern) => pattern.matches(name),
+                    Target::Net(_) | Target::OwnAddresses => false,
+                }
+        };
+        match self.rules().into_iter().find(decides) {
+            Some(rule) => rule.action == Action::Allow,
+            None => self.egress_default(base::defaults(mode).egress) == Verdict::Allow,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +192,92 @@ mod tests {
             .find(|r| r.origin == Origin::BoxProtocols)
             .unwrap();
         assert_eq!(limit.protocols, Protocols::UDP.union(Protocols::ICMP));
+    }
+
+    #[test]
+    fn a_name_is_admitted_by_the_first_entry_that_can_decide_it() {
+        let names = |list: &[&str]| BoxPolicy {
+            names: list.iter().map(|n| n.parse().unwrap()).collect(),
+            ..BoxPolicy::default()
+        };
+        let rule = |action, protocols, ports, to| BoxRule {
+            action,
+            protocols,
+            ports,
+            to,
+        };
+
+        // Nothing declared: the mode decides.
+        let nothing = BoxPolicy::default();
+        assert!(nothing.admits_tcp_by_name(Mode::HostIp, "example.com", 443));
+        assert!(!nothing.admits_tcp_by_name(Mode::OwnIp, "example.com", 443));
+        assert!(!nothing.admits_tcp_by_name(Mode::None, "example.com", 443));
+
+        // A list of names denies the rest in every mode. A wildcard matches
+        // the names below its domain and not the domain.
+        let listed = names(&["example.com", "*.pkg.example.org"]);
+        for mode in [Mode::HostIp, Mode::OwnIp] {
+            assert!(listed.admits_tcp_by_name(mode, "Example.COM.", 443));
+            assert!(listed.admits_tcp_by_name(mode, "a.pkg.example.org", 8443));
+            assert!(!listed.admits_tcp_by_name(mode, "pkg.example.org", 443));
+            assert!(!listed.admits_tcp_by_name(mode, "other.example", 443));
+        }
+
+        // A protocol list without TCP refuses the name before its entry.
+        let no_tcp = BoxPolicy {
+            protocols: Some(Protocols::UDP),
+            ..names(&["example.com"])
+        };
+        assert!(!no_tcp.admits_tcp_by_name(Mode::HostIp, "example.com", 443));
+
+        // An entry by prefix decides no name. An allowed prefix still makes
+        // the default deny, and a denied one leaves it allow.
+        let allowed_prefix = BoxPolicy {
+            allow: vec!["0.0.0.0/0".parse().unwrap()],
+            ..BoxPolicy::default()
+        };
+        assert!(!allowed_prefix.admits_tcp_by_name(Mode::HostIp, "example.com", 443));
+        let denied_prefix = BoxPolicy {
+            deny: vec!["0.0.0.0/0".parse().unwrap()],
+            ..BoxPolicy::default()
+        };
+        assert!(denied_prefix.admits_tcp_by_name(Mode::OwnIp, "example.com", 443));
+
+        // Explicit rules come first and are read by protocol and port.
+        let ruled = BoxPolicy {
+            rules: vec![
+                rule(
+                    BoxAction::Deny,
+                    Protocols::TCP,
+                    PortRange::one(8443),
+                    Target::Names("example.com".parse().unwrap()),
+                ),
+                rule(
+                    BoxAction::Deny,
+                    Protocols::UDP,
+                    PortRange::one(443),
+                    Target::Any,
+                ),
+                rule(
+                    BoxAction::Allow,
+                    Protocols::TCP,
+                    PortRange::one(443),
+                    Target::Names("*.example.com".parse().unwrap()),
+                ),
+            ],
+            ..names(&["example.com"])
+        };
+        assert!(ruled.admits_tcp_by_name(Mode::OwnIp, "example.com", 443));
+        assert!(!ruled.admits_tcp_by_name(Mode::OwnIp, "example.com", 8443));
+        assert!(ruled.admits_tcp_by_name(Mode::OwnIp, "api.example.com", 443));
+        assert!(!ruled.admits_tcp_by_name(Mode::OwnIp, "api.example.com", 80));
+
+        // An explicit default stands in for the implied one.
+        let open = BoxPolicy {
+            default: Some(Verdict::Allow),
+            ..names(&["example.com"])
+        };
+        assert!(open.admits_tcp_by_name(Mode::OwnIp, "other.example", 443));
     }
 
     #[test]

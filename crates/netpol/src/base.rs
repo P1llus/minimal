@@ -435,7 +435,9 @@ fn published(ports: &[PortOf], out: &mut Vec<Rule>) {
     }
 }
 
-const fn defaults(mode: Mode) -> Defaults {
+/// The verdicts for what no rule decides, by the box's mode.
+#[must_use]
+pub const fn defaults(mode: Mode) -> Defaults {
     match mode {
         Mode::HostIp => Defaults {
             egress: Verdict::Allow,

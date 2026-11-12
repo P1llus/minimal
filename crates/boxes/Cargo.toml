@@ -11,6 +11,7 @@ license.workspace = true
 client-config.workspace = true
 common.workspace = true
 globset.workspace = true
+netpol.workspace = true
 camino.workspace = true
 nutype.workspace = true
 paths.workspace = true

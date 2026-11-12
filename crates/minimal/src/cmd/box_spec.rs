@@ -63,10 +63,10 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         full_breadth_acknowledged: inputs.acknowledged,
         ..HostFacts::LOCAL
     };
-    let egress = None;
+    let egress = boxes::egress::box_policy(None, inputs.network, false)?;
     let spec = ActivationSpec {
         network: inputs.network,
-        egress,
+        egress: &egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
     };

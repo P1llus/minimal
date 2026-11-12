@@ -65,6 +65,13 @@ impl StoreRuleConfig {
             .iter()
             .map(|authority| authority_host(authority))
     }
+
+    /// The normalised host and the port of each upstream authority.
+    pub fn upstream_authorities(&self) -> impl Iterator<Item = (String, u16)> + '_ {
+        self.upstream
+            .iter()
+            .map(|authority| authority_parts(authority))
+    }
 }
 
 /// The `[secret-store-rules]` table: rules by item identifier.
@@ -350,13 +357,22 @@ pub fn store_consent(rule: &StoreRuleConfig, tty: bool) -> StoreConsent {
     }
 }
 
+/// The normalised host and the port of an authority, `host` or `host:port`.
+/// An authority that names no port is port 443.
+#[must_use]
+pub fn authority_parts(authority: &str) -> (String, u16) {
+    const HTTPS_PORT: u16 = 443;
+    match authority.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
+            (normalize_host(host), port.parse().unwrap_or(HTTPS_PORT))
+        }
+        _ => (normalize_host(authority), HTTPS_PORT),
+    }
+}
+
 /// The normalised host part of an authority, `host` or `host:port`.
 fn authority_host(authority: &str) -> String {
-    let host = match authority.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => authority,
-    };
-    normalize_host(host)
+    authority_parts(authority).0
 }
 
 /// Whether `authority` is a plain `host` or `host:port`: a DNS name of

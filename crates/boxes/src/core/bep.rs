@@ -22,7 +22,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use client_config::store_rules::normalize_host;
 // The store rules live in `client-config` so `bep` reads them without
 // linking this crate. These paths stay for every caller.
 pub use client_config::store_rules::{
@@ -30,7 +29,7 @@ pub use client_config::store_rules::{
     StoreRuleRefused, StoreRules, check_store_rules, store_consent,
 };
 
-use crate::{EgressPolicy, NetworkMode};
+use crate::NetworkMode;
 
 /// The exit code of a box spec that the activation refuses.
 pub const REFUSAL_EXIT_CODE: u8 = 3;
@@ -406,24 +405,32 @@ impl HostFacts {
 pub struct ActivationSpec<'a> {
     /// The box's network mode.
     pub network: NetworkMode,
-    /// The box's declared egress, if any. `None` admits no name, except on
-    /// a box that [`egress_admits_every_name`] says reaches them all.
-    pub egress: Option<&'a EgressPolicy>,
+    /// The box's egress as the engine reads it
+    /// ([`crate::egress::box_policy`]).
+    pub egress: &'a netpol::BoxPolicy,
     /// The proxy settings.
     pub bep: &'a BepSettings,
     /// The grants.
     pub secrets: &'a SecretGrants,
 }
 
-/// Whether a box's egress admits every name without listing any: a
-/// `host_ip` box with no `egress` section. That box shares its host's
-/// address, so the absent section stays allow-all in every phase
-/// ([`crate::effective_egress`]). It can also declare no list, because the
-/// classifier decides addresses and refuses a name rule (NET-079). An
-/// `egress` section of any shape decides by what it lists.
-#[must_use]
-pub fn egress_admits_every_name(network: NetworkMode, egress: Option<&EgressPolicy>) -> bool {
-    network == NetworkMode::HostNet && egress.is_none()
+/// The port of an authority that names none.
+const HTTPS_PORT: u16 = 443;
+
+/// The hosts of `authorities` that a box in `network` with `egress` does
+/// not let TCP out to by name, each once, in order.
+fn outside_egress(
+    network: NetworkMode,
+    egress: &netpol::BoxPolicy,
+    authorities: impl IntoIterator<Item = (String, u16)>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for (host, port) in authorities {
+        if !egress.admits_tcp_by_name(network.into(), &host, port) && !missing.contains(&host) {
+            missing.push(host);
+        }
+    }
+    missing
 }
 
 impl ActivationSpec<'_> {
@@ -858,19 +865,15 @@ pub fn refusals(
         });
     }
 
-    // BEP-008: every host of the GitHub set must be reachable: an egress
-    // name, or a box whose egress admits every name.
-    if !github.is_empty() && !egress_admits_every_name(spec.network, spec.egress) {
-        let allowed: Vec<String> = spec
-            .egress
-            .and_then(|egress| egress.allow_dns_hosts.as_ref())
-            .map(|hosts| hosts.iter().map(|h| normalize_host(h)).collect())
-            .unwrap_or_default();
-        let missing: Vec<String> = module_hosts
-            .iter()
-            .filter(|host| !allowed.contains(&normalize_host(host)))
-            .map(|host| (*host).to_string())
-            .collect();
+    // The box's own egress must let every host of the GitHub set out.
+    if !github.is_empty() {
+        let missing = outside_egress(
+            spec.network,
+            spec.egress,
+            module_hosts
+                .iter()
+                .map(|host| ((*host).to_string(), HTTPS_PORT)),
+        );
         if !missing.is_empty() {
             out.push(BepRefusal::HostsOutsideEgress { missing });
         }
@@ -1133,19 +1136,16 @@ pub fn store_references(secrets: &SecretGrants) -> impl Iterator<Item = StoreRef
 
 /// Every reason to refuse the store references in `secrets`, in grant name
 /// order (BEP-034, BEP-036). A reference to the GitHub sign-in item is
-/// refused. So is a reference whose rule registers an upstream host that
-/// `egress` does not admit.
+/// refused. So is a reference whose rule registers an upstream that a box
+/// in `network` with `egress` does not let out.
 #[must_use]
 pub fn store_refusals(
     secrets: &SecretGrants,
-    egress: Option<&EgressPolicy>,
+    network: NetworkMode,
+    egress: &netpol::BoxPolicy,
     rules: &StoreRules,
     deny: StoreDenySet<'_>,
 ) -> Vec<BepRefusal> {
-    let allowed: Vec<String> = egress
-        .and_then(|egress| egress.allow_dns_hosts.as_ref())
-        .map(|hosts| hosts.iter().map(|h| normalize_host(h)).collect())
-        .unwrap_or_default();
     let mut out = Vec::new();
     for reference in store_references(secrets) {
         if deny.is_sign_in_item(reference.id) {
@@ -1157,12 +1157,7 @@ pub fn store_refusals(
         let Some(rule) = reference.rule(rules) else {
             continue;
         };
-        let mut missing: Vec<String> = Vec::new();
-        for host in rule.upstream_hosts() {
-            if !allowed.contains(&host) && !missing.contains(&host) {
-                missing.push(host);
-            }
-        }
+        let missing = outside_egress(network, egress, rule.upstream_authorities());
         if !missing.is_empty() {
             out.push(BepRefusal::StoreHostsOutsideEgress {
                 grant: reference.grant.to_string(),
@@ -1182,11 +1177,12 @@ pub fn store_refusals(
 /// [`store_refusals`].
 pub fn check_store_references(
     secrets: &SecretGrants,
-    egress: Option<&EgressPolicy>,
+    network: NetworkMode,
+    egress: &netpol::BoxPolicy,
     rules: &StoreRules,
     deny: StoreDenySet<'_>,
 ) -> Result<(), ActivationRefused> {
-    let refusals = store_refusals(secrets, egress, rules, deny);
+    let refusals = store_refusals(secrets, network, egress, rules, deny);
     if refusals.is_empty() {
         return Ok(());
     }
@@ -1204,7 +1200,13 @@ pub fn check_store_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EgressPolicy;
     use proptest::prelude::*;
+
+    /// `egress` as the engine reads it for a box in `network`.
+    fn rules(network: NetworkMode, egress: Option<&EgressPolicy>) -> netpol::BoxPolicy {
+        crate::egress::box_policy(egress, network, false).expect("a valid section")
+    }
 
     const GITHUB_HOSTS: &[&str] = &[
         "github.com",
@@ -1413,12 +1415,11 @@ mod tests {
             host in any_host(),
             module in any_module_hosts(),
         ) {
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
-            let allowed: Vec<String> = egress
-                .as_ref()
-                .and_then(|e| e.allow_dns_hosts.clone())
-                .unwrap_or_default()
+            let spec = ActivationSpec { network, egress: &rules(network, egress.as_ref()), bep: &bep, secrets: &secrets };
+            let listed = egress.as_ref().and_then(|e| e.allow_dns_hosts.clone());
+            let allowed: Vec<String> = listed
                 .iter()
+                .flatten()
                 .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
                 .collect();
             let absent: Vec<String> = module
@@ -1426,9 +1427,11 @@ mod tests {
                 .filter(|h| !allowed.contains(&(**h).to_string()))
                 .map(|h| (*h).to_string())
                 .collect();
+            // A box that shares the node's address and lists no name it
+            // allows lets every name out.
             let expected = secrets.values().any(SecretGrant::is_github)
                 && !absent.is_empty()
-                && !(network == NetworkMode::HostNet && egress.is_none());
+                && !(network == NetworkMode::HostNet && listed.is_none());
             let named = refusals(&spec, host, &module).into_iter().find_map(|r| match r {
                 BepRefusal::HostsOutsideEgress { missing } => Some(missing),
                 _ => None,
@@ -1456,13 +1459,13 @@ mod tests {
             host in any_host(),
         ) {
             // A `client_env` grant in a `none` box is legal.
-            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
+            let client_spec = ActivationSpec { network, egress: &rules(network, egress.as_ref()), bep: &bep, secrets: &client };
             let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
                 .iter()
                 .any(|r| matches!(r, BepRefusal::NoNetworkWithGrant { .. }));
             prop_assert!(!client_fired);
 
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: &rules(network, egress.as_ref()), bep: &bep, secrets: &secrets };
             let credentialed: Vec<String> = secrets
                 .iter()
                 .filter(|(_, g)| g.is_credentialed())
@@ -1494,7 +1497,7 @@ mod tests {
             secrets in any_grants(),
         ) {
             let host = HostFacts { enrolled: false, full_breadth_acknowledged: false };
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: &rules(network, egress.as_ref()), bep: &bep, secrets: &secrets };
             let expected: Vec<String> = secrets
                 .iter()
                 .filter(|(_, g)| g.is_github() && g.mode == Some(GrantMode::Installation))
@@ -1531,7 +1534,7 @@ mod tests {
             acknowledged in any::<bool>(),
         ) {
             let host = HostFacts { enrolled, full_breadth_acknowledged: acknowledged };
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: &rules(network, egress.as_ref()), bep: &bep, secrets: &secrets };
             let expected: Vec<String> = if enrolled || acknowledged {
                 Vec::new()
             } else {
@@ -1593,7 +1596,7 @@ mod tests {
         let egress = egress_with(GITHUB_HOSTS);
         let spec = ActivationSpec {
             network: NetworkMode::OwnIp,
-            egress: Some(&egress),
+            egress: &rules(NetworkMode::OwnIp, Some(&egress)),
             bep: &bep,
             secrets: &secrets.grants,
         };
@@ -1616,7 +1619,7 @@ mod tests {
         let bep = proxy_env();
         let spec = ActivationSpec {
             network: NetworkMode::OwnIp,
-            egress: Some(&egress),
+            egress: &rules(NetworkMode::OwnIp, Some(&egress)),
             bep: &bep,
             secrets: &secrets,
         };
@@ -1640,7 +1643,7 @@ mod tests {
         };
         let spec = ActivationSpec {
             network: NetworkMode::OwnIp,
-            egress: Some(&egress),
+            egress: &rules(NetworkMode::OwnIp, Some(&egress)),
             bep: &bep,
             secrets: &secrets,
         };
@@ -1677,7 +1680,7 @@ mod tests {
         let bep = proxy_env();
         let spec = ActivationSpec {
             network: NetworkMode::OwnIp,
-            egress: Some(&egress),
+            egress: &rules(NetworkMode::OwnIp, Some(&egress)),
             bep: &bep,
             secrets: &secrets,
         };
@@ -1725,7 +1728,7 @@ mod tests {
         };
         let spec = ActivationSpec {
             network: NetworkMode::OwnIp,
-            egress: None,
+            egress: &rules(NetworkMode::OwnIp, None),
             bep: &bep,
             secrets: &secrets,
         };
@@ -1753,7 +1756,7 @@ mod tests {
         let bep = BepSettings::default();
         let spec = ActivationSpec {
             network: NetworkMode::OwnIp,
-            egress: Some(&egress),
+            egress: &rules(NetworkMode::OwnIp, Some(&egress)),
             bep: &bep,
             secrets: &secrets,
         };
@@ -1775,7 +1778,7 @@ mod tests {
             for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
                 let spec = ActivationSpec {
                     network,
-                    egress: Some(&egress),
+                    egress: &rules(network, Some(&egress)),
                     bep: &bep,
                     secrets: &secrets,
                 };
@@ -1887,7 +1890,7 @@ mod tests {
             };
             let spec = ActivationSpec {
                 network: NetworkMode::OwnIp,
-                egress: Some(&egress),
+                egress: &rules(NetworkMode::OwnIp, Some(&egress)),
                 bep: &bep,
                 secrets: &secrets,
             };
@@ -2007,31 +2010,63 @@ mod tests {
         )));
     }
 
-    /// BEP-008: a `host_ip` box with no `egress` section reaches the GitHub
-    /// set, and a declared section of any shape still has to list it.
+    /// A GitHub grant is refused unless the box's own egress lets every
+    /// host of the set out by name, read the way the engine reads it.
     #[test]
-    fn host_ip_grant_box_with_no_egress_section_reaches_the_github_hosts() {
+    fn a_github_grant_needs_its_hosts_let_out_by_the_box_s_own_egress() {
         let bep = BepSettings::default();
         let secrets = grants(github_grant(None));
         let outside = |network, egress: Option<&EgressPolicy>| {
             let spec = ActivationSpec {
                 network,
-                egress,
+                egress: &rules(network, egress),
                 bep: &bep,
                 secrets: &secrets,
             };
             refusals(&spec, HostFacts::LOCAL, GITHUB_HOSTS)
-                .iter()
-                .any(|refusal| matches!(refusal, BepRefusal::HostsOutsideEgress { .. }))
+                .into_iter()
+                .find_map(|refusal| match refusal {
+                    BepRefusal::HostsOutsideEgress { missing } => Some(missing),
+                    _ => None,
+                })
         };
-        let deny_all = EgressPolicy {
-            allow_dns_hosts: Some(Vec::new()),
-            ..EgressPolicy::default()
+        let section = |edit: fn(&mut EgressPolicy)| {
+            let mut section = EgressPolicy::default();
+            edit(&mut section);
+            section
         };
+        let list = |entries: &[&str]| Some(entries.iter().map(|e| (*e).to_string()).collect());
 
-        assert!(!outside(NetworkMode::HostNet, None));
-        assert!(outside(NetworkMode::HostNet, Some(&deny_all)));
-        assert!(outside(NetworkMode::OwnIp, None));
+        // No section: the mode decides.
+        assert_eq!(outside(NetworkMode::HostNet, None), None);
+        assert_eq!(
+            outside(NetworkMode::OwnIp, None).map(|missing| missing.len()),
+            Some(GITHUB_HOSTS.len())
+        );
+        // An allow list denies what it does not name, also by subnet alone.
+        let no_names = section(|s| s.allow_dns_hosts = Some(Vec::new()));
+        assert!(outside(NetworkMode::HostNet, Some(&no_names)).is_some());
+        let every_address = section(|s| s.allow_subnets = Some(vec!["0.0.0.0/0".into()]));
+        assert!(outside(NetworkMode::HostNet, Some(&every_address)).is_some());
+        // A pattern admits the names below its domain, not the domain.
+        let mut pattern = section(|_| {});
+        pattern.allow_dns_hosts = list(&["*.github.com"]);
+        assert_eq!(
+            outside(NetworkMode::OwnIp, Some(&pattern)),
+            Some(vec!["github.com".to_string()])
+        );
+        pattern.allow_dns_hosts = list(&["*.github.com", "GitHub.com."]);
+        assert_eq!(outside(NetworkMode::OwnIp, Some(&pattern)), None);
+        // A section that only denies allows the rest.
+        let only_denies = section(|s| s.deny_subnets = Some(vec!["10.0.0.0/8".into()]));
+        assert_eq!(outside(NetworkMode::OwnIp, Some(&only_denies)), None);
+        // A protocol list without TCP lets no HTTPS out.
+        let mut no_tcp = egress_with(GITHUB_HOSTS);
+        no_tcp.allow_protocols = Some(vec![crate::IpProto::Udp]);
+        assert_eq!(
+            outside(NetworkMode::OwnIp, Some(&no_tcp)).map(|missing| missing.len()),
+            Some(GITHUB_HOSTS.len())
+        );
     }
 
     // --- store rules (BEP-034 to BEP-037) ---------------------------------
@@ -2415,8 +2450,14 @@ mod tests {
             "TOKEN".to_string(),
             store_grant("keychain", "dev.minimal.github-sign-in"),
         )]);
-        let err = check_store_references(&secrets, None, &StoreRules::new(), deny())
-            .expect_err("a reference to the sign-in item is refused");
+        let err = check_store_references(
+            &secrets,
+            NetworkMode::OwnIp,
+            &rules(NetworkMode::OwnIp, None),
+            &StoreRules::new(),
+            deny(),
+        )
+        .expect_err("a reference to the sign-in item is refused");
         assert_eq!(err.exit_code(), REFUSAL_EXIT_CODE);
         assert_eq!(
             err.refusals,
@@ -2491,7 +2532,9 @@ mod tests {
                 .filter(|h| !allowed.contains(h))
                 .map(|h| (*h).to_string())
                 .collect();
-            match check_store_references(&secrets, Some(&egress), &rules, deny()) {
+            let network = NetworkMode::OwnIp;
+            let admitted = self::rules(network, Some(&egress));
+            match check_store_references(&secrets, network, &admitted, &rules, deny()) {
                 Ok(()) => prop_assert!(missing.is_empty()),
                 Err(err) => {
                     prop_assert_eq!(err.exit_code(), REFUSAL_EXIT_CODE);
@@ -2506,7 +2549,7 @@ mod tests {
             }
             // A reference with no rule registers nothing to check.
             let other = SecretGrants::from([("X".to_string(), store_grant("keychain", "other"))]);
-            prop_assert!(check_store_references(&other, None, &rules, deny()).is_ok());
+            prop_assert!(check_store_references(&other, network, &admitted, &rules, deny()).is_ok());
         }
     }
 }

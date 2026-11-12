@@ -1452,11 +1452,9 @@ pub struct ActivateArgs {
     // The egress flags are shared with `min task run`, from one definition.
     #[command(flatten)]
     pub egress: EgressArgs,
-    /// Let the box reach the Box Egress Proxy, whatever its
-    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
-    /// box sends to the proxy's address is dropped. Takes effect with
-    /// `--network own_ip`, and with `--network host_ip` on a host that runs
-    /// boxes in a VM.
+    /// Declare a credentialed upstream for the box although its spec grants
+    /// it no secret through the Box Egress Proxy. A box with such a grant
+    /// declares one without this flag.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.

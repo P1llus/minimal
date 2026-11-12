@@ -1708,15 +1708,22 @@ fn refuse_unhonourable_grants(
     full_breadth_acknowledged: bool,
     spec_env: &[String],
 ) -> Result<Vec<boxes::core::bep::BepWarning>, anyhow::Error> {
-    use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
+    use boxes::core::bep::{ActivationSpec, HostFacts, SecretGrant, check_activation};
     let hosts: Vec<&str> = bep::module::GITHUB
         .hosts
         .iter()
         .map(|authority| authority.host)
         .collect();
+    // Only a GitHub grant makes the checks read the egress. For a box with
+    // none, the daemon names an entry that is not what its list holds.
+    let own_egress = if secrets.values().any(SecretGrant::is_github) {
+        boxes::egress::box_policy(egress, network, false)?
+    } else {
+        Default::default()
+    };
     let spec = ActivationSpec {
         network,
-        egress,
+        egress: &own_egress,
         bep: settings,
         secrets,
     };
@@ -1768,6 +1775,7 @@ pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::Net
 fn check_store_grants(
     global: &GlobalArgs,
     secrets: &boxes::core::bep::SecretGrants,
+    network: boxes::NetworkMode,
     egress: Option<&boxes::EgressPolicy>,
     can_ask: bool,
 ) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
@@ -1775,7 +1783,7 @@ fn check_store_grants(
         return Ok(boxes::core::bep::StoreRules::new());
     }
     let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
-    accept_store_references(secrets, egress, &rules, can_ask, &mut |question| {
+    accept_store_references(secrets, network, egress, &rules, can_ask, &mut |question| {
         crate::cmd::confirm(question, false)
     })
 }
@@ -1793,6 +1801,7 @@ fn check_store_grants(
 /// As [`check_store_grants`] says. `ask`'s own error ends the check.
 fn accept_store_references(
     secrets: &boxes::core::bep::SecretGrants,
+    network: boxes::NetworkMode,
     egress: Option<&boxes::EgressPolicy>,
     rules: &boxes::core::bep::StoreRules,
     can_ask: bool,
@@ -1801,9 +1810,10 @@ fn accept_store_references(
     use boxes::core::bep::{StoreConsent, check_store_references, store_consent, store_references};
     let module_hosts = crate::config::store_module_hosts();
     let deny = crate::config::store_deny_set(&module_hosts);
+    let own_egress = boxes::egress::box_policy(egress, network, false)?;
     let mut checked: Vec<String> = Vec::new();
     let outcome = (|| {
-        if let Err(refused) = check_store_references(secrets, egress, rules, deny) {
+        if let Err(refused) = check_store_references(secrets, network, &own_egress, rules, deny) {
             checked.extend(
                 refused
                     .refusals
@@ -2227,7 +2237,8 @@ fn mint_grants(
     stores: &[crate::mint::StoreGrant],
     config_dir: Option<&std::path::Path>,
     box_id: Option<String>,
-    egress: Vec<String>,
+    policy: &boxes::BoxPolicy,
+    network: boxes::NetworkMode,
     proxy: Option<ProxyPaths>,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
@@ -2242,6 +2253,7 @@ fn mint_grants(
         });
     };
     let stored = grants.is_empty();
+    let egress = proxy_egress(policy, network, !stored)?;
     let declares = if stored {
         "a secret from the host's secret store"
     } else {
@@ -2381,24 +2393,40 @@ fn store_grants(
         .collect()
 }
 
-/// The authorities to register with the proxy as the box's declared egress
-/// (BEP-022). A box whose egress admits every name lists none, so a GitHub
-/// grant registers the module's hosts for it, or the proxy would refuse them.
+/// The authorities to register with the proxy as the box's declared
+/// egress: the names the box lists, the GitHub hosts for a GitHub grant and
+/// the upstreams of the box's accepted store rules, each one only if the
+/// box's own egress lets it out. The proxy compares authorities and reads
+/// no pattern, so a pattern counts through the GitHub hosts and the
+/// upstreams below its domain.
 fn proxy_egress(
-    egress: Option<&boxes::EgressPolicy>,
+    policy: &boxes::BoxPolicy,
     network: boxes::NetworkMode,
     github_grant: bool,
-) -> Vec<String> {
-    if github_grant && boxes::core::bep::egress_admits_every_name(network, egress) {
-        return bep::module::GITHUB
-            .hosts
-            .iter()
-            .map(|authority| authority.host.to_string())
-            .collect();
+) -> Result<Vec<String>, boxes::egress::SpecError> {
+    let own_egress = boxes::egress::box_policy(policy.egress.as_ref(), network, false)?;
+    let listed = own_egress
+        .names
+        .iter()
+        .filter(|name| !name.is_wildcard())
+        .map(|name| (name.domain().to_string(), bep::module::HTTPS_PORT));
+    let github = bep::module::GITHUB
+        .hosts
+        .iter()
+        .filter(|_| github_grant)
+        .map(|authority| (authority.host.to_string(), authority.port));
+    let stored = policy
+        .credentialed_upstream
+        .iter()
+        .flat_map(boxes::CredentialedUpstream::store_upstream_authorities);
+    let mut out = Vec::new();
+    for (host, port) in listed.chain(github).chain(stored) {
+        let authority = format!("{host}:{port}");
+        if own_egress.admits_tcp_by_name(network.into(), &host, port) && !out.contains(&authority) {
+            out.push(authority);
+        }
     }
-    egress
-        .and_then(|egress| egress.allow_dns_hosts.clone())
-        .unwrap_or_default()
+    Ok(out)
 }
 
 /// Mints the box's GitHub grants and its accepted store references for the
@@ -2431,11 +2459,7 @@ async fn mint_into_request(
     let stored = github_grants.is_empty();
     let box_id = registered_id.map(|box_id| box_id.to_string());
     let network = request.config.network;
-    let egress = proxy_egress(
-        request.config.policy.egress.as_ref(),
-        network,
-        !github_grants.is_empty(),
-    );
+    let policy = request.config.policy.clone();
     // The mint blocks on the proxy's control socket and the host keychain,
     // so it runs off the runtime's workers.
     let minted = tokio::task::spawn_blocking(move || {
@@ -2444,7 +2468,8 @@ async fn mint_into_request(
             &stores,
             config_dir.as_deref(),
             box_id,
-            egress,
+            &policy,
+            network,
             proxy,
         )
     })
@@ -3093,10 +3118,6 @@ pub(crate) async fn activate_box(
                 "the create request's effective egress"
             );
             let mut policy = boxes::BoxPolicy {
-                // NET-134: the lane is the box's own declaration, never a default —
-                // a box that did not ask for a credentialed upstream keeps every
-                // frame it sends to the proxy's address refused at the host-side
-                // gate, whatever its egress rules say.
                 credentialed_upstream: credentialed_upstream_for(
                     args.credentialed_upstream,
                     &project_bep,
@@ -3127,7 +3148,13 @@ pub(crate) async fn activate_box(
             // BEP-032: each accepted reference gets a store handle, sealed
             // as a `store` member at the mint below.
             let accepted_store_rules =
-                check_store_grants(global, &project_secrets, policy.egress.as_ref(), can_ask)?;
+                check_store_grants(
+                    global,
+                    &project_secrets,
+                    args.network.into(),
+                    policy.egress.as_ref(),
+                    can_ask,
+                )?;
             let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
             // BEP-062: a `dns` or `both` box resolves each accepted rule's
             // upstream to the proxy, so the gate needs the authorities.
@@ -5027,27 +5054,76 @@ mod tests {
         );
     }
 
-    /// BEP-022: a `host_ip` box with no `egress` section registers the GitHub
-    /// hosts for its grant. A box with a section registers what it lists.
+    /// The proxy learns the names the box lists and its credentialed
+    /// authorities, each only if the box's own egress lets it out.
     #[test]
-    fn host_ip_grant_box_with_no_egress_section_registers_the_github_hosts() {
-        let hosts: Vec<String> = bep::module::GITHUB
+    fn the_proxy_learns_the_credentialed_authorities_the_box_s_egress_lets_out() {
+        let github: Vec<String> = bep::module::GITHUB
             .hosts
             .iter()
-            .map(|authority| authority.host.to_string())
+            .map(ToString::to_string)
             .collect();
-        assert_eq!(proxy_egress(None, boxes::NetworkMode::HostNet, true), hosts);
-        assert!(proxy_egress(None, boxes::NetworkMode::HostNet, false).is_empty());
-        assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, true).is_empty());
-
-        let listed = boxes::EgressPolicy {
-            allow_dns_hosts: Some(vec!["github.com".to_string()]),
-            ..boxes::EgressPolicy::default()
+        let host_ip = boxes::NetworkMode::HostNet;
+        let own_ip = boxes::NetworkMode::OwnIp;
+        let registered = |policy: &boxes::BoxPolicy, network, github_grant| {
+            proxy_egress(policy, network, github_grant).expect("a valid egress section")
         };
+        let listing = |names: &[&str]| boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_dns_hosts: Some(names.iter().map(|name| (*name).to_string()).collect()),
+                ..boxes::EgressPolicy::default()
+            }),
+            ..boxes::BoxPolicy::default()
+        };
+
+        // No section: the mode decides.
+        let no_section = boxes::BoxPolicy::default();
+        assert_eq!(registered(&no_section, host_ip, true), github);
+        assert!(registered(&no_section, host_ip, false).is_empty());
+        assert!(registered(&no_section, own_ip, true).is_empty());
+
+        // A listed name is registered once. A pattern is not, and lets the
+        // GitHub hosts below its domain out.
         assert_eq!(
-            proxy_egress(Some(&listed), boxes::NetworkMode::HostNet, true),
-            ["github.com"]
+            registered(&listing(&["GitHub.com.", "example.com"]), host_ip, true),
+            ["github.com:443", "example.com:443"]
         );
+        assert_eq!(
+            registered(&listing(&["*.github.com"]), own_ip, true),
+            [
+                "api.github.com:443",
+                "uploads.github.com:443",
+                "codeload.github.com:443"
+            ]
+        );
+
+        // The upstreams of the accepted store rules, each at its own port.
+        let mut stored = listing(&["api.openai.com", "mcp.example"]);
+        stored.credentialed_upstream = Some(boxes::CredentialedUpstream {
+            store_upstreams: vec![
+                "API.OpenAI.com".into(),
+                "mcp.example:8443".into(),
+                "other.example".into(),
+            ],
+            ..boxes::CredentialedUpstream::default()
+        });
+        assert_eq!(
+            registered(&stored, own_ip, false),
+            ["api.openai.com:443", "mcp.example:443", "mcp.example:8443"]
+        );
+
+        // A listed name that the protocol list keeps TCP from is left out.
+        let mut no_tcp = listing(&["github.com"]);
+        no_tcp.egress.as_mut().expect("section").allow_protocols = Some(vec![boxes::IpProto::Udp]);
+        assert!(registered(&no_tcp, own_ip, true).is_empty());
+
+        // An entry that is not what its list holds is named.
+        let mut bad = listing(&[]);
+        bad.egress.as_mut().expect("section").deny_subnets = Some(vec!["ten-dot".into()]);
+        assert!(matches!(
+            proxy_egress(&bad, own_ip, true),
+            Err(boxes::egress::SpecError::Subnet { .. })
+        ));
     }
 
     /// BEP-082: a `host_ip` grant box whose record takes another id than
@@ -5401,6 +5477,7 @@ mod tests {
         let egress = egress_of(&["api.openai.com"]);
         let accepted = accept_store_references(
             &secrets,
+            boxes::NetworkMode::OwnIp,
             Some(&egress),
             &store_rule(None),
             false,
@@ -5485,6 +5562,7 @@ mod tests {
         secrets.insert("ZZ_KEY".into(), store_reference("openai-key"));
         let accepted = accept_store_references(
             &secrets,
+            boxes::NetworkMode::OwnIp,
             Some(&egress),
             &store_rule(None),
             false,
@@ -5617,8 +5695,14 @@ mod tests {
             ..crate::cli::GlobalArgs::default()
         };
         let egress = egress_of(&["api.openai.com"]);
-        let err = check_store_grants(&global, &store_grant(), Some(&egress), false)
-            .expect_err("a reference with no rule is refused");
+        let err = check_store_grants(
+            &global,
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            false,
+        )
+        .expect_err("a reference with no rule is refused");
         let refused = err
             .downcast_ref::<GrantNotDelivered>()
             .expect("a refusal main.rs ends with exit 3");
@@ -5636,16 +5720,28 @@ mod tests {
         );
         assert!(text.contains("[secret-store-rules]"), "{text}");
 
-        let none = check_store_grants(&global, &boxes::core::bep::SecretGrants::new(), None, false)
-            .expect("no store reference, nothing to refuse");
+        let none = check_store_grants(
+            &global,
+            &boxes::core::bep::SecretGrants::new(),
+            boxes::NetworkMode::OwnIp,
+            None,
+            false,
+        )
+        .expect("no store reference, nothing to refuse");
         assert!(none.is_empty());
 
         // A rule in another store does not name the reference.
         let mut other = store_rule(None);
         other.get_mut("openai-key").expect("rule").store = Some("vault".into());
-        let err =
-            accept_store_references(&store_grant(), Some(&egress), &other, true, &mut never_ask)
-                .expect_err("a rule in another store is no rule");
+        let err = accept_store_references(
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &other,
+            true,
+            &mut never_ask,
+        )
+        .expect_err("a rule in another store is no rule");
         assert!(matches!(
             err.downcast_ref::<GrantNotDelivered>(),
             Some(GrantNotDelivered::NoStoreRule { .. })
@@ -5653,6 +5749,7 @@ mod tests {
 
         let accepted = accept_store_references(
             &store_grant(),
+            boxes::NetworkMode::OwnIp,
             Some(&egress),
             &store_rule(None),
             false,
@@ -5669,6 +5766,7 @@ mod tests {
         for egress in [None, Some(egress_of(&["example.com"]))] {
             let err = accept_store_references(
                 &store_grant(),
+                boxes::NetworkMode::OwnIp,
                 egress.as_ref(),
                 &store_rule(None),
                 true,
@@ -5696,9 +5794,15 @@ mod tests {
     fn ask_rule_without_a_terminal_denies() {
         let egress = egress_of(&["api.openai.com"]);
         let ask = store_rule(Some(boxes::core::bep::StoreAction::Ask));
-        let err =
-            accept_store_references(&store_grant(), Some(&egress), &ask, false, &mut never_ask)
-                .expect_err("no terminal denies");
+        let err = accept_store_references(
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &ask,
+            false,
+            &mut never_ask,
+        )
+        .expect_err("no terminal denies");
         let refused = err.downcast_ref::<GrantNotDelivered>().expect("exit 3");
         assert_eq!(
             refused,
@@ -5710,12 +5814,18 @@ mod tests {
         assert!(refused.to_string().contains("--no-input"), "{refused}");
 
         let mut questions = Vec::new();
-        let accepted =
-            accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |q| {
+        let accepted = accept_store_references(
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &ask,
+            true,
+            &mut |q| {
                 questions.push(q.to_owned());
                 Ok(true)
-            })
-            .expect("a yes accepts");
+            },
+        )
+        .expect("a yes accepts");
         assert_eq!(accepted, ask);
         assert_eq!(questions.len(), 1);
         assert!(questions[0].contains("api.openai.com"), "{}", questions[0]);
@@ -5724,9 +5834,14 @@ mod tests {
             "KEY\\u{1b}[2K\\nAllow? y"
         );
 
-        let err = accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |_| {
-            Ok(false)
-        })
+        let err = accept_store_references(
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &ask,
+            true,
+            &mut |_| Ok(false),
+        )
         .expect_err("a no refuses");
         assert!(matches!(
             err.downcast_ref::<GrantNotDelivered>(),
@@ -5734,9 +5849,15 @@ mod tests {
         ));
 
         let deny = store_rule(Some(boxes::core::bep::StoreAction::Deny));
-        let err =
-            accept_store_references(&store_grant(), Some(&egress), &deny, true, &mut never_ask)
-                .expect_err("a deny rule refuses");
+        let err = accept_store_references(
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &deny,
+            true,
+            &mut never_ask,
+        )
+        .expect_err("a deny rule refuses");
         assert!(matches!(
             err.downcast_ref::<GrantNotDelivered>(),
             Some(GrantNotDelivered::StoreReferenceDenied { .. })
@@ -5749,9 +5870,15 @@ mod tests {
         let mut denied = deny["openai-key"].clone();
         denied.upstream = vec!["api.openai.com".into()];
         ask_then_deny.insert("other-key".into(), denied);
-        let err =
-            accept_store_references(&two, Some(&egress), &ask_then_deny, true, &mut never_ask)
-                .expect_err("the deny refuses before any question");
+        let err = accept_store_references(
+            &two,
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &ask_then_deny,
+            true,
+            &mut never_ask,
+        )
+        .expect_err("the deny refuses before any question");
         assert!(matches!(
             err.downcast_ref::<GrantNotDelivered>(),
             Some(GrantNotDelivered::StoreReferenceDenied { .. })
@@ -5761,10 +5888,17 @@ mod tests {
         let mut shared = store_grant();
         shared.insert("ZZ_TOKEN".into(), store_reference("openai-key"));
         let mut questions = Vec::new();
-        let accepted = accept_store_references(&shared, Some(&egress), &ask, true, &mut |q| {
-            questions.push(q.to_owned());
-            Ok(true)
-        })
+        let accepted = accept_store_references(
+            &shared,
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &ask,
+            true,
+            &mut |q| {
+                questions.push(q.to_owned());
+                Ok(true)
+            },
+        )
         .expect("a yes accepts both grants");
         assert_eq!(accepted, ask);
         assert_eq!(questions.len(), 1, "{questions:?}");
@@ -5793,6 +5927,45 @@ mod tests {
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");
         assert_eq!(refused.exit_code(), 3);
+    }
+
+    /// The creation check reads the egress the way the daemon does: a
+    /// pattern lets the GitHub hosts below its domain out. It names a
+    /// malformed entry only for a box whose grant makes it read the egress.
+    #[test]
+    fn the_creation_check_reads_the_egress_as_the_daemon_does() {
+        use boxes::core::bep::{BepSettings, GrantSource, SecretGrant, SecretGrants};
+        let own_ip = boxes::NetworkMode::OwnIp;
+        let bep = BepSettings::default();
+        let github = SecretGrants::from([(
+            "GH_TOKEN".to_string(),
+            SecretGrant {
+                source: GrantSource::Broker,
+                scopes: vec!["github:user-token".into()],
+                mode: None,
+            },
+        )]);
+        let check = |egress: &boxes::EgressPolicy, secrets: &SecretGrants| {
+            refuse_unhonourable_grants(own_ip, Some(egress), &bep, secrets, true, &[])
+        };
+
+        let mut egress = egress_of(&["*.github.com"]);
+        let err = check(&egress, &github).expect_err("the pattern does not match its own domain");
+        assert_eq!(
+            err.to_string(),
+            "This box declares a GitHub grant, but its egress does not allow: github.com. \
+             Add them to egress.allow_dns_hosts."
+        );
+        egress = egress_of(&["*.github.com", "github.com"]);
+        check(&egress, &github).expect("every GitHub host is let out");
+
+        egress.deny_subnets = Some(vec!["ten-dot".into()]);
+        let err = check(&egress, &github).expect_err("the malformed entry is named");
+        assert!(
+            err.downcast_ref::<boxes::egress::SpecError>().is_some(),
+            "{err}"
+        );
+        check(&egress, &SecretGrants::new()).expect("left to the daemon's own check");
     }
 
     /// NET-046: a `none` box on a VM host holds its name with the host, as
@@ -5975,6 +6148,7 @@ mod tests {
         secrets.insert("ZZ_KEY".into(), store_reference("openai-key"));
         let accepted = accept_store_references(
             &secrets,
+            boxes::NetworkMode::OwnIp,
             Some(&egress_of(&["api.openai.com"])),
             &store_rule(None),
             false,
