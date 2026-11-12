@@ -1001,6 +1001,11 @@ teardown() {
   # alone: only the whole walk destroys it before it returns.
   if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
   AHM_SID=""
+  # The host-exposures table proof's boxes, while the daemon that holds
+  # them still runs: a `min` call after the stop would start a new one.
+  for hx_sid in $HX_SIDS; do
+    mnl session destroy --force "$hx_sid" >/dev/null 2>&1 || true
+  done
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
@@ -1093,11 +1098,8 @@ teardown() {
   fi
   [ -n "$PROXY_SEED_DIR" ] && rm -rf "$PROXY_SEED_DIR"
   [ -n "$PROXY_OWN_SEED_DIR" ] && rm -rf "$PROXY_OWN_SEED_DIR"
-  # The host-exposures table proof: its entry, its boxes, its listener.
+  # The host-exposures table proof: its entry and its listener.
   host_exposure_restore
-  for hx_sid in $HX_SIDS; do
-    mnl session destroy --force "$hx_sid" >/dev/null 2>&1 || true
-  done
   [ -n "$HX_SRV_PID" ] && { kill "$HX_SRV_PID" 2>/dev/null || true; }
   [ -n "$HX_HOST_DIR" ] && rm -rf "$HX_HOST_DIR"
   [ -n "$HX_SEED_DIR" ] && rm -rf "$HX_SEED_DIR"
@@ -9232,6 +9234,9 @@ proof_answerer_survives_session_stop() {
     echo "answerer survives session stop SKIPPED (native lane: this is the VM-backed host's handover; native_answerer_survives_session_stop proves the native one)"
     return 0
   fi
+  if [ "$(uname -s)" = Linux ]; then
+    names_step_offered answerer_survives_session_stop || return 0
+  fi
   echo "::group::the box-zone answerer host service survives a session stop (NET-122, NET-138)"
   local asr_os asr_channel asr_marker
   asr_os="$(uname -s)"
@@ -17298,18 +17303,41 @@ proof_min_internal_names_through_proxy() {
       fail
     fi
 
+    # Which box asks the proxy for the own-address box. On a native node the
+    # host-address box does: it is on the host's network, where no rule of
+    # its own stands between it and a peer. In a guest every box is on the
+    # virtual network, where a box reaches a peer only when it lists the
+    # peer's name. There the host-address box is refused, and a box that
+    # lists the name asks.
+    local proxy_own_caller="$proxy_sid" proxy_peer_sid=""
+    if [ -n "$E2E_VM" ]; then
+      proxy_request "$proxy_sid" "a box that does not list the own-address box's name is refused it" \
+        "http://$PROXY_OWN_NAME.min.internal:$PROXY_OWN_EXTERNAL_PORT/" proxy ""
+      proxy_want 403 "the caller's egress policy denies this target" ""
+      proxy_peer_sid="$(cd "$PROXY_SEED_DIR" && mnl session activate . --no-prompt \
+        --name "$PROXY_OWN_NAME-peer" --network host_ip \
+        --allow-dns-hosts "$PROXY_OWN_NAME.min.internal" 2>"$WORK/proxy-peer.err")" || {
+        echo "::error::'min session activate --network host_ip --allow-dns-hosts $PROXY_OWN_NAME.min.internal' failed"
+        echo "--- stderr ---"; cat "$WORK/proxy-peer.err" 2>/dev/null || true
+        fail
+      }
+      proxy_peer_sid="$(printf '%s\n' "$proxy_peer_sid" | tail -n1 | tr -d '\r')"
+      proxy_own_caller="$proxy_peer_sid"
+    fi
+
     # Its PUBLISHED port routes to the box's lease — straight to it, on the
     # switch, not via any host-side forwarder.
-    proxy_request "$proxy_sid" "NET-001: an own-address box's published port routes to its lease" \
+    proxy_request "$proxy_own_caller" "NET-001: an own-address box's published port routes to its lease" \
       "http://$PROXY_OWN_NAME.min.internal:$PROXY_OWN_EXTERNAL_PORT/" proxy ""
     proxy_want 200 "$PROXY_BOX_MARKER" ""
 
     # A port the box never published: refused at the proxy, where the host,
     # the session and the port are all in hand.
-    proxy_request "$proxy_sid" "NET-001 refusal: an own-address box's unpublished port" \
+    proxy_request "$proxy_own_caller" "NET-001 refusal: an own-address box's unpublished port" \
       "http://$PROXY_OWN_NAME.min.internal:$PROXY_CLOSED_PORT/" proxy \
       'the box has not published this port'
-    proxy_want 403 "" 'the box has not published this port'
+    proxy_want 403 "the box has not published this port" 'the box has not published this port'
+    [ -z "$proxy_peer_sid" ] || mnl session destroy --force "$proxy_peer_sid" >/dev/null 2>&1 || true
 
     # The own-address box resolves host.min.internal to the alias too, the
     # same address the host-address box got above.
