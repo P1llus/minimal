@@ -56,6 +56,25 @@ pub fn egress_posture_cell(posture: Option<minimald_rpc::EgressPosture>) -> Stri
     )
 }
 
+/// What a box of `network` accepts from outside, as `min session policy`
+/// prints it under `ingress`. Egress rules judge the connections a box
+/// opens, so a box answers a connection it accepted whatever they say, and
+/// the line says so. `None` for a box with no network.
+#[must_use]
+pub fn ingress_stance_words(network: boxes::NetworkMode) -> Option<&'static str> {
+    match network {
+        boxes::NetworkMode::HostNet => Some(
+            "accepts connections on the host address it shares; its replies pass whatever the \
+             egress rules say",
+        ),
+        boxes::NetworkMode::OwnIp => Some(
+            "accepts connections on published ports only; its replies pass whatever the egress \
+             rules say",
+        ),
+        _ => None,
+    }
+}
+
 /// Renders a session's effective policy as its rules.
 ///
 /// The egress block prints a declared section's dimensions, each as its
@@ -63,12 +82,14 @@ pub fn egress_posture_cell(posture: Option<minimald_rpc::EgressPosture>) -> Stri
 /// nothing is denied). A section that admits nothing prints `deny-all`. A
 /// box that declared no egress prints the default its daemon resolved,
 /// marked as one: `deny-all (default)` or `allow-all (default)`. The
-/// ingress block prints the mappings and the dynamic stance.
+/// ingress block starts with what the box's mode accepts
+/// ([`ingress_stance_words`]), then prints the mappings and the dynamic
+/// stance.
 ///
 /// A box with no network prints one line in place of both blocks. A box
-/// that shares its host's address has no ingress policy, so its ingress
-/// block is left out. Shared by `min session policy` and the tests that
-/// pin the rendering.
+/// that shares its host's address declares no ports, so its ingress block
+/// is the mode's line alone. Shared by `min session policy` and the tests
+/// that pin the rendering.
 pub fn format_policy(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
@@ -116,12 +137,14 @@ pub fn format_policy(
         }
         write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
     }
-    // Ingress is an own-address surface: the switch's static forwarder is the
-    // only per-session ingress minimald applies, and a host-address box
-    // shares its host's namespace, so there is no per-session ingress policy
-    // to show for it — "deny-all" there would claim a deny-rule exists.
+    writeln!(out, "ingress")?;
+    if let Some(stance) = ingress_stance_words(network) {
+        writeln!(out, "  {stance}")?;
+    }
+    // Published ports are an own-address matter. A box that shares its
+    // host's address declares none, and a `deny-all` row there would claim
+    // a rule that does not exist.
     if network != boxes::NetworkMode::HostNet {
-        writeln!(out, "ingress")?;
         // The dynamic row is the resolved stance, printed whether or not
         // anything was declared (NET-043): an absent setting is the deny the
         // policy module evaluates it as, and this render is where a person
@@ -894,6 +917,38 @@ mod tests {
         assert!(
             rendered.contains("  dynamic ingress  ask"),
             "dynamic ingress row must render alongside mapping: {rendered}"
+        );
+    }
+
+    /// The ingress block says what the box's mode accepts, also for a box
+    /// whose egress is deny-all: such a box opens no connection and still
+    /// answers one it accepts.
+    #[test]
+    fn format_policy_states_what_the_mode_accepts() {
+        let policy = EffectiveBoxPolicy {
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let rendered = |network| {
+            let mut out = Vec::new();
+            format_policy(&mut out, &policy, network, &[]).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            rendered(NetworkMode::HostNet),
+            "egress\n  deny-all\ningress\n  accepts connections on the host address it shares; \
+             its replies pass whatever the egress rules say\n"
+        );
+        assert_eq!(
+            rendered(NetworkMode::OwnIp),
+            "egress\n  deny-all\ningress\n  accepts connections on published ports only; its \
+             replies pass whatever the egress rules say\n  deny-all\n  dynamic ingress  deny \
+             (default)\n"
+        );
+        assert_eq!(
+            rendered(NetworkMode::NoNet),
+            "This box has no network (--network none)\n"
         );
     }
 

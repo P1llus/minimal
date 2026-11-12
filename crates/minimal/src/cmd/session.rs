@@ -354,11 +354,11 @@ pub async fn cmd_session_policy(
 
     let client = connect_daemon(global).await?;
 
-    // The effective reply carries only the rules, but the ingress block is
-    // suppressed for host-address sessions (see [`format_policy`]), so the
-    // command also resolves the record the policy rides on for its network
-    // mode. The name alone decides which VM is asked (NET-058): a box on
-    // another VM is read from that VM's daemon, with no global flag.
+    // The effective reply carries only the rules, and the ingress block
+    // depends on the network mode (see [`format_policy`]), so the command
+    // also resolves the record the policy rides on for its mode. The name
+    // alone decides which VM is asked: a box on another VM is read from
+    // that VM's daemon, with no global flag.
     let example = format!("session policy {}", args.session);
     let (mut client, record) =
         resolve_box_on_any_vm(global, client, &args.session, &example).await?;

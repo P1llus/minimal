@@ -1519,12 +1519,15 @@ pub struct EgressArgs {
     /// minimal.toml declares for the box. Once `--allow-subnets` or
     /// `--allow-dns-hosts` is given, the box reaches only what the two
     /// lists name: `--allow-dns-hosts github.com` alone reaches no address
-    /// directly, and `--allow-subnets 0.0.0.0/0` writes allow-all out. The
-    /// egress flags are accepted with `--network own_ip` and `--network
-    /// host_ip`, and both enforce them. A box whose rules this host cannot
-    /// enforce is refused at creation. `--network none` rejects every
-    /// egress flag. `min session policy` shows the rules a box ended up
-    /// with.
+    /// directly, and `--allow-subnets 0.0.0.0/0` allows every address but
+    /// lets the box look up no name. The egress flags govern the
+    /// connections the box opens. A box still answers a connection it
+    /// accepts: a `host_ip` box accepts them on the host address it shares,
+    /// an `own_ip` box on its published ports. The egress flags are
+    /// accepted with `--network own_ip` and `--network host_ip`, and both
+    /// enforce them. A box whose rules this host cannot enforce is refused
+    /// at creation. `--network none` rejects every egress flag. `min
+    /// session policy` shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
@@ -1545,14 +1548,17 @@ pub struct EgressArgs {
     /// declares for the box, so it never drops a range the file denies.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address. Drops
-    /// every `allow_subnets` and `allow_dns_hosts` value minimal.toml
-    /// declares for the box. Cannot be combined with `--allow-subnets` or
+    /// Declare deny-all egress: the box can open no connection to an
+    /// external address. It governs the connections the box opens, so the
+    /// box still answers a connection it accepts, which a `host_ip` box
+    /// does on the host address it shares. Use `--network own_ip` or
+    /// `--network none` for a box that must accept nothing. Drops every
+    /// `allow_subnets` and `allow_dns_hosts` value minimal.toml declares
+    /// for the box. Cannot be combined with `--allow-subnets` or
     /// `--allow-dns-hosts`. The file's `allow_protocols` and `deny_subnets`
     /// stay, and `--deny-subnets` and `--allow-protocols` still apply.
-    /// Unless the
-    /// host opts out, a `--network own_ip` box with no egress rules already
-    /// reaches no external address.
+    /// Unless the host opts out, a `--network own_ip` box with no egress
+    /// rules already reaches no external address.
     #[arg(
         long = "deny-all-egress",
         conflicts_with_all = ["allow_subnets", "allow_dns_hosts"]

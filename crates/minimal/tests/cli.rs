@@ -1975,8 +1975,8 @@ async fn policy_json_failure_answers_with_the_error_contract() {
 /// through the daemon and fetched the way the command fetches it — the
 /// effective-policy RPC (NET-074) — and `format_policy` is the rendering the
 /// command prints. The same egress on a host-address box is still shown,
-/// but with no ingress block, and a none box shows no blocks at all — just
-/// the note the TUI shows in their place.
+/// with an ingress block that says what the mode accepts, and a none box
+/// shows no blocks at all, just the note the TUI shows in their place.
 #[tokio::test]
 async fn policy_shows_effective_egress() {
     let (daemon, args) = setup().await;
@@ -2032,11 +2032,10 @@ async fn policy_shows_effective_egress() {
         "denied subnets missing:\n{text}"
     );
 
-    // The same egress is accepted on a host-address box (NET-120), but the
-    // ingress block is suppressed there: a host-address session shares its
-    // host's namespace, so minimald applies no per-session ingress to it and
-    // a `deny-all` row would claim a deny-rule that does not exist. The TUI's
-    // detail pane suppresses the block for the same reason.
+    // The same egress is accepted on a host-address box. Its ingress block
+    // is one line: the box accepts connections on the address it shares,
+    // and egress rules do not stop its replies. It declares no ports, so no
+    // `deny-all` row claims a rule that does not exist.
     let host_id = create_session_with_policy(
         &daemon,
         "egress-policy-host",
@@ -2062,8 +2061,11 @@ async fn policy_shows_effective_egress() {
         "the host-address egress rules are still shown:\n{text}"
     );
     assert!(
-        !text.contains("ingress"),
-        "a host-address session has no per-session ingress policy to show:\n{text}"
+        text.ends_with(
+            "ingress\n  accepts connections on the host address it shares; its replies pass \
+             whatever the egress rules say\n"
+        ),
+        "a host-address box says what it accepts and declares no ports:\n{text}"
     );
 
     // A none box has no network, so it can carry no egress or ingress
